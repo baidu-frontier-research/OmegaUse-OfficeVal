@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose an improvement to the framework or verifier contract
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or evaluation problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe public API, compatibility, and platform implications.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: data
+    attributes:
+      label: Data safety
+      options:
+        - label: This request contains no confidential documents, credentials, or personal data.
+          required: true

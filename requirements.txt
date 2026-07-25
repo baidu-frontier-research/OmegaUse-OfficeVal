@@ -1,0 +1,6 @@
+# Install the project and its public runtime dependencies.
+-e .
+
+# Development and verification tools.
+build>=1.0.3
+pytest>=8.0

@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omegause-officeval"
+version = "0.1.0"
+description = "A secure batch evaluation framework for Office documents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Omegause Officeval Contributors" },
+]
+keywords = ["office", "document", "evaluation", "benchmark", "verifier"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "python-docx>=1.1",
+    "pywin32>=306; platform_system == 'Windows'",
+    "python-pptx>=0.6.23",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.11",
+    "pypdfium2>=4",
+    "lxml>=5.0",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "build>=1.0.3",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+omegause-officeval = "omegause_officeval.cmdline:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["omegause_officeval", "core", "verifiers"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/.github",
+    "/core",
+    "/docs",
+    "/examples",
+    "/omegause_officeval",
+    "/tests",
+    "/verifiers",
+    "/.editorconfig",
+    "/.gitattributes",
+    "/.gitignore",
+    "/CHANGELOG.md",
+    "/CITATION.cff",
+    "/CODE_OF_CONDUCT.md",
+    "/CONTRIBUTING.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/README.md",
+    "/README_zh-CN.md",
+    "/requirements.txt",
+    "/SECURITY.md",
+    "/THIRD_PARTY_LICENSES.md",
+    "/pyproject.toml",
+]
+
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
