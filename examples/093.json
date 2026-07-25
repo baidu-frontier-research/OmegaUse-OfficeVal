@@ -1,0 +1,30 @@
+{
+  "id": "093",
+  "instruction": "帮我在表格里加点东西，就图片上红矩形框圈起来的图形，给我加一个放到“图形组织”右边的格子里（这个图形我要可编辑的，不要图片），不要盖住序号和边框，放在序号后面就行",
+  "rubrics": {
+    "dim1": [
+      "交付文件为.xlsx或.xlsx格式，文件可正常打开。"
+    ],
+    "dim2": [
+      "+3：“Sheet0”工作表C32可编辑图形：“30、”之后存在2个宽1.1-1.3cm高0.9-1.1cm的可编辑的闭合自由多边形对象，每个对象均可单独选择并修改顶点、轮廓和尺寸；两个对象可组合为一个图形组。左侧多边形位于序号“30、”右侧，由5个主要折点组成，轮廓为倾斜约30度的等边五边形，右侧尖角伸向单元格中部。右侧多边形位于左侧多边形右边，与左侧图形近似镜像排列，由5个主要折点组成，左侧尖角伸向单元格中部。左右两个多边形相互交叠，交叉轮廓在图形中部形成一个清晰的竖向菱形区域。",
+      "+3：“Sheet0”工作表C32图形尺寸：组合图形整体宽2.2–2.5cm、高0.9-1.1cm，两个多边形高度基本一致。两个多边形均使用黑色或深灰色实线轮廓，线宽1.5–2.5磅，无虚线、阴影、发光或立体效果。无填充或白色透明填充，单元格浅色底纹能够正常显示。",
+      "-1：“Sheet0”工作表C32边框：新增图形覆盖上边框、下边框、左边框或右边框中的任意一条。",
+      "-1：“Sheet0”工作表C32图形范围：图形超出C32并进入D32、E32、F32或相邻行。",
+      "-5：“Sheet0”工作表中A3:C32间存在文本不显示或显示不清的情况"
+    ]
+  },
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 13,
+  "task_price_proxy": 6,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/093/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/093/日常信息处理能力观察表.xlsx",
+      "dest": "日常信息处理能力观察表.xlsx"
+    }
+  ]
+}

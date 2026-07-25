@@ -1,0 +1,46 @@
+{
+  "id": "037",
+  "instruction": "把PDF文档转换成word格式并按照”周测二_高三英语试题“文档的格式对”澜桥市高三英语试题“文档的格式进行调整",
+  "rubrics": {
+    "dim1": [
+      "交付文件为.docx格式，文件可正常打开。"
+    ],
+    "dim2": [
+      "+1：整篇Word文档页面设置：纸张为A4纵向，纸张宽度21厘米、高度29.7厘米，上、下、左、右页边距均为1.27厘米，页眉距页面顶端1.00厘米，页脚距页面底端1.30厘米。",
+      "+5：整篇Word文档分页：正文共8页，第1页至第8页内容连续，不能出现第9页空白页或题目内容超出第8页页面底部。",
+      "+1：各页页脚页码：页脚中部显示页码字段，格式为“第X页/共8页”，中文字体为宋体五号，数字为Times New Roman五号，黑色，水平居中。",
+      "+1：第1页左上保密文本：保留“绝密★启用前”，字体为宋体五号，黑色，左对齐，位于页面正文顶部。",
+      "+1：第1页主标题：文本为“澜桥市2026年高三年级第二学期质量检测”“英语试题”，字体为宋体四号、数字为Times New Roman四号、加粗、黑色，水平居中。",
+      "+1：第1页日期文本：文本为“2026年6月”，字体为宋体小四号、数字为Times New Roman小四号、黑色，水平居中，不加粗。",
+      "+5：整篇正文：中文说明、章节标题、写作要求和注意事项使用宋体小四号；英文文章、英文题目、选项、单词和数字使用Times New Roman小四号，颜色为黑色。",
+      "+5：整篇正文行距：标题以外的题目、文章、选项和说明文字均设置为固定值20磅，段前0磅、段后0磅。英文文章普通段落首行缩进2字符，两端对齐，段落之间不增加空行。",
+      "+3：题目段落：第21—67题题号和题干左对齐，不设置首行缩进，题号、题干和句末标点处于同一段落内。",
+      "+5：选择题选项段落：选项段落首行缩进0.74厘米；如果出现同一题选项A与B位于同一行，且C与D位于下一行时，A与C左对齐且B与D左对齐；如果出现同一题的所有选项均单独成行，则要求所有选项互相左对齐",
+      "+1：第1页“第二部分 阅读理解（共两节，满分50分）”“第一节（共15小题；每小题2.5分，满分37.5分）”“阅读下列短文，从每题所给的A、B、C和D四个选项中，选出最佳答案。”等标题，字体为宋体小四号、数字为Times New Roman小四号、加粗，左对齐。",
+      "+1：阅读文章编号：文章编号“A”“B”“C”“D”分别独立成段，使用Times New Roman 小四号、加粗、居中对齐。",
+      "+5：第1页课程信息表：将PDF中的Programme、Date (2026)、Time、Fee (credits)、Main focus内容制作成5列5行的可编辑Word表格，不能使用截图。五列宽度依次为4.30厘米、3.20厘米、2.50厘米、2.70厘米、5.76厘米，表格总宽度为18.46厘米，水平居中。表头和内容使用Times New Roman 小四号；表头加粗，数据行不加粗，所有单元格垂直居中。外框和内部横竖线均为黑色0.5磅单实线。",
+      "+1：写作第一节：保留第66题、“Learning with a Clear Purpose”、名言、三项写作内容、注意事项为宋体小四号、数字和英文为Times New Roman小四号",
+      "+1：开头句“Learning with a clear purpose matters greatly to Grade 12 students.”为Times New Roman小四号加粗倾斜。",
+      "+1：第一节答题横线：开头句下方设置3条可编辑下划线段落，每条横线覆盖正文宽度，横线使用Times New Roman 小四号下划线字符或段落底边框。",
+      "+1：Paragraph 1文本和Paragraph 2文本：完整显示“Paragraph 1: I sat with him on the bench near the stairway and opened his notebook.”，“When I returned to my own classroom on Monday, I found a small card on my desk.”，字体为Times New Roman小四号加粗。",
+      "+1：续写横线：Paragraph 1和Paragraph 2下方分别设置3条可编辑横线，每条横线宽度一致，不超出页面左右边距。",
+      "-5：第1页课程信息表为截图或普通图片，不是可编辑Word表格。",
+      "-1：课程信息表中的课程名称、日期、时间、费用或Main focus任意一项缺失。",
+      "-3：文档中出现与任务无关的批注、红色箭头、修订标记、转换软件水印或新增空白页。"
+    ]
+  },
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 178,
+  "task_price_proxy": 38,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/037/周测二_高三英语试题.docx",
+      "dest": "周测二_高三英语试题.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/037/澜桥市高三英语试题.pdf",
+      "dest": "澜桥市高三英语试题.pdf"
+    }
+  ]
+}

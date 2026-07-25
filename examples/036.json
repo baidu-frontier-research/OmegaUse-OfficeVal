@@ -1,0 +1,39 @@
+{
+  "id": "036",
+  "instruction": "把PDF里面的收支记录对应整理到word文档里，每一项记录行高一致",
+  "rubrics": {
+    "dim1": [
+      "交付文件为.docx格式，文件可正常打开。",
+      "PDF中的46笔收支交易、1行期初余额和1行期末汇总均整理到Word表格中，共48行数据记录。",
+      "所有记录按照PDF中的日期和先后顺序排列，不能出现遗漏、重复、顺序颠倒或金额错列。",
+      "每一项记录的表格行高完全一致，不能因描述长短出现高低不一。"
+    ],
+    "dim2": [
+      "+3：收支记录表格：使用5列可编辑Word表格，列顺序从左至右为“Date”“Description”“Withdrawals”“Deposits”“Balance”。表头文字为Arial 11.5磅、加粗；Date和Description左对齐，Withdrawals、Deposits和Balance右对齐",
+      "+3：收支记录表格列宽：Date，Description，Withdrawals，Deposits，Balance列宽为统一3.68厘米，各页续表列宽保持一致。",
+      "+1：收支记录数据字体：所有数据行使用Arial 五号，颜色为黑色；日期和交易说明使用常规字形，Balance列数值加粗。",
+      "+1：收支记录段落格式：数据单元格段前0磅、段后10磅、1.15倍行距，单元格内不出现额外空段落或多余换行。",
+      "+3：收支记录横向边框：每一条记录下方使用浅灰色细实线，线宽0.75磅；",
+      "+1：收支记录金额格式：Withdrawals、Deposits和Balance列金额统一显示为美元格式，使用千位分隔符并保留两位小数，例如“$6,870.20”“$43,712.48”。",
+      "+5：记录完整数量：表格中除表头外共有50行数据，",
+      "+1：续表表头：记录跨页时，每一页顶部重复显示Date、Description、Withdrawals、Deposits、Balance表头，列宽、字体和对齐方式与前一页一致。",
+      "-1：封面图片大小不满足宽15-17cm高9-11cm",
+      "-1：封面“Activity details — 出支记录”为艺术体",
+      "-3：收支记录空白金额单元格不满足：属于收入记录时Withdrawals单元格保持空白；属于支出记录时Deposits单元格保持空白；不能使用0、横杠或错误金额填充空白列。"
+    ]
+  },
+  "operation_intent": "Extract",
+  "domain": "Financial Data",
+  "human_labor_time": 180,
+  "task_price_proxy": 20,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/036/Cedarline_Statement_2025DEC_reordered.pdf",
+      "dest": "Cedarline_Statement_2025DEC_reordered.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/036/public_ready_statement.docx",
+      "dest": "public_ready_statement.docx"
+    }
+  ]
+}

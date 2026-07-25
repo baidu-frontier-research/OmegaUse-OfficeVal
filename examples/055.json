@@ -1,0 +1,38 @@
+{
+  "id": "055",
+  "instruction": "给我把这张图片做成可编辑的PPT，不要图片形式\n另外请帮我做这些调整：\n1.把图中第二部分assessment一词换成check\n2.把图中finish部分内容替换成The site was back up and stable within 10 minutes, order submissions resumed, and a post-incident review has been scheduled for 4:00 PM this afternoon.",
+  "rubrics": {
+    "dim1": [
+      "交付文件为.ppt或.pptx格式，文件可正常打开。",
+      "交付PPT中存在1页承载该流程图的幻灯片",
+      "该幻灯片不是一整张图片"
+    ],
+    "dim2": [
+      "+5：第1页整体构图：页面中完整出现5个阶段节点、顶部图例、横向action箭头、底部emotion虚线、4个单词和底部theme文字，整体宽度占页面宽度85%-96%，高度占页面高度75%-90%。",
+      "+3：第1页左上图例框：位于页面左上角，距上边线0.4-0.7cm距左边线0.6-0.8cm，宽度5.5-5.9厘米，高度2.2-2.4厘米，白色填充，深蓝色圆角矩形边框，包含长度为2.2-2.4cm黑色实线箭头与文本“action”、长度为2.2-2.4cm橙色虚线箭头与文本“emotion”，文本字体为Arial或新罗马14-18磅。",
+      "+5：第1页第1阶段节点：位于页面左上至中上区域，距上边线3.5-3.8cm，包含包含宽高1-1.2cm深绿色填充、白色编号的圆形“1”、编号为白色，宽高3.1-3.4cm的浅蓝色圆形内含一个电脑警告图标、宽4-4.2cm高0.9-1.1cm的深青色圆角标题条“start”，文本字体为白色Arial或新罗马14-18磅加粗和下方宽5.1-5.3cm高4.3-4.6cm的白色说明框，说明框文本为“At 8:40 a.m., the team noticed that the online store was no longer loading for customers.”文本字体为Arial或新罗马10-14磅",
+      "+5：第1页第2阶段节点：位于第1阶段右侧，包含宽高1-1.2cm深绿色填充、白色编号的圆形“2”、编号为白色宽高3.1-3.4cm的浅蓝色圆形内含一个放大镜图标、橙色感叹号小圆标、宽4-4.2cm高0.9-1.1cm的深青色圆角标题条“check”，文本字体为白色Arial或新罗马14-18磅加粗和下方宽5.1-5.3cm高4.3-4.6cm的填充色为浅蓝色的圆角矩形说明框，说明框文本为“The support lead checked alerts, confirmed the outage, and opened an incident channel for developers and operations.”文本字体为Arial或新罗马10-14磅。",
+      "+5：第1页第3阶段节点：位于页面中部，包含宽高1-1.2cm深绿色填充、白色编号的圆形“3”、编号为白色、宽高3.1-3.4cm的浅蓝色圆形内含一个服务器警告图标、宽4-4.2cm高0.9-1.1cm的深青色圆角标题条“problem peak”，文本字体为白色Arial或新罗马14-18磅加粗和下方宽5.1-5.3cm高4.3-4.6cm的填充色为浅蓝色的圆角矩形说明框，说明框文本为“Orders failed repeatedly because the database connection pool was exhausted during the launch traffic surge.”，文本字体为Arial或新罗马10-14磅。",
+      "+5：第1页第4阶段节点：位于第3阶段右侧，包含宽高1-1.2cm深绿色填充、白色编号的圆形“4”、宽高3.1-3.4cm的浅蓝色圆形内含一个云朵对勾图标、宽4-4.2cm高0.9-1.1cm的深青色圆角标题条“solution point”，文本字体为白色Arial或新罗马14-18磅加粗和下方宽5.1-5.3cm高4.3-4.6cm的填充色为浅蓝色的圆角矩形说明框。说明框文本为“The team rolled back the latest configuration and switched traffic to a healthy backup instance.”文本字体为Arial或新罗马10-14磅。",
+      "+5：第1页第5阶段节点：位于页面右侧，包含宽高1-1.2cm的填充色为深绿色编号圆形“5”、宽高3.1-3.4cm的浅蓝色圆形内含一个显示器对勾图标、宽4-4.2cm高0.9-1.1cm的深青色圆角标题条“finish”，文本字体为白色Arial或新罗马14-18磅加粗和下方宽5.1-5.3cm高4.3-4.6cm的填充色为浅蓝色的圆角矩形说明框。说明框文本为“The site was back up and stable within 10 minutes, order submissions resumed, and a post-incident review has been scheduled for 4:00 PM this afternoon.”，文本字体为Arial或新罗马10-14磅。",
+      "+1：编号“1”“2”“3”“4”“5”为Arial或新罗马18-22磅白色加粗水平居中",
+      "+1：第1页action主箭头：第1至第5阶段之间设置4条黑色水平单箭头，方向均从左向右，线宽1.0-1.5磅，长度为2.5-2.7cm，箭头连接相邻阶段图标区域。",
+      "+3：第1页emotion虚线：页面下方设置橙色虚线折线箭头，从左到右为长度为2.8-3.1cm的斜向右下方、到长度为8.5-8.7cm的斜向右上方、到长度为6.3-6.6cm的斜向右下方、到长度为5.1-5.5cm的斜向右上方、到长度为2.3-2.5cm的斜向右下方、到长度为6.3-6.6cm的斜向右上方箭头结束，线宽1.0-1.5磅，虚线样式清晰。",
+      "+1：第1页情绪标签：底部依次出现“concerned”“tense and focused”“hopeful”“relieved”，字体为Times New Roman或等效西文字体12-14磅，橙色、倾斜，位于虚线附近。",
+      "+1：第1页底部主题文字：页面底部中央出现“theme: managing a website outage before a product launch”，字体为Times New Roman或等效西文字体14-16磅，蓝色、倾斜，水平居中。",
+      "+3：第1页图标样式：5个阶段图标均为可编辑图标或形状组合，不能是从原图裁剪出来的位图；图标颜色以深青色、浅蓝色、橙色和绿色为主。",
+      "+1：第1页背景：页面背景为白色或极浅灰白色，不出现图片水印、截图边框、红色标注或无关装饰。",
+      "+3：第1页可编辑性：用户可以分别选中并修改每个阶段标题、每个说明框正文、每个编号、每个图标、每条箭头和情绪线。"
+    ]
+  },
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 188,
+  "task_price_proxy": 45,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/055/website_outage_editable_flow .png",
+      "dest": "website_outage_editable_flow .png"
+    }
+  ]
+}

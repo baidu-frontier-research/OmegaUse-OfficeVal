@@ -1,0 +1,47 @@
+{
+  "id": "034",
+  "instruction": "文件排版，对于具体条款格式参照图片排版，分两栏，中英文分开；文件其余部分一行中文一行英文。协议条款合理布局，可以多条协议在同一页，但同一条协议不要跨两页，添加页码，页码位置居中，高度也在页脚中间",
+  "rubrics": {
+    "dim1": [
+      "交付文件为PDF格式，文件可正常打开。"
+    ],
+    "dim2": [
+      "+1：首页中文标题：第1页顶部出现文本“智能办公设备租赁及支持服务合同”，左对齐或居中，位于页面顶部正文区域。",
+      "+1：首页英文标题：第1页中文标题“智能办公设备租赁及支持服务合同”下方出现文本“Managed Workspace Equipment Leasing and Support Contract”，左对齐或居中。",
+      "+1：首页合同签署说明区：第1页标题“Managed Workspace Equipment Leasing and Support Contract”下方保留“本合同由以下双方于________签署：”(\"双方于\"和\"签署\"之间存在下划线，下划线长度约为4cm-7cm)和“This Contract is entered into on ________ by and between:”(on和by之间存在下划线，下划线长度约为4cm-7cm)两行，中文行在英文行上方，英文行紧随中文行，填写横线为下划线或制表符下划线。",
+      "+3：首页甲方信息区：第1页保留“甲方 / 服务提供方”“Party A / Service Provider”“统一识别号”“UEN”“授权代表”“Authorized Representative”“地址”“Address”“行政联系”“Administrative Contact”等字段，中文字段行与对应英文行上下相邻排列，文字后面都带有填写横线，填写横线为下划线或制表符下划线，填写横线长度一致，长度为4cm-7cm。",
+      "+3：首页乙方信息区：第1页保留“乙方 / 客户方”“Party B / Client”“统一识别号”“UEN”“授权代表”“Authorized Representative”“地址”“Address”“行政联系”“Administrative Contact”等字段，中文字段行与对应英文行上下相邻排列，填写横线长度一致。",
+      "+1：首页双方合称说明文本：第1页甲乙方信息区下方出现“甲方与乙方以下合称为‘双方’。”和“Party A and Party B are hereinafter collectively referred to as the \"Parties\".”，中文行在英文行上方或中文行紧邻英文行。",
+      "+1：首页分隔线：合同双方信息区与第一条条款之间出现一条浅灰色水平分隔线，位于页面宽度10%至90%范围内。",
+      "+5：第1条至第16条条款标题：Clause 1至Clause 16均保留对应中英文标题，中文标题位于英文标题上方，，每个条款标题与其下方条款表格保持在同一页，同一标题下方条款表格不可跨页存在。",
+      "+5：条款内容双列表格结构：Clause 1至Clause 16的具体条款内容均使用表格排版，表格为2列结构，左列表头为“中文”，右列表头为“English”，表头下方为对应的中文或英文条款，左列表格为中文条款，右列表格为英文条款，不能使用文本框堆叠或图片替代表格。",
+      "+5：Signature Page签署页：文档末尾出现“签署页”和“Signature Page”，并保留Party A、Party B、Authorized Representative Signature、Name、Date及对应中文字段，中文字段与英文字段按一行中文一行英文上下对应方式排列，文字后面都带有填写横线，填写横线为下划线或制表符下划线，填写横线长度一致，长度为4cm-7cm。",
+      "+1：页面页脚页码：每一页页脚中间位置出现页码，页码位于页面底部居中，字体为Calibri或微软雅黑，颜色为黑色。页码从第1页开始连续编号，编号顺序无跳号、重复号或空白页无页码情况。所有页面页码均位于页脚水平居中位置，不能出现在页眉、正文中间、左下角或右下角。",
+      "+3：表格宽度：所有条款表格宽度为页面正文宽度的95%至100%，表格左边界与标题左边界对齐，右边界不超出页面边距。",
+      "-3：首页没有出现中文标题“智能办公设备租赁及支持服务合同”或英文标题“Managed Workspace Equipment Leasing and Support Contract”。",
+      "-3：Signature Page签署页缺失Party A或Party B任意一方签署字段。",
+      "-3：条款表格没有出现“中文”和“English”两个表头或左右两列宽度明显不一致，任意一列宽度小于页面正文宽度的35%。",
+      "-1：任意三个以上条款编号出现中英文不对应。",
+      "-3：任意条款表格中文字超出单元格边界或被截断到无法阅读。",
+      "-3：任意页面出现超过页面高度50%的无内容空白区域或文本重叠情况。"
+    ]
+  },
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 188,
+  "task_price_proxy": 30,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/034/bilingual_service_contract_title_no_period.pdf",
+      "dest": "bilingual_service_contract_title_no_period.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/034/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/034/image_002.png",
+      "dest": "image_002.png"
+    }
+  ]
+}

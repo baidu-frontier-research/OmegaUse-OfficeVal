@@ -1,0 +1,33 @@
+{
+  "id": "003",
+  "instruction": "修改给到你的文档，要求“会议内容”下方每一行文字都放到表里面并加上横线，横线样式和图片中的一样，再把没有字的空行删掉，其他格式保持不变",
+  "rubrics": {
+    "dim1": [
+      "交付文件扩展名为.doc或.docx；文件可正常打开"
+    ],
+    "dim2": [
+      "+5：文档表格中没有空白行",
+      "+5：文档表格中所有文本：下方都出现横线；横线长度与表格上边框长度一致；颜色为黑色，类型为细实线",
+      "+5：文档表格中所有横线：相邻两条横线之间的距离几乎相等，只允许有0.15cm的误差",
+      "-5：文中出现图片或者不可编辑的部分",
+      "-5：文档第一页顶部不满足其中任意一项：文档标题为“部门协调会”；主持人为许承柏；地点为综合楼二层会议室",
+      "-1：“会议内容：”下方第一行出现缩进",
+      "-1：文中没有出现“侯景澜：上月两项重点现场事项整改推进如下：“文本内容",
+      "-1：”二月份作业偏差共发生若干件，具体情况如下：“与”四、研究后续事项“之间的文本出现缩进"
+    ]
+  },
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 80,
+  "task_price_proxy": 13,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/003/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/003/部门协调会记录 (1).docx",
+      "dest": "部门协调会记录 (1).docx"
+    }
+  ]
+}

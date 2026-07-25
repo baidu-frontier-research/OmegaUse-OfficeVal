@@ -1,0 +1,36 @@
+{
+  "id": "009",
+  "instruction": "我需要改表格：长表格分页下一页也需要延续表头，跨页的表格在上一页表格底部需加上“续下页”三字，位置跟图片一样",
+  "rubrics": {
+    "dim1": [
+      "交付文件为.docx格式，文件可正常打开。"
+    ],
+    "dim2": [
+      "+3：跨页表格在表格底部页面右下侧有“续下页”文本",
+      "+5：文中所有“续下页”：位于页面右下侧、表格底部附近，靠近表格右边界和下边线",
+      "+1：“续下页”字体颜色为黑色，无其他样式",
+      "+5：每一页的表格：都有三条平行的边线，上边线和下边线1.5磅，内边线0.75磅",
+      "+5：“续下页”上方的表格表头与下方的表格表头：内容、中文和英文数字的字体字号格式均一致",
+      "-5：交付文件出现图片",
+      "-3：表格上方加粗的表题：其中数字部分字体为宋体",
+      "-1：表5不是9行5列的表格",
+      "-1：“3.3 分层比较与模型校准”：中文文本不是四号黑体，不是1.3倍行距，不是左对齐",
+      "-1：表1下方空一行的位置没有出现“注：分类变量以 n（%）表示，连续变量根据分布特征以 Mean±SD 或 M（Q1，Q3）表示；统计量为χ²、t 或 Z 值。”",
+      "-3：表2整体少于40行"
+    ]
+  },
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 74,
+  "task_price_proxy": 33,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/009/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/009/第三章研究结果.docx",
+      "dest": "第三章研究结果.docx"
+    }
+  ]
+}

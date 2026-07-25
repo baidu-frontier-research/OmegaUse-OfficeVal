@@ -1,0 +1,29 @@
+{
+  "id": "078",
+  "instruction": "麻烦将\"CRM_pipeline_restyled_reordered\"文件插到\"区域协同汇报\"文件第8页右边的空白处做一个超链接",
+  "rubrics": {
+    "dim1": [
+      "交付文件为.pptx格式，文件能够正常打开、编辑和放映。",
+      "PPT保持10页"
+    ],
+    "dim2": [
+      "+5：第8页右侧空白区域超链接：左边缘距页面左边线约26.0至29.0厘米，整体位于页面右侧约77%至95%区域。上边缘距页面上边线约5.0至11.0厘米，不进入顶部标题区或底部橙色圆形区域。宽度约3.5至5.5厘米、高度约1.5至3.5厘米，能够清楚点击且不过度占据空白区域。使用Excel图标、文件图标或带文字的按钮超链接，能够直观表达“打开Excel文件”。",
+      "+5：第8页放映状态：单击超链接对象后能够调用Excel或系统默认表格程序打开工作簿。通过PowerPoint支持的“Ctrl+单击”或“打开超链接”操作能够访问Excel文件。",
+      "-3：PPT页数不是10页"
+    ]
+  },
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 23,
+  "task_price_proxy": 7,
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/078/CRM_pipeline_restyled_reordered.xlsx",
+      "dest": "CRM_pipeline_restyled_reordered.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/078/区域协同汇报.pptx",
+      "dest": "区域协同汇报.pptx"
+    }
+  ]
+}
