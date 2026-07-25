@@ -1,0 +1,15 @@
+{
+  "id": "officeval_029",
+  "instruction": "给我做一下图片上的表格，第一列宽度是2.4厘米，第一行第二格宽2.4厘米，第三格宽1.45厘米 第四格宽1.2厘米 第五格宽1.45 厘米，第六格宽2.4厘米，第七格宽2.4厘米 第八个宽2.4厘米，第二行第一列宽2.4厘米，第三行宽度是分别是2.4 2.6 2.85 2.85 2.65 2.65厘米，第四行是2.4 2.6 2.85厘米，所有文字是仿宋小三。我要word文件，可编辑的",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 153,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/029/image_001.jpg",
+      "dest": "image_001.jpg"
+    }
+  ]
+}

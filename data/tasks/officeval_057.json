@@ -1,0 +1,19 @@
+{
+  "id": "officeval_057",
+  "instruction": "给我按照图片做一页PPT，每个部分都要可编辑，大小和图片一样，画圈那要改成直线",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 132,
+  "task_price_proxy": 40,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/057/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/057/化学式.png",
+      "dest": "化学式.png"
+    }
+  ]
+}

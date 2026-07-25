@@ -1,0 +1,19 @@
+{
+  "id": "officeval_036",
+  "instruction": "把PDF里面的收支记录对应整理到word文档里，每一项记录行高一致",
+  "operation_intent": "Extract",
+  "domain": "Financial Data",
+  "human_labor_time": 180,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/036/Cedarline_Statement_2025DEC_reordered.pdf",
+      "dest": "Cedarline_Statement_2025DEC_reordered.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/036/public_ready_statement.docx",
+      "dest": "public_ready_statement.docx"
+    }
+  ]
+}

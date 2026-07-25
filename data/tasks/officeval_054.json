@@ -1,0 +1,15 @@
+{
+  "id": "officeval_054",
+  "instruction": "复刻成一页和原图内容一模一样的PPT，要可编辑的。内容使用宋体，线条宽0.75磅，图高度7cm，居中放置在一页PPT中",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 239,
+  "task_price_proxy": 40,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/054/路径图.png",
+      "dest": "路径图.png"
+    }
+  ]
+}

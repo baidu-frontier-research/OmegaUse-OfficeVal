@@ -1,0 +1,19 @@
+{
+  "id": "officeval_020",
+  "instruction": "按照图片的格式要求调整教案的格式",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 194,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/020/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/020/《浅赏叙事古文，读懂处世道理》.docx",
+      "dest": "《浅赏叙事古文，读懂处世道理》.docx"
+    }
+  ]
+}

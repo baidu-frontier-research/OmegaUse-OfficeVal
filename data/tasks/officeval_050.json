@@ -1,0 +1,15 @@
+{
+  "id": "officeval_050",
+  "instruction": "帮我把这两页PPT改成可以直接在上面编辑、删减的状态，内容要和原来的一模一样",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 321,
+  "task_price_proxy": 25,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/050/111.pptx",
+      "dest": "111.pptx"
+    }
+  ]
+}

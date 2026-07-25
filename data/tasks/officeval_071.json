@@ -1,0 +1,19 @@
+{
+  "id": "officeval_071",
+  "instruction": "按如下要求修改一下PPT：\n首页标题做成艺术字，要白色外边蓝色填充\n第二页排版改一下，改成左右布局，护鸟带和驱鸟器各占一半，仿照图片上的排版，照片就放置在各自板块的右上角空白处，内容用原PPT的",
+  "operation_intent": "Restructure",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 48,
+  "task_price_proxy": 24,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/071/image (2).png",
+      "dest": "image (2).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/071/护鸟带.pptx",
+      "dest": "护鸟带.pptx"
+    }
+  ]
+}

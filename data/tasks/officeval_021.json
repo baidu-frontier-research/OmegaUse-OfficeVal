@@ -1,0 +1,19 @@
+{
+  "id": "officeval_021",
+  "instruction": "把“要改的版本（2）”文件格式按照模板文件的格式修改，修改完再把第一个文件里面的两个技术路线图删除",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 77,
+  "task_price_proxy": 25,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/021/毕业设计论文.docx",
+      "dest": "毕业设计论文.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/021/毕业设计论文开题报告 (模版).docx",
+      "dest": "毕业设计论文开题报告 (模版).docx"
+    }
+  ]
+}

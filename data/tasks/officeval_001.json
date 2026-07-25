@@ -1,0 +1,43 @@
+{
+  "id": "officeval_001",
+  "instruction": "按照下述要求修改给到你的word文档\n1、课时学习目标和课时评价任务里面的内容要删掉(不包括标题)\n2、删除课时学习内容分析、课时学生实际水平和活动意图说明这三部分所有内容（包括标题）以及所有图片，让表格上移\n3、删掉环节后面括号中的内容（指向目标几）\n4、给第二页的表格设一个标题“三、学习过程设计”、板书设计改为四、教学反思改为五\n5、所有内容浓缩到两页文档上，文字图片不变，只改变字体大小、行距、图片与文本距离",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 204,
+  "task_price_proxy": 50,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/01_课时学习方案_观察一位校园志愿者_第一课时.docx",
+      "dest": "01_课时学习方案_观察一位校园志愿者_第一课时.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/02_课时学习方案_方法交流与片段尝试_第一课时.docx",
+      "dest": "02_课时学习方案_方法交流与片段尝试_第一课时.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/03_课时学习方案_身边人物初识.docx",
+      "dest": "03_课时学习方案_身边人物初识.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/04_课时学习方案_人物细节描写_第二课时.docx",
+      "dest": "04_课时学习方案_人物细节描写_第二课时.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/05_课时学习方案_匠心故事研读.docx",
+      "dest": "05_课时学习方案_匠心故事研读.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/06_课时学习方案_家乡风物介绍_第二课时.docx",
+      "dest": "06_课时学习方案_家乡风物介绍_第二课时.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/07_课时学习方案_写一个让人记住的人_第一课时.docx",
+      "dest": "07_课时学习方案_写一个让人记住的人_第一课时.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/08_课时学习方案_习作讲评与修改_第二课时.docx",
+      "dest": "08_课时学习方案_习作讲评与修改_第二课时.docx"
+    }
+  ]
+}

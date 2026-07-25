@@ -1,0 +1,15 @@
+{
+  "id": "officeval_038",
+  "instruction": "帮我把PDF版文档转成可修改的word版文件，并把最后几页的答案按照题号填写到题目后方的括号中，字体格式保持原样不动。",
+  "operation_intent": "Annotate",
+  "domain": "Education & Examination",
+  "human_labor_time": 111,
+  "task_price_proxy": 63,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/038/多岗位从业人员综合复习题_菟思学院.pdf",
+      "dest": "多岗位从业人员综合复习题_菟思学院.pdf"
+    }
+  ]
+}

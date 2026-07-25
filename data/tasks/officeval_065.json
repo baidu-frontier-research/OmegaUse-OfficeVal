@@ -1,0 +1,19 @@
+{
+  "id": "officeval_065",
+  "instruction": "给我这个ppt第10页加一个就像视频中这样的动画，页面中粉色椭圆中心点放乘号，左右两边各放一个转盘，大小一致并对齐排版，两个转盘都由一个共同的按钮控制转动和暂停",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 125,
+  "task_price_proxy": 70,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/065/double_spinner_new.mp4",
+      "dest": "double_spinner_new.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/065/口算教学课件.pptx",
+      "dest": "口算教学课件.pptx"
+    }
+  ]
+}

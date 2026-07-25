@@ -1,0 +1,19 @@
+{
+  "id": "officeval_013",
+  "instruction": "按照核查承诺书的要求对论文的封皮、摘要、英文摘要、目录、正文、参考文献及致谢进行检查，不符合规范的在原文档中进行修改",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 227,
+  "task_price_proxy": 41,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/013/基于Spark的园区能耗分析与可视化系统论文.docx",
+      "dest": "基于Spark的园区能耗分析与可视化系统论文.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/013/本科毕业论文内容与格式核验承诺书.xlsx",
+      "dest": "本科毕业论文内容与格式核验承诺书.xlsx"
+    }
+  ]
+}

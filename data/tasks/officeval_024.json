@@ -1,0 +1,19 @@
+{
+  "id": "officeval_024",
+  "instruction": "按照论文模板文档中的格式要求对我的论文做以下调整：\n1.调整并统一三线表的宽度，并设置所有表格居中对齐\n2.参考文献需要交叉引用\n3.规范标点符号的使用：中文用全角，英文/数字/公式用半角\n4.帮我调整一下图片的位置大小，确保文档排版不会出现大片的空白。",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 211,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/024/城市社区绿地可达性与居民步行行为研究.docx",
+      "dest": "城市社区绿地可达性与居民步行行为研究.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/024/论文模版.docx",
+      "dest": "论文模版.docx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_081",
+  "instruction": "制作一个能达到视频中讲的，在一个单元格输入一个数字自动跳转到下一个单元格并且是以三列蛇形排布形式出现的Excel表格（想达到的结果是在三列的其中一个单元格中输入一个数字就会自动跳到蛇形方向的下一个单元格）",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 196,
+  "task_price_proxy": 145,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/081/VID_20260525_102540.mp4",
+      "dest": "VID_20260525_102540.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/081/image (3).png",
+      "dest": "image (3).png"
+    }
+  ]
+}

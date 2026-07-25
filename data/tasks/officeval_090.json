@@ -1,0 +1,15 @@
+{
+  "id": "officeval_090",
+  "instruction": "将所有子表中的总重量合计数据以及砼体积数据提取到汇总表",
+  "operation_intent": "Extract",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 30,
+  "task_price_proxy": 200,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/090/子表数据提取到汇总表.xlsx",
+      "dest": "子表数据提取到汇总表.xlsx"
+    }
+  ]
+}

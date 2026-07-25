@@ -1,0 +1,27 @@
+{
+  "id": "officeval_004",
+  "instruction": "按照图片的格式要求分别对实习报告和实习鉴定表进行修改，只能在原文档中对格式进行修改，最后给我输出两个可编辑的word文档",
+  "operation_intent": "Reformat",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 105,
+  "task_price_proxy": 25,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/004/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/004/image_002.png",
+      "dest": "image_002.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/004/毕业实习报告.docx",
+      "dest": "毕业实习报告.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/004/毕业实习鉴定表.docx",
+      "dest": "毕业实习鉴定表.docx"
+    }
+  ]
+}

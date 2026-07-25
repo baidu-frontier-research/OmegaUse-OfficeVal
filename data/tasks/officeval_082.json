@@ -1,0 +1,19 @@
+{
+  "id": "officeval_082",
+  "instruction": "帮我在“1111”表格中实现把左边勾选后，选定的内容自动显示在右边（图片中红色箭头指出的）",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 230,
+  "task_price_proxy": 145,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/082/1111.xlsx",
+      "dest": "1111.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/082/image (4).png",
+      "dest": "image (4).png"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "officeval_026",
+  "instruction": "这个文件的三线表5-4到5-12按示例这种排版样式给我改一下（示例在表格最后面）",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 84,
+  "task_price_proxy": 50,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/026/项目式协作学习统计表.docx",
+      "dest": "项目式协作学习统计表.docx"
+    }
+  ]
+}

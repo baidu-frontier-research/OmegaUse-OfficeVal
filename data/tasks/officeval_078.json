@@ -1,0 +1,19 @@
+{
+  "id": "officeval_078",
+  "instruction": "麻烦将\"CRM_pipeline_restyled_reordered\"文件插到\"区域协同汇报\"文件第8页右边的空白处做一个超链接",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 23,
+  "task_price_proxy": 7,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/078/CRM_pipeline_restyled_reordered.xlsx",
+      "dest": "CRM_pipeline_restyled_reordered.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/078/区域协同汇报.pptx",
+      "dest": "区域协同汇报.pptx"
+    }
+  ]
+}

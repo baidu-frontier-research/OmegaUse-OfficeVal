@@ -1,0 +1,63 @@
+{
+  "id": "officeval_064",
+  "instruction": "我现在没有时间弄，帮我把这12张照片按顺序精准的放在“核心技术”PPT内容下方的空白部分处里，一框放三张照片，第一页要上一大下两小，第二页要左二小右一大，最好给我标题再弄个浅蓝色边框",
+  "operation_intent": "Restructure",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 77,
+  "task_price_proxy": 28,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/1.png",
+      "dest": "1.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/10.png",
+      "dest": "10.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/11.png",
+      "dest": "11.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/12.png",
+      "dest": "12.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/2.png",
+      "dest": "2.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/3.png",
+      "dest": "3.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/4.png",
+      "dest": "4.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/5.png",
+      "dest": "5.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/6.png",
+      "dest": "6.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/7.png",
+      "dest": "7.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/8.png",
+      "dest": "8.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/9.png",
+      "dest": "9.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/064/核心技术.pptx",
+      "dest": "核心技术.pptx"
+    }
+  ]
+}

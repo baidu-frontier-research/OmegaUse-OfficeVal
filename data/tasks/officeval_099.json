@@ -1,0 +1,15 @@
+{
+  "id": "officeval_099",
+  "instruction": "把表格里的从第四小题到最后一个题每道给我做成二维饼状图，就插在每道题目的右边就行",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 96,
+  "task_price_proxy": 10,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/099/调查结果.xlsx",
+      "dest": "调查结果.xlsx"
+    }
+  ]
+}

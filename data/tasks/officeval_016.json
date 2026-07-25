@@ -1,0 +1,27 @@
+{
+  "id": "officeval_016",
+  "instruction": "我需要参考“澄禾社区生鲜服务满意度研究”文档的格式来排版我的论文；要做一个这样的封面；还缺少”原创性声明及使用授权声明”这一页，直接复制参考文件的复制粘贴上去就可以了",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 157,
+  "task_price_proxy": 48,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/image_002.jpg",
+      "dest": "image_002.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/小微企业财务数据管理规范化问题及改进路径研究.docx",
+      "dest": "小微企业财务数据管理规范化问题及改进路径研究.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/澄禾社区生鲜服务满意度研究.docx",
+      "dest": "澄禾社区生鲜服务满意度研究.docx"
+    }
+  ]
+}

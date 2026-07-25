@@ -1,0 +1,19 @@
+{
+  "id": "officeval_015",
+  "instruction": "麻烦帮我按试题内容对答题卡进行调整，修改出对应符合试题内容的可修改的word版答题卡",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 92,
+  "task_price_proxy": 60,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/015/九年级答题卡 (1) (3).docx",
+      "dest": "九年级答题卡 (1) (3).docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/015/初中语文跨年级综合质量检测.docx",
+      "dest": "初中语文跨年级综合质量检测.docx"
+    }
+  ]
+}

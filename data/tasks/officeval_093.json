@@ -1,0 +1,19 @@
+{
+  "id": "officeval_093",
+  "instruction": "帮我在表格里加点东西，就图片上红矩形框圈起来的图形，给我加一个放到“图形组织”右边的格子里（这个图形我要可编辑的，不要图片），不要盖住序号和边框，放在序号后面就行",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 13,
+  "task_price_proxy": 6,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/093/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/093/日常信息处理能力观察表.xlsx",
+      "dest": "日常信息处理能力观察表.xlsx"
+    }
+  ]
+}

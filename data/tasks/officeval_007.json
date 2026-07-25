@@ -1,0 +1,19 @@
+{
+  "id": "officeval_007",
+  "instruction": "按照“齐鲁启明继续教育学院论文模板”文件中的格式要求修改“幼儿园自然探究活动课程设计”中的目录",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 150,
+  "task_price_proxy": 18,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/007/幼儿园自然探究活动课程设计.docx",
+      "dest": "幼儿园自然探究活动课程设计.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/007/齐鲁启明继续教育学院论文模板.docx",
+      "dest": "齐鲁启明继续教育学院论文模板.docx"
+    }
+  ]
+}

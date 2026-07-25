@@ -1,0 +1,19 @@
+{
+  "id": "officeval_086",
+  "instruction": "数据就在表格里面，我需要一个复合饼图，左边是“人员薪酬-物料-其他”的饼图，右边解释“其他”中“交通-住宿-餐饮”的比例，就像图片上这种类型的，给我做在原表格的sheet2工作簿里，要可编辑的",
+  "operation_intent": "Other",
+  "domain": "Financial Data",
+  "human_labor_time": 65,
+  "task_price_proxy": 35,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/086/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/086/数据1.xlsx",
+      "dest": "数据1.xlsx"
+    }
+  ]
+}

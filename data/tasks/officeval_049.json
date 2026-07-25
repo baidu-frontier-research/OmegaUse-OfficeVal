@@ -1,0 +1,15 @@
+{
+  "id": "officeval_049",
+  "instruction": "复刻这个图片，每一处都得可编辑状态，给我做成一页ppt发给我，大小和图片一样",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 240,
+  "task_price_proxy": 100,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/049/Image 1.png",
+      "dest": "Image 1.png"
+    }
+  ]
+}

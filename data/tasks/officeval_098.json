@@ -1,0 +1,15 @@
+{
+  "id": "officeval_098",
+  "instruction": "画图，以关注度总均值（4.11）为纵轴参考线，体验总均值（3.63）为横轴参考线，绘制重要性-满意度象限图。图内文字按照制图标准书写，中文为小五号（或9磅）宋体；英文和数字用小五号Times New Roman字体。有数字标注的坐标图，必须注明坐标单位",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 121,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/098/满意度调查.xlsx",
+      "dest": "满意度调查.xlsx"
+    }
+  ]
+}

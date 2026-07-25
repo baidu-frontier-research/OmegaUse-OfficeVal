@@ -1,0 +1,31 @@
+{
+  "id": "officeval_041",
+  "instruction": "1.按照PPT每一页的备注把PPT修改好\n2.把目录页调整至第二页的位置，其他页依次往后排，顺序不要弄乱",
+  "operation_intent": "Restructure",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 163,
+  "task_price_proxy": 40,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/041/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/041/image_002.png",
+      "dest": "image_002.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/041/image_003.png",
+      "dest": "image_003.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/041/对比分析表.xlsx",
+      "dest": "对比分析表.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/041/高速成型线碎屑分离与状态监测装置.pptx",
+      "dest": "高速成型线碎屑分离与状态监测装置.pptx"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "officeval_043",
+  "instruction": "把名片复刻成2页PPT，做成的PPT要都是可编辑的状态，右上角的二维码要做成图片形式，必须和原名片一样的排版布局",
+  "operation_intent": "Other",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 400,
+  "task_price_proxy": 82,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/043/image_001.png",
+      "dest": "image_001.png"
+    }
+  ]
+}

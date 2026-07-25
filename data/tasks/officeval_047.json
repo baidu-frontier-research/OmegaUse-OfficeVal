@@ -1,0 +1,19 @@
+{
+  "id": "officeval_047",
+  "instruction": "把这个图上的内容复刻到第19页，不要图片的形式，要以后还能编辑的那种并显示在页面居中位置，页面原有的内容删除就行(不要把上面的导航栏和Logo删掉)，参考第3页帮我调整一下第9,15,22,28,33页的字体字号，在目录页新增一个标题5：研究结论，最后帮我在第一页把汇报人冒号后头的内容改成，陈前康邮箱:896700205@qq.com",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 68,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/047/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/047/设备状态监测研究汇报 .pptx",
+      "dest": "设备状态监测研究汇报 .pptx"
+    }
+  ]
+}

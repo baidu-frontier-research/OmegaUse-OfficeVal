@@ -1,0 +1,19 @@
+{
+  "id": "officeval_061",
+  "instruction": "宣言那页两张图片和图片下面的文字挪到第一页(具体参考图中画红框的位置)，图片和文字的相对位置不变，长宽比例可以相对等比变化，但不能做拉伸，整体放置在页面右边居中的位置，原本宣言这页删掉。将第8页两位老师的信息全部挪到第7页后，将第7页5位老师的信息介绍板块做成视频中这样的动画效果，然后删除原本的第8页",
+  "operation_intent": "Restructure",
+  "domain": "Business Operations",
+  "human_labor_time": 55,
+  "task_price_proxy": 30,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/061/product_video.mp4",
+      "dest": "product_video.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/061/星市静默回声教育科技有限公司简介.pptx",
+      "dest": "星市静默回声教育科技有限公司简介.pptx"
+    }
+  ]
+}

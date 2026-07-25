@@ -1,0 +1,15 @@
+{
+  "id": "officeval_074",
+  "instruction": "这个PPT里面所有的中文全部给我翻译成英语，不要打乱排版，图片背景也不能被改变",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 237,
+  "task_price_proxy": 95,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/074/农业县低空经济发展方案.pptx",
+      "dest": "农业县低空经济发展方案.pptx"
+    }
+  ]
+}

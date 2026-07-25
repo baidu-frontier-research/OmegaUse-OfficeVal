@@ -1,0 +1,19 @@
+{
+  "id": "officeval_035",
+  "instruction": "把PDF格式的外文文献翻译成中文，放到一个新的word文档里，也将PDF中图片放到Word适当位置，并按照“002毕业设计外文翻译封面及格式要求（普通班）”文档对新的word文档格式做修改",
+  "operation_intent": "Other",
+  "domain": "Academic Papers",
+  "human_labor_time": 137,
+  "task_price_proxy": 68,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/035/002 毕业设计外文翻译封面及格式要求（普通班）.docx",
+      "dest": "002 毕业设计外文翻译封面及格式要求（普通班）.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/035/neighborhood_reading_garden_article.pdf",
+      "dest": "neighborhood_reading_garden_article.pdf"
+    }
+  ]
+}

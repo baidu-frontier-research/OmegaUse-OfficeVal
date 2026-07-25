@@ -1,0 +1,19 @@
+{
+  "id": "officeval_094",
+  "instruction": "给我把表格中的两份成绩数据分别做成两个多类别嵌套合并饼图，类似于图片中那样的效果,就用探究表现和能力层级两个类别做",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 98,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/094/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/094/七年级地理探究成绩登记.xlsx",
+      "dest": "七年级地理探究成绩登记.xlsx"
+    }
+  ]
+}

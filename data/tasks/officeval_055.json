@@ -1,0 +1,15 @@
+{
+  "id": "officeval_055",
+  "instruction": "给我把这张图片做成可编辑的PPT，不要图片形式\n另外请帮我做这些调整：\n1.把图中第二部分assessment一词换成check\n2.把图中finish部分内容替换成The site was back up and stable within 10 minutes, order submissions resumed, and a post-incident review has been scheduled for 4:00 PM this afternoon.",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 188,
+  "task_price_proxy": 45,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/055/website_outage_editable_flow .png",
+      "dest": "website_outage_editable_flow .png"
+    }
+  ]
+}

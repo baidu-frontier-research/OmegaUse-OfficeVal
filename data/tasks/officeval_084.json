@@ -1,0 +1,23 @@
+{
+  "id": "officeval_084",
+  "instruction": "能制作个宏按钮么\n在第一个工作簿里创建一个宏按钮，点击图片中红色框起来的“打印进账单”，能直接选定第三个划拨进账单工作簿里选定区域里（与图中类似的区域） ，进行打印预览",
+  "operation_intent": "Other",
+  "domain": "Financial Data",
+  "human_labor_time": 344,
+  "task_price_proxy": 200,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/084/image (5).png",
+      "dest": "image (5).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/084/image (6).png",
+      "dest": "image (6).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/084/进账单打印.xlsx",
+      "dest": "进账单打印.xlsx"
+    }
+  ]
+}

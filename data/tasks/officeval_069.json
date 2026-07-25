@@ -1,0 +1,19 @@
+{
+  "id": "officeval_069",
+  "instruction": "调整一下这张PPT里面框以及字体的大小和格式，具体可以参考发给你的这张图片，如图所示：红、粉、绿矩形框里面的文字和方框分别跟各自颜色箭头指向的那部分大小、格式一致",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 38,
+  "task_price_proxy": 18,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/069/image (2).png",
+      "dest": "image (2).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/069/工商层面_流程图.pptx",
+      "dest": "工商层面_流程图.pptx"
+    }
+  ]
+}

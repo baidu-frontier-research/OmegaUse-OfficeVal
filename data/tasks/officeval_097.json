@@ -1,0 +1,15 @@
+{
+  "id": "officeval_097",
+  "instruction": "帮我在每道题的右边空白处都做一个图，6，7 ，10，11，12 ，16 题做成饼状图，其他题目都做成横向条形图吧",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 94,
+  "task_price_proxy": 15,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/097/数据.xlsx",
+      "dest": "数据.xlsx"
+    }
+  ]
+}

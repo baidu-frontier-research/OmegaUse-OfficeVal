@@ -1,0 +1,19 @@
+{
+  "id": "officeval_058",
+  "instruction": "给我把目录那页填上小标签，就图片上给你发的样式就行，每个小标题下面空白的地方弄三个从左至右依次排列，距离相等，大小一致（字体选择MiSans字号10.5；深绿绿色背景白色字体），具体填写的小标签如下所示：\n文化沟通：儒家伦理、叙事逻辑、文化折扣\n工业化体系：特效能力、宣发困境、产业链断点\n全球竞争：好莱坞、韩国电影、发行网络\n认知偏差：预设立场、误解误读、题材受限",
+  "operation_intent": "Annotate",
+  "domain": "Business Operations",
+  "human_labor_time": 85,
+  "task_price_proxy": 42,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/058/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/058/中国电影业面临的挑战.pptx",
+      "dest": "中国电影业面临的挑战.pptx"
+    }
+  ]
+}

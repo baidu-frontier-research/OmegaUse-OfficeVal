@@ -1,0 +1,15 @@
+{
+  "id": "officeval_033",
+  "instruction": "把文档的所有零售价的数值替换为乘以1.1之后的数值，其他格式不变，给我输出一个替换完成可修改的word文档",
+  "operation_intent": "Compute",
+  "domain": "Business Operations",
+  "human_labor_time": 307,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/033/家居零售价目册.docx",
+      "dest": "家居零售价目册.docx"
+    }
+  ]
+}

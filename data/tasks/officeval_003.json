@@ -1,0 +1,19 @@
+{
+  "id": "officeval_003",
+  "instruction": "修改给到你的文档，要求“会议内容”下方每一行文字都放到表里面并加上横线，横线样式和图片中的一样，再把没有字的空行删掉，其他格式保持不变",
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 80,
+  "task_price_proxy": 13,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/003/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/003/部门协调会记录 (1).docx",
+      "dest": "部门协调会记录 (1).docx"
+    }
+  ]
+}

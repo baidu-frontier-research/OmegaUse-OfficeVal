@@ -1,0 +1,19 @@
+{
+  "id": "officeval_012",
+  "instruction": "1、帮我重新按照“东岳技术学院高等教育自学考试毕业论文格式”的要求做一下目录，并且改成可以自动更新的目录\n2、我把论文的要求发你这边，你这边能不能顺便帮我看一下，我的论文格式是否符合要求，如果不符合要求的帮我修改一下",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 114,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/012/东岳技术学院高等教育自学考试毕业论文格式.docx",
+      "dest": "东岳技术学院高等教育自学考试毕业论文格式.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/012/城市社区雨水花园参与式维护机制研究.docx",
+      "dest": "城市社区雨水花园参与式维护机制研究.docx"
+    }
+  ]
+}

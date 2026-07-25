@@ -1,0 +1,31 @@
+{
+  "id": "officeval_042",
+  "instruction": "一、将1-2页ppt背景替换成我给你发的图片：第1页背景50%的透明度，第2页85%透明度，使用透明度可以让文字跟背景不会很冲突\n二、第2页ppt给我重新排版一下(我给你一张图，图中被圈起来的地方需做改动)：\n1.红色标题字体选择Arial加粗，绿色框内的小标题用蓝色字体加下划线\n2.所有小标题都由横排变成竖排显示，就像图片里绿色框里那样\n3.调整粉色、黄色、蓝色框里内容的位置，变成图片中这样的三栏排版，每一栏都要有一样的间距，文字不能堆叠；对应的标题都各自在对应的内容上方居中显示，评价及对应内容删除\n三、将我发给你的音乐放到最后一页，并把播放按钮设置在左下角",
+  "operation_intent": "Beautify",
+  "domain": "Education & Examination",
+  "human_labor_time": 119,
+  "task_price_proxy": 39,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/042/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/042/image_002.png",
+      "dest": "image_002.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/042/image_003.png",
+      "dest": "image_003.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/042/幼儿游戏活动课程设计与实施.pptx",
+      "dest": "幼儿游戏活动课程设计与实施.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/042/钢琴曲.wav",
+      "dest": "钢琴曲.wav"
+    }
+  ]
+}

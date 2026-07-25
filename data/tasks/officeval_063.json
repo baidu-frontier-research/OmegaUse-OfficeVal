@@ -1,0 +1,31 @@
+{
+  "id": "officeval_063",
+  "instruction": "修订后Task:\n1.根据这个数据给我做个曲线图插到最后一页：月份  营收数值  盈利比值\n1 月 68000  1.42 \n2 月 352000 1.56\n3 月 486000 1.71\n4 月 423000 1.63\n5 月 579000 1.85\n2.在第1张图画圈处帮我补上内容：排班岗\n3.第2张图是把整个画面都调正一点，背景换成和其他页一样的一样的\n3.第3张图画圈处重复了给我删掉\n4.第4张图红色删掉，黄色整体换一换吧，换成“搭建标准化复盘范式 强化岗位协同配合效能 赋能团队稳步长效发展”排版跟原来一样",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 108,
+  "task_price_proxy": 28,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/063/6.JPG",
+      "dest": "6.JPG"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/063/7.JPG",
+      "dest": "7.JPG"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/063/8.JPG",
+      "dest": "8.JPG"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/063/9.JPG",
+      "dest": "9.JPG"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/063/直播运营阶段复盘.pptx",
+      "dest": "直播运营阶段复盘.pptx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_018",
+  "instruction": "按照排版格式要求对“公告书房运营规划书”报告进行修改，包括字体、字号、段落格式、数字格式，另外图和表都需要加图注或表注，格式要求也在文档里",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 251,
+  "task_price_proxy": 48,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/018/公共书房运营规划书.docx",
+      "dest": "公共书房运营规划书.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/018/报告排版格式要求.docx",
+      "dest": "报告排版格式要求.docx"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "officeval_092",
+  "instruction": "表格中有一页截图，根据截图制成一个表格，并用这个表格替换掉截图；将整个表格排版一下：表内字体，表头字体，表名称字体分别统一。调整表格高，让所有文字都显示，相似表格高度一致；将打印预览中断开的部分表格调整为一个表格，打印预览中每个表格不跨两页",
+  "operation_intent": "Extract",
+  "domain": "Business Operations",
+  "human_labor_time": 101,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/092/智慧农业示范园建设项目报价表.xlsx",
+      "dest": "智慧农业示范园建设项目报价表.xlsx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_066",
+  "instruction": "在ppt后面新建一页把这个“PPT相关不同数据表”做成跟前几页一样的表格，再在表格页后面新建一页做一个折线图（参考前几页）",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 142,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/066/PPT相关不同数据表.xlsx",
+      "dest": "PPT相关不同数据表.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/066/表格图表关联数据.pptx",
+      "dest": "表格图表关联数据.pptx"
+    }
+  ]
+}

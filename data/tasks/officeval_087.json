@@ -1,0 +1,19 @@
+{
+  "id": "officeval_087",
+  "instruction": "我要识字表格里的内容粘到分层设计表格，模板表格原始格式不要变",
+  "operation_intent": "Extract",
+  "domain": "Education & Examination",
+  "human_labor_time": 127,
+  "task_price_proxy": 60,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/087/分层作业设计.xlsx",
+      "dest": "分层作业设计.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/087/识字主题分层作业.xlsx",
+      "dest": "识字主题分层作业.xlsx"
+    }
+  ]
+}

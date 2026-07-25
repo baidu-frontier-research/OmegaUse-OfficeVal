@@ -1,0 +1,19 @@
+{
+  "id": "officeval_073",
+  "instruction": "按照图片要求修改ppt，不可以增加删改原PPT的内容",
+  "operation_intent": "Reformat",
+  "domain": "Other",
+  "human_labor_time": 77,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/073/9d1a84f16251c3b86af41d3a6205354a.png",
+      "dest": "9d1a84f16251c3b86af41d3a6205354a.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/073/流程图.pptx",
+      "dest": "流程图.pptx"
+    }
+  ]
+}

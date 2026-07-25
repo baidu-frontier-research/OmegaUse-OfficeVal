@@ -1,0 +1,19 @@
+{
+  "id": "officeval_037",
+  "instruction": "把PDF文档转换成word格式并按照”周测二_高三英语试题“文档的格式对”澜桥市高三英语试题“文档的格式进行调整",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 178,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/037/周测二_高三英语试题.docx",
+      "dest": "周测二_高三英语试题.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/037/澜桥市高三英语试题.pdf",
+      "dest": "澜桥市高三英语试题.pdf"
+    }
+  ]
+}

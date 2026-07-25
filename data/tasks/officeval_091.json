@@ -1,0 +1,19 @@
+{
+  "id": "officeval_091",
+  "instruction": "1.整理第一张图片上的的数据到这个表格里，需要将整理到表格中的图片数据“重量”一栏的单位kg换算成吨，表格原本的格式数据都不许更改\n2.整理表格数据：帮我按客户名称，商品种类（按大类分类，开口料、保育/育肥料、蛋禽料、水禽料、沉水鱼料、浮水鱼料）分别统计出每个客户对应大类的数量。",
+  "operation_intent": "Extract",
+  "domain": "Business Operations",
+  "human_labor_time": 94,
+  "task_price_proxy": 28,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/091/2026年区域渠道销量统计表.xlsx",
+      "dest": "2026年区域渠道销量统计表.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/091/image_001.png",
+      "dest": "image_001.png"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "officeval_022",
+  "instruction": "按照“企业经营情况说明书”的格式对”企业经营异常核查呈报材料“文件的格式进行修改，并添加封面（格式和”企业经营情况说明书“格式相同，具体内容在“华中区域零售项目经营异常核查封面”文档里）和目录，；”华中区域零售项目经营资金异常及现金流风险“文件主题改为”华中区域零售项目财务资金异常、库存占用及现金流风险专项核查材料”",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 287,
+  "task_price_proxy": 48,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/企业经营异常核查呈报材料.docx",
+      "dest": "企业经营异常核查呈报材料.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/企业经营情况说明书.docx",
+      "dest": "企业经营情况说明书.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/华中区域零售项目经营异常核查封面.docx",
+      "dest": "华中区域零售项目经营异常核查封面.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/华中区域零售项目经营资金异常及现金流风险.docx",
+      "dest": "华中区域零售项目经营资金异常及现金流风险.docx"
+    }
+  ]
+}

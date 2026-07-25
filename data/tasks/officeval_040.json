@@ -1,0 +1,19 @@
+{
+  "id": "officeval_040",
+  "instruction": "1.设置文档标题格式：隶书，二号，加粗，蓝色，发光（橄榄色、7pt发光、强调文字颜色3），阴影（向上偏移），居中对齐，段后20磅\n2.设置正文为楷体，小四号，首行缩进2字符，段后间距6磅，1.1行距\n3.对第三段的”专业设置如下“设置首字下沉：悬挂2行，距离正文0.3厘米\n4.把中文的“智能工程系”替换成“智能软件工程系”，格式设置为宋体四号，加粗倾斜，绿色，加着重号 \n5.把图片制作成简介文档的水印背景，“冲蚀”、缩放：100%",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 190,
+  "task_price_proxy": 23,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/040/Image.png",
+      "dest": "Image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/040/简介素材.docx",
+      "dest": "简介素材.docx"
+    }
+  ]
+}

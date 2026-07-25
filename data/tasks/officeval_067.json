@@ -1,0 +1,15 @@
+{
+  "id": "officeval_067",
+  "instruction": "修改一下PPT，每页设置不同的切换动画，但是开头结尾要一样",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 23,
+  "task_price_proxy": 22,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/067/智慧园区再生水管网.pptx",
+      "dest": "智慧园区再生水管网.pptx"
+    }
+  ]
+}

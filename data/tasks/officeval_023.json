@@ -1,0 +1,15 @@
+{
+  "id": "officeval_023",
+  "instruction": "第一，打开章节导航查看页码是否对应，并对不正确页码进行修改：从摘要部分开始编码，摘要及目录的页码用大写罗马数字，正文页码用阿拉伯数字。\n第二，删除文档中的最后一页\n第三，将文中所有表制作成表目录，放到文档中表目录那一页\n第四，调整表格摆放位置和大小：文中表格能和文字放一页的就放到一页，不能放一页的表格尽量单独放在一页。",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 87,
+  "task_price_proxy": 44,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/023/董事會數位素養對企業低碳轉型績效的影響.docx",
+      "dest": "董事會數位素養對企業低碳轉型績效的影響.docx"
+    }
+  ]
+}

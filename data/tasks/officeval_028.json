@@ -1,0 +1,19 @@
+{
+  "id": "officeval_028",
+  "instruction": "文档中的表格缺少边框，有的表格还缺少标题，要求：\n1.文档中的所有表格补齐边框\n2.图片中的表格上下单元格字体对齐\n3.在图片红色圆圈处，按顺序从左往右依次添加“起始时间”、“专业技术人员类别”、“指导内容”、指导情况“，一个单元格一个标题，标题和具体内容对应。",
+  "operation_intent": "Reformat",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 92,
+  "task_price_proxy": 35,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/028/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/028/职称评审表.docx",
+      "dest": "职称评审表.docx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_083",
+  "instruction": "做一个图片上类似这种的变化趋势图，利用表格里的数据，做成可编辑的，不要图片",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 98,
+  "task_price_proxy": 145,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/083/image (5).png",
+      "dest": "image (5).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/083/出货量对比.xlsx",
+      "dest": "出货量对比.xlsx"
+    }
+  ]
+}

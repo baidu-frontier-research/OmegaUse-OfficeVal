@@ -1,0 +1,19 @@
+{
+  "id": "officeval_080",
+  "instruction": "这份PPT是需要修改的，文档里有修改要求，按照修改要求修改一下PPT",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 41,
+  "task_price_proxy": 30,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/080/公开课课件.pptx",
+      "dest": "公开课课件.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/080/要求.docx",
+      "dest": "要求.docx"
+    }
+  ]
+}

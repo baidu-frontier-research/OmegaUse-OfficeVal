@@ -1,0 +1,15 @@
+{
+  "id": "officeval_052",
+  "instruction": "把课本上这个立体模型图帮我拿PPT画一下吧，做成可编辑的，主色调改为橙色，不改变横纵比的情况下居中放置在一页PPT上",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 128,
+  "task_price_proxy": 50,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/052/模型图.png",
+      "dest": "模型图.png"
+    }
+  ]
+}

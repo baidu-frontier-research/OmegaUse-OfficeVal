@@ -1,0 +1,15 @@
+{
+  "id": "officeval_079",
+  "instruction": "我要翻译PPT，要求就是把它里面的翻译成蒙语文，不要改变任何数据和排版位置",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 241,
+  "task_price_proxy": 24,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/079/第二课时课件.pptx",
+      "dest": "第二课时课件.pptx"
+    }
+  ]
+}

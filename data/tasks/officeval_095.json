@@ -1,0 +1,19 @@
+{
+  "id": "officeval_095",
+  "instruction": "把文件中第一个问题和答案的占比做成环状图并放置在问题右边的空白处，环状图就做成图片中这样的，把问题放在圆环最中间，要求可编辑的",
+  "operation_intent": "Other",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 88,
+  "task_price_proxy": 18,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/095/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/095/乡村公共服务调查汇总.xlsx",
+      "dest": "乡村公共服务调查汇总.xlsx"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "officeval_056",
+  "instruction": "把这个流程图使用文本框和箭头形状做到PPT上，做好的流程图要全部都能编辑的状态，不要图片那种，大小和图片一样，居中放置",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 230,
+  "task_price_proxy": 35,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/056/客户投诉闭环处理流程 (2).png",
+      "dest": "客户投诉闭环处理流程 (2).png"
+    }
+  ]
+}

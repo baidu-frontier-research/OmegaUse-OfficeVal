@@ -1,0 +1,15 @@
+{
+  "id": "officeval_053",
+  "instruction": "这个图帮我用ppt画出来(要求在PPT里面可编辑)，不改变横纵比的情况下居中放置在一页PPT上",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 125,
+  "task_price_proxy": 80,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/053/111.png",
+      "dest": "111.png"
+    }
+  ]
+}

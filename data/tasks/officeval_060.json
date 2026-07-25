@@ -1,0 +1,15 @@
+{
+  "id": "officeval_060",
+  "instruction": "对第四页PPT重新排版，要求图片组合符合页面比例，页面两边无大片空白",
+  "operation_intent": "Restructure",
+  "domain": "Other",
+  "human_labor_time": 5,
+  "task_price_proxy": 12,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/060/PPT.pptx",
+      "dest": "PPT.pptx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_025",
+  "instruction": "对文档格式做修改，正文1倍行距，表格内容1.25倍行距；检查全文的错别字并改正；按照图片要求对标题的格式进行修改；文档中“（二）旅游资源分析”下方表格排版到两页上，其余表格不要分页放置，一个表格放到一页上。",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 99,
+  "task_price_proxy": 55,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/025/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/025/青岭山居旅居营造计划.docx",
+      "dest": "青岭山居旅居营造计划.docx"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "officeval_027",
+  "instruction": "帮我把PDF里的题目重新排版一下：\n1.清晰度不变\n2.文字有倾斜的调整到水平\n3.题目排版，两个题目之前保留一行间距\nA4页面，去掉顶部大段空白。",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 149,
+  "task_price_proxy": 49,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/027/1200题题本错题集.pdf",
+      "dest": "1200题题本错题集.pdf"
+    }
+  ]
+}

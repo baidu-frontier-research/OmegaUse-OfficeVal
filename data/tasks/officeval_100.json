@@ -1,0 +1,19 @@
+{
+  "id": "officeval_100",
+  "instruction": "这个做一个堆叠柱状图，综管科＋服务科+合计的登记数量和实际的核验数量做对比，做一个图片这样的图表，做成可编辑的",
+  "operation_intent": "Other",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 137,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/100/图表示例.png",
+      "dest": "图表示例.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/100/工作簿1.xlsx",
+      "dest": "工作簿1.xlsx"
+    }
+  ]
+}

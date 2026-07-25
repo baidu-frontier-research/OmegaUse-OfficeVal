@@ -1,0 +1,19 @@
+{
+  "id": "officeval_008",
+  "instruction": "把PDF英文文献翻译成中文，并以“文献翻译译文”文档的格式作为模板对翻译好的文献翻译文档进行修改",
+  "operation_intent": "Other",
+  "domain": "Academic Papers",
+  "human_labor_time": 304,
+  "task_price_proxy": 78,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/008/reed_fiber_biosorbent.pdf",
+      "dest": "reed_fiber_biosorbent.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/008/文献翻译译文.docx",
+      "dest": "文献翻译译文.docx"
+    }
+  ]
+}

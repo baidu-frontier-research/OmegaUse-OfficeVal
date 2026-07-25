@@ -1,0 +1,31 @@
+{
+  "id": "officeval_045",
+  "instruction": "在结束页前再添加一页，将背景设成线性渐变（浅蓝 → 白），再把我给发的三个视频做成图片上的样式，给三个视频增加动画效果，三个视频点击后依次出现，并播放，视频放到新增的一页上。9、12、14页PPT图片缩小使其整齐的放在页面上（尺寸调为17.60cm×16.82cm），给非标题过渡页、非首尾页添加页码。",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 43,
+  "task_price_proxy": 75,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/045/electric_toothbrush_vertical_01_clean_360x720.mp4",
+      "dest": "electric_toothbrush_vertical_01_clean_360x720.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/045/electric_toothbrush_vertical_02_timer_360x720.mp4",
+      "dest": "electric_toothbrush_vertical_02_timer_360x720.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/045/electric_toothbrush_vertical_03_gumcare_360x720.mp4",
+      "dest": "electric_toothbrush_vertical_03_gumcare_360x720.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/045/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/045/海岚清齿声波护理品牌汇报.pptx",
+      "dest": "海岚清齿声波护理品牌汇报.pptx"
+    }
+  ]
+}

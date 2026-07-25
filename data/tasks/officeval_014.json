@@ -1,0 +1,31 @@
+{
+  "id": "officeval_014",
+  "instruction": "给论文按“毕业论文要求”文档的规范生成自动更新目录，并按要求对论文中的所有格式做修改。",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 99,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/014/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/014/image_002.jpg",
+      "dest": "image_002.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/014/image_003.jpg",
+      "dest": "image_003.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/014/冻结肩多模态康复研究.docx",
+      "dest": "冻结肩多模态康复研究.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/014/毕业论文要求_星途理工大学.docx",
+      "dest": "毕业论文要求_星途理工大学.docx"
+    }
+  ]
+}

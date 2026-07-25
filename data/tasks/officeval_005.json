@@ -1,0 +1,19 @@
+{
+  "id": "officeval_005",
+  "instruction": "按照这个PDF里面要求的改Word文件格式",
+  "operation_intent": "Reformat",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 141,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/005/综合设计指导书.docx",
+      "dest": "综合设计指导书.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/005/综合设计指导书.pdf",
+      "dest": "综合设计指导书.pdf"
+    }
+  ]
+}

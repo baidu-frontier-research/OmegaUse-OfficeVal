@@ -1,0 +1,15 @@
+{
+  "id": "officeval_096",
+  "instruction": "我想制作一个图片上这样的统计图，上面不需要有折线的，横轴是11～20岁，纵轴是0-200cm，每50一格，再在上方做一个11～20岁身高统计表（可直接填写数据），我还像让这个表能够一输入数据下方图表就能自动显示数据点",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 103,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/096/image_001.jpg",
+      "dest": "image_001.jpg"
+    }
+  ]
+}

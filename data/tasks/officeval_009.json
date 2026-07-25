@@ -1,0 +1,19 @@
+{
+  "id": "officeval_009",
+  "instruction": "我需要改表格：长表格分页下一页也需要延续表头，跨页的表格在上一页表格底部需加上“续下页”三字，位置跟图片一样",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 74,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/009/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/009/第三章研究结果.docx",
+      "dest": "第三章研究结果.docx"
+    }
+  ]
+}

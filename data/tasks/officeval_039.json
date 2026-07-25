@@ -1,0 +1,19 @@
+{
+  "id": "officeval_039",
+  "instruction": "将文档四页排版成两页，两页分页位置为图片中红线所示的位置",
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 18,
+  "task_price_proxy": 19,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/039/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/039/办公设备维护与巡检服务合同.docx",
+      "dest": "办公设备维护与巡检服务合同.docx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_068",
+  "instruction": "我现在要把两个文件合在一起后修改一下，把“综合调度坐席系统操作介绍”ppt里的第13/16/18页删掉不用了，之后把“综合调度坐席系统操作介绍”ppt剩余的页面放在第二个PDF的第8页后面，最后给我一个做好的PPT文件。所有PPT颜色排版统一用浅蓝色，都做成可编辑的",
+  "operation_intent": "Restructure",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 125,
+  "task_price_proxy": 40,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/068/应急有线人工通信保障网专题汇报.pdf",
+      "dest": "应急有线人工通信保障网专题汇报.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/068/综合调度坐席系统操作介绍.pptx",
+      "dest": "综合调度坐席系统操作介绍.pptx"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "officeval_019",
+  "instruction": "为试题添加封面（具体排版参照图片）；试卷内主题标题用黑体三号居中显示，正文中文字体为宋体小四号，英文和阿拉伯数字字体为Times New Roman小四；另外需要为试题添加页码，页码格式为“化学试题 第x页 共x页”，封面不需要添加页码，其余格式参照模板文档修改。",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 249,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/019/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/019/image_002.png",
+      "dest": "image_002.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/019/初中化学模拟试题.docx",
+      "dest": "初中化学模拟试题.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/019/模板.docx",
+      "dest": "模板.docx"
+    }
+  ]
+}

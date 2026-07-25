@@ -1,0 +1,15 @@
+{
+  "id": "officeval_048",
+  "instruction": "给第一页PPT添加动画，我点击一次之后每条案例要一条条自动快速的呈现出来，凸显出紧迫性，给最后一个案例添加战争爆炸的音效",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 46,
+  "task_price_proxy": 10,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/048/演示文稿1.pptx",
+      "dest": "演示文稿1.pptx"
+    }
+  ]
+}

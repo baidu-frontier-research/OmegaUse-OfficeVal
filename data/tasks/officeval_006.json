@@ -1,0 +1,19 @@
+{
+  "id": "officeval_006",
+  "instruction": "把PDF里面的内容放入给的Word模板中，格式与模版中格式一致，要可编辑的",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 123,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/006/2026年3月17日高中数学作业.pdf",
+      "dest": "2026年3月17日高中数学作业.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/006/高一年级第一次数学周练111 (2).docx",
+      "dest": "高一年级第一次数学周练111 (2).docx"
+    }
+  ]
+}

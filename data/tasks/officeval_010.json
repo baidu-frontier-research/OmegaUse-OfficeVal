@@ -1,0 +1,15 @@
+{
+  "id": "officeval_010",
+  "instruction": "对文档的流程图进行修改：第四行删除，字体需要移动到框内 ，给我做成可编辑的",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 228,
+  "task_price_proxy": 31,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/010/技术路线图.docx",
+      "dest": "技术路线图.docx"
+    }
+  ]
+}

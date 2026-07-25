@@ -1,0 +1,19 @@
+{
+  "id": "officeval_030",
+  "instruction": "“V2毕业设计论文格式要求”文档里边有批注，按照批注把另一个文档格式改一下；然后在目录页重新生成一个符合要求的目录，点击目录能自动跳转；再帮我把页码加上，在页面下方居中显示，目录页以前(包括目录页)是不需要页码的",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 152,
+  "task_price_proxy": 45,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/030/V2成果说明书_A.docx",
+      "dest": "V2成果说明书_A.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/030/V2毕业设计论文格式要求.docx",
+      "dest": "V2毕业设计论文格式要求.docx"
+    }
+  ]
+}

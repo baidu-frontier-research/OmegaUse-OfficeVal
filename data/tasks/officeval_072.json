@@ -1,0 +1,15 @@
+{
+  "id": "officeval_072",
+  "instruction": "把这个做成文字部分可以编辑的ppt，排版内容颜色都要和原来的差不多",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 187,
+  "task_price_proxy": 110,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/072/Illuminating_the_Starry_Sky.pptx",
+      "dest": "Illuminating_the_Starry_Sky.pptx"
+    }
+  ]
+}

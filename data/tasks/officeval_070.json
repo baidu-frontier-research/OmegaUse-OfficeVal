@@ -1,0 +1,15 @@
+{
+  "id": "officeval_070",
+  "instruction": "美化1页，可以缩小字体和间距，最后将字完整放在板块区域框内，使字不要叠着放，帮我调整成像“临床问题”和“科学假说”这两块的布局就可以了。PPT尺寸不改变。",
+  "operation_intent": "Beautify",
+  "domain": "Academic Papers",
+  "human_labor_time": 32,
+  "task_price_proxy": 15,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/070/技术路线图.pptx",
+      "dest": "技术路线图.pptx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_075",
+  "instruction": "把\"呼吸项目课件”的模板替换成“医疗服务收费指引”那种的，也就是背景配色风格什么的做一下改变，不要动原来的文字和内容",
+  "operation_intent": "Beautify",
+  "domain": "Education & Examination",
+  "human_labor_time": 114,
+  "task_price_proxy": 43,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/075/医疗服务收费指引.pptx",
+      "dest": "医疗服务收费指引.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/075/呼吸项目课件.pptx",
+      "dest": "呼吸项目课件.pptx"
+    }
+  ]
+}

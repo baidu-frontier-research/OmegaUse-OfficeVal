@@ -1,0 +1,27 @@
+{
+  "id": "officeval_062",
+  "instruction": "把ppt的标题栏都给我加上像图片上这样的基础形状，再给我添加一页作为结束页加上“谢谢观看”的蓝色加粗字样（居中，字体调为宋体）并在谢谢观看下方插入我给你发的两段视频，要求把两段视频并列排版",
+  "operation_intent": "Beautify",
+  "domain": "Business Operations",
+  "human_labor_time": 120,
+  "task_price_proxy": 35,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/coffee_grind_to_latte_720x960.mp4",
+      "dest": "coffee_grind_to_latte_720x960.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/基础形状.png",
+      "dest": "基础形状.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/晨岚咖啡品牌运营研究.pptx",
+      "dest": "晨岚咖啡品牌运营研究.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/晨岚咖啡店环境介绍.mp4",
+      "dest": "晨岚咖啡店环境介绍.mp4"
+    }
+  ]
+}

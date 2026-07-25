@@ -1,0 +1,15 @@
+{
+  "id": "officeval_051",
+  "instruction": "把这张流程图做成PPT（要一模一样并且能编辑的，不要做成图片）",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 157,
+  "task_price_proxy": 78,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/051/Image 2.png",
+      "dest": "Image 2.png"
+    }
+  ]
+}

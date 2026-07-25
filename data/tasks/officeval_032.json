@@ -1,0 +1,19 @@
+{
+  "id": "officeval_032",
+  "instruction": "首先把图片里画横线的那句话删掉，然后在简历里加一个“志愿服务”的模块，格式和其他模块一样，内容是：“2022年1-2月在社区做抗击疫情先进志愿者；2023年7-9月在山底村做志愿者”，两段文字需分行添加，格式和原文档格式保持一致，最后在技能证书模块另起一行添加“2021年11月-2023年9月参加青年马克思主义者培养工程，培训合格”，简历还是一张纸哦不要弄到两张纸",
+  "operation_intent": "Annotate",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 69,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/032/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/032/求学申请材料_林绯绯.pdf",
+      "dest": "求学申请材料_林绯绯.pdf"
+    }
+  ]
+}

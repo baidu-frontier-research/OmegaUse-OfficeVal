@@ -1,0 +1,15 @@
+{
+  "id": "officeval_089",
+  "instruction": "我需要毛利率和净利率趋势图、柱形图，ROE的趋势图，\n资产负债率的趋势图，营业收入增长率、净利润的增长率趋势图。帮我根据表格相应数据在sheet2中绘制这些图表，规定所有图表横坐标为时间",
+  "operation_intent": "Other",
+  "domain": "Financial Data",
+  "human_labor_time": 93,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/089/企业财务统计总表.xlsx",
+      "dest": "企业财务统计总表.xlsx"
+    }
+  ]
+}

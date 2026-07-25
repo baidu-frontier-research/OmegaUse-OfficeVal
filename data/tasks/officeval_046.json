@@ -1,0 +1,19 @@
+{
+  "id": "officeval_046",
+  "instruction": "给我新建两页ppt，复刻这2页就行（要求一模一样），在不改变横纵比的情况下居中放置在两页30×20PPT上。将图片中的元素以组件的方式拼接到PPT上面，要求文字和组件都是可编辑的",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 501,
+  "task_price_proxy": 130,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/046/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/046/image_002.png",
+      "dest": "image_002.png"
+    }
+  ]
+}

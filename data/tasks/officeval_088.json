@@ -1,0 +1,39 @@
+{
+  "id": "officeval_088",
+  "instruction": "请查看“产品数据”文件夹中的 5 份产品说明文档，根据“选货汇总表_模板2”整理信息，将信息填入该表，表格样式不变，展示图片仅需洗衣机图片，不要营销性文字，从原图上裁剪一下，嵌入表格。然后将表格里的前三个高价产品信息写入“模板”文档并将洗衣机图片贴到图片粘贴框里面，图片上侧和下侧和框贴合，文档布局合理，单个产品不要跨页，最后重命名成“产品分析”Word，添加页眉“产品分析”，文字下有一个长的横线，最后加页码，页眉页码居中。",
+  "operation_intent": "Extract",
+  "domain": "Business Operations",
+  "human_labor_time": 78,
+  "task_price_proxy": 23,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/云溪5.0 D3滚筒洗衣机产品说明文档.docx",
+      "dest": "云溪5.0 D3滚筒洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/小天鹅12KG滚筒洗衣机产品说明文档.docx",
+      "dest": "小天鹅12KG滚筒洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/模板.docx",
+      "dest": "模板.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/米家8KG滚筒洗衣机产品说明文档.docx",
+      "dest": "米家8KG滚筒洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/统帅三桶懒人洗衣机产品说明文档.docx",
+      "dest": "统帅三桶懒人洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/美的8KG波轮洗衣机产品说明文档.docx",
+      "dest": "美的8KG波轮洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/选货汇总表_模板2_已填充 (1).xlsx",
+      "dest": "选货汇总表_模板2_已填充 (1).xlsx"
+    }
+  ]
+}
