@@ -1,0 +1,15 @@
+{
+  "id": "officeval_070",
+  "instruction": "Beautify slide 1. You may reduce the font size and spacing. Ensure that all text fits completely within the section boxes and does not overlap. Please adjust the layout to match that of the “Clinical Questions” and “Scientific Hypotheses” sections. Do not change the PPT dimensions.",
+  "operation_intent": "Beautify",
+  "domain": "Academic Papers",
+  "human_labor_time": 32,
+  "task_price_proxy": 15,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_070/技术路线图.pptx",
+      "dest": "技术路线图.pptx"
+    }
+  ]
+}

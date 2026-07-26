@@ -1,0 +1,20 @@
+{
+  "id": "officeval_073",
+  "instruction": "Modify the PPT according to the requirements shown in the image. Do not add, delete, or alter any content in the original PPT.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .pptx format and can be opened, edited, and presented normally."
+    ],
+    "dim2": [
+      "+3: Standardize the fonts on Slide 1: set all text inside the icons and all icon content in the document to SimSun, Chinese font size No. 6, while keeping the colors black and dark gray.",
+      "+3: Standardize the fonts on Slide 2: set all text inside the icons and all icon content in the document to SimSun, Chinese font size No. 6, while keeping the colors black and dark gray.",
+      "+1: The width of the outer flowchart box containing \"1. Patterns of Child Development and Learning Characteristics  2. Competency Goals and Educational Requirements of the Curriculum Standards\" must be changed to no more than 8 cm.",
+      "+1: The width of the outer flowchart box containing \"Intelligent Technology Supporting Differentiated Learning for Primary School Students\" must be changed to no more than 8 cm.",
+      "-5: The overall flowchart must not be smaller than 20 cm.",
+      "-3: The width of any flowchart box other than \"1. Patterns of Child Development and Learning Characteristics  2. Competency Goals and Educational Requirements of the Curriculum Standards\" and \"Intelligent Technology Supporting Differentiated Learning for Primary School Students\" exceeds 8 cm.",
+      "-3: In any 3 or more flowchart boxes, the text extends outside the box or is obscured by the box outline.",
+      "-3: Any 3 or more connector lines are disconnected.",
+      "-3: Any one of the following levels is missing: Goal Layer, Core Layer, Foundation Layer, Mechanism Layer, Implementation Layer, or Operating Logic."
+    ]
+  }
+}

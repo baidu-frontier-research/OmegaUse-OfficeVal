@@ -1,0 +1,19 @@
+{
+  "id": "officeval_095",
+  "instruction": "Create a doughnut chart showing the proportions of the answers to the first question in the file, and place it in the blank area to the right of the question. Make the doughnut chart look like the one shown in the image, place the question in the very center of the doughnut, and ensure that it is editable.",
+  "operation_intent": "Other",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 88,
+  "task_price_proxy": 18,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_095/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_095/乡村公共服务调查汇总.xlsx",
+      "dest": "乡村公共服务调查汇总.xlsx"
+    }
+  ]
+}

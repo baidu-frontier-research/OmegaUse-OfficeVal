@@ -1,0 +1,19 @@
+{
+  "id": "officeval_039",
+  "instruction": "Format the four-page document into two pages, with the page break between the two pages positioned where indicated by the red line in the image.",
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 18,
+  "task_price_proxy": 19,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_039/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_039/办公设备维护与巡检服务合同.docx",
+      "dest": "办公设备维护与巡检服务合同.docx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_081",
+  "instruction": "Create an Excel spreadsheet that achieves what is demonstrated in the video: after a number is entered in one cell, the active cell automatically moves to the next cell, with the cells arranged in a three-column serpentine pattern (the intended result is that entering a number in any cell in the three columns automatically moves the active cell to the next cell in the serpentine direction).",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .xlsx or .xlsm format, and the file must open normally.",
+      "(The code permits .xlsm/.xlsx/.xlam, making the criterion too lenient. Change the format threshold to allow only candidate_path.suffix.lower() == '.xlsm'; candidate file discovery should also prioritize and accept only .xlsm.)",
+      "The three-column serpentine entry area on the \"Serpentine Entry\" worksheet must consist of editable cells and must not be converted into an image, screenshot, or non-editable object.",
+      "The workbook must not exhibit macro errors, an inability to save, an inability to enter data into cells, confused navigation directions, a data area protected against editing, missing worksheets, or similar issues."
+    ],
+    "dim2": [
+      "+5: Odd-numbered rows of the serpentine path on the \"Serpentine Entry\" worksheet: enter values sequentially from left to right. After completing entry in a cell on the left, pressing Enter moves to the adjacent cell on the right. After completing entry in the last cell on the right of an odd-numbered row, pressing Enter moves to the cell in the next row in the same column.",
+      "+5: Even-numbered rows of the serpentine path on the \"Serpentine Entry\" worksheet: enter values sequentially from right to left. After completing entry in a cell on the right, pressing Enter moves to the adjacent cell on the left. After completing entry in the last cell on the left of an even-numbered row, pressing Enter moves to the cell in the next row in the same column.",
+      "+5: Complete serpentine path on the \"Serpentine Entry\" worksheet: movement follows the sequence of left to right on odd-numbered entry rows and right to left on even-numbered entry rows, without leaving the three-column by n-row input area at any point (n is an integer greater than 3).",
+      "+3: Undo or edit logic on the \"Serpentine Entry\" worksheet: when an existing number in the three-column by n-row area (n is an integer greater than 3) is edited, completing the edit still moves to the next serpentine position corresponding to that cell.",
+      "+1: Entry format on the \"Serpentine Entry\" worksheet: cells in the three-column by n-row area (n is an integer greater than 3) use the General or Number format. After numbers such as 1, 2, and 3 are entered, they are displayed as ordinary numbers and must not be displayed as dates, scientific notation, or garbled text."
+    ]
+  }
+}

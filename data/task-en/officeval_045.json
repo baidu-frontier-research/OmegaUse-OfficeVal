@@ -1,0 +1,31 @@
+{
+  "id": "officeval_045",
+  "instruction": "Add one more slide before the closing slide and set its background to a linear gradient (light blue → white). Then style the three videos I sent to match the image, add animation effects to all three videos, and make the videos appear sequentially on click and play. Place the videos on the newly added slide. Reduce the sizes of the images on Slides 9, 12, and 14 so that they fit neatly on the slides (set the size to 17.60cm × 16.82cm), and add slide numbers to slides that are neither title/section-divider slides nor the first or last slide.",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 43,
+  "task_price_proxy": 25,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_045/electric_toothbrush_vertical_01_clean_360x720.mp4",
+      "dest": "electric_toothbrush_vertical_01_clean_360x720.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_045/electric_toothbrush_vertical_02_timer_360x720.mp4",
+      "dest": "electric_toothbrush_vertical_02_timer_360x720.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_045/electric_toothbrush_vertical_03_gumcare_360x720.mp4",
+      "dest": "electric_toothbrush_vertical_03_gumcare_360x720.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_045/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_045/海岚清齿声波护理品牌汇报.pptx",
+      "dest": "海岚清齿声波护理品牌汇报.pptx"
+    }
+  ]
+}

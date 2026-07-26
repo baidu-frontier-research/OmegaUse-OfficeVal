@@ -8,19 +8,19 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/企业经营异常核查呈报材料.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/企业经营异常核查呈报材料.docx",
       "dest": "企业经营异常核查呈报材料.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/企业经营情况说明书.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/企业经营情况说明书.docx",
       "dest": "企业经营情况说明书.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/华中区域零售项目经营异常核查封面.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/华中区域零售项目经营异常核查封面.docx",
       "dest": "华中区域零售项目经营异常核查封面.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/022/华中区域零售项目经营资金异常及现金流风险.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/华中区域零售项目经营资金异常及现金流风险.docx",
       "dest": "华中区域零售项目经营资金异常及现金流风险.docx"
     }
   ]

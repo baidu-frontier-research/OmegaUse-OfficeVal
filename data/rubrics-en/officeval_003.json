@@ -1,0 +1,19 @@
+{
+  "id": "officeval_003",
+  "instruction": "Modify the provided document. Place every line of text below “Meeting Content” inside the table and add a horizontal line beneath it, using the same horizontal-line style as shown in the image. Then delete the blank lines that contain no text, and keep all other formatting unchanged.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file has a .doc or .docx extension; the file opens properly"
+    ],
+    "dim2": [
+      "+5: There are no blank rows in the document table",
+      "+5: Every line of text in the document table has a horizontal line below it; each horizontal line is the same length as the table’s top border; the lines are black, thin, and solid",
+      "+5: For all horizontal lines in the document table, the distances between adjacent horizontal lines are nearly equal, with an error of only 0.15cm allowed",
+      "-5: An image or a non-editable part appears in the document",
+      "-5: The top of the document’s first page fails to satisfy any one of the following: the document title is “Department Coordination Meeting”; the chair is Xu Chengbai; the location is the conference room on the second floor of the Comprehensive Building",
+      "-1: The first line below “Meeting Content:” is indented",
+      "-1: The text “Hou Jinglan: The progress in rectifying two key on-site matters from last month is as follows: ‘text content’” does not appear in the document",
+      "-1: The text between “Several operational deviations occurred in February; the details are as follows:” and “IV. Discussion of Follow-up Matters” is indented"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "id": "officeval_099",
+  "instruction": "Create a 2-D pie chart for each question in the spreadsheet from Question 4 through the last question, and insert each chart to the right of its corresponding question.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .xlsx or .xlsm format and can be opened successfully."
+    ],
+    "dim2": [
+      "+5: Total number of charts in “sheet1”: 22 charts are added in total from Question 4 through Question 25, with one 2-D pie chart in the blank area to the right of each question; they are not 3-D pie charts, doughnut charts, bar charts, column charts, line charts, or any other chart type.",
+      "+3: Chart data sources in “sheet1”: All 22 charts use the corresponding question's “Option—Subtotal” or “Option—Percentage” data range as the chart data source, corresponding respectively to Question 4 A27:C30, Question 5 A35:C39, Question 6 A44:C47, Question 7 A52:C55, Question 8 A60:C64, Question 9 A69:C72, Question 10 A77:C81, Question 11 A86:C89, Question 12 A94:C98, Question 13 A103:C106, Question 14 A111:C114, Question 15 A119:C122, Question 16 A127:C130, Question 17 A135:C138, Question 18 A143:C146, Question 19 A151:C154, Question 20 A159:C162, Question 21 A167:C171, Question 22 A176:C179, Question 23 A184:C188, Question 24 A193:C197, and Question 25 A202:C206.",
+      "+1: Chart positions in “sheet1”: All 22 charts are located in the blank area to the right of their corresponding questions; the left edge of each chart is in column D or farther to the right, and the charts do not cover the original data in columns A:C.",
+      "+5: Chart labels in “sheet1”: All 22 2-D pie charts display the key proportion information; the data labels contain percentages, values, or both, and the main slices are distinguishable.",
+      "+1: Chart titles in “sheet1”: All 22 charts have titles that contain the corresponding question number, from “Question 4” through “Question 25,” or that clearly identify the corresponding question's content.",
+      "+1: Chart fonts in “sheet1”: Chart titles, data labels, and legend text use standard fonts such as SimSun, Microsoft YaHei, or Calibri, with font sizes of 5–20 points, clear and legible colors, and no WordArt.",
+      "+5: Chart legends in “sheet1”: All 22 charts allow the option corresponding to each slice to be identified through the legend or data labels.",
+      "+3: Chart sizes in “sheet1”: Each chart is approximately 5–10 cm high, and the chart body, title, legend, and labels are displayed in full without obvious clipping.",
+      "-3: Chart data sources in “sheet1”: Any chart incorrectly includes the “Valid responses for this question” row, the header row, or data from another question in the chart for the current question.",
+      "-1: Chart order in “sheet1”: Multiple charts are clearly out of vertical order relative to the questions on the left, making it difficult to match Questions 4 through 25 one-to-one."
+    ]
+  }
+}

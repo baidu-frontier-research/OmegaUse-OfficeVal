@@ -1,0 +1,15 @@
+{
+  "id": "officeval_029",
+  "instruction": "Create the table shown in the image. The first column should be 2.4 cm wide. In the first row, the second cell should be 2.4 cm wide, the third cell 1.45 cm, the fourth cell 1.2 cm, the fifth cell 1.45 cm, the sixth cell 2.4 cm, the seventh cell 2.4 cm, and the eighth cell 2.4 cm. In the second row, the first column should be 2.4 cm wide. In the third row, the widths should be 2.4, 2.6, 2.85, 2.85, 2.65, and 2.65 cm, respectively. In the fourth row, they should be 2.4, 2.6, and 2.85 cm. Use FangSong in Small Three size for all text. I need an editable Word file.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 153,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_029/image_001.jpg",
+      "dest": "image_001.jpg"
+    }
+  ]
+}

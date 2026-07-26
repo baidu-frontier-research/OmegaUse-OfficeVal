@@ -1,0 +1,19 @@
+{
+  "id": "officeval_036",
+  "instruction": "Organize the income and expense records from the PDF into the Word document, ensuring that every record row has the same height.",
+  "operation_intent": "Extract",
+  "domain": "Financial Data",
+  "human_labor_time": 180,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_036/Cedarline_Statement_2025DEC_reordered.pdf",
+      "dest": "Cedarline_Statement_2025DEC_reordered.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_036/public_ready_statement.docx",
+      "dest": "public_ready_statement.docx"
+    }
+  ]
+}

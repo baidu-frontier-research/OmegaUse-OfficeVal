@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/068/应急有线人工通信保障网专题汇报.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_068/应急有线人工通信保障网专题汇报.pdf",
       "dest": "应急有线人工通信保障网专题汇报.pdf"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/068/综合调度坐席系统操作介绍.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_068/综合调度坐席系统操作介绍.pptx",
       "dest": "综合调度坐席系统操作介绍.pptx"
     }
   ]

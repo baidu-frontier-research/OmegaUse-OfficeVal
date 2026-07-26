@@ -1,0 +1,20 @@
+{
+  "id": "officeval_048",
+  "instruction": "Add animations to the first slide of the PPT. After I click once, each case should automatically appear one by one in quick succession to convey a sense of urgency. Add a war explosion sound effect to the final case.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .ppt or .pptx format and must open, be editable, and play normally.",
+      "The delivered PPT must remain 16 slides long, with slides 1 through 16 in the same order; do not add blank slides or delete content slides."
+    ],
+    "dim2": [
+      "+5: Initial Slide Show state of slide 1: When slide 1 opens, the title, background, course information at the bottom, and the timeline baseline may be displayed first, but all 8 case entries must not be displayed at the same time. After 1 mouse click in Slide Show mode, the 8 cases begin appearing automatically and continuously in sequence, with no further clicks required; all animations play continuously using “After Previous” or an equivalent automatic trigger. The playback order is: 1948 Arab–Israeli War, 1956 Suez Crisis, 1967 Six-Day War, 1980—1988 Iran–Iraq War, 1990—1991 Gulf War, 2003 Iraq War, Syrian conflict since 2011, and Gaza conflict since 2023.",
+      "+3: Animation speed on slide 1: The appearance animation for each case lasts 0.1—0.5 seconds, and the next case begins automatically within 0—0.3 seconds after the previous one ends, maintaining a fast overall pace. From when the 8 cases begin playing until the final case has finished appearing, the total duration must be kept within 2—5 seconds to convey a sense of urgency. The case animations may use Fade, Wipe, Fly In, Zoom, or an emphasis Flash effect, with a consistent overall style. The appearance pace of the 8 cases remains fast from beginning to end, or accelerates slightly in the second half, visually creating a sense of urgency as the events continue to unfold.",
+      "+5: Sound effect for the final case on slide 1: When the 8th case, “Gaza conflict since 2023,” appears, a war explosion sound effect plays simultaneously and is bound to the final case's animation. The war explosion sound effect is embedded in the PPT file or packaged and saved with the PPT, with no missing media or broken links when played on another computer. The explosion sound effect lasts approximately 1—4 seconds, is clearly audible without continuously drowning out the narration, and does not loop. The audio icon may be hidden or placed at the edge of the slide and must not obscure the timeline, case text, title, or information at the bottom.",
+      "-5: Slide 1 is converted into a video, GIF, or full-slide image, making the text and case objects uneditable.",
+      "-3: After the animations finish, any 2 or more cases disappear automatically, preventing the timeline from being read in full.",
+      "-3: Any 3 or more objects on slide 1 become visibly misaligned or overlap as a result of adding the animations.",
+      "-3: Any 3 or more slides from slide 2 through slide 16 have missing content, a broken layout, missing slide numbers, or unrelated objects.",
+      "-3: The PPT contains comments, red markings, blank slides, or temporary explanatory text unrelated to the task."
+    ]
+  }
+}

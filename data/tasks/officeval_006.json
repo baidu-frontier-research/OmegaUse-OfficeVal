@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/006/2026年3月17日高中数学作业.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_006/2026年3月17日高中数学作业.pdf",
       "dest": "2026年3月17日高中数学作业.pdf"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/006/高一年级第一次数学周练111 (2).docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_006/高一年级第一次数学周练111 (2).docx",
       "dest": "高一年级第一次数学周练111 (2).docx"
     }
   ]

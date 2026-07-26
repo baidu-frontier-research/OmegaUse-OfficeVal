@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/069/image (2).png",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_069/image (2).png",
       "dest": "image (2).png"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/069/工商层面_流程图.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_069/工商层面_流程图.pptx",
       "dest": "工商层面_流程图.pptx"
     }
   ]

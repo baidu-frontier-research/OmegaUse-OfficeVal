@@ -1,0 +1,17 @@
+{
+  "id": "officeval_027",
+  "instruction": "Please reformat the questions in the PDF:\n1. Keep the clarity unchanged.\n2. Straighten any tilted text so that it is horizontal.\n3. Format the questions with one line of spacing between questions.\nUse A4 pages and remove the large blank area at the top.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .pdf format and can be opened normally."
+    ],
+    "dim2": [
+      "+5: Text areas on all pages: Skew correction is completed, and the baselines of the question body text remain horizontal; the skew angle is kept within ±0.5 degrees of horizontal, with no entire lines visibly sloping upward or downward. All horizontal table lines and the horizontal axes of statistical charts are basically parallel to the top edge of the page, with a skew angle no greater than ±0.5 degrees.",
+      "+3: Top areas of all pages: The top of each A4 page has no blank area exceeding 10% of the page.",
+      "+5: Adjacent question areas: Retain vertical spacing of approximately one line of body-text height; questions neither touch nor have a large blank area between them.",
+      "-5: Three or more pages are not A4 portrait pages.",
+      "-3: On three or more pages, content is close to the page edges, posing a risk of being cut off when printed.",
+      "-5: Any one page is more than 30% blank, is a black page, has an inverted page orientation, or requires manual rotation."
+    ]
+  }
+}

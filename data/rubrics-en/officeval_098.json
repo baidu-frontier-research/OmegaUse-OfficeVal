@@ -1,0 +1,23 @@
+{
+  "id": "officeval_098",
+  "instruction": "Create a chart using the overall mean attention score (4.11) as the reference line for the vertical axis and the overall mean experience score (3.63) as the reference line for the horizontal axis, and plot an Importance-Satisfaction Quadrant Chart. Text within the chart must follow charting standards: Chinese text must use SimSun in Chinese size Small Five (or 9 pt); English text and numbers must use Times New Roman in Chinese size Small Five. Charts with numeric coordinate labels must indicate the coordinate units.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .xlsx or .xlsm format, and the file must open normally."
+    ],
+    "dim2": [
+      "+1: Chart data source: The chart uses A2:C21, comprising 20 indicator records, as the plotting data source; the data in column A, “Evaluation Dimension,” are the indicator names, the data in column B are the mean attention scores, and the data in column C are the mean experience scores.",
+      "+5: Chart type: The newly added chart is an Importance-Satisfaction Quadrant Chart, plotted as an XY scatter chart or an equivalent two-dimensional coordinate scatter chart. The horizontal and vertical axes intersect at the center of the chart as the dividing lines for the four quadrants. It is not a pie chart, column chart, line chart, or radar chart.",
+      "+5: Chart reference lines: The chart contains 1 vertical reference line and 1 horizontal reference line; the vertical-axis reference line corresponds to the overall mean experience score of 4.11, and the horizontal-axis reference line corresponds to the overall mean attention score of 3.63. The two lines span the entire chart and divide it into 4 quadrants.",
+      "+1: Chart axes: The horizontal axis represents “Experience” or “Mean Experience,” and the vertical axis represents “Attention” or “Mean Attention.” The horizontal and vertical axes are oriented correctly, and their meanings are not swapped.",
+      "+1: Number of scatter points: The chart displays a total of 20 scatter points, corresponding one-to-one with A2:A21, which contains the identifiers of the 20 evaluation dimensions.",
+      "+1: Chart data positions: The horizontal and vertical coordinates of each scatter point correspond respectively to the values in C2:C21 and B2:B21, and the point positions are substantially consistent with the source data.",
+      "+1: Chart labels: All 20 scatter points have identifiable data labels. The label content consists of question numbers Q6-Q25, allowing the evaluation dimensions to be distinguished.",
+      "+1: Chart title: The chart includes a title containing “Importance-Satisfaction Quadrant Chart,” clearly indicating the chart's purpose.",
+      "+1: Fonts for text in the chart: The chart title, axis titles, Chinese data labels, Chinese legend, or Chinese explanatory text use SimSun in Chinese size Small Five or 9 pt.",
+      "+1: “Fonts for English text and numbers in the chart: English text, Arabic numerals, axis tick-label numbers, mean values, Q question numbers, and similar content in the chart use Times New Roman in Chinese size Small Five or 9 pt.",
+      "+1: Chart axis units: Both the horizontal-axis title and the vertical-axis title indicate units, such as “Mean Experience (points)” and “Mean Attention (points),” or equivalent wording.",
+      "+1: Chart layout: The chart is placed to the right of the source data table, below it, or in another blank area, and does not cover the main data area A1:C22 by more than 30%."
+    ]
+  }
+}

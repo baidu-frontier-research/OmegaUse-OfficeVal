@@ -8,11 +8,11 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/082/1111.xlsx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_082/1111.xlsx",
       "dest": "1111.xlsx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/082/image (4).png",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_082/image (4).png",
       "dest": "image (4).png"
     }
   ]

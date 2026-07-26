@@ -8,7 +8,7 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/092/智慧农业示范园建设项目报价表.xlsx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_092/智慧农业示范园建设项目报价表.xlsx",
       "dest": "智慧农业示范园建设项目报价表.xlsx"
     }
   ]

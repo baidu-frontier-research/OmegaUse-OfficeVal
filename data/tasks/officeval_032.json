@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/032/image_001.png",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_032/image_001.png",
       "dest": "image_001.png"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/032/求学申请材料_林绯绯.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_032/求学申请材料_林绯绯.pdf",
       "dest": "求学申请材料_林绯绯.pdf"
     }
   ]

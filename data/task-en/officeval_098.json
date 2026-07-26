@@ -1,0 +1,15 @@
+{
+  "id": "officeval_098",
+  "instruction": "Create a chart using the overall mean attention score (4.11) as the reference line for the vertical axis and the overall mean experience score (3.63) as the reference line for the horizontal axis, and plot an Importance-Satisfaction Quadrant Chart. Text within the chart must follow charting standards: Chinese text must use SimSun in Chinese size Small Five (or 9 pt); English text and numbers must use Times New Roman in Chinese size Small Five. Charts with numeric coordinate labels must indicate the coordinate units.",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 121,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_098/满意度调查.xlsx",
+      "dest": "满意度调查.xlsx"
+    }
+  ]
+}

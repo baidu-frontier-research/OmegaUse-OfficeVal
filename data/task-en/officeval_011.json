@@ -1,0 +1,19 @@
+{
+  "id": "officeval_011",
+  "instruction": "In the Word document, the table at the image location is split and needs to be adjusted.",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 22,
+  "task_price_proxy": 15,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_011/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_011/课程资料.docx",
+      "dest": "课程资料.docx"
+    }
+  ]
+}

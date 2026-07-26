@@ -1,0 +1,27 @@
+{
+  "id": "officeval_063",
+  "instruction": "Revised Task:\n1. Based on the following data, create a line chart and insert it on the last slide: Month  Revenue Value  Profit Ratio\nMonth 1 68000  1.42 \nMonth 2 352000 1.56\nMonth 3 486000 1.71\nMonth 4 423000 1.63\nMonth 5 579000 1.85\n2. Add the following content at the circled location in Image 1: Scheduling Role\n3. For Image 2, straighten the entire image slightly and change the background to match the backgrounds of the other slides.\n3. Delete the duplicated content at the circled location in Image 3.\n4. In Image 4, delete the red content and replace all of the yellow content with “Establish a standardized review framework  Strengthen the effectiveness of cross-role coordination and collaboration  Empower the team to achieve steady, sustainable, long-term development,” retaining the original layout.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .ppt or .pptx format and can be opened, edited, and presented normally.",
+      "The PPT remains 10 slides long.",
+      "The text, backgrounds, and objects on slides 2, 5, 6, and 9 remain editable, and the modified slides have not been converted into full-slide images.",
+      "The chart data, slide text, and original layout do not exhibit large-scale misalignment, overlap, cropping, or missing content.",
+      "If the file cannot be opened, an entire slide is not editable, the line chart is a screenshot, or the slide structure is severely damaged, the Dimension 1 score is 0."
+    ],
+    "dim2": [
+      "+5: Line chart object on slide 10: Insert an editable line chart or smoothed line chart in a blank area on the right or in the center of the closing slide. It must contain two vertical-axis data series, “Revenue Value” and “Profit Ratio,” with the two lines in different colors. From left to right, the horizontal axis must display “Month 1, Month 2, Month 3, Month 4, Month 5” in the correct order. Revenue Value series: The data for the five months must be 68000, 352000, 486000, 423000, and 579000, in that order. Profit Ratio series: The data for the five months must be 1.42, 1.56, 1.71, 1.63, and 1.85, in that order. The labels “Revenue Value” and “Profit Ratio” must be displayed accurately, and each legend color must correspond to its respective line.",
+      "+1: On slide 2, role card No. 3 on the right side: The blank area contains the title “Scheduling Role” in dark green, bold, 24 pt Microsoft YaHei.",
+      "+3: All cards and the image on the right side of slide 5: Their rotation angles are adjusted to 0 degrees or close to 0 degrees, and the card borders, text baselines, and the top and bottom edges of the image remain horizontal.",
+      "+3: The background of slide 5 is changed to a light blue background that is identical or highly similar to those of slides 2 and 3; the beige background is no longer used.",
+      "+1: “Optimization Actions” area on slide 6: The content “Rewrite sensitive expressions as scenario-based, explanatory language” must appear no more than 1 time.",
+      "+5: Except for the title and background, slide 9 of the PPT contains only two sections: the “Short Term” section and the “Long Term” section. The two sections are centered, with no other content below them.",
+      "+1: “Long Term” section on the right side of slide 9: The three lines of content are “Establish a standardized review framework,” “Strengthen the effectiveness of cross-role coordination and collaboration,” and “Empower the team to achieve steady, sustainable, long-term development,” with each sentence on a separate line.",
+      "+1: Line chart title on slide 10: Use “Monthly Revenue and Profit Ratio Trend” or a semantically equivalent title that is clear and legible.",
+      "+1: Line chart layout on slide 10: Approximately 13 to 17 cm wide and 7 to 10 cm high, with reasonable spacing between the chart and the other elements on the closing slide.",
+      "-3: The chart on slide 10 obscures the closing-slide title, name, or any other content.",
+      "-1: The PPT contains red circles or markings, yellow circles or markings, temporary explanatory text, comments, or screenshot borders.",
+      "-3: The PPT must not have a slide count other than 10 or have slides in an incorrect order."
+    ]
+  }
+}

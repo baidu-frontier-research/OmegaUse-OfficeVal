@@ -1,0 +1,40 @@
+{
+  "id": "officeval_089",
+  "instruction": "I need a trend chart and a column chart for gross profit margin and net profit margin, a trend chart for ROE,\na trend chart for the debt-to-asset ratio, and a trend chart for the operating revenue growth rate and net profit growth rate. Please create these charts in Sheet2 based on the corresponding data in the table, with time as the horizontal axis for all charts.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable file is in .xlsx or .xlsm format and can be opened normally."
+    ],
+    "dim2": [
+      "+5: Five charts appear in Sheet2.",
+      "+1: Sheet2 worksheet: A second worksheet named \"Sheet2\" is added to the workbook. The worksheet contains only the financial analysis title, 5 charts, and necessary legends, with no large areas of data or images unrelated to the task.",
+      "+3: The top-left gross profit margin and net profit margin trend chart in Sheet2 is an Excel-editable line chart with data markers.",
+      "+3: Data for the top-left gross profit margin and net profit margin trend chart in Sheet2: The first series is named \"Gross Profit Margin\" and its values reference “企业财务统计总表”!B4:B12; the second series is named \"Net Profit Margin\" and its values reference “企业财务统计总表”!C4:C12.",
+      "+1: Title of the top-left gross profit margin and net profit margin trend chart in Sheet2: The title text is \"Gross Profit Margin and Net Profit Margin Trend Chart\" and is centered at the top of the chart.",
+      "+3: Horizontal time labels for the top-left gross profit margin and net profit margin trend chart in Sheet2: The 9 time texts in A4:A12 are displayed in sequence along the bottom. Their left-to-right order matches the top-to-bottom order of the data in sheet1, and default sequence numbers such as 1, 2, and 3 do not appear.",
+      "+1: Series style of the top-left gross profit margin and net profit margin trend chart in Sheet2: \"Gross Profit Margin\" and \"Net Profit Margin\" use solid lines in different colors and differently shaped data.",
+      "+1: Legend of the top-left gross profit margin and net profit margin trend chart in Sheet2: The legend is positioned at the bottom of the chart and displays \"Gross Profit Margin\" and \"Net Profit Margin\" in that order, with colors matching the corresponding lines.",
+      "+3: The top-right gross profit margin and net profit margin column chart in Sheet2 is an Excel-editable clustered column chart.",
+      "+3: Data for the top-right gross profit margin and net profit margin column chart in Sheet2: The column chart contains two series, \"Gross Profit Margin\" and \"Net Profit Margin,\" referencing “企业财务统计总表”!B4:B12 and C4:C12 respectively, with A4:A12 as the horizontal categories.",
+      "+1: Title of the top-right gross profit margin and net profit margin column chart in Sheet2: The title text is \"Gross Profit Margin and Net Profit Margin Column Chart\" and is centered at the top of the chart.",
+      "+1: Series style of the top-right gross profit margin and net profit margin column chart in Sheet2: The columns for \"Gross Profit Margin\" and \"Net Profit Margin\" have different fill colors; the two columns for the same time are arranged side by side and are not stacked.",
+      "+3: The left-center return on equity trend chart in Sheet2 is an Excel-editable line chart with data markers.",
+      "+3: Data for the left-center return on equity trend chart in Sheet2: The series is named \"Return on Equity (ROE),\" its values reference “企业财务统计总表”!D4:D12, and its horizontal categories reference A4:A12.",
+      "+1: Title of the left-center return on equity trend chart in Sheet2: The title text is \"Return on Equity (ROE) Trend Chart\" and is centered at the top of the chart.",
+      "+1: Line style of the right-center return on equity trend chart in Sheet2: The line is solid, the data points have circular or square markers, and the changes in the line match the changes in the data in H4:H12 of sheet1.",
+      "+3: The right-center debt-to-asset ratio trend chart in Sheet2 is an Excel-editable line chart with data markers.",
+      "+3: Data for the right-center debt-to-asset ratio trend chart in Sheet2: The series is named \"Debt-to-Asset Ratio,\" its values reference “企业财务统计总表”!H4:H12, and its horizontal categories reference A4:A12.",
+      "+1: Title of the right-center debt-to-asset ratio trend chart in Sheet2: The title text is \"Debt-to-Asset Ratio Trend Chart\" and is centered at the top of the chart.",
+      "+1: Line style of the right-center debt-to-asset ratio trend chart in Sheet2: The line is solid, the data points have circular or square markers, and the changes in the line match the changes in the data in H4:H12 of sheet1.",
+      "+3: The bottom growth rate trend chart in Sheet2 is an Excel-editable dual-series line chart with data markers.",
+      "+3: Data for the bottom growth rate trend chart in Sheet2: The first series is named \"Operating Revenue Growth Rate\" and its values reference “企业财务统计总表”!K4:K12; the second series is named \"Net Profit Growth Rate\" and its values reference “企业财务统计总表”!L4:L12; the horizontal categories reference A4:A12.",
+      "+1: Title of the bottom growth rate trend chart in Sheet2: The title text is \"Operating Revenue Growth Rate and Net Profit Growth Rate Trend Chart\" and is centered at the top of the chart.",
+      "+1: Series style of the bottom growth rate trend chart in Sheet2: \"Operating Revenue Growth Rate\" and \"Net Profit Growth Rate\" use solid lines in different colors and markers of different shapes, and the two lines have the same width.",
+      "+1: Legend of the bottom growth rate trend chart in Sheet2: The legend is positioned at the bottom of the chart and displays \"Operating Revenue Growth Rate\" and \"Net Profit Growth Rate\" in that order. The series names are complete, and default names such as \"Series 1\" and \"Series 2\" are not used.",
+      "+3: Time order for all charts in Sheet2: The horizontal time labels of all 5 charts are arranged in order from FY2021 through 2026Q4. The 2026 quarterly data must not be placed before the annual data, and the labels must not be reordered alphabetically or numerically.",
+      "+3: Value display for all charts in Sheet2: Gross profit margin, net profit margin, ROE, debt-to-asset ratio, operating revenue growth rate, and net profit growth rate are all displayed in percentage format, with chart tooltip values or data labels retaining two decimal places.",
+      "-5: No Excel-editable chart objects appear in Sheet2, or all charts are images or screenshots.",
+      "-3: The workbook contains duplicate charts, images, watermarks, or large areas of blank content."
+    ]
+  }
+}

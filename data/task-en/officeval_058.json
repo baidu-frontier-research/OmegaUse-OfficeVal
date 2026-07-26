@@ -1,0 +1,19 @@
+{
+  "id": "officeval_058",
+  "instruction": "Please add small labels to the table-of-contents slide, following the style shown in the image I sent you. In the blank space below each subheading, place three labels arranged from left to right, equally spaced and identical in size (use MiSans, font size 10.5; dark green background with white text). The specific label text is as follows:\nCultural Communication: Confucian Ethics, Narrative Logic, Cultural Discount\nIndustrialization System: Visual Effects Capabilities, Promotion and Distribution Challenges, Industry Chain Gaps\nGlobal Competition: Hollywood, Korean Cinema, Distribution Network\nCognitive Bias: Preconceived Position, Misunderstanding and Misreading, Subject Matter Restrictions",
+  "operation_intent": "Annotate",
+  "domain": "Business Operations",
+  "human_labor_time": 85,
+  "task_price_proxy": 42,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_058/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_058/中国电影业面临的挑战.pptx",
+      "dest": "中国电影业面临的挑战.pptx"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "officeval_039",
+  "instruction": "Format the four-page document into two pages, with the page break between the two pages positioned where indicated by the red line in the image.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .docx format and can be opened normally.",
+      "The delivered document contains only 2 pages.",
+      "All contract text, tables, check marks, headers, footers, and page numbers in the document are editable Word objects; the pages must not be converted into images or screenshots."
+    ],
+    "dim2": [
+      "+5: Overall page count of the Word document: The document is paginated into 2 pages, and the page counts shown in the status bar, Print Preview, and the exported PDF are all 2 pages. Overall content of Page 1: Page 1 contains the contract title, the Party A and Party B information table, the contract notes, Articles 1 through 4, the Service Scope table, the Service Package table, the Contract Total Price paragraph, and Party B's Payment Collection Account paragraph. Overall content of Page 2: Page 2 contains all contract clauses in Articles 5 through 10 and the signing information for Party A and Party B.",
+      "+1: Party A and Party B information table on Page 1: The table remains 7 rows by 4 columns, with the four column widths, in order, being 2.47 cm, 7.42 cm, 2.47 cm, and 7.42 cm, and the table does not span pages. +1: Service Scope table on Page 1: The table remains 5 rows by 4 columns, with all column widths being 4.88 cm, and contains the four headers \"Service Module,\" \"Included Content,\" \"Delivery Records,\" and \"Excluded Items.\"",
+      "+1: Service Package table on Page 1: The table remains 6 rows by 5 columns and contains the five headers \"Selection,\" \"Package Name,\" \"Applicable Device Scale,\" \"Annual Fee,\" and \"Main Service Content.\" The entire table is on Page 1. The widths of the Selection, Package Name, Applicable Device Scale, Annual Fee, and Main Service Content columns are all 3.24 cm.",
+      "+1: Signing Information table on Page 2: Retain the 2-column, 5-row signing table at the bottom of the page, with both the left and right columns having a width of 8.10 cm.",
+      "-1: Party B's Payment Collection Account paragraph does not appear on Page 1.",
+      "-1: Any one of the account name, bank name, or account number appears on Page 2.",
+      "-1: The Service Package table on Page 1 is split across pages.",
+      "-1: The right border of any table extends beyond the page margins.",
+      "-3: Any page in the document contains a blank area exceeding 50% of the page.",
+      "-1: The page setup for the entire document meets any one of the following conditions: the paper is not A4 portrait, the top and bottom margins are not 0.35 cm, the left and right margins are not 0.85 cm, the header distance from the top is not 0.20 cm, or the footer distance from the bottom is not 0.20 cm.",
+      "-1: Either page is missing the header \"Office Equipment Maintenance and Inspection Service Contract,\" or a header is not set in 8 pt Microsoft YaHei, in gray or black, and horizontally centered.",
+      "-1: The continuous blank height below the account information and above the footer on Page 1 exceeds 1.5 cm; the continuous blank height below the signing table and above the footer on Page 2 exceeds 1.5 cm."
+    ]
+  }
+}

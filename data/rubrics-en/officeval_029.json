@@ -1,0 +1,23 @@
+{
+  "id": "officeval_029",
+  "instruction": "Create the table shown in the image. The first column should be 2.4 cm wide. In the first row, the second cell should be 2.4 cm wide, the third cell 1.45 cm, the fourth cell 1.2 cm, the fifth cell 1.45 cm, the sixth cell 2.4 cm, the seventh cell 2.4 cm, and the eighth cell 2.4 cm. In the second row, the first column should be 2.4 cm wide. In the third row, the widths should be 2.4, 2.6, 2.85, 2.85, 2.65, and 2.65 cm, respectively. In the fourth row, they should be 2.4, 2.6, and 2.85 cm. Use FangSong in Small Three size for all text. I need an editable Word file.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .doc or .docx format and can be opened, edited, and printed normally."
+    ],
+    "dim2": [
+      "+5: Overall table structure: Contains 8 rows from top to bottom, in this order: basic information, training date, training information, assessment information, evaluation method, learning completion status, direct supervisor comments, and human resources comments.",
+      "+5: Row 1 base grid: Contains 8 base cells, with the necessary cell merges configured to match the image. From left to right, the widths are 2.4 cm, 2.4 cm, 1.45 cm, 1.2 cm, 1.45 cm, 2.4 cm, 2.4 cm, and 2.4 cm, respectively, with a deviation of no more than 0.05 cm for each cell width. The text in row 1 includes \"Employee Name,\" \"Department,\" \"Gender,\" and \"Position,\" with each label located in its corresponding information area; cells 2, 4, 6, and 8 on the right remain blank and fillable.",
+      "+1: Row 2 cells: The cell on the left is labeled \"Training Date\"; cells 2-8 on the right are merged horizontally and extend to the table's right border. In row 2, column 1 is 2.4 cm wide, with a width deviation of no more than 0.05 cm.",
+      "+3: Row 3 cells: There are 6 cells, arranged in the order \"Training Objective\"—input area—\"Training Program\"—input area—\"Learning Duration\"—input area. From left to right, the widths are 2.4 cm, 2.6 cm, 2.85 cm, 2.85 cm, 2.65 cm, and 2.65 cm, respectively, with a deviation of no more than 0.05 cm for each cell width.",
+      "+3: Row 4 cells: Arranged in the structure \"Assessment Result\"—input area—\"Competency Evaluation\"—input area, with the final input area extending horizontally to the table's right border. From left to right, the widths are 2.4 cm, 2.6 cm, and 2.85 cm, respectively, with a deviation of no more than 0.05 cm for each cell width.",
+      "+1: Row 5 cells: The left side displays \"Evaluation Method\" and is 2.4 cm wide; cells 2-8 on the right form a horizontally merged blank input area.",
+      "+1: Row 6 cells: The left side displays \"Learning Completion Status\" and is 2.4 cm wide; cells 2-8 on the right form a large blank input area.",
+      "+1: Row 7 cells: The left side displays \"Direct Supervisor Comments\" and is 2.4 cm wide; cells 2-8 on the right form a horizontally merged large blank input area.",
+      "+1: Row 8 cells: The left side displays \"Human Resources Comments\" and is 2.4 cm wide; cells 2-8 on the right form a horizontally merged large blank input area.",
+      "+1: All text in the table: Use FangSong consistently as the Chinese font.",
+      "+1: All text in the table: Use Small Three consistently, without mixing in other font sizes.",
+      "+1: Table borders: Use thin, solid black or dark gray lines. All inner and outer borders are continuous and clear, with no missing lines, duplicate lines, or extraneous diagonal lines."
+    ]
+  }
+}

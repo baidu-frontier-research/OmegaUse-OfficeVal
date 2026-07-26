@@ -1,0 +1,19 @@
+{
+  "id": "officeval_046",
+  "instruction": "Create a new two-slide ppt for me and replicate just these 2 pages (they must be exactly identical), centered on two 30 × 20 PPT slides without changing the aspect ratio. Reconstruct the elements in the images as components assembled on the PPT slides; both the text and the components must be editable.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 501,
+  "task_price_proxy": 130,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_046/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_046/image_002.png",
+      "dest": "image_002.png"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "officeval_077",
+  "instruction": "I only need one PPT slide modified: only the first slide needs to be modified, and the following three slides are reference materials for modifying the first slide.\n1. Fixed content: Keep the three columns under “Intellectual Trajectory” on the first slide visible throughout; do not hide any of them with animations.\nThe images on the first slide and the “Respective Views” content below the images should be hidden using animations.\n\n Step-by-step animation sequence\n 1. Locke:\n- Click 1: Fade in Locke’s “Respective Views” content.\n2. Montesquieu:\n- Click 1: On the current slide, fade in Montesquieu’s portrait + quotation materials (do not navigate to another slide, and keep the background clean without displaying the original table content).\n- Click 2: Fade out the materials.\n- Click 3: Fade in Montesquieu’s “Respective Views” content.\n3. Voltaire:\n- Click 1: On the current slide, fade in Voltaire’s portrait + quotation materials (do not navigate to another slide, and keep the background clean without displaying the original table content).\n- Click 2: Fade out the materials.\n- Click 3: Fade in Voltaire’s “Respective Views” content.\n4. Rousseau:\nSame as the previous two.\n5. Hume:\n- Click 1: Fade in Hume’s “Respective Views” content.\n6. Adam Smith:\n- Click 1: Fade in Adam Smith’s “Respective Views” content.\n7. Kant:\n- Click 1: On the current slide, fade in Kant’s portrait + quotation materials (do not navigate to another slide).\n- Click 2: Fade out the materials.\n- Click 3: Fade in Kant’s “Respective Views” content.\n In other words, 2 (Montesquieu), 3 (Voltaire), 4 (Rousseau), and 7 (Kant) need to display materials; the others do not.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .pptx format and can be opened, edited, and presented normally."
+    ],
+    "dim2": [
+      "+3: Locke image object on Slide 1: Locke’s image is initially hidden and fades in after the first click. The “Natural Rights, Property Rights, Limited Government, Consent of the Governed,” and other Respective Views content below Locke’s image fades in simultaneously with the image or immediately afterward on the first click.",
+      "+3: Montesquieu material display layer on Slide 1: On the second click, the current slide fades in the Montesquieu portrait image and summarized viewpoint content from the right side of Slide 2.",
+      "+3: Montesquieu material exit on Slide 1: After the third click, Montesquieu’s portrait and summarized viewpoint content fade out.",
+      "+3: Montesquieu image and views on Slide 1: After the fourth click, Montesquieu’s image and the “Separation of Powers and Checks and Balances, Legal Rationality,” and other Respective Views below the image fade in.",
+      "+3: Voltaire material display layer on Slide 1: After the fifth click, the current slide fades in the Voltaire portrait image and summarized viewpoint content from the left side of Slide 2.",
+      "+3: Voltaire material exit on Slide 1: After the sixth click, Voltaire’s portrait image and summarized viewpoint material fade out.",
+      "+3: Voltaire image and views on Slide 1: After the seventh click, Voltaire’s image and the “Freedom of Thought, Critique of Autocracy,” and other Respective Views below the image fade in.",
+      "+3: Rousseau material display layer on Slide 1: After the eighth click, the current slide fades in the Rousseau portrait image and summarized viewpoint content from the left side of Slide 3.",
+      "+3: Rousseau material exit on Slide 1: After the ninth click, Rousseau’s portrait image and summarized viewpoint content fade out.",
+      "+3: Rousseau image and views on Slide 1: After the tenth click, Rousseau’s image and the “Social Contract, Popular Sovereignty,” and other Respective Views below the image fade in.",
+      "+3: Hume views text on Slide 1: After the eleventh click, the “Empiricism, Limits of Reason,” and other Respective Views content below Hume’s image fades in simultaneously with Hume’s image or immediately afterward.",
+      "+3: Adam Smith image object on Slide 1: After the twelfth click, Adam Smith’s image and the “Division of Labor and Markets, Free Competition,” and other Respective Views content below it fade in.",
+      "+3: Kant material display layer on Slide 1: After the thirteenth click, the current slide fades in the Kant portrait image and summarized viewpoint content from the right side of Slide 4.",
+      "+3: Kant material exit on Slide 1: On the fourteenth click, the Kant portrait image and summarized viewpoint content from Slide 4 fade out and do not obscure the subsequent Kant views content.",
+      "+3: Kant image and views on Slide 1: After the fifteenth click, Kant’s image on Slide 1 and the “Independent Thinking, Freedom and Autonomy,” and other Respective Views below the image fade in.",
+      "-5: The Intellectual Trajectory section content does not appear on Slide 1 during the slide show."
+    ]
+  }
+}

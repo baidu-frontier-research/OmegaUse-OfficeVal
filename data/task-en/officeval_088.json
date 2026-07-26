@@ -1,0 +1,39 @@
+{
+  "id": "officeval_088",
+  "instruction": "Review the 5 product description documents in the “Product Data” folder, organize the information according to “Product Selection Summary Sheet_Template 2,” and enter the information into that sheet without changing the table formatting. For the display images, include only images of the washing machines with no marketing text; crop them from the original images and embed them in the table. Then enter the information for the three highest-priced products in the table into the “Template” document and place the washing machine images inside the image placeholders, with the top and bottom edges of each image flush with the placeholder. Ensure a reasonable document layout, and do not split any individual product across pages. Finally, rename the Word document “Product Analysis,” add a header reading “Product Analysis” with a long horizontal line beneath the text, and add page numbers; center both the header and the page numbers.",
+  "operation_intent": "Extract",
+  "domain": "Business Operations",
+  "human_labor_time": 78,
+  "task_price_proxy": 23,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/云溪5.0 D3滚筒洗衣机产品说明文档.docx",
+      "dest": "云溪5.0 D3滚筒洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/小天鹅12KG滚筒洗衣机产品说明文档.docx",
+      "dest": "小天鹅12KG滚筒洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/模板.docx",
+      "dest": "模板.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/米家8KG滚筒洗衣机产品说明文档.docx",
+      "dest": "米家8KG滚筒洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/统帅三桶懒人洗衣机产品说明文档.docx",
+      "dest": "统帅三桶懒人洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/美的8KG波轮洗衣机产品说明文档.docx",
+      "dest": "美的8KG波轮洗衣机产品说明文档.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/选货汇总表_模板2_已填充 (1).xlsx",
+      "dest": "选货汇总表_模板2_已填充 (1).xlsx"
+    }
+  ]
+}

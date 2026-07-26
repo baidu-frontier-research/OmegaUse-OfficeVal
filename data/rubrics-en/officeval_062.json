@@ -1,0 +1,25 @@
+{
+  "id": "officeval_062",
+  "instruction": "Add basic shapes like the ones shown in the image to all title bars in the PPT. Then add a new slide as an ending slide, with the text “Thank You for Watching” in blue and bold (centered, with the font set to SimSun), and insert the two videos I sent you below “Thank You for Watching,” with the two videos laid out side by side.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .ppt or .pptx format and can be opened, edited, and played normally.",
+      "The basic shapes in the title bars must not obscure the original slide titles, body text, charts, slide numbers, images, or primary visual elements.",
+      "The text, charts, images, backgrounds, slide numbers, and layout in the original PPT must remain editable; entire slides must not be converted into images.",
+      "When the entire PPT is played, there must be no missing slides, unplayable videos, misaligned title bars, large-scale object overlaps, content extending beyond slide boundaries, or newly added blank slides."
+    ],
+    "dim2": [
+      "+1: Final PPT slide count: The delivered PPT contains 16 slides. Slides 1 through 15 contain the original brand operations research content, and Slide 16 is the newly added ending slide.",
+      "+5: A title bar composed of blue shapes is added around the title at the top of each PPT slide from Slides 2-15.",
+      "+5: Blue main shape on the left side of the PPT title bar on Slides 2-15: The left side of the title bar on each slide contains only one blue trapezoid or folded-corner card shape, 3-4 cm wide and 2-3 cm high, with a blue gradient or light-blue fill and an editable outline.",
+      "+5: Long outer frame on the right side of the PPT title bar on Slides 2-15: Each slide's title bar contains a long, light-blue or white rounded-parallelogram outer frame on the right, 12-15 cm wide and 1.5-3 cm high, with a thin blue solid-line border. Between the blue main shape on the left and the long bar on the right is a white or light-blue angled transition shape at an angle of approximately 15—30 degrees, creating a layered-card effect. The border line width of all title bar shapes remains 0.75—1.5 pt, and the color is blue or light blue.",
+      "+5: The left area of the PPT title bar on Slides 2-15 displays the corresponding slide number or section number, such as 02, 03, 04, etc., in Arial, white or a light color, at 28-32 pt, and positioned inside the blue main shape. The Chinese slide title in the title bar uses blue, bold SimSun at 30 pt and is positioned in the middle-left area of the long bar, with the text not extending beyond the title bar boundaries. The English subtitle in the title bar uses light-blue Arial at 10-14 pt and is positioned below or near the Chinese title, with text corresponding to the slide's theme.",
+      "+5: Decorative dot matrix and diagonal lines in the PPT title bar on Slides 2-15: The right side of the title bar contains a light-blue decorative dot matrix consisting of 9—25 small dots, positioned in the upper-right area of the title bar, with all dots the same size. The lower-right side of the title bar contains 3 short, light-blue decorative diagonal lines that do not overlap the light-blue decorative dot matrix, have a line width of 1—3 pt and a consistent angle, and do not obscure the body text.",
+      "+1: “Thank You for Watching” text on Slide 16: “Thank You for Watching” is centered in the upper or upper-middle portion of the slide, in SimSun, at 36-50 pt, bold, and blue. The text box is within 30%—70% of the slide width and 10%—25% of the slide height, is horizontally centered, and the text is not tilted or distorted.",
+      "+5: Video objects on Slide 16: Insert the corresponding coffee-making video on the left below “Thank You for Watching,” with a width of 8-10 cm and a height of 11-12 cm. On the No. 1 right side, insert the corresponding coffee shop environment introduction video below “Thank You for Watching,” with a width of 8-10 cm and a height of 11-12 cm. The two videos are arranged side by side, with their top edges aligned and their heights identical or nearly identical, with horizontal spacing of 1.0—2.5 cm, and the overall arrangement centered in the middle-lower area of the slide.",
+      "+5: In PPT Slide Show mode, both videos can be played normally, whether by clicking to play or through automatic playback, with no missing-media, playback-failure, or incorrect-path prompts. When paused, both videos display a clear cover image or first frame, rather than a black screen, blank placeholder, or damaged icon.",
+      "-5: On any 5 or more slides, the title bar obscures the original slide title, body text, or charts.",
+      "-3: Any slide in the PPT has a blank area covering more than 50% of the slide or contains comments, red markings, watermarks, or screenshot borders unrelated to the task."
+    ]
+  }
+}

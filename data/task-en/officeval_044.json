@@ -1,0 +1,23 @@
+{
+  "id": "officeval_044",
+  "instruction": "In the completed PPT, delete the original text from slide 8 and create a table of contents slide (the table of contents only needs to include the main headings of the subsequent sections, i.e., the section headings indicated by the “red box + arrow” in the image). Set the table of contents so that clicking an entry jumps to the specified slide. (For the title “Table of Contents” on the table of contents slide: use SimSun at font size 96 and center it; use FangSong at font size 44 for the text below.)\nPlace the video I sent you on the left side of slide 9 so that it perfectly covers the left image area (12.06 cm × 14.22 cm). Set an effect so that clicking the image brings up the video, which then automatically starts playing immediately.",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 91,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_044/early_modern_europe_voyage_preparation_departure_720x960.mp4",
+      "dest": "early_modern_europe_voyage_preparation_departure_720x960.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_044/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_044/新航路开辟说课PPT.pptx",
+      "dest": "新航路开辟说课PPT.pptx"
+    }
+  ]
+}

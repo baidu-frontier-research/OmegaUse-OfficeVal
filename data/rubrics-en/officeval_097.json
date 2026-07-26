@@ -1,0 +1,23 @@
+{
+  "id": "officeval_097",
+  "instruction": "Please create a chart in the blank area to the right of each question. Make Questions 6, 7, 10, 11, 12, and 16 pie charts, and make all the other questions horizontal bar charts.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .xlsx or .xlsm format and opens normally."
+    ],
+    "dim2": [
+      "+5: “sheet1” total chart count: Questions 6 through 21 have a total of 16 newly added charts, with 1 corresponding chart in the blank area to the right of each question that has statistical data; no chart is required for the open-ended Question 22.",
+      "+5: “sheet1” pie chart questions: Questions 6, 7, 10, 11, 12, and 16 each have 1 pie chart to their right. The chart type is a pie chart or an equivalent circular proportional chart, not a bar chart, column chart, or line chart.",
+      "+5: “sheet1” horizontal bar chart questions: Questions 8, 9, 13, 14, 15, 17, 18, 19, 20, and 21 each have 1 horizontal bar chart to their right. The categories are arranged horizontally, and the chart type is not a pie chart or vertical column chart.",
+      "+5: “sheet1” chart data sources: All 16 charts use the corresponding “Option—Subtotal—Percentage” data area for their respective questions as their data source, respectively from Question 6 A4:C8, Question 7 A13:C15, Question 8 A20:C26, Question 9 A31:C38, Question 10 A43:C46, Question 11 A51:C55, Question 12 A59:C63, Question 13 A68:C72, Question 14 A77:C83, Question 15 A88:C94, Question 16 A99:C103, Question 17 A108:C114, Question 18 A119:C126, Question 19 A131:C136, Question 20 A141:C148, and Question 21 A153:C158.",
+      "+5: “sheet1” pie chart labels: The pie charts for Questions 6, 7, 10, 11, 12, and 16 all display the proportion of each option. The data labels include percentages, values, or both, and the main slices are distinguishable.",
+      "+5: “sheet1” horizontal bar chart orientation: The charts for Questions 8, 9, 13, 14, 15, 17, 18, 19, 20, and 21 are all horizontal bar charts. The option text appears in the vertical-axis category area, and all subtotals or percentages are represented by the lengths of the horizontal bars.",
+      "+5: “sheet1” horizontal bar chart labels: The 10 horizontal bar charts display data labels for the subtotals or percentages.",
+      "+5: “sheet1” chart dimensions: Each chart is approximately 5–9cm wide and 3–8cm high. The chart body, title, legend, or labels are fully displayed, with no obvious clipping.",
+      "+5: “sheet1” chart consistency: Charts of the same type are generally consistent in color scheme, font, and label style, and the pie charts and horizontal bar charts are neatly arranged on the same worksheet.",
+      "-5: “sheet1” chart objects: The added objects are primarily images or screenshots rather than editable charts.",
+      "-3: “sheet1” chart positions: Any one or more charts cover the original data in columns A:C, obscure the question text, or seriously overlap adjacent charts.",
+      "-1: “sheet1” open-ended question area: An irrelevant statistical chart has been added to the right of Question 22, “Open-ended Question/Fill-in-the-Blank Question,” or a chart covers the text in A161:C162."
+    ]
+  }
+}

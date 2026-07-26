@@ -1,0 +1,15 @@
+{
+  "id": "officeval_027",
+  "instruction": "Please reformat the questions in the PDF:\n1. Keep the clarity unchanged.\n2. Straighten any tilted text so that it is horizontal.\n3. Format the questions with one line of spacing between questions.\nUse A4 pages and remove the large blank area at the top.",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 149,
+  "task_price_proxy": 49,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_027/1200题题本错题集.pdf",
+      "dest": "1200题题本错题集.pdf"
+    }
+  ]
+}

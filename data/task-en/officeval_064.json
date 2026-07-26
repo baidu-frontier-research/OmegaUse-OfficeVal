@@ -1,0 +1,63 @@
+{
+  "id": "officeval_064",
+  "instruction": "I do not have time to work on this right now. Please place these 12 photos precisely, in order, in the blank areas below the content in the “Core Technologies” PPT, with three photos in each frame. On the first page, arrange one large photo on top and two small photos below; on the second page, arrange two small photos on the left and one large photo on the right. It would be best to also add a light blue border around the title.",
+  "operation_intent": "Restructure",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 77,
+  "task_price_proxy": 28,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/1.png",
+      "dest": "1.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/10.png",
+      "dest": "10.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/11.png",
+      "dest": "11.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/12.png",
+      "dest": "12.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/2.png",
+      "dest": "2.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/3.png",
+      "dest": "3.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/4.png",
+      "dest": "4.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/5.png",
+      "dest": "5.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/6.png",
+      "dest": "6.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/7.png",
+      "dest": "7.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/8.png",
+      "dest": "8.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/9.png",
+      "dest": "9.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_064/核心技术.pptx",
+      "dest": "核心技术.pptx"
+    }
+  ]
+}

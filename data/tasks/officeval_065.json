@@ -8,11 +8,11 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/065/double_spinner_new.mp4",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_065/double_spinner_new.mp4",
       "dest": "double_spinner_new.mp4"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/065/口算教学课件.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_065/口算教学课件.pptx",
       "dest": "口算教学课件.pptx"
     }
   ]

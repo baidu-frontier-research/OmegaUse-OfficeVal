@@ -8,7 +8,7 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/027/1200题题本错题集.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_027/1200题题本错题集.pdf",
       "dest": "1200题题本错题集.pdf"
     }
   ]

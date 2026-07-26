@@ -1,0 +1,42 @@
+{
+  "id": "officeval_024",
+  "instruction": "Make the following adjustments to my thesis in accordance with the formatting requirements in the thesis template document:\n1. Adjust and standardize the widths of the three-line tables, and center-align all tables.\n2. Reference citations must use cross-references.\n3. Standardize the use of punctuation: use full-width punctuation for Chinese and half-width punctuation for English/numbers/formulas.\n4. Adjust the positions and sizes of the images to ensure that the document layout does not contain large blank areas.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is a Microsoft Word file in .doc or .docx format, and the file can be opened normally",
+      "The delivered document is between 30 and 40 pages long"
+    ],
+    "dim2": [
+      "+5: The document retains all 10 tables, Table 1 through Table 10, with table titles containing, in order, “Research Variables and Data Sources,” “Demographic Characteristics of the Questionnaire Sample,” “Classification of Community Green Space Accessibility Levels,” “Questionnaire Reliability and Validity Tests,” “Descriptive Statistics of Walking Behavior,” “Statistics for Community Built Environment Indicators,” “Results of the Health Perception Regression Model,” “Standardized Coefficients of the Path Model,” “Robustness Test Results,” and “Community Renewal Strategy Matrix”; all tables are center-aligned, with their left and right boundaries centered relative to the main text area and the left-right deviation not exceeding 0.5 cm; widths are standardized to 85%-100% of the main text area width, and the difference in width between any two tables does not exceed 1 cm; no table in the document extends beyond the printable area of the page, and no table's right boundary crosses the right margin of the body text",
+      "+5: All tables throughout the document use a three-line table style, retaining only three types of primary horizontal lines: the table's top border, the horizontal line below the header row, and the table's bottom border; the top and bottom borders are 1.5 pt wide; the horizontal line below the header row is 0.75 pt wide",
+      "+3: The header text of every table in the body text is bold; Chinese text uses SimSun, No. 5, and English text and numbers use Times New Roman, No. 5",
+      "+3: In the body of every table in the body text, Chinese text uses SimSun, No. 5, and English text and numbers use Times New Roman, No. 5",
+      "+3: Every table in the body text has a row height of no less than 0.6 cm, and table text is not clipped by the top or bottom borders",
+      "+3: Every table title in the body text is positioned above its corresponding table; table numbers use consecutive Arabic numerals in the format “Table Number Table Title,” with 2 spaces between the table number and table title; paragraph formatting is 0.5 lines, center-aligned, with 12 pt line spacing",
+      "+3: Every English table title in the body text is positioned below its Chinese table title, uses Times New Roman, No. 5, and is adjacent to the corresponding Chinese table title and table",
+      "+1: One blank line is left above each table title and below each table note. If the table is at the top of a page, no blank line is left above it",
+      "+5: Every location in the body text that cites a reference is set as a Word cross-reference field, bookmark reference field, or citation object that can be clicked to jump to the reference entry",
+      "+5: All citation numbers in the body text use square-bracket format, such as [1], [2], and [7,8]; all are formatted as superscript, use Times New Roman, and are No. 4 in size",
+      "+5: The “Preface” section retains and standardizes at least the two reference cross-references [1] and [2]; paragraphs related to “Research Design and Data Sources,” “Indicator System and Variable Specification,” “Spatial Data Organization,” “Questionnaire and Interview Data,” and “Statistical Analysis Methods” retain and standardize at least the four reference cross-references [3], [4], [5], and [6]; paragraphs related to “Analysis of Residents' Walking Behavior,” “Health Perception and Path Model,” “Robustness and Stratified Analysis,” and “Discussion” retain and standardize at least [7], [8], and subsequent reference cross-references",
+      "+1: In the reference list, each entry is numbered with Arabic numerals, the numbers increase consecutively starting from 1, there is no punctuation after the number, and one space follows the number",
+      "+1: English text and Arabic numerals throughout the document use Times New Roman, with the same font size as the Chinese text in the paragraph where they appear",
+      "+3: The document retains all 8 images, Figure 1 through Figure 8, with figure titles containing, in order, “Research Technical Roadmap,” “Quality Control Diagram for the Multi-source Data Processing Workflow,” “Grid Distribution Map of Green Space Accessibility in Sample Areas,” “Distribution Chart of Residents' Recreational Walking Frequency,” “Scatter Plot of Green Space Accessibility and Walking Duration,” “Model Coefficient Plot of Factors Affecting Walking Behavior,” “Radar Chart of Green Space Use Experience Evaluation,” and “Health Perception Path Model Diagram”; all images are centered, with their left and right boundaries centered relative to the main text area and the left-right deviation not exceeding 0.5 cm; image widths are set to 55%-90% of the main text area width and do not extend beyond the printable area of the page",
+      "+3: Figure 1, Figure 2, Figure 3, Figure 4, Figure 5, Figure 6, Figure 7, and Figure 8 are each positioned above their corresponding figure title, and each figure title is positioned below the image; figure numbers use consecutive Arabic numerals, and every Chinese figure title in the document uses the format “Figure Number Figure Title” or “FigureNumber Figure Title,” with two spaces between the figure number and figure title, in SimSun, No. 5, and centered",
+      "+1: One blank line is left above each figure and below each figure note. If the figure is at the top of a page, no blank line is left above it.",
+      "+3: Every English figure title in the document is positioned below its Chinese figure title, uses Times New Roman, No. 5, and is centered",
+      "+5: Chinese punctuation in all Chinese body-text paragraphs throughout the document uses full-width punctuation, including “，”, “。”, “；”, “：”, “（”, and “）”",
+      "+5: English punctuation in the English abstract, English title, English figure titles, English table titles, and English references throughout the document uses half-width punctuation, including “,”, “.”, “;”, “:”, “(”, and “)”",
+      "+5: Punctuation used with Arabic numerals, English letters, statistical symbols, and formulas throughout the document uses half-width characters, for example, 300 m, 78.3%, Cronbach α, P<0.01, R², 500 m, 800 m, and 1000 m",
+      "+1: The title “List of Figures and Tables” uses SimHei, Small No. 3, and is centered (bonus points)",
+      "+1: The content of the List of Figures and Tables uses SimSun, No. 4, while English text and numbers use Times New Roman, No. 4 (bonus points)",
+      "-3: The title and content of the “Declaration of Originality of the Degree Thesis” are not positioned at the top of the third page of the thesis",
+      "-3: The abbreviation-list table does not meet the three-line table requirements: only three types of primary horizontal lines are retained—the table's top border, the horizontal line below the header row, and the table's bottom border; the top and bottom borders are 1.5 pt wide; the horizontal line below the header row is 0.75 pt wide",
+      "-1: Any 1 page contains a large blank area exceeding 1/3 of the page height",
+      "-3: The text in the “Declaration of Originality of the Degree Thesis” section on the page immediately before the table of contents page has been moved to the blank page after the cover page",
+      "-3: On any page, there is an empty blank area exceeding 1/3 of the page height between an image or table and the body text",
+      "-1: Starting from the Preface page, any page has a missing, duplicate, or skipped page number",
+      "-1: Any page after the Preface page has a missing header",
+      "-1: The footer on any page appears at the one-third position of the page"
+    ]
+  }
+}

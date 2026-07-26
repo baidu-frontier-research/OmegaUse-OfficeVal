@@ -1,0 +1,19 @@
+{
+  "id": "officeval_069",
+  "instruction": "Adjust the sizes and formatting of the boxes and fonts in this PowerPoint presentation, using the provided image as a reference. As shown in the image, make the text and boxes inside the red, pink, and green rectangular outlines match the size and formatting of the respective elements indicated by the arrows of the same color.",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 38,
+  "task_price_proxy": 18,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_069/image (2).png",
+      "dest": "image (2).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_069/工商层面_流程图.pptx",
+      "dest": "工商层面_流程图.pptx"
+    }
+  ]
+}

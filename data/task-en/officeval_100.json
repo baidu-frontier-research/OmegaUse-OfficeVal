@@ -1,0 +1,19 @@
+{
+  "id": "officeval_100",
+  "instruction": "Create a stacked column chart, using the provided image as a reference, to compare the registered quantities for the General Administration Section and Service Section, including their total, against the actual verified quantities. Make the chart editable.",
+  "operation_intent": "Other",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 137,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_100/图表示例.png",
+      "dest": "图表示例.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_100/工作簿1.xlsx",
+      "dest": "工作簿1.xlsx"
+    }
+  ]
+}

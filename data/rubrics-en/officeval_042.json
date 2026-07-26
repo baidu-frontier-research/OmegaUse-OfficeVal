@@ -1,0 +1,46 @@
+{
+  "id": "officeval_042",
+  "instruction": "I. Replace the backgrounds of slides 1-2 in the ppt with the images I sent you: set the slide 1 background to 50% transparency and the slide 2 background to 85% transparency. Using transparency will prevent the text from conflicting too much with the background.\nII. Reformat slide 2 of the ppt (I will give you an image; the circled areas in the image need to be changed):\n1. Use bold Arial for the red title, and use blue underlined text for the small headings inside the green box.\n2. Change all small headings from horizontal to vertical, as shown inside the green box in the image.\n3. Adjust the positions of the content inside the pink, yellow, and blue boxes to create the three-column layout shown in the image. Each column must have equal spacing, and the text must not overlap. Center each corresponding heading above its corresponding content. Delete “Evaluation” and its corresponding content.\nIII. Place the music I sent you on the last slide, and position the playback button in the lower-left corner.",
+  "rubrics": {
+    "dim1": [
+      "The submitted deliverable is an editable PPT file in .ppt or .pptx format, and the file opens properly."
+    ],
+    "dim2": [
+      "+1: The slide 1 background is replaced with a children’s cartoon-themed image. The image is 18-20cm high and 32-34cm wide, with no tiling, stretching distortion, blank margins, or blank blocks.",
+      "+3: The slide 1 background image has approximately 50% transparency, within an allowed range of 45%-55%, and the background does not noticeably overpower the title or body text.",
+      "+1: The slide 2 background is replaced with the children’s cartoon-themed image provided by the user. The image is 18-20cm high and 32-34cm wide, with no tiling, severe cropping, blank margins, or blank blocks.",
+      "+3: The slide 2 background image has approximately 85% transparency, within an allowed range of 80%-90%. The background is light and does not impair the readability of the slide text.",
+      "+1: The red text on slide 2, including the red title “Overall Instructional Design: From Learning Foundations to Practice Improvement,” is in Arial and bold.",
+      "+1: All six small headings on slide 2—“Learning Diagnosis, Task Transformation, Resource Integration, Scenario Rehearsal, Performance Evaluation, Iterative Growth”—are changed to blue text and underlined.",
+      "+5: All small headings on slide 2—“Learning Diagnosis,” “Task Transformation,” “Resource Integration,” “Scenario Rehearsal,” “Performance Evaluation,” and “Iterative Growth”—are displayed vertically.",
+      "+1: The three headings “Students,” “Tasks,” and “Resources” on slide 2 are all changed to horizontal orientation and are each centered above the corresponding content box.",
+      "+3: The pink, yellow, and blue content boxes on slide 2 are rearranged into a three-column structure, with each column 6-8cm wide and 3-4.3cm high.",
+      "+1: Delete the “Evaluation” small heading and its corresponding content from the second slide.",
+      "+3: The audio playback button on the last slide is positioned in the lower-left area of the slide and is a PPT audio object, not a static image or invalid placeholder. The button is visible but does not obscure the main title, body cards, or slide number.",
+      "+3: In Slide Show mode, the music plays properly after the playback button in the lower-left corner of the last slide is clicked. The audio is embedded or reliably packaged so that it does not depend on a local absolute path after delivery.",
+      "-5: The second slide of the PPT is converted into a non-editable image.",
+      "-3: On the third slide, “Teaching Objectives: Character, Knowledge, and Ability Grow in Sync” and the text beneath it are deleted; the fourth slide is moved to after “Key and Difficult Points and Paths to Solutions: Turning ‘Can Do’ into ‘Do It Reliably’.”",
+      "-1: The title on slide 3 is positioned outside the slide.",
+      "-1: The image on the third slide obscures the “Objective Reframing” text above it.",
+      "-1: “Character Objectives” and “Knowledge Objectives” overlap on the third slide.",
+      "-1: A slide number is missing from any slide other than the cover slide.",
+      "-1: The backgrounds of slides 1 and 2 have 0% transparency.",
+      "-1: The audio content is inserted at the bottom of the first slide.",
+      "-1: When slide 2 is reformatted, the “Evaluation” section among “Students,” “Tasks,” “Resources,” and “Evaluation” is deleted.",
+      "-1: When slide 2 is reformatted, the top six-step sequence—“Learning Diagnosis, Task Transformation, Resource Integration, Scenario Rehearsal, Performance Evaluation, Iterative Growth”—is accidentally deleted or rearranged as “Learning Diagnosis, Task Transformation, Scenario Rehearsal, Performance Evaluation, Resource Integration, Iterative Growth.”",
+      "-1: The course name at the bottom of slide 2 is accidentally deleted, obscured, or moved to the right side of the slide.",
+      "-1: The course name and slide number at the bottom of slide 2 are changed to SimSun in Small Four size.",
+      "-1: The music button on the last slide is enlarged to more than 1-3cm wide and more than 1-3cm high, causing it to obscure the original title, body cards, slide number, or main content. Unrelated images, explanatory text, or decorative elements must not be added either.",
+      "-1: The PPT contains slides outside the instructions, explanatory slides, advertisement slides, blank slides, or unrelated content.",
+      "-1: The fourth slide of the PPT contains overlapping text, garbled text, or element occlusion covering more than 1/3 of the slide area.",
+      "-1: The PPT slide size is changed from the 16:9 widescreen aspect ratio to 4:3 or another aspect ratio.",
+      "-1: The slide 1 title “Early Childhood Game Activity: Curriculum Design and Implementation” is not positioned on the left side of the slide.",
+      "-1: The subtitle and bottom keywords on slide 1, including “Learning Situation Insights, Task-Driven, Scenario Practice, Evaluation and Growth,” are changed into an image or screenshot.",
+      "-1: The slide 2 background is behind the text and graphics and does not obscure the title, process blocks, three-column content, or the bottom core throughline text.",
+      "-1: The red title on slide 2 appears in the lower half of the slide, must not use SimSun in Small Four size, and does not overlap the background image, process modules, or other text.",
+      "-1: The six steps at the top of slide 2 are arranged vertically; the connecting arrows or process relationships between steps are clear, with breaks or occlusion present.",
+      "-1: The three columns on slide 2 have the correct content relationships: the “Students” column contains content related to student foundations and adaptability; the “Tasks” column contains continuous task content such as game plans, environment setup, and organization and implementation; and the “Resources” column contains resource content such as digital courses, observation records, game material kits, and kindergarten collaboration scenarios. The “Resources” column is changed to game plans, environment setup, organization and implementation, and similar content.",
+      "-1: The fill colors of the pink, yellow, and blue content boxes on slide 2 are removed, preventing the three columns from being clearly distinguished."
+    ]
+  }
+}

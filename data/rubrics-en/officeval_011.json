@@ -1,0 +1,45 @@
+{
+  "id": "officeval_011",
+  "instruction": "In the Word document, the table at the image location is split and needs to be adjusted.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file has a .doc extension; the file opens normally, and the delivered file remains an editable Word document."
+    ],
+    "dim2": [
+      "+5: Page 4 of the document contains exactly one table, and the table is not split anywhere.",
+      "-1: On the cover page, “Urban Green Space System Planning” is not positioned within the top third of the page.",
+      "-1: On the cover page, the font formatting of “Urban Green Space System Planning” does not meet the requirements of Noto Sans CJK SC, size 56, and bold.",
+      "-1: On the cover page, the paragraph formatting of “Urban Green Space System Planning” does not meet the requirements of single line spacing and center alignment.",
+      "-1: On the cover page, the font formatting of “Understanding and Design of Green Spaces in Resilient Neighborhoods” does not meet the requirements of Noto Sans CJK SC, Xiaochu, and bold.",
+      "-1: On the cover page, the paragraph formatting of “Section 1: The Role and Organizational Logic of Site Interpretation Diagrams” does not meet the requirements of single line spacing and center alignment.",
+      "-1: On the cover page, the font formatting of “Section 1: The Role and Organizational Logic of Site Interpretation Diagrams” does not meet the requirements of Noto Sans CJK SC, Yihao, and bold.",
+      "-1: On the cover page, the font formatting of “Instructional Design” does not meet the requirements of Noto Sans CJK SC, size 48, and bold.",
+      "-1: On the cover page, the paragraph formatting of “Instructional Design” does not meet the requirements of single line spacing and center alignment.",
+      "-1: On page 2, the font formatting of “Section 1: The Role and Organizational Logic of Site Interpretation Diagrams” does not meet the requirements of Noto Sans CJK SC, Xiao'er, and bold.",
+      "-1: On page 2, the paragraph formatting of “Section 1: The Role and Organizational Logic of Site Interpretation Diagrams” does not meet the following requirements: justified alignment, 0.1 centimeters before text, a first-line indent of two characters, single line spacing, and 13.5 points of spacing before the paragraph.",
+      "-3: The number of tables on page 2 is greater than 1, or a table is split.",
+      "-3: The number of tables on page 3 is greater than 1, or a table is split.",
+      "-1: No image appears in the cell to the right of “Behavioral Characteristics” on page 3.",
+      "-1: The image in the cell to the right of “Behavioral Characteristics” on page 3 does not use Square text wrapping.",
+      "-1: The image in the cell to the right of “Behavioral Characteristics” on page 3 does not have a size of 11.25 × 5.04 centimeters.",
+      "-1: The image in the cell to the right of “Behavioral Characteristics” on page 3 overlaps the table or text.",
+      "-3: The number of tables on page 5 is greater than 1, or a table is split.",
+      "-3: The number of tables on page 6 is greater than 1, or a table is split.",
+      "-1: No image appears in the cell below “Grounded in Professional Expertise, Empowered by Tools, and Integrating Diverse Information Technology Methods to Support Teaching.” on page 6.",
+      "-1: The image in the cell below “Grounded in Professional Expertise, Empowered by Tools, and Integrating Diverse Information Technology Methods to Support Teaching.” on page 6 does not use the In Line with Text layout.",
+      "-1: The image in the cell below “Grounded in Professional Expertise, Empowered by Tools, and Integrating Diverse Information Technology Methods to Support Teaching.” on page 6 does not have a size of 4.19 × 13.53 centimeters.",
+      "-1: The image in the cell below “Grounded in Professional Expertise, Empowered by Tools, and Integrating Diverse Information Technology Methods to Support Teaching.” on page 6 overlaps the table or text below it.",
+      "-3: The number of tables on page 7 is greater than 1, or a table is split.",
+      "-3: The number of tables on page 8 is greater than 1, or a table is split.",
+      "-3: The number of tables on page 9 is greater than 1, or a table is split.",
+      "-3: The number of tables on page 10 is greater than 1, or a table is split.",
+      "-3: The number of tables on page 11 is greater than 1, or a table is split.",
+      "-1: On page 11, no image appears below “3. Blackboard Design”.",
+      "-1: On page 11, the image below “3. Blackboard Design” does not have dimensions of 9.64 × 6.14 centimeters.",
+      "-1: On page 11, the image below “3. Blackboard Design” overlaps the table or text below it.",
+      "-1: On page 11, the image below “3. Blackboard Design” does not use the In Line with Text layout.",
+      "-3: At least one page of the document other than the cover page has no page number.",
+      "-1: The page number formatting in the document does not meet any one of the following requirements: the page number is centered at the bottom of the page, the style is “1, 2, 3,” and the font is SimSun, Xiaowu."
+    ]
+  }
+}

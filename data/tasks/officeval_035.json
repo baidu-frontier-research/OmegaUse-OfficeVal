@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/035/002 毕业设计外文翻译封面及格式要求（普通班）.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_035/002 毕业设计外文翻译封面及格式要求（普通班）.docx",
       "dest": "002 毕业设计外文翻译封面及格式要求（普通班）.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/035/neighborhood_reading_garden_article.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_035/neighborhood_reading_garden_article.pdf",
       "dest": "neighborhood_reading_garden_article.pdf"
     }
   ]

@@ -24,34 +24,56 @@ Each task is described by two parallel JSON files that share the same identifier
 ```
 data/
   tasks/
-    officeval_001.json      # task metadata (instruction, economic signals, input files)
+    officeval_001.json      # original Chinese task metadata
     ...
     officeval_100.json
   rubrics/
-    officeval_001.json      # evaluation rubric for the corresponding task
+    officeval_001.json      # original Chinese evaluation rubric
+    ...
+    officeval_100.json
+  task-en/
+    officeval_001.json      # English task metadata
+    ...
+    officeval_100.json
+  rubrics-en/
+    officeval_001.json      # English evaluation rubric
     ...
     officeval_100.json
   README.md
 ```
 
 - **`tasks/`** — One file per task holding the instruction, task attributes,
-  economic-grounding signals, and the list of input files.
-- **`rubrics/`** — One file per task holding the evaluation rubric. A rubric file
-  matches its task file by identical `id` / filename.
+  economic-grounding signals, and the list of input files in the original
+  Chinese.
+- **`rubrics/`** — One original Chinese evaluation rubric per task. A rubric
+  file matches its task file by identical `id` / filename.
+- **`task-en/`** — English translations of `tasks/`. All non-language fields
+  and input-file references are identical to the corresponding Chinese task.
+- **`rubrics-en/`** — English translations of `rubrics/`, with the same
+  dimensions, item ordering, scores, and non-language fields.
 
 The input artifacts referenced by each task are hosted on the Hugging Face Hub:
 
 ```
-https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal
+https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/tree/main/task_files
 ```
 
-## Task Schema (`tasks/officeval_<NNN>.json`)
+Artifacts are grouped by task identifier. JSON `url` fields use the
+direct-download form:
+
+```
+https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_<NNN>/<filename>
+```
+
+## Task Schema (`tasks/` and `task-en/`)
 
 - **`id`** *(string)* — Task identifier, `"officeval_001"`–`"officeval_100"`.
 
 - **`instruction`** *(string)* — The natural-language user request describing the
   task. Instructions preserve the original colloquial style and phrasing of real
-  office requests; line breaks separate individual sub-requirements.
+  office requests; line breaks separate individual sub-requirements. The
+  `tasks/` version is in Chinese, while the `task-en/` version is its faithful
+  English translation.
 
 - **`operation_intent`** *(string)* — The primary operation the task requires.
   One of: `Reformat`, `Restructure`, `Annotate`, `Extract`, `Compute`,
@@ -83,18 +105,21 @@ https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal
 - **`origin_files`** *(array of objects)* — The input files required to complete
   the task. Each entry contains:
   - **`url`** — A direct-download link to the file on the Hugging Face Hub
-    (`.../resolve/main/<NNN>/<filename>`).
+    (`.../resolve/main/task_files/officeval_<NNN>/<filename>`).
   - **`dest`** — The local filename the artifact should be saved as.
 
-## Rubric Schema (`rubrics/officeval_<NNN>.json`)
+## Rubric Schema (`rubrics/` and `rubrics-en/`)
 
 - **`id`** *(string)* — Matches the corresponding task id, e.g. `"officeval_001"`.
 
 - **`instruction`** *(string)* — The same instruction text as the task file,
-  duplicated so the rubric is self-contained.
+  duplicated so the rubric is self-contained. It is Chinese in `rubrics/` and
+  English in `rubrics-en/`.
 
 - **`rubrics`** *(object)* — The task evaluation rubric, split into two dimensions.
-  Each dimension is a list of checkable requirement strings.
+  Each dimension is a list of checkable requirement strings. The English version
+  faithfully preserves the scoring prefixes, numerical constraints, ordering,
+  and evaluation semantics of the Chinese version.
   - **`dim1`** — *Usability rubric.* Basic usability requirements that the
     delivered artifact must satisfy (e.g., correct file format, the file opens
     normally, content/layout is not corrupted, the file remains editable). If any
@@ -122,7 +147,7 @@ https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/01_课时学习方案_观察一位校园志愿者_第一课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/01_课时学习方案_观察一位校园志愿者_第一课时.docx",
       "dest": "01_课时学习方案_观察一位校园志愿者_第一课时.docx"
     }
   ]

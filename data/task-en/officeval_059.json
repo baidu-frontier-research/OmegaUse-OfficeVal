@@ -1,0 +1,19 @@
+{
+  "id": "officeval_059",
+  "instruction": "Insert the PPT into the “Project Introduction Materials” section of the Word document. Clicking the PPT in the document must automatically navigate to the PPT.",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 35,
+  "task_price_proxy": 10,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_059/青梧谷灵MR共创计划.pptx",
+      "dest": "青梧谷灵MR共创计划.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_059/青梧谷灵MR共创计划_项目申报书.docx",
+      "dest": "青梧谷灵MR共创计划_项目申报书.docx"
+    }
+  ]
+}

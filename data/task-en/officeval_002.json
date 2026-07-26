@@ -1,0 +1,19 @@
+{
+  "id": "officeval_002",
+  "instruction": "Remove the horizontal lines from the headers on all pages before the Abstract. On the Abstract page and all subsequent pages, make the thicknesses of the header lines match those in the PDF file.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 48,
+  "task_price_proxy": 15,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_002/城市更新中社区公共艺术参与机制研究.pdf",
+      "dest": "城市更新中社区公共艺术参与机制研究.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_002/城市社区微气候韧性评价与公共空间更新研究_.docx",
+      "dest": "城市社区微气候韧性评价与公共空间更新研究_.docx"
+    }
+  ]
+}

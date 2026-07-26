@@ -1,0 +1,19 @@
+{
+  "id": "officeval_013",
+  "instruction": "Check the paper's cover page, Chinese abstract, English abstract, table of contents, main text, references, and acknowledgments in accordance with the requirements of the verification commitment form, and revise any noncompliant content in the original document.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 227,
+  "task_price_proxy": 41,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_013/基于Spark的园区能耗分析与可视化系统论文.docx",
+      "dest": "基于Spark的园区能耗分析与可视化系统论文.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_013/本科毕业论文内容与格式核验承诺书.xlsx",
+      "dest": "本科毕业论文内容与格式核验承诺书.xlsx"
+    }
+  ]
+}

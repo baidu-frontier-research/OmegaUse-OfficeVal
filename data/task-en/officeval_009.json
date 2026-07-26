@@ -1,0 +1,19 @@
+{
+  "id": "officeval_009",
+  "instruction": "I need the tables revised: when a long table continues onto the next page, its header row must also be repeated on that page. For a table that spans pages, add the three-character text “Continued on next page” at the bottom of the table on the preceding page, positioned as shown in the image.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 74,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_009/image (1).png",
+      "dest": "image (1).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_009/第三章研究结果.docx",
+      "dest": "第三章研究结果.docx"
+    }
+  ]
+}

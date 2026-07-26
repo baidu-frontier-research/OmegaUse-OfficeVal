@@ -1,0 +1,15 @@
+{
+  "id": "officeval_048",
+  "instruction": "Add animations to the first slide of the PPT. After I click once, each case should automatically appear one by one in quick succession to convey a sense of urgency. Add a war explosion sound effect to the final case.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 46,
+  "task_price_proxy": 10,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_048/演示文稿1.pptx",
+      "dest": "演示文稿1.pptx"
+    }
+  ]
+}

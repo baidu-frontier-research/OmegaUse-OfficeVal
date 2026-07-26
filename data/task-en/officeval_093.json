@@ -1,0 +1,19 @@
+{
+  "id": "officeval_093",
+  "instruction": "Please add something to the spreadsheet: the shape outlined by the red rectangle in the image. Add one of these shapes to the cell to the right of “Shape Organization” (I need this shape to be editable, not an image). Do not cover the serial number or the borders; just place it after the serial number.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 13,
+  "task_price_proxy": 6,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_093/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_093/日常信息处理能力观察表.xlsx",
+      "dest": "日常信息处理能力观察表.xlsx"
+    }
+  ]
+}

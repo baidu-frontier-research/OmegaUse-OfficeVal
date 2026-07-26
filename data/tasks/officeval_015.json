@@ -8,11 +8,11 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/015/九年级答题卡 (1) (3).docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_015/九年级答题卡 (1) (3).docx",
       "dest": "九年级答题卡 (1) (3).docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/015/初中语文跨年级综合质量检测.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_015/初中语文跨年级综合质量检测.docx",
       "dest": "初中语文跨年级综合质量检测.docx"
     }
   ]

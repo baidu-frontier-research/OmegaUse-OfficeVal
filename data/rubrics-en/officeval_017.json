@@ -1,0 +1,42 @@
+{
+  "id": "officeval_017",
+  "instruction": "The PDF document needs a table of contents, with its style based on the reference image.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in PDF format and can be opened normally.",
+      "The delivered PDF contains at least 17 pages.",
+      "The delivered PDF has no sequence of 2 or more blank pages and no text overlap covering more than 1/3 of a page."
+    ],
+    "dim2": [
+      "+5: Table of contents page position: The table of contents page is page 2 of the file, before the “Learning Structure Overview” page.",
+      "+1: The two-character title “Table of Contents” uses Heiti or Microsoft YaHei in Xiaochu size, bold, and green.",
+      "+3: The two-character title “Table of Contents” is 55-65 pt from the top edge of the page and 85-95 pt from the left edge of the page, with 0.3-1 character of spacing between “Table” and “Contents.”",
+      "+3: To the left of the two-character title “Table of Contents” are one solid green rectangular block and two parallel green diagonal stripe decorations. The stripes slant from upper left to lower right and are aligned with the top of the text.",
+      "+3: Below the two-character title “Table of Contents” is a 0.1-0.2 cm thick horizontal green gradient line, darker on the left and lighter on the right. It is aligned with the left edge of “Table” and extends from the right side of “Table” to approximately two-thirds of the way across the page toward the right.",
+      "+5: The text below the horizontal line under “Table of Contents” remains left-aligned.",
+      "+3: All table of contents page numbers are located in the same vertical area on the right side of the page; the page numbers are black Arabic numerals; each page number is on the same horizontal line as its corresponding entry. They are right-aligned and 1.5-3 characters from the right edge of the page.",
+      "+3: Dotted leaders on the table of contents page: Black dotted leaders are used between the table of contents entry text and the page numbers; the leaders run horizontally; the leaders do not pass through the entry text or page number digits.",
+      "+3: “Learning Structure Overview” uses Heiti or Microsoft YaHei in Xiao'er size, bold, is approximately 30-35 pt below the horizontal line under the table of contents title, and is 45-50 pt from the left edge of the page.",
+      "+3: The page number to the right of “Learning Structure Overview” is the numeric text 2, connected by a black dotted leader.",
+      "+3: “Unit 1,” “Unit 2,” “Unit 3,” and “Unit 4” use Heiti or Microsoft YaHei in Xiao'er size, bold, and white.",
+      "+5: Beneath each of the texts “Unit 1,” “Unit 2,” “Unit 3,” and “Unit 4” is a horizontal green arrow with a pointed right end. The left side is a rectangle and the right side has a pointed corner; the text is centered inside the shape, and the background fill is green.",
+      "+5: The leftmost edges of the four horizontal green arrows with pointed right ends are 45-50 pt from the left edge of the page.",
+      "+5: “Earth and Maps,” “Land and Oceans,” “Weather and Climate,” and “Population and Settlements” are to the right of the green arrows and, in order, are on the same horizontal lines as “Unit 1,” “Unit 2,” “Unit 3,” and “Unit 4,” respectively, approximately 20-25 pt from the pointed ends of the green arrows to their left.",
+      "+5: The page numbers to the right of “Earth and Maps,” “Land and Oceans,” “Weather and Climate,” and “Population and Settlements” are the numeric texts 3, 7, 9, and 12, respectively, connected by black dotted leaders.",
+      "+5: The texts “Task 1 Understanding the Earth and the Latitude-Longitude Grid,” “Task 2 The Three Elements of a Map and Direction,” “Task 3 Contour Topographic Maps,” “Task 4 The Seven Continents and Four Oceans,” “Task 5 Land-Sea Changes and Plate Tectonics,” “Task 6 Weather Forecasts and Air Quality,” “Task 7 Temperature Curves and Precipitation Bar Charts,” “Task 8 World Climate Types and Life,” “Task 9 Population Distribution and Settlement Formation,” and “Task 10 Settlement Development and Sustainable Living” use Songti or Microsoft YaHei in Sanhao size. The number in each is separated from the text to its right by 1-2 characters, and each text is 85-95 pt from the left edge of the page.",
+      "+5: The titles “Task 1 Understanding the Earth and the Latitude-Longitude Grid,” “Task 2 The Three Elements of a Map and Direction,” and “Task 3 Contour Topographic Maps” are below “Unit 1 Earth and Maps”; the page numbers on the right are 3, 4, and 5, respectively, with black dotted leaders between the titles and the page numbers on the right.",
+      "+5: The titles “Task 4 The Seven Continents and Four Oceans” and “Task 5 Land-Sea Changes and Plate Tectonics” are below “Unit 2 Land and Oceans”; the page numbers on the right are 7 and 8, respectively, with black dotted leaders between the titles and the page numbers on the right.",
+      "+5: The titles “Task 6 Weather Forecasts and Air Quality,” “Task 7 Temperature Curves and Precipitation Bar Charts,” and “Task 8 World Climate Types and Life” are below “Unit 3 Weather and Climate”; the page numbers on the right are 9, 10, and 11, respectively, with black dotted leaders between the titles and the page numbers on the right.",
+      "+5: The titles “Task 9 Population Distribution and Settlement Formation” and “Task 10 Settlement Development and Sustainable Living” are below “Unit 4 Population and Settlements”; the page numbers on the right are 12 and 13, respectively, with black dotted leaders between the titles and the page numbers on the right.",
+      "+3: “Midterm Project   Campus Guide Map Creation Task,” “Final Project   Observation Report on Local Settlements,” and “Full-Course Learning Portfolio   Stage Review and Growth Record” are below “Task 10 Settlement Development and Sustainable Living.” The page numbers on the right are 14, 15, and 16, respectively, with black dotted leaders between the text and the page numbers on the right.",
+      "+3: “Midterm Project: Campus Guide Map Creation Task,” “Final Project: Observation Report on Local Settlements,” and “Full-Course Learning Portfolio   Stage Review and Growth Record” use Heiti or Microsoft YaHei in Xiao'er size and are bold.",
+      "+3: In “Midterm Project   Campus Guide Map Creation Task,” “Final Project   Observation Report on Local Settlements,” and “Full-Course Learning Portfolio   Stage Review and Growth Record,” there is 1-2 characters of spacing between “Midterm Project” and “Campus Guide Map Creation Task,” between “Final Project” and “Observation Report on Local Settlements,” and between “Full-Course Learning Portfolio” and “Stage Review and Growth Record,” respectively.",
+      "+3: At a position 1 character to the left of each of “Midterm Project   Campus Guide Map Creation Task,” “Final Project   Observation Report on Local Settlements,” and “Full-Course Learning Portfolio   Stage Review and Growth Record” is a small green right-pointing arrow. Its left side is rectangular and its right side has a triangular point; it is 20-25 pt wide and 30-35 pt high, and is 52-57 pt from the left edge of the page.",
+      "+3: All page numbers are vertically aligned and 50-60 pt from the right edge of the page.",
+      "-3: Any page contains a blank obstruction covering more than 1/3 of the page area.",
+      "-3: Any page contains garbled text covering more than 1/3 of the page area.",
+      "-3: An image obscures text on any page.",
+      "-3: Text on any page is clipped by the page boundary."
+    ]
+  }
+}

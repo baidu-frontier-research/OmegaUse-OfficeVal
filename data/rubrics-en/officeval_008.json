@@ -1,0 +1,52 @@
+{
+  "id": "officeval_008",
+  "instruction": "Translate the English-language PDF paper into Chinese, and modify the translated paper using the formatting of the “Translated Literature” document as a template.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable file has the .docx extension and can be opened normally."
+    ],
+    "dim2": [
+      "+3: Except in tables and references, every continuous block of text in the paper that spans more than 2 lines has a first-line indent of 2 characters.",
+      "+3: Except for tables, headings, figure captions, and references, all body text in the paper has line spacing of 27-30 pt.",
+      "+5: Except for page numbers, all numbers and letters appearing in the paper use Times New Roman.",
+      "+5: All page numbers in the document are centered at the bottom of the page; use SimSun, Small No. 5; and follow a numbering format such as 1, 2, 3….",
+      "+5: All page numbers in the document are 1.40 cm from the bottom edge of the page.",
+      "+3: The header throughout the document is “Huayu Qingyue University Undergraduate Graduation Design (Thesis) Paper”.",
+      "+5: All headers in the document use light gray text, FZYaoTi, Small No. 2, and 1× line spacing.",
+      "+5: The header text throughout the document is centered above the thick horizontal line; the header is 1.5 cm from the top edge of the page.",
+      "+5: A line appears in every header in the document: it is a double solid line, light gray, and 2.25 pt.",
+      "+5: The page size and margins meet the following requirements: A4; top 3.3 cm, bottom 2.6 cm, left 2.1 cm, and right 2.2 cm.",
+      "+3: Non-empty title text appears at the top of page 1; it uses SimHei, Small No. 2, and is centered.",
+      "+3: The author names, institution names, and received/revised/accepted/published dates in English use Times New Roman, Small No. 4, and are centered.",
+      "+1: There is one blank line between the bibliographic information in English, such as the author names, institution names, and received/revised/accepted/published dates, and the “Abstract” title below.",
+      "+3: The “Abstract” title text on the abstract page is in Chinese; it uses SimHei, No. 3, is centered, and has the text color Steel Blue (Accent 1, Darker 25%).",
+      "+3: The text below the title on the abstract page is in Chinese; it uses SimSun, Small No. 4, and is justified.",
+      "+3: The keywords and the terms after the colon are all in Chinese; the terms after the colon are separated by full-width semicolons, with no punctuation after the last term; the text uses SimHei, No. 5, and is justified.",
+      "+5: First-level heading text uses SimHei, No. 3, for Chinese text and Times New Roman, No. 3, for numbers or numbering; all headings are centered.",
+      "+3: The spacing between the numbering or numbers and the text in headings is 0.2-0.5 characters.",
+      "+3: Except for text in headings, figure captions, and tables, as well as keyword lines, unnumbered subheading lines, and author lines, all other Chinese text uses SimSun, Small No. 4, and is justified.",
+      "+3: Footnote numbering runs through 40 across the entire document and uses Times New Roman, Small No. 4.",
+      "+3: Footnote numbers throughout the document are placed immediately to the right of the text with no extra spaces; the format is square brackets + Arabic numerals, with the entire number in superscript.",
+      "+3: Table formatting meets the following requirements: table sequence numbers are consecutive throughout the document; when a table spans pages, the continued table on each following page has a header row whose content and formatting are identical to those of the original table.",
+      "+3: All table titles throughout the document are centered above their tables, 0-0.3 characters from the top border of the table; they use SimSun, No. 5, and bold.",
+      "+3: In all tables throughout the document, Chinese text uses SimSun, No. 5, while English text and Arabic numerals use Times New Roman, No. 5.",
+      "+3: Every table throughout the document has only three border lines: the top and bottom borders are 1.5 pt single solid lines, and the column-heading line is a 0.75 pt single solid line.",
+      "+3: All figure caption text is centered below the image; it uses SimSun, No. 5, and bold.",
+      "+3: Images and their figure captions are not split across pages, and there is a spacing of 0.2-0.5 characters between the figure number and title in each caption.",
+      "+3: All images inserted in the document use the In Line with Text wrapping style.",
+      "+1: The text below the heading numbered “2.1.1 ” contains 1 image.",
+      "+1: The text below the heading numbered “2.1.2 ” contains 1 image.",
+      "+1: The text below the heading numbered “2.2 ” contains 2 images.",
+      "+1: The text below the heading numbered “2.3.1 ” contains 1 image.",
+      "+1: The text below the heading “2.3.2 Effect of Initial Dye Concentration” contains 1 image.",
+      "+1: The text below the heading “2.3.3 Temperature Dependence” contains 1 image.",
+      "+1: The text below the heading “2.3.4 Effect of Solution pH” contains 1 image.",
+      "+1: The text below the heading “2.4 Adsorption Isotherm Analysis” contains 1 image.",
+      "+1: The text below the heading “2.5 Kinetic Analysis” contains 1 image.",
+      "+1: The text below the heading “2.6 Regeneration and Matrix Tolerance” contains 1 image.",
+      "+3: In the reference-section title text “References”: the two characters meaning “Literature” use SimHei, No. 4; the two characters meaning “Reference” are blue; and the entire title is centered.",
+      "+3: Reference entries are numbered in square brackets, for example, \"[1]\"; consecutive numbering is used throughout, with no extra spaces between the number and the reference content.",
+      "+3: In reference entries, the number uses Times New Roman, size 10, while all Chinese text uses SimSun, Small No. 4; the entire entry has a hanging indent of 2 characters."
+    ]
+  }
+}

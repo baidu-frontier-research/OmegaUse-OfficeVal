@@ -8,11 +8,11 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/061/product_video.mp4",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_061/product_video.mp4",
       "dest": "product_video.mp4"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/061/星市静默回声教育科技有限公司简介.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_061/星市静默回声教育科技有限公司简介.pptx",
       "dest": "星市静默回声教育科技有限公司简介.pptx"
     }
   ]

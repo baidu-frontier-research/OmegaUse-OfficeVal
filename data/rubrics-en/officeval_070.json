@@ -1,0 +1,25 @@
+{
+  "id": "officeval_070",
+  "instruction": "Beautify slide 1. You may reduce the font size and spacing. Ensure that all text fits completely within the section boxes and does not overlap. Please adjust the layout to match that of the “Clinical Questions” and “Scientific Hypotheses” sections. Do not change the PPT dimensions.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .ppt or .pptx format and can be opened, edited, and presented normally.",
+      "The PPT remains a 1-slide presentation, with a slide width of 20.00 cm and height of 28.29 cm; the dimensions and orientation remain unchanged.",
+      "If the file cannot be opened, the slide dimensions are changed, the entire slide is uneditable, or the text still overlaps severely, the score for Dimension 1 is 0."
+    ],
+    "dim2": [
+      "+1: In the “Research Content One: Definition of Key Pathological Events” section, the title and all 4 body-text items fit completely within the green box in the first row beneath the “Research Methods and Technical Roadmap” content and do not extend beyond the box.",
+      "+1: In the “Research Content Two: Localization of Abnormal Tryptophan Metabolism” section, the title and all 4 body-text items fit completely within the blue box in the second row beneath the “Research Methods and Technical Roadmap” content and do not extend beyond the box.",
+      "+1: In the “Research Content Three: Analysis of ATF4 Nuclear Regulation” section, the title and all 4 body-text items fit completely within the purple box in the third row beneath the “Research Methods and Technical Roadmap” content and do not extend beyond the box.",
+      "+1: In the “Research Content Four: Mechanism of Epigenetic Persistence” section, the title and all 4 body-text items fit completely within the yellow box in the first row beneath the “Research Methods and Technical Roadmap” content and do not extend beyond the box.",
+      "+1: In the “Research Content Five: Causal Validation of the Axis” section, the title and all 4 body-text items fit completely within the green box in the second row beneath the “Research Methods and Technical Roadmap” content and do not extend beyond the box.",
+      "+1: In the “Expected Results and Scientific Significance” section, the title and all 4 body-text items fit completely within the pink box in the third row beneath the “Research Methods and Technical Roadmap” content and do not extend beyond the box.",
+      "+3: The titles of all six research sections consistently use approximately 10.5 to 11.5 pt, bold, and left-aligned text and are positioned at the top inside their boxes. The body text consistently uses approximately 7.2 to 8.2 pt and regular weight, with a font size that ensures all content is displayed in full.",
+      "+3: Body-text line spacing in all six research sections is consistently set to single spacing or approximately 0.9 to 1.0 times. Spacing before and after paragraphs is 0 to 2 pt. The text is approximately 0.3 to 0.5 cm from the left and right borders of the boxes and at least 0.2 cm from the top and bottom borders.",
+      "+1: The left edges of the titles, body text, and numbers are aligned in the left-side 01, 02, and 03 sections and in the right-side 04, 05, and 06 sections; the three vertically arranged sections on each side follow the same formatting rules.",
+      "-1: The slide dimensions are not 20.00 × 28.29 cm.",
+      "-5: Any three or more research sections contain obvious text overlap.",
+      "-3: Body text overlaps arrows, numbers, or adjacent sections in any two or more places."
+    ]
+  }
+}

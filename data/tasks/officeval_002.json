@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/002/城市更新中社区公共艺术参与机制研究.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_002/城市更新中社区公共艺术参与机制研究.pdf",
       "dest": "城市更新中社区公共艺术参与机制研究.pdf"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/002/城市社区微气候韧性评价与公共空间更新研究_.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_002/城市社区微气候韧性评价与公共空间更新研究_.docx",
       "dest": "城市社区微气候韧性评价与公共空间更新研究_.docx"
     }
   ]

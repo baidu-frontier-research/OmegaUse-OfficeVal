@@ -1,0 +1,15 @@
+{
+  "id": "officeval_023",
+  "instruction": "First, open the Navigation pane to check whether the page numbers correspond correctly, and correct any incorrect page numbers: begin page numbering with the Abstract section; use uppercase Roman numerals for the Abstract and table of contents pages, and Arabic numerals for the main body.\nSecond, delete the last page of the document.\nThird, create a List of Tables from all tables in the document and place it on the document's List of Tables page.\nFourth, adjust the positions and sizes of the tables: place a table on the same page as the text whenever they can fit on one page; if they cannot fit on one page, place the table on a separate page whenever possible.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 87,
+  "task_price_proxy": 44,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_023/董事會數位素養對企業低碳轉型績效的影響.docx",
+      "dest": "董事會數位素養對企業低碳轉型績效的影響.docx"
+    }
+  ]
+}

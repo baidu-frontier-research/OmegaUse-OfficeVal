@@ -1,0 +1,19 @@
+{
+  "id": "officeval_024",
+  "instruction": "Make the following adjustments to my thesis in accordance with the formatting requirements in the thesis template document:\n1. Adjust and standardize the widths of the three-line tables, and center-align all tables.\n2. Reference citations must use cross-references.\n3. Standardize the use of punctuation: use full-width punctuation for Chinese and half-width punctuation for English/numbers/formulas.\n4. Adjust the positions and sizes of the images to ensure that the document layout does not contain large blank areas.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 211,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_024/城市社区绿地可达性与居民步行行为研究.docx",
+      "dest": "城市社区绿地可达性与居民步行行为研究.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_024/论文模版.docx",
+      "dest": "论文模版.docx"
+    }
+  ]
+}

@@ -8,7 +8,7 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/038/多岗位从业人员综合复习题_菟思学院.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_038/多岗位从业人员综合复习题_菟思学院.pdf",
       "dest": "多岗位从业人员综合复习题_菟思学院.pdf"
     }
   ]

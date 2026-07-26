@@ -1,0 +1,15 @@
+{
+  "id": "officeval_053",
+  "instruction": "Please recreate this diagram in PowerPoint (it must remain editable in PowerPoint) and center it on a single slide without changing its aspect ratio.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 125,
+  "task_price_proxy": 80,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_053/111.png",
+      "dest": "111.png"
+    }
+  ]
+}

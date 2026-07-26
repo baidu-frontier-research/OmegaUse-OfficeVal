@@ -1,0 +1,27 @@
+{
+  "id": "officeval_022",
+  "instruction": "Following the format of the “Statement of Business Operations,” reformat the “Business Operations Anomaly Investigation Submission Materials” document, and add a cover page (using the same format as the “Statement of Business Operations,” with the specific content provided in the “Central China Regional Retail Project Business Anomaly Investigation Cover Page” document) and a table of contents. Change the subject of the “Central China Regional Retail Project Operating Fund Anomalies and Cash Flow Risks” document to “Central China Regional Retail Project Special Investigation Materials on Financial Fund Anomalies, Inventory Occupancy, and Cash Flow Risks.”",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 287,
+  "task_price_proxy": 48,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/企业经营异常核查呈报材料.docx",
+      "dest": "企业经营异常核查呈报材料.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/企业经营情况说明书.docx",
+      "dest": "企业经营情况说明书.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/华中区域零售项目经营异常核查封面.docx",
+      "dest": "华中区域零售项目经营异常核查封面.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_022/华中区域零售项目经营资金异常及现金流风险.docx",
+      "dest": "华中区域零售项目经营资金异常及现金流风险.docx"
+    }
+  ]
+}

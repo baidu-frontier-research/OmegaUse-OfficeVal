@@ -1,0 +1,23 @@
+{
+  "id": "officeval_060",
+  "instruction": "Reformat slide 4 of the PPT so that the image arrangement matches the slide's aspect ratio and there are no large blank areas on either side of the slide.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .ppt or .pptx format and can be opened normally.",
+      "The delivered PPT contains 5 slides, with slides 1 through 5 in consecutive order; the content, text, images, and layouts of all slides other than slide 4 remain normal.",
+      "Slide 4 has a landscape 16:9 aspect ratio and dimensions of 33.87 cm × 19.05 cm.",
+      "On slide 4, there are no large areas of overlap among images, information cards, and text; no content extends beyond the slide boundaries; no text is cropped; and the main subjects of the images remain recognizable."
+    ],
+    "dim2": [
+      "+5: Full-slide background image on slide 4: The image covers the entire slide. Its left edge is within 0—0.3 cm of the slide's left edge, its right edge is within 0—0.3 cm of the slide's right edge, its top edge is within 0—0.3 cm of the slide's top edge, and its bottom edge is within 0—0.3 cm of the slide's bottom edge.",
+      "+3: Position of the main subjects in the background image on slide 4: The high-turbidity water tank on the left is within the 0%—22% region of the slide width, and the membrane stack in the center is within the 30%—62% region of the slide width. The main equipment is not completely obscured by the slide edges or information cards.",
+      "+3: Blank-space control for the background image on slide 4: There are no continuous pure-white, pure-gray, or empty areas wider than 1 cm on the left or right side of the slide; the main visual content covers 90% or more of the slide width.",
+      "-5: On slide 4, any two or more of the 3 explanatory text items are missing.",
+      "-5: On slide 4, any two or more of the 4 labels \"Pretreatment,\" \"Membrane Separation,\" \"Differential Pressure Interpretation,\" and \"Reuse Buffering\" are missing.",
+      "-3: The title, body text, or process labels on slide 4 extend beyond the PPT boundaries in one or more places.",
+      "-3: On slide 4, the 3 explanatory text items overlap, or any one of them is cropped to the point that it cannot be read in full.",
+      "-3: The process description at the bottom of slide 4 extends beyond the slide's right boundary, is cropped, or disappears entirely.",
+      "-3: The blank space on the two sides of slide 4 is clearly asymmetrical, with the blank area on one side more than 2 cm wider than the other."
+    ]
+  }
+}

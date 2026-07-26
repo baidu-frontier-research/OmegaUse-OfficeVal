@@ -1,0 +1,27 @@
+{
+  "id": "officeval_059",
+  "instruction": "Insert the PPT into the “Project Introduction Materials” section of the Word document. Clicking the PPT in the document must automatically navigate to the PPT.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and can be opened normally.",
+      "The inserted PPT must not be merely a regular screenshot, static image, or non-clickable text.",
+      "The document body, tables, and inserted PPT object must all remain editable; the entire document page or entire table must not be converted into an image.",
+      "The document has none of the following issues: it cannot be opened, pages are missing, tables are severely misaligned, text overlaps extensively, page numbers are missing, the PPT link is broken, or clicking the object has no effect."
+    ],
+    "dim2": [
+      "+5: Corresponding content cell for “Project Introduction Materials” on page 4: Insert a PPT object, PPT icon, or PPT link object into the application-content cell to the right of “Project Introduction Materials” on page 4, positioned within the right-hand cell of that row. The displayed filename, icon title, or link text of the inserted object contains “Tidal Art Realm MR Co-creation Program” or “Project Introduction Materials PPT,” allowing the user to clearly identify the object in the document as the project introduction PPT.",
+      "+5: PPT hyperlink click functionality on page 4: Single-clicking or double-clicking the PPT object in Word automatically opens the “Tidal Art Realm MR Co-creation Program.pptx” file or navigates to the playback/editing interface for that PPT. The PPT opened by clicking is “Tidal Art Realm MR Co-creation Program,” and its first or title slide contains project introduction content such as “Tidal Art Realm MR Co-creation Program” and “Reconstructing the Regional Cultural Experience through Coastal Handcrafts, Interactive Storytelling, and Digital Performances.”",
+      "+1: Editability of the PPT hyperlink object on page 4: The PPT hyperlink portion can be selected, moved, resized, or relinked independently; it is not merely an image displaying a screenshot of the PPT’s first slide that cannot be clicked.",
+      "+3: PPT hyperlink display style: In the “Project Introduction Materials” cell on page 4, it is displayed as a PowerPoint icon, file icon, embedded-object icon, or underlined hyperlink text. The icon or link is appropriately sized and does not cover the “Project Introduction Materials” section text. If displayed as an icon object, it is centered within the cell to the right of “Project Introduction Materials” and does not extend beyond the cell boundaries; if displayed as link text, the text uses the Chinese font size Xiaowu or approximately Xiaowu, the full link text is displayed, and it does not extend beyond the cell boundaries.",
+      "+5: PPT file embedding or attachment method: If an embedded object is used, the Word file contains the PPT object internally, and the PPT can still be opened after the Word file is moved; if an external link is used, the delivery package also contains “Tidal Art Realm MR Co-creation Program.pptx,” and the link path is a relative path or a usable path within the same directory.",
+      "-5: The Project Application Form on pages 2 through 4 is an image or a non-editable object.",
+      "-1: The PPT hyperlink in the Word document covers the “Social Value” section text or the “Project Introduction Materials” text.",
+      "-1: The PPT hyperlink in the Word document extends beyond the table’s right boundary or the page’s right margin.",
+      "-1: A blank page has been added to the document, and the blank area exceeds 80% of the page height.",
+      "-1: The page number is missing from any page among pages 1 through 4 of the document.",
+      "-1: The header text is missing from any page among pages 1 through 4 of the document.",
+      "-1: The bottom border of the final row of the Project Application Form on page 5 is missing, or the table structure is broken.",
+      "-1: The document contains large red arrows, screenshot boxes, comment boxes, or explanatory text unrelated to the task."
+    ]
+  }
+}

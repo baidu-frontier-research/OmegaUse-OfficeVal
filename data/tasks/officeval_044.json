@@ -8,15 +8,15 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/044/early_modern_europe_voyage_preparation_departure_720x960.mp4",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_044/early_modern_europe_voyage_preparation_departure_720x960.mp4",
       "dest": "early_modern_europe_voyage_preparation_departure_720x960.mp4"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/044/image_001.png",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_044/image_001.png",
       "dest": "image_001.png"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/044/新航路开辟说课PPT.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_044/新航路开辟说课PPT.pptx",
       "dest": "新航路开辟说课PPT.pptx"
     }
   ]

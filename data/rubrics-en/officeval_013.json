@@ -1,0 +1,33 @@
+{
+  "id": "officeval_013",
+  "instruction": "Check the paper's cover page, Chinese abstract, English abstract, table of contents, main text, references, and acknowledgments in accordance with the requirements of the verification commitment form, and revise any noncompliant content in the original document.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .doc or .docx format and can be opened normally."
+    ],
+    "dim2": [
+      "+1: The Chinese abstract title is “Abstract” with or without a space between the two characters in the original Chinese title; it uses SimSun, No. 2, bold, and centered alignment; one blank line separates it from the text below.",
+      "+1: In the “Keywords” section below the Chinese abstract body, the four keywords are separated by full-width Chinese commas, with no symbol after the last keyword; the colon and commas are full-width.",
+      "+1: The “Key words” section on the English abstract page is positioned below the English abstract, with one blank line separating it from the text above; “Key words” uses Times New Roman, Small No. 4, and bold, while the text after the colon is not bold; the colon and commas are half-width, each comma is followed by one space, and there is no punctuation at the end.",
+      "+5: For the text below the title on the table of contents page, first-level entries use SimSun, No. 3, and bold; second-level entries use SimSun, Small No. 4, with a 2-character indent; third-level entries use SimSun, Small No. 4, with a 4-character indent.",
+      "+5: For headings on all pages after the table of contents page, the heading numbering is ordered sequentially according to this scheme: “Chapter 1/(1)/1、/1.”; first-level headings use the Chapter 1 numbering type, second-level headings use the (1) numbering type, third-level headings use the 1、 numbering type, and fourth-level headings use the 1. numbering type.",
+      "+3: Headers appear from the abstract page through the final page of the paper; the header text uses SimHei, No. 5, and centered alignment, and the header content matches the name of the section to which the current page belongs.",
+      "+1: In footer page numbers, Chinese characters use SimSun and Small No. 5 SimHei, while numerals use Times New Roman, Small No. 5; the page numbers are centered.",
+      "+3: Page numbers on the abstract and table of contents pages use uppercase Roman numerals; starting from Chapter 1, page numbering restarts and uses a format such as “Page 1”.",
+      "+5: Every figure caption is centered directly below its figure; Chinese text uses SimHei, No. 5, English text uses Times New Roman, No. 5, and neither is bold.",
+      "+1: Every table in the main text has a table title centered directly above the table; Chinese text uses SimHei, No. 5, English text uses Times New Roman, No. 5, and neither is bold.",
+      "+3: All tables in the main text are three-line tables, retaining only the top rule, column-heading rule, and bottom rule, with no vertical rules; the top and bottom rules are 1.5 pt, and the column-heading rule is 0.75 pt.",
+      "+3: All table headers in the main text are bold; within tables, Chinese text uses SimSun, No. 5, while English text and numerals use Times New Roman, No. 5; rows and columns are aligned.",
+      "+1: Program code blocks use Times New Roman, No. 5, with 1.25 line spacing.",
+      "-5: Page 1 fails to meet any one of the following criteria:",
+      "-1: The Chinese abstract page fails to meet any one of the following criteria: the text below the title uses SimSun, Small No. 4, with a 2-character first-line indent, 1.5 line spacing, and justified alignment.",
+      "-1: The English abstract page fails to meet any one of the following criteria: the title “Abstract” uses Times New Roman, No. 2, bold, and centered alignment.",
+      "-1: The text below the title on the English abstract page fails to meet any one of the following criteria: all text except “Key words” uses Times New Roman, Small No. 4, with 1.5 line spacing and a 1-character first-line indent.",
+      "-1: The table of contents page fails to meet any one of the following criteria: the title “Table of Contents” uses SimHei, No. 2, with centered alignment, 12 pt spacing after, and 1.35 line spacing.",
+      "-3: Text other than headings, figure captions, and table titles on pages after the table of contents page fails to meet any one of the following criteria: Chinese text uses SimSun, Small No. 4; English text, numerals, and the English portions of formula descriptions use Times New Roman, Small No. 4; paragraphs have a first-line indent of 2 Chinese characters, 0 lines of spacing before and after, 1.5 line spacing, and justified alignment.",
+      "-3: Any page after the table of contents page fails to meet any one of the following criteria: there is one blank line between headings and between a heading and the main text.",
+      "-3: A table cell on any page after the table of contents page fails to meet this criterion: the text within it occupies only a single line.",
+      "-1: A program code block fails to meet any one of the following criteria: it has a 2-character first-line indent and no Before text or After text indentation."
+    ]
+  }
+}

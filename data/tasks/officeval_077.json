@@ -8,7 +8,7 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/077/启蒙运动思想解放.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_077/启蒙运动思想解放.pptx",
       "dest": "启蒙运动思想解放.pptx"
     }
   ]

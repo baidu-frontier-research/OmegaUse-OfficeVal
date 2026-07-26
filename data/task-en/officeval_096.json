@@ -1,0 +1,15 @@
+{
+  "id": "officeval_096",
+  "instruction": "I want to create a statistical chart like the one shown in the image, but without any connecting lines. The horizontal axis should cover ages 11–20, and the vertical axis should cover 0–200 cm with intervals of 50. Above the chart, create a Height Statistics Table for Ages 11–20 (with data that can be entered directly). I also want the chart below to automatically display data points as soon as data is entered into the table.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 103,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_096/image_001.jpg",
+      "dest": "image_001.jpg"
+    }
+  ]
+}

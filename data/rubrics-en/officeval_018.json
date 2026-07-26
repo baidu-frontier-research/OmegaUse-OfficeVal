@@ -1,0 +1,33 @@
+{
+  "id": "officeval_018",
+  "instruction": "Modify the “Public Notice Study Room Operations Plan” report in accordance with the formatting requirements, including the font, font size, paragraph formatting, and number formatting. In addition, captions must be added to all figures and tables; the formatting requirements are also provided in the document.",
+  "rubrics": {
+    "dim1": [
+      "The submitted deliverable is an editable Word document in .docx format, and the file opens normally."
+    ],
+    "dim2": [
+      "+1: The report title “Linhai Public Study Room Networked Operations and Renewal Plan” on page 1 uses single line spacing.",
+      "+1: The title on the abstract page is formatted in SimHei, No. 4, and the abstract page is positioned after the title page.",
+      "+3: The first-level heading numbering style is “I.”, for example, “I. Project Positioning and Service Principles”.",
+      "+3: The second-level heading numbering style is “(I)”, for example, “(I) Construction Background of Public Notice Reading Spaces”.",
+      "+3: First-level headings are formatted in SimHei, Small No. 3.",
+      "+3: Second-level headings are formatted in SimHei, No. 4.",
+      "+3: The third-level heading numbering style is “1.”, for example, “1. Urban Cultural Consumption and Neighborhood Reading Needs”.",
+      "+3: Third-level headings are formatted in SimSun, Small No. 4.",
+      "+3: The fourth-level heading numbering style is “（1）”, for example, “（1）Target Users and Coverage Logic of the Public Study Room Network”.",
+      "+3: Fourth-level headings are formatted in SimSun, Small No. 4.",
+      "+5: All text other than headings, tables, figure captions, and table captions is uniformly formatted in SimSun, Small No. 4.",
+      "+5: Every figure in the document has a corresponding caption below it, and the caption is centered. Figure captions are numbered consecutively in order of appearance, with no skipped numbers or numbering out of sequence.",
+      "+3: Figure captions, table captions, appendices, references, and equation numbers all use consecutive Arabic numerals, such as “Figure 1”, “Table 1”, and “Equation (1)”.",
+      "+3: Figure captions are formatted in SimSun, Small No. 4. There are two spaces between the figure number and figure title in every figure caption, for example, “Figure 1  Functional Zoning Relationships of Public Study Rooms”.",
+      "+5: Every table has a table caption above it, and the caption is centered. Table captions are numbered consecutively in order of appearance, with no skipped numbers or numbering out of sequence.",
+      "+3: Table captions are formatted in SimSun, Small No. 4. There are two spaces between the table number and table title in every table caption, for example, “Table 1  Public Study Room Operations Metrics Table”.",
+      "+5: All text in every table is uniformly formatted in SimSun, Small No. 4, with single line spacing.",
+      "-5: On all pages after the abstract page, the paragraph formatting of all remaining text, excluding headings at all levels, table captions, figure captions, and text in tables, does not meet the following requirements: 1.25-line spacing, 0.5 lines of spacing before each paragraph, and a first-line indent of two characters.",
+      "-1: The report title “Linhai Public Study Room Networked Operations and Renewal Plan” on page 1 is not formatted in SimSun, No. 3, bold, and centered.",
+      "-5: Any page in the document other than the first two pages and the last page contains a large blank area covering more than forty percent of the page.",
+      "-3: A table in the document is split across pages or otherwise discontinuous.",
+      "-3: The document page margins are not 2.54 cm at the top and bottom and 3.18 cm at the left and right."
+    ]
+  }
+}

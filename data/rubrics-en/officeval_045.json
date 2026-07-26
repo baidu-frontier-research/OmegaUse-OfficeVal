@@ -1,0 +1,35 @@
+{
+  "id": "officeval_045",
+  "instruction": "Add one more slide before the closing slide and set its background to a linear gradient (light blue → white). Then style the three videos I sent to match the image, add animation effects to all three videos, and make the videos appear sequentially on click and play. Place the videos on the newly added slide. Reduce the sizes of the images on Slides 9, 12, and 14 so that they fit neatly on the slides (set the size to 17.60cm × 16.82cm), and add slide numbers to slides that are neither title/section-divider slides nor the first or last slide.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .ppt or .pptx format and can be opened normally.",
+      "The delivered presentation contains 17 slides.",
+      "The delivered presentation remains editable overall; the entire presentation must not be exported as an image-based presentation or as non-editable PDF-style content."
+    ],
+    "dim2": [
+      "+3: New video slide on Slide 16: It is positioned before the original closing slide, and Slide 17 remains the closing slide. Full-slide background on Slide 16: It covers the entire Slide 16 and is a linear gradient transitioning from light blue to white. The slide has no dark-colored visual noise, image watermarks, or solid-color background used in place of the gradient background.",
+      "+5: Overall arrangement of the three videos on Slide 16: From left to right, the three videos are cleaning, timer, and gum care, evenly spaced in a horizontally centered arrangement, with the corresponding video content. The videos are playable video objects, not static images. The videos have an aspect ratio close to 1:2.",
+      "+5: Left video animation on Slide 16: On the first click, the video appears and plays. The animation is triggered by a click, and the playback object is the left cleaning video or its corresponding card.",
+      "+5: Middle video animation on Slide 16: On the second click, it appears and plays. Its animation sequence is after the left cleaning video and before the right gum care video, and the playback object is the middle timer video or its corresponding card.",
+      "+5: Right video animation on Slide 16: On the third click, it appears and plays. Its animation sequence is after the left cleaning video and the middle timer video, and the playback object is the right gumcare video or its corresponding card.",
+      "+1: Main image on Slide 9: It is positioned in the middle of the slide and is 17.60cm wide and 16.82cm high. The image is scaled proportionally, its edges do not extend beyond the visible area of the slide, and it does not cover the title \"03 Product Life Cycle Management\" or the footer brand text \"Hailan Qingchi HAILAN CARE\".",
+      "+1: Main image on Slide 12: It is positioned in the middle of the slide and is 17.60cm wide and 16.82cm high. The image is scaled proportionally, and its edges do not extend beyond the visible area of the slide.",
+      "+1: Main image on Slide 14: It is positioned in the middle of the slide and is 17.60cm wide and 16.82cm high. The image is scaled proportionally, its edges do not extend beyond the visible area of the slide, and it does not cover \"05 Product Portfolio\", \"ORAL CARE BRAND\", or the footer brand text \"Hailan Qingchi HAILAN CARE\".",
+      "+5: Except for Slides 1, 3, 6, 9, 11, 14, and 17, Slides 2, 4, 5, 7, 8, 10, 12, 13, 15, and 16 must have slide-number text added in the bottom-right corner without covering slide content.",
+      "+3: Editable state of newly added objects on Slide 16: The video cards, slide-number text, gradient background, and three video objects can each be selected and edited individually. The three videos are not merged with the background into a full-slide image, and the slide number is a text object, not an image.",
+      "-3: Image object state on Slides 1, 12, and 14 does not meet the requirements: The main images on all three slides remain independent image objects and have not been merged with the full-slide background. The main slide titles, body text, and footer brand text remain editable text objects.",
+      "-3: The overall layout from Slide 1 through Slide 17 does not meet the requirements: There are no issues such as overlapping text, slide numbers covering body text, videos covering the footer, images extending beyond the slide, titles being covered by images, an incorrect closing-slide order, or the gradient background covering the videos.",
+      "-3: The width difference among the left, middle, and right video objects on Slide 16 exceeds 0.5cm, or their height difference exceeds 0.5cm.",
+      "-3: The left, middle, and right video objects on Slide 16 overlap, or any one of the video objects extends beyond the slide boundaries.",
+      "-1: The text \"Thank You for Watching\" does not appear on Slide 17.",
+      "-1: Newly added slide-number text appears at the bottom or in the bottom-right corner of any of Slides 1, 3, 6, 9, 11, 14, or 17.",
+      "-1: On any of Slides 2, 4, 5, 7, 8, 10, 12, 13, 15, or 16, the slide-number font is not Microsoft YaHei, Arial, or a similar sans-serif font; the font size exceeds 6–10 pt; or its position is not in the bottom-right corner, causing it to cover content on the slide.",
+      "-1: The text \"HAILAN CARE\" does not appear on Slide 1, or the text \"Sonic Care Brand Report\" does not appear.",
+      "-5: The text \"Contents\" does not appear on Slide 2, or the six table-of-contents entries \"01 Brand Overview\", \"02 Development Path\", \"03 Product Life Cycle\", \"04 Maturity-Stage Strategy\", \"05 Product Portfolio\", and \"06 Future Outlook\" do not appear.",
+      "-5: Any slide from Slide 1 through Slide 17 contains an image object whose width exceeds 90% of the slide width and whose height exceeds 90% of the slide height, and the main Chinese title on that slide cannot be selected and edited independently.",
+      "-3: Any slide from Slide 1 through Slide 17 has any one of the following: text extending beyond the slide boundaries, a video covering a title, an image covering body text, a slide number covering body text, or the closing slide not being the last slide.",
+      "-1: Slide 16 was not inserted after Slide 15 and before the closing slide, or it appears among Slides 1-15."
+    ]
+  }
+}

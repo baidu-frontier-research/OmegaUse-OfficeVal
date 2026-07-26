@@ -1,0 +1,19 @@
+{
+  "id": "officeval_032",
+  "instruction": "First, delete the underlined sentence in the image. Then add a “Volunteer Service” section to the résumé, formatted the same as the other sections, with the following content: “2022/1-2: Served as an outstanding volunteer in the community's fight against the epidemic; 2023/7-9: Served as a volunteer in Shandi Village.” Add these two passages on separate lines and keep the formatting consistent with the original document. Finally, add a new line to the Skills and Certifications section containing “2021/11-2023/9: Participated in the Young Marxists Training Program and passed the training.” Keep the résumé to one page; do not let it extend to two pages.",
+  "operation_intent": "Annotate",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 69,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_032/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_032/求学申请材料_林绯绯.pdf",
+      "dest": "求学申请材料_林绯绯.pdf"
+    }
+  ]
+}

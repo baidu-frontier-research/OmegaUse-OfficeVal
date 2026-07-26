@@ -1,0 +1,15 @@
+{
+  "id": "officeval_051",
+  "instruction": "Recreate this flowchart in PowerPoint (it must look exactly the same and be editable; do not make it an image).",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 157,
+  "task_price_proxy": 78,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_051/Image 2.png",
+      "dest": "Image 2.png"
+    }
+  ]
+}

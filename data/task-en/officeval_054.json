@@ -1,0 +1,15 @@
+{
+  "id": "officeval_054",
+  "instruction": "Recreate the original image as a single-slide PowerPoint presentation with content identical to the original image. It must be editable. Use SimSun for all content, set the line width to 0.75 pt, set the diagram height to 7 cm, and center the diagram on the slide.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 239,
+  "task_price_proxy": 40,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_054/路径图.png",
+      "dest": "路径图.png"
+    }
+  ]
+}

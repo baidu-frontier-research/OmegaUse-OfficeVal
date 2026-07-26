@@ -1,0 +1,15 @@
+{
+  "id": "officeval_089",
+  "instruction": "I need a trend chart and a column chart for gross profit margin and net profit margin, a trend chart for ROE,\na trend chart for the debt-to-asset ratio, and a trend chart for the operating revenue growth rate and net profit growth rate. Please create these charts in Sheet2 based on the corresponding data in the table, with time as the horizontal axis for all charts.",
+  "operation_intent": "Other",
+  "domain": "Financial Data",
+  "human_labor_time": 93,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_089/企业财务统计总表.xlsx",
+      "dest": "企业财务统计总表.xlsx"
+    }
+  ]
+}

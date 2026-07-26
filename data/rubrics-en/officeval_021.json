@@ -1,0 +1,42 @@
+{
+  "id": "officeval_021",
+  "instruction": "Reformat the “Version to Be Revised (2)” file to match the formatting of the template file. After completing the reformatting, delete the two technical roadmaps from the first file.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is a Microsoft Word file; .docx format is accepted, and the file can be opened normally.",
+      "The document is between 5 and 9 pages long."
+    ],
+    "dim2": [
+      "+3: The document pages are A4 portrait, with page margins set to 2.2 cm at the top, 2.0 cm at the bottom, 2.5 cm on the left, and 2.3 cm on the right.",
+      "+3: Page 1 is a cover page. The upper third of the cover contains the text “Lanzhou Institute of Applied Technology” and “Graduation Project (Thesis) Proposal Report,” as well as an image of the school emblem.",
+      "+1: On the cover page, the font formatting of “Lanzhou Institute of Applied Technology” is KaiTi_GB2312, Size No. 1.",
+      "+1: On the cover page, the paragraph formatting of “Lanzhou Institute of Applied Technology” is centered alignment, 0.2 lines of spacing after, and 1.5 line spacing.",
+      "+1: On the cover page, “Graduation Project (Thesis) Proposal Report” uses SimHei, Small Initial, is located below “Lanzhou Institute of Applied Technology,” and is centered.",
+      "+1: On the cover page, the paragraph formatting of “Graduation Project (Thesis) Proposal Report” is centered alignment, an after-text indent of -3.01 characters, and 1.5 line spacing.",
+      "+1: The information section at the bottom of the cover page contains the fields “Institution:”, “Major:”, “Student ID:”, “Name:”, and “Supervisor:”, together with their corresponding content.",
+      "+3: In the information section at the bottom of the cover page, the fields “Institution:”, “Major:”, “Student ID:”, “Name:”, and “Supervisor:” use bold SimSun, Size No. 3.",
+      "+3: In the information section at the bottom of the cover page, the corresponding content “Lanzhou Institute of Applied Technology,” “Mechanical Equipment Design and Automation,” “Xu Zhihan,” and “Qin Ruoheng” uses SimSun, Size No. 3.",
+      "+3: In the information section at the bottom of the cover page, the paragraph formatting of the corresponding content “Lanzhou Institute of Applied Technology,” “Mechanical Equipment Design and Automation,” “2360140827,” “Xu Zhihan,” and “Qin Ruoheng” is centered alignment, 4 pt of spacing before, and 1.35 line spacing.",
+      "+3: In the information section at the bottom of the cover page, the content “Lanzhou Institute of Applied Technology,” “Mechanical Equipment Design and Automation,” “2360140827,” “Xu Zhihan,” and “Qin Ruoheng” has underlining beneath it.",
+      "+5: In the information section at the bottom of the cover page, blank strings appear on both the left and right sides of the content “Lanzhou Institute of Applied Technology,” “Mechanical Design, Manufacturing and Automation,” “2360140827,” “Xu Zhihan,” and “Qin Ruoheng,” with a difference in the number of blank strings on the two sides of no more than 2, and the blank strings have underlining beneath them.",
+      "+5: In the information section at the bottom of the cover page, the underlining beneath the content “Lanzhou Institute of Applied Technology,” “Mechanical Design, Manufacturing and Automation,” “2360140827,” “Xu Zhihan,” and “Qin Ruoheng” is right-aligned.",
+      "+5: In the information section at the bottom of the cover page, the font of the fields “Institution:”, “Major:”, “Student ID:”, “Name:”, and “Supervisor:” is left-aligned.",
+      "+5: The text “Graduation Project (Thesis) Proposal Report” appears at the top of page 2 or page 3, with a table below it.",
+      "+3: Starting from page 3, all body content appears as text within tables.",
+      "+3: The table as a whole has outside borders: the top and bottom borders are 0.5 pt double solid lines, and the left and right borders are 0.5 pt single solid lines.",
+      "+5: Text headings within the tables, such as “I. Research Purpose and Significance,” “II. Current State of Industry Research,” “Supervisor’s Comments,” “I. Strengths,” “II. Weaknesses,” “III. Problems to Be Studied or Solved in This Project and Proposed Research Methods (Approaches),” “IV. Work Schedule,” and “V. Main References,” use bold SimSun, Small Four.",
+      "+5: Within the tables, all body text other than headings and table notes uses SimSun, Small Four; English text or Arabic numerals use Times New Roman, Small Four.",
+      "+5: Paragraphs of text within the tables use fixed line spacing of approximately 22 pt, justified alignment, and a first-line indent of two characters.",
+      "+1: The table column width is 15.90-15.00 cm.",
+      "+3: The content “Supervisor’s Comments,” “Teaching and Research Office Review Comments,” and “Secondary College Review Comments” is all within one table, and the table does not break across pages.",
+      "+3: The row height of the table cell containing “Supervisor’s Comments” is 16.40-16.50 cm.",
+      "+3: The row height of the table cell containing “Teaching and Research Office Review Comments” is 2.70-2.90 cm.",
+      "+5: The content “V. Main Reference Materials” or “V. Main References” is placed in a separate table, and the table is located on page 6 of the document.",
+      "+1: No image appears below “III. Research Content and Technical Plan.”",
+      "-5: The document contains a large blank area exceeding 50 percent of a page.",
+      "-3: The full text must not omit core keywords such as “agricultural granular material spreading mechanism,” “flexible seed metering,” “anti-clogging auxiliary structure,” “3D modeling,” and “motion simulation.”",
+      "-1: Temporary instructional text such as “Version to Be Revised,” “Template,” “Template Example,” or “Fill In Here” remains in the document.",
+      "-3: The body text is missing either of the first-level headings “I. Research Purpose and Significance” or “III. Research Content and Technical Plan.”"
+    ]
+  }
+}

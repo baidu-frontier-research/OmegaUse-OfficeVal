@@ -1,0 +1,22 @@
+{
+  "id": "officeval_090",
+  "instruction": "Extract the total weight sums and concrete volume data from all individual worksheets into the Summary worksheet.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable file is in .xlsx or .xlsm format and can be opened successfully.",
+      "The workbook retains the “Summary” worksheet and 60 individual worksheets, for a total of 61 worksheets; the individual worksheet names are, in order, Sheet1 through Sheet10 and Sheet12 through Sheet61, and no blank worksheet named Sheet11 is added.",
+      "Rows 3 through 62 of the “Summary” worksheet respectively correspond to the 60 individual worksheets. Each individual worksheet must correspond to exactly one row, with no omissions, duplicates, or misalignment between worksheet names and data."
+    ],
+    "dim2": [
+      "+5: “Summary” worksheet Concrete Volume column: “Summary”!F3:F62 is populated with the concrete volume data from the 60 individual worksheets. All entries must be numeric values or reference formulas, with no blanks, text units, error values, or data extracted from the “Concrete Weight (t)” column. “Summary” worksheet Total Weight column: “Summary”!G3:G62 is populated with the total weight sum data from the 60 individual worksheets. All entries must be numeric values or reference formulas; no individual “Weight (kg)” entry from the reinforcement details may be used in place of the total weight sum.",
+      "+5: “Summary” worksheet Concrete Volume format: “Summary”!F3:F62 uses the number format “0.000”, for example, 0.049, 0.053, and 0.404; the text “m³” is not repeated in the cells. “Summary” worksheet Total Weight format: “Summary”!G3:G62 uses the number format “0.000”, for example, 19.006, 20.316, and 97.116; the text “kg” is not repeated in the cells.",
+      "+5: “Summary” worksheet Content column: “Summary”!H3:H62 uses formulas to calculate the total weight sum divided by the concrete volume. The formula in H3 is “=IFERROR(G3/F3,\"\")” or an equivalent formula, and is filled down through H62. “Summary” worksheet Content format: “Summary”!H3:H62 uses the number format “0.00”, and each calculated result matches the result of dividing the value in column G by the value in column F for the corresponding row.",
+      "+5: Total weight for Sheet3 and individual worksheets with the same structure: the total weight sums for Sheet3, Sheet6 through Sheet10, Sheet12 through Sheet39, and Sheet41 are extracted from I10 of each respective worksheet and written to column G of the corresponding row in “Summary”. Concrete volume for Sheet3 and individual worksheets with the same structure: the concrete volumes for Sheet3, Sheet6 through Sheet10, Sheet12 through Sheet39, and Sheet41 are extracted from D20 of each respective worksheet and written to column F of the corresponding row in “Summary”.",
+      "+5: Total weight for Sheet5 and individual worksheets with the same structure: the total weight sums for Sheet5 and Sheet42 through Sheet61 are extracted from I11 of each respective worksheet and written to column G of the corresponding row in “Summary”. Concrete volume for Sheet5 and individual worksheets with the same structure: the concrete volumes for Sheet5 and Sheet42 through Sheet61 are extracted from E21 of each respective worksheet and written to column F of the corresponding row in “Summary”.",
+      "-1: Any 10 or more cells in “Summary”!F3:F62 and !G3:G62 are blank.",
+      "-3: “Summary”!F3:G62 uses text format, causing values to display error indicators in their upper-left corners or preventing them from being used in calculations.",
+      "-3: A blank worksheet named “sheet11” is present.",
+      "-1: “Component Material Data Summary” does not contain any merged cells."
+    ]
+  }
+}

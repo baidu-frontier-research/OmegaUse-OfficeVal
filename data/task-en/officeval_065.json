@@ -1,0 +1,19 @@
+{
+  "id": "officeval_065",
+  "instruction": "Add an animation like the one in the video to slide 10 of this PowerPoint. Place a multiplication sign at the center of the pink oval, position one spinner on each side, make them the same size and align them, and use a single shared button to control the spinning and pausing of both spinners.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 125,
+  "task_price_proxy": 105,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_065/double_spinner_new.mp4",
+      "dest": "double_spinner_new.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_065/口算教学课件.pptx",
+      "dest": "口算教学课件.pptx"
+    }
+  ]
+}

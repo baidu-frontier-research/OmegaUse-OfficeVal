@@ -1,0 +1,15 @@
+{
+  "id": "officeval_072",
+  "instruction": "Turn this into a PPT with editable text; the layout, content, and colors should all be roughly the same as the original.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 187,
+  "task_price_proxy": 110,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_072/Illuminating_the_Starry_Sky.pptx",
+      "dest": "Illuminating_the_Starry_Sky.pptx"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "officeval_082",
+  "instruction": "In the “1111” spreadsheet, set it up so that when items on the left are checked, the selected content is automatically displayed on the right (as indicated by the red arrow in the image).",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .xlsx or .xlsm format and can be opened successfully.",
+      "On the “1111” worksheet, the user tag dimension table on the left remains as editable cells and must not be converted into an image, screenshot, or non-editable object.",
+      "On the “1111” worksheet, the checkbox controls on the left, linked cells, and automatic display area on the right are all editable, or their logic can be modified further."
+    ],
+    "dim2": [
+      "+5: “1111” worksheet tag checkbox controls: Every tag option in columns B and C has a clickable checkbox control to its left or within its cell. The number of controls matches the number of tag options, the checkbox controls do not obscure the tag text, and clicking a control toggles it between checked and unchecked states. Each checkbox control is linked to a Boolean value, formula condition, or VBA logic for the corresponding row and column; when a tag is checked, it is recognized as selected, and when it is unchecked, it is recognized as unselected.",
+      "+5: “1111” worksheet single-item selection display behavior: After any tag option in column B is checked, the text of that tag appears in the automatic display area on the right; after any tag option in column C is checked, the text of that tag appears in the automatic display area on the right. When any checked tag is unchecked, the text of that tag disappears from the automatic display area on the right at the same time, while the other tags that remain checked continue to be displayed.",
+      "+1: “1111” worksheet right-side output list row height: The row height in the output area on the right is 20–24 pt, the text is displayed in full, and long text wraps automatically or the column is wide enough, with no text truncated to the point of being unreadable.",
+      "+1: “1111” worksheet right-side output font: The output text on the right uses Microsoft YaHei, SimSun, or Calibri, at 9–12 pt, in black or dark gray, with left or center alignment, and is clear and readable overall.",
+      "+3: “1111” worksheet control size: Each checkbox or checkable area is approximately 0.25cm–0.5cm in width and height, is uniform in size, can be clicked with the mouse, and does not extend beyond the boundaries of its cell.",
+      "+1: “1111” worksheet left-side table borders: The area has complete borders; horizontal and vertical dividing lines are thin light-gray or white lines, and the table's row and column structure is clear. The body rows have a white or very light gray fill, and the category dimension in column A may use light green or white shading.",
+      "-5: “1111” worksheet column widths do not meet the requirements: Column A is approximately 8–12 characters wide, columns B and C are approximately 24–26 characters wide, the output columns I and J on the right are similar in width to columns B and C at approximately 24–26 characters, and all primary tag text and right-side result text can be displayed in full.",
+      "-1: On the right side of the “1111” worksheet, “Dimension Category (Selected)” or a similar selected-results title does not appear near I4:J4.",
+      "-1: Intermediate values such as TRUE, FALSE, 0, 1, #VALUE!, #N/A, and #CALC! appear in the display area in columns I and J on the right.",
+      "-5: The user tag dimension table on the left in columns A through C has been converted into an image or screenshot."
+    ]
+  }
+}

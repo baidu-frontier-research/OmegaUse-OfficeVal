@@ -1,0 +1,24 @@
+{
+  "id": "officeval_086",
+  "instruction": "The data is in the spreadsheet. I need a Pie of Pie chart: the pie on the left should show “Personnel Compensation,” “Materials,” and “Other,” while the pie on the right should show the proportions of “Transportation,” “Accommodation,” and “Dining” within “Other,” like the type shown in the image. Create it in Sheet2 of the original workbook, and make it editable.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .xlsx or .xlsm format and can be opened normally.",
+      "The delivered workbook contains at least two worksheets, Sheet1 and Sheet2, with Sheet2 used for the Pie of Pie chart."
+    ],
+    "dim2": [
+      "+5: Main pie chart on the left in Sheet2: It is positioned on the left side of the chart area, with its center located within 25%–35% of the chart width and 45%–55% of the chart height. It contains three slices: “Personnel Compensation,” “Materials,” and “Other,” and their area proportions match the main-category data in Sheet1. Split pie chart on the right in Sheet2: It is positioned on the right side of the chart area, with its center located within 72%–82% of the chart width and 42%–55% of the chart height. It contains three slices: “Transportation,” “Accommodation,” and “Dining,” and their area proportions match the “Other” detail data in the source table. The two pie charts are connected by dashed lines.",
+      "+1: The main pie chart on the left in Sheet2 contains a “Personnel Compensation” slice whose text includes “Personnel Compensation” and the corresponding percentage “55%”; a “Materials” slice whose text includes “Materials” and the corresponding percentage “34%”; and an “Other” slice whose text includes “Other” and the corresponding percentage “11%.” The labels do not extend beyond the chart area. The font is Microsoft YaHei, SimSun, or Calibri, the font size is 12–16 points, and the color is black.",
+      "+1: The split pie chart on the right in Sheet2 contains a “Transportation” slice whose text includes “Transportation” and the corresponding percentage “15%”; an “Accommodation” slice whose text includes “Accommodation” and the corresponding percentage “65%”; and a “Dining” slice whose text includes “Dining” and the corresponding percentage “20%.” The font is Microsoft YaHei, SimSun, or Calibri, the font size is 10–14 points, and the color is black.",
+      "+1: Slice colors for the main pie chart on the left in Sheet2: The three slices use mutually distinguishable light colors or colors with medium saturation, including at least three different colors from blue, orange, teal, purple, and light green. The slice colors in the split pie chart on the right are consistent in style with the main pie chart on the left. The slices have white or light gray separator lines with a line width of 0.75–1.5 points.",
+      "+1: Connecting lines between the left and right pie charts in Sheet2: There are two gray or light gray dashed connecting lines between the “Other” slice in the main pie chart on the left and the split pie chart on the right. The upper connecting line is within 15%–45% of the chart height, and the lower connecting line is within 55%–85% of the chart height. The line width is 0.75–1.25 points, and the line style is dashed or dotted-dashed.",
+      "+1: Relative positions of the left and right pie charts in Sheet2: The main pie chart on the left is wider than the split pie chart on the right. The diameter of the main pie chart on the left is approximately 1.3–1.8 times the diameter of the split pie chart on the right. The horizontal spacing between the two pie charts is approximately 3cm–7cm, and they do not overlap.",
+      "+1: Chart legend in Sheet2: The chart does not obscure the pie charts' data labels. If a legend is present, it is placed at the bottom of the chart or in an empty area on the right, and its category names and colors are consistent with “Personnel Compensation, Materials, Other, Transportation, Accommodation, Dining.”",
+      "+1: Chart title area in Sheet2: The unrelated default title “Chart Title” does not appear at the top of the chart. If a title is set, it should convey the meaning of “Expense Breakdown” or “Pie of Pie Chart,” be black or dark gray, and be centered at the top of the chart.",
+      "-1: The default text “Chart Title” appears in the chart title position in Sheet2.",
+      "-1: Any one of the following text items is missing from Sheet2: “Personnel Compensation,” “Materials,” “Other,” “Transportation,” “Accommodation,” or “Dining.”",
+      "-1: Text within the main pie chart on the left or the split pie chart on the right in Sheet2 uses a decorative font.",
+      "-1: The workbook contains a newly added worksheet unrelated to the task, and that worksheet contains a duplicate chart or a large area of blank content."
+    ]
+  }
+}

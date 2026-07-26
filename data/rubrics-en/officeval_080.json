@@ -1,0 +1,26 @@
+{
+  "id": "officeval_080",
+  "instruction": "This PPT needs to be revised. The document contains revision requirements; revise the PPT according to those requirements.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .pptx format and can be opened and edited normally.",
+      "The revised PPT still has 18 slides.",
+      "If the file cannot be opened, the slides as a whole are not editable, the slide count differs significantly, or the layout is extensively damaged, the Dimension 1 score is 0."
+    ],
+    "dim2": [
+      "+1: On Slide 1, “Comics & Animation” is approximately 28 to 29 points, “Story Writing Lab” is approximately 44 to 45 points, the subtitle “Build a story from panels, bubbles, and action.” is approximately 18 to 19 points, and the three lines of body text below the subtitle are approximately 19 to 20 points.",
+      "+1: Slide 2 background: Delete the dark blue background and replace it with the same beige background as Slide 3.",
+      "+1: Image on the right side of Slide 3: Insert an image of students studying. The image is 12 cm wide and 9 cm high and is positioned on the right side of the slide.",
+      "+1: Overall layout of Slide 4: Move the image of the adventurer to the left side of the slide, and arrange the title, question, and explanatory text on the right side, with a clear left-right layout.",
+      "+3: New images on Slide 5: Slide 5 contains two images with aspect ratios of 3:2 and 4:3, respectively, and neither image covers any text.",
+      "+1: Area to the right of the arrows on Slide 6: Each corresponding blank area to the right of an arrow contains two horizontal lines, and there is no other text to the right of the arrows besides the horizontal lines.",
+      "+5: Animations for the four groups of content on Slide 8: “Speech bubble”, “Caption”, “Sound effect”, and “Thought bubble”, along with their respective explanatory text, all have animations applied, and the animation effects are not all identical across the groups.",
+      "+5: Animations for the four groups of content on Slide 9: “Caption”, “Speech bubble”, “Thought bubble”, and “Sound effect”, along with their corresponding example sentences, all have animations applied, and the animation effects are not all identical across the groups.",
+      "+3: Slide 10 replacement: The title of the new Slide 10 accurately displays “Match five stages of the story with frames”. A curve chart of the five stages of the story is placed below the title; the image is 20 cm wide and 12.79 cm high.",
+      "+5: Text box animations on Slide 11: Except for the main title, the subtitle, slide number, and six dialogue text boxes all have the same animation applied, and each text box can be triggered separately in the order of explanation.",
+      "+1: Image in the bottom-right corner of Slide 16: The dialogue bubble illustration in the bottom-right corner of the slide is no longer displayed, and the bottom-right area remains clean.",
+      "+5: Transitions on Slides 1 through 18: A transition effect is applied to every slide, and for any two slides, the combination of transition effect name and direction is not exactly the same.",
+      "-3: There are three or more instances of text overlapping other text or extending beyond the slide boundary."
+    ]
+  }
+}

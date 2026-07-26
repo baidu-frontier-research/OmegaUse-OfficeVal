@@ -1,0 +1,19 @@
+{
+  "id": "officeval_061",
+  "instruction": "Move the two images on the Brand Manifesto slide and the text beneath them to Slide 1 (refer specifically to the positions marked by the red boxes in the image). Keep the relative positions of the images and text unchanged. Their dimensions may be scaled proportionally, but they must not be stretched. Place the entire group centered on the right side of the slide, and delete the original Brand Manifesto slide. After moving all information for the two teachers from Slide 8 to Slide 7, apply the animation effect shown in the video to the information section for the five teachers on Slide 7, and then delete the original Slide 8.",
+  "operation_intent": "Restructure",
+  "domain": "Business Operations",
+  "human_labor_time": 55,
+  "task_price_proxy": 30,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_061/product_video.mp4",
+      "dest": "product_video.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_061/星市静默回声教育科技有限公司简介.pptx",
+      "dest": "星市静默回声教育科技有限公司简介.pptx"
+    }
+  ]
+}

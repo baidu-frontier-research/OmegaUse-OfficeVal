@@ -1,0 +1,25 @@
+{
+  "id": "officeval_036",
+  "instruction": "Organize the income and expense records from the PDF into the Word document, ensuring that every record row has the same height.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and can be opened normally.",
+      "All 46 income and expense transactions from the PDF, along with 1 opening balance row and 1 ending summary row, are organized in the Word table, for a total of 48 rows of data records.",
+      "All records are arranged by date and in the same sequence as in the PDF, with no omissions, duplicates, reversals in order, or amounts placed in the wrong columns.",
+      "The table row height is exactly the same for every record and must not vary with the length of the description."
+    ],
+    "dim2": [
+      "+3: Income and expense records table: Use an editable 5-column Word table, with the columns ordered from left to right as \"Date\", \"Description\", \"Withdrawals\", \"Deposits\", and \"Balance\". The header text is Arial 11.5 pt and bold; Date and Description are left-aligned, while Withdrawals, Deposits, and Balance are right-aligned.",
+      "+3: Income and expense records table column widths: The Date, Description, Withdrawals, Deposits, and Balance columns each have a uniform width of 3.68 cm, and the column widths remain consistent on continuation tables across all pages.",
+      "+1: Income and expense record data font: All data rows use Arial in Chinese font size No. 5 and black; dates and transaction descriptions use regular font style, and values in the Balance column are bold.",
+      "+1: Income and expense record paragraph formatting: Data cells have 0 pt spacing before, 10 pt spacing after, and 1.15 line spacing, with no extra blank paragraphs or unnecessary line breaks within cells.",
+      "+3: Income and expense record horizontal borders: A light gray, thin solid line with a width of 0.75 pt is used below every record;",
+      "+1: Income and expense record amount format: Amounts in the Withdrawals, Deposits, and Balance columns are consistently displayed in US dollar format, with thousands separators and two decimal places, for example, \"$6,870.20\" and \"$43,712.48\".",
+      "+5: Complete record count: The table contains a total of 50 data rows, excluding the header row,",
+      "+1: Repeated header row on continuation pages: When records span multiple pages, the Date, Description, Withdrawals, Deposits, and Balance header row is repeated at the top of every page, with column widths, fonts, and alignment consistent with those on the preceding page.",
+      "-1: The cover image size does not meet the width requirement of 15-17 cm and the height requirement of 9-11 cm.",
+      "-1: The cover title \"Activity details — Expenditure Records\" uses an artistic typeface.",
+      "-3: Blank amount cells in the income and expense records do not meet the following requirements: For an income record, the Withdrawals cell remains blank; for an expense record, the Deposits cell remains blank; blank columns must not be filled with 0, a dash, or an incorrect amount."
+    ]
+  }
+}

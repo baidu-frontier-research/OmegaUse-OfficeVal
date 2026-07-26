@@ -1,0 +1,21 @@
+{
+  "id": "officeval_066",
+  "instruction": "Add a new slide at the end of the PPT and create a table from “Various PPT-Related Data Tables” that matches the tables on the preceding slides. Then add another new slide after the table slide and create a line chart (refer to the preceding slides).",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .ppt or .pptx format and must open, be editable, and run normally in Slide Show mode.",
+      "If the file cannot be opened, the newly added table or chart is not editable, the slide count is significantly incorrect, or the slide structure is severely damaged, the score for dimension 1 is 0."
+    ],
+    "dim2": [
+      "+5: PPT slide count and order: The final file contains 6 slides in total; slide 5 is the data table slide, and slide 6 is the corresponding line chart slide.",
+      "+1: Slide 5 title: Use the title “Store Digitalization and Low-Carbon Operations Metrics,” positioned at the top left of the slide, in 24 pt bold Microsoft YaHei.",
+      "+5: Slide 5 table structure: Include 1 header row and 9 data rows, for a total of 10 rows and 8 columns; all cells must be editable. From left to right, the headers are “Year,” “Smart Store Response Rate (%),” “Online Order Share (%),” “Self-Service Checkout Coverage (%),” “Green Store-Visit Traffic Share (%),” “Low-Carbon Delivery Completion Rate (%),” “Last-Mile Connection Convenience (%),” and “Operations Coordination Index (0–100).” The 2016—2018 data, from top to bottom on the left, are: 2016: 31.8, 18.9, 24.6, 27.3, 22.6, 33.4, 29.7; 2017: 34.9, 23.7, 29.8, 31.5, 26.1, 36.8, 34.1; 2018: 42.6, 27.9, 35.2, 34.4, 30.6, 39.6, 39.8. The 2019—2021 data are: 2019: 45.7, 33.8, 40.9, 37.2, 35.9, 43.8, 44.7; 2020: 53.4, 41.7, 49.6, 42.8, 44.3, 50.6, 52.9; 2021: 58.6, 48.8, 55.7, 47.6, 49.7, 55.1, 58.4. The 2022—2024 data are: 2022: 66.7, 56.9, 62.6, 55.8, 57.4, 63.7, 66.2; 2023: 71.6, 62.4, 69.8, 61.6, 64.9, 70.2, 72.1; 2024: 78.9, 68.1, 76.7, 67.3, 72.6, 74.9, 78.2.",
+      "+1: Slide 5 table style: Use a blue or teal header row, white header text, and alternating light-colored data rows.",
+      "+5: Slide 6 line chart object: Use a native, editable PowerPoint line chart. The chart data workbook must contain all years and metrics from slide 5. From left to right, the horizontal axis must display 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, and 2024. The data series must include all 7 lines: “Smart Store Response Rate,” “Online Order Share,” “Self-Service Checkout Coverage,” “Green Store-Visit Traffic Share,” “Low-Carbon Delivery Completion Rate,” “Last-Mile Connection Convenience,” and “Operations Coordination Index.” All 7 lines, comprising 63 data points in total, must exactly match the corresponding cells on slide 5. The vertical axis must use a consistent scale from 0 to 100. The legend must accurately display the names of all 7 series in the same order as the headers on slide 5 and must not use default names such as “Series 1.” The chart's data must be sourced from the table on the fifth slide.",
+      "+1: Slide 6 line styles: Each series must use a line in a distinct color and have clear data point markers.",
+      "+1: Slide 6 chart title and annotation: A title must be present and positioned at the top left of the slide, in 24 pt bold Microsoft YaHei. An explanation of the highest point must appear below the chart.",
+      "+3: PPT backgrounds on the fifth and sixth slides: Match the style of the first four slides, using a solid light-blue fill with color code F7FAFC.",
+      "-3: The file contains comments, red markings, temporary notes, screenshot borders, or extra placeholder objects."
+    ]
+  }
+}

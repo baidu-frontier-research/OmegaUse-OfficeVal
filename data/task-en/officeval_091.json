@@ -1,0 +1,19 @@
+{
+  "id": "officeval_091",
+  "instruction": "1. Enter the data from the first image into this spreadsheet. Convert the unit in the “Weight” column of the image data entered into the spreadsheet from kg to tons. Do not change any of the spreadsheet's existing formatting or data.\n2. Organize the spreadsheet data: By customer name and product type (grouped into the major categories “Starter Feed,” “Nursery/Fattening Feed,” “Layer Feed,” “Waterfowl Feed,” “Sinking Fish Feed,” and “Floating Fish Feed”), separately calculate the quantity in each major category for each customer.",
+  "operation_intent": "Extract",
+  "domain": "Business Operations",
+  "human_labor_time": 94,
+  "task_price_proxy": 28,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_091/2026年区域渠道销量统计表.xlsx",
+      "dest": "2026年区域渠道销量统计表.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_091/image_001.png",
+      "dest": "image_001.png"
+    }
+  ]
+}

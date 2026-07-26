@@ -1,0 +1,19 @@
+{
+  "id": "officeval_086",
+  "instruction": "The data is in the spreadsheet. I need a Pie of Pie chart: the pie on the left should show “Personnel Compensation,” “Materials,” and “Other,” while the pie on the right should show the proportions of “Transportation,” “Accommodation,” and “Dining” within “Other,” like the type shown in the image. Create it in Sheet2 of the original workbook, and make it editable.",
+  "operation_intent": "Other",
+  "domain": "Financial Data",
+  "human_labor_time": 65,
+  "task_price_proxy": 35,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_086/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_086/数据1.xlsx",
+      "dest": "数据1.xlsx"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "officeval_094",
+  "instruction": "Create two multi-category nested combined pie charts, one for each of the two sets of score data in the spreadsheet, with an effect similar to the image, using the two categories of inquiry performance and proficiency level.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 98,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_094/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_094/七年级地理探究成绩登记.xlsx",
+      "dest": "七年级地理探究成绩登记.xlsx"
+    }
+  ]
+}

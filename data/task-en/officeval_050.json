@@ -1,0 +1,15 @@
+{
+  "id": "officeval_050",
+  "instruction": "Please make these two PowerPoint slides directly editable, including allowing content to be deleted, while keeping the content exactly the same as the original.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 321,
+  "task_price_proxy": 25,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_050/111.pptx",
+      "dest": "111.pptx"
+    }
+  ]
+}

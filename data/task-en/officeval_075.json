@@ -1,0 +1,19 @@
+{
+  "id": "officeval_075",
+  "instruction": "Replace the template of \"Respiratory Project Courseware\" with one like that of \"Medical Service Fee Guidelines\"; that is, change the background color scheme, style, and so on, without altering the original text or content.",
+  "operation_intent": "Beautify",
+  "domain": "Education & Examination",
+  "human_labor_time": 114,
+  "task_price_proxy": 43,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_075/医疗服务收费指引.pptx",
+      "dest": "医疗服务收费指引.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_075/呼吸项目课件.pptx",
+      "dest": "呼吸项目课件.pptx"
+    }
+  ]
+}

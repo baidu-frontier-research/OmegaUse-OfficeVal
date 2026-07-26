@@ -1,0 +1,16 @@
+{
+  "id": "officeval_093",
+  "instruction": "Please add something to the spreadsheet: the shape outlined by the red rectangle in the image. Add one of these shapes to the cell to the right of “Shape Organization” (I need this shape to be editable, not an image). Do not cover the serial number or the borders; just place it after the serial number.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .xlsx or .xlsx format, and the file can be opened normally."
+    ],
+    "dim2": [
+      "+3: “Sheet0” worksheet, cell C32—editable shapes: after “30、”, there are 2 editable closed freeform polygon objects, each 1.1-1.3 cm wide and 0.9-1.1 cm high. Each object can be selected individually and have its vertices, outline, and size modified; the two objects can be grouped into one shape group. The left polygon is positioned to the right of the serial number “30、” and consists of 5 main turning points. Its outline is an equilateral pentagon tilted by approximately 30 degrees, with the pointed corner on the right extending toward the middle of the cell. The right polygon is positioned to the right of the left polygon, arranged approximately as its mirror image, and consists of 5 main turning points, with the pointed corner on the left extending toward the middle of the cell. The left and right polygons overlap each other, and their intersecting outlines form a distinct vertical diamond-shaped region in the middle of the shape.",
+      "+3: “Sheet0” worksheet, cell C32—shape dimensions: the grouped shape is 2.2–2.5 cm wide and 0.9-1.1 cm high overall, and the two polygons are essentially the same height. Both polygons use a black or dark gray solid outline with a line width of 1.5–2.5 pt, with no dashes, shadow, glow, or three-dimensional effect. They have no fill or a transparent white fill, allowing the cell's light-colored shading to remain visible normally.",
+      "-1: “Sheet0” worksheet, cell C32 borders: the newly added shape overlaps any one of the top, bottom, left, or right borders.",
+      "-1: “Sheet0” worksheet, cell C32 shape boundaries: the shape extends outside C32 and into D32, E32, F32, or an adjacent row.",
+      "-5: In the “Sheet0” worksheet, some text in A3:C32 is not displayed or is unclear."
+    ]
+  }
+}

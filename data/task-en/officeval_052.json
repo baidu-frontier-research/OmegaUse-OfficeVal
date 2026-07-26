@@ -1,0 +1,15 @@
+{
+  "id": "officeval_052",
+  "instruction": "Please recreate this 3D model diagram from the textbook in PowerPoint, make it editable, change the primary color scheme to orange, and center it on a single PowerPoint slide without changing its aspect ratio.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 128,
+  "task_price_proxy": 50,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_052/模型图.png",
+      "dest": "模型图.png"
+    }
+  ]
+}

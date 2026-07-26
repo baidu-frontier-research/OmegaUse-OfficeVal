@@ -1,0 +1,18 @@
+{
+  "id": "officeval_091",
+  "instruction": "1. Enter the data from the first image into this spreadsheet. Convert the unit in the “Weight” column of the image data entered into the spreadsheet from kg to tons. Do not change any of the spreadsheet's existing formatting or data.\n2. Organize the spreadsheet data: By customer name and product type (grouped into the major categories “Starter Feed,” “Nursery/Fattening Feed,” “Layer Feed,” “Waterfowl Feed,” “Sinking Fish Feed,” and “Floating Fish Feed”), separately calculate the quantity in each major category for each customer.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .xlsx or .xlsm format and can be opened properly.",
+      "The workbook contains a worksheet named “December,” and all tables are editable."
+    ],
+    "dim2": [
+      "+3: The file contains exactly two tables.",
+      "+1: Cell N41 on the “December” worksheet contains 2.52.",
+      "+5: The document contains one sheet whose name is not “December”; it has the fields “Customer” or “Customer Name,” “Starter Feed,” “Nursery/Fattening Feed,” “Layer Feed,” “Waterfowl Feed,” “Sinking Fish Feed,” and “Floating Fish Feed,” and the “Customer” or “Customer Name” column contains different customer names.",
+      "-1: The formula in cell L41 on the “December” worksheet is not =SUM(M41:R41).",
+      "-1: The content of cell K57 on the “December” worksheet is not “Total.”",
+      "-1: At least one of cells O41 through R41 on the “December” worksheet contains content."
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "officeval_092",
+  "instruction": "The workbook contains a worksheet with a screenshot. Recreate the screenshot as a table and replace the screenshot with this table; format all the tables: standardize the fonts used in the table bodies, table headers, and table titles separately. Adjust the row heights so that all text is displayed, and make the row heights of similar tables consistent; consolidate any parts of a table that are split in Print Preview into a single table, and ensure that no table spans two pages in Print Preview.",
+  "operation_intent": "Extract",
+  "domain": "Business Operations",
+  "human_labor_time": 101,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_092/智慧农业示范园建设项目报价表.xlsx",
+      "dest": "智慧农业示范园建设项目报价表.xlsx"
+    }
+  ]
+}

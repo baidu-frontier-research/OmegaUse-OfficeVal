@@ -1,0 +1,24 @@
+{
+  "id": "officeval_002",
+  "instruction": "Remove the horizontal lines from the headers on all pages before the Abstract. On the Abstract page and all subsequent pages, make the thicknesses of the header lines match those in the PDF file.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and can be opened normally."
+    ],
+    "dim2": [
+      "+3: All pages before the Abstract: there are no horizontal lines in the header.",
+      "+5: The Abstract page and all subsequent pages: there are two parallel horizontal lines in the header; the lines are black; the upper line is at least 3 times as thick as the lower line; the lower line is no more than 1.5 pt thick.",
+      "+5: On every page, the horizontal lines in the header are positioned below the header text, with a spacing of 1-4 characters from the header text.",
+      "-1: On any page, the header text is not \"Chenghu University of Technology Master's Thesis\" or is not centered.",
+      "-1: All pages after the table of contents fail to satisfy any one of the following:",
+      "-1: On any page, no page number appears in the center of the footer.",
+      "-1: The page numbers on the table of contents page and all preceding pages are not Roman numerals, and the page numbers on the pages after the table of contents are not Arabic numerals.",
+      "-1: The Chinese Abstract page, English Abstract page, and table of contents page are not in this order.",
+      "-1: All first-level headings after the table of contents are not in SimHei, Chinese font size No. 3, and bold.",
+      "-1: All second-level headings after the table of contents are not in SimHei, Chinese font size No. 4, and bold.",
+      "-1: All third-level headings after the table of contents are not in SimHei, Chinese font size Small No. 4, and bold.",
+      "-1: The text between \"1.1.1 Research Background\" and \"1.1.2 Research Significance\" fails to satisfy any one of the following: SimSun, Chinese font size Small No. 4, 1.5 line spacing, or justified alignment.",
+      "-3: Any table after the table of contents does not have exactly 3 border lines."
+    ]
+  }
+}

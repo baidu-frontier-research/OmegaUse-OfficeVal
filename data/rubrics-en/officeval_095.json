@@ -1,0 +1,21 @@
+{
+  "id": "officeval_095",
+  "instruction": "Create a doughnut chart showing the proportions of the answers to the first question in the file, and place it in the blank area to the right of the question. Make the doughnut chart look like the one shown in the image, place the question in the very center of the doughnut, and ensure that it is editable.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .xlsx or .xlsm format and can be opened normally.",
+      "The newly added chart and helper area do not disrupt the original sheet's headers in columns A:D, question text, answer options, valid respondent counts, or proportion data."
+    ],
+    "dim2": [
+      "+3: On Sheet1, 1 doughnut chart is added in the blank area to the right of the first question. The chart's data source uses the answer options in B3:B7 and the proportion data in D3:D7 corresponding to the first question, \"How aware are you of the convenient services available in your village?\" The doughnut chart includes the first question's 5 answer options, \"Very aware,\" \"Fairly aware,\" \"Some knowledge,\" \"Limited knowledge,\" and \"Never paid attention,\" and the proportions of its sectors basically match D3:D7. The chart uses a doughnut style with a clearly visible hollow center; it is not a regular pie chart, column chart, line chart, or scatter chart.",
+      "+1: The text \"How aware are you of the convenient services available in your village?\" is placed in the center of the doughnut chart, positioned in the middle of the doughnut and fully readable.",
+      "+5: The doughnut chart's overall appearance uses pattern fills, with white foreground colors and five different colored background colors.",
+      "+1: The doughnut chart displays percentage data labels.",
+      "+5: The color of each percentage data label on the doughnut chart matches the background color of the corresponding sector below it.",
+      "+5: In the doughnut chart, four of the sections are connected, while another sector is independently separated outside the ring.",
+      "-5: The newly added content is an image, screenshot, or statically pasted object, making it impossible to edit the chart's data source, sectors, labels, or center text in Excel.",
+      "-3: The text \"How aware are you of the convenient services available in your village?\" obscures the doughnut chart.",
+      "-1: The legend or labels do not make it possible to determine which answer option corresponds to each sector."
+    ]
+  }
+}

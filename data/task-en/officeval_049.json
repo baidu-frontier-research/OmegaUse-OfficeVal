@@ -1,0 +1,15 @@
+{
+  "id": "officeval_049",
+  "instruction": "Recreate this image, with every element editable, and deliver it to me as a one-slide ppt with the same dimensions as the image.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 240,
+  "task_price_proxy": 100,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_049/Image 1.png",
+      "dest": "Image 1.png"
+    }
+  ]
+}

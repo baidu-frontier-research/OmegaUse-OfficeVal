@@ -8,19 +8,19 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/image_001.jpg",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/image_001.jpg",
       "dest": "image_001.jpg"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/image_002.jpg",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/image_002.jpg",
       "dest": "image_002.jpg"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/小微企业财务数据管理规范化问题及改进路径研究.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/小微企业财务数据管理规范化问题及改进路径研究.docx",
       "dest": "小微企业财务数据管理规范化问题及改进路径研究.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/016/澄禾社区生鲜服务满意度研究.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/澄禾社区生鲜服务满意度研究.docx",
       "dest": "澄禾社区生鲜服务满意度研究.docx"
     }
   ]

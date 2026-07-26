@@ -1,0 +1,19 @@
+{
+  "id": "officeval_035",
+  "instruction": "Translate the foreign-language literature in PDF format into Chinese and place the translation in a new Word document. Also place the images from the PDF at appropriate locations in the Word document, and format the new Word document according to the document “002 Graduation Project Foreign-Language Translation Cover and Formatting Requirements (Regular Class).”",
+  "operation_intent": "Other",
+  "domain": "Academic Papers",
+  "human_labor_time": 137,
+  "task_price_proxy": 68,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_035/002 毕业设计外文翻译封面及格式要求（普通班）.docx",
+      "dest": "002 毕业设计外文翻译封面及格式要求（普通班）.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_035/neighborhood_reading_garden_article.pdf",
+      "dest": "neighborhood_reading_garden_article.pdf"
+    }
+  ]
+}

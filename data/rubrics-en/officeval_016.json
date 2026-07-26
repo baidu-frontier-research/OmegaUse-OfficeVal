@@ -1,0 +1,36 @@
+{
+  "id": "officeval_016",
+  "instruction": "I need to format my thesis by following the formatting of the “A Study of Satisfaction with Fresh Food Services in Chenghe Community” document; create a cover page like the one in that document; and add the missing “Statement of Originality and Authorization for Use” page by simply copying and pasting it from the reference document.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and can be opened normally",
+      "The document is more than 6 pages long"
+    ],
+    "dim2": [
+      "+5: Cover page: it is page 1 of the document, uses A4 portrait orientation, and has no page number; overall, it contains four areas: the “Songjiang Institute of Applied Technology” combined school emblem-and-name graphic at the top, the main title “Adult Education Undergraduate Graduation Thesis,” a five-field information section, and the date at the bottom",
+      "+1: Combined school emblem-and-name graphic at the top of the cover page: overall, it spans 0-30% of the page from top to bottom; the combined graphic is arranged in one row and horizontally centered, with the school emblem to the left of the school name “Songjiang Institute of Applied Technology”",
+      "+1: Cover-page main title “Adult Education Undergraduate Graduation Thesis”: it appears below the combined school emblem-and-name graphic on a separate line; the font is SimHei, Chinese font size Xiaochu, bold, and centered",
+      "+3: Cover-page information section: it contains five fields—“Title,” “Student ID,” “Name,” “Major,” and “Advisor”; the five fields are vertically centered and arranged with both their left and right edges aligned; the left ends of the lines following the labels are aligned, and the lines are the same length; the text for all five fields is SimHei, Chinese font size Sanhao, and bold",
+      "+1: Cover-page date: “Year 2026, Month 3” is centered at the bottom of the page; the numerals in the date are in Times New Roman, Chinese font size Sihao, and bold, while the Chinese text is in SimHei, Chinese font size Sihao, and bold",
+      "+1: Statement of Originality and Authorization for Use page: it is page 2 of the entire document and appears after the cover page",
+      "+1: The title “Statement of Originality and Authorization for Use” appears on the Statement of Originality and Authorization for Use page: the font is SimSun, Chinese font size Sanhao, and bold",
+      "+1: Text below the title on the Statement of Originality and Authorization for Use page: the font is SimSun, Chinese font size Sihao; the first line is indented by two characters; paragraph spacing is set to 1.5 line spacing",
+      "+1: Signature area on the Statement of Originality and Authorization for Use page: the lower part of the page contains “Thesis Author’s Signature:” and “Date::”; the text font is SimSun, Chinese font size Xiaosi; the two items are on the same line; a fillable line appears after each item",
+      "+1: A table of contents page appears on the page immediately after the Statement of Originality and Authorization for Use page",
+      "+1: The title “Table of Contents” appears at the top of the table of contents page: the text is in SimSun, Chinese font size Erhao, not bold, and centered; spacing after the paragraph is 10 points, with 2× line spacing",
+      "+3: Entry text below the title on the table of contents page: first-level headings are in SimHei, Chinese font size Sanhao; second- and third-level headings are both in SimHei, Chinese font size Xiaosi; all entries have no indentation, and the content as a whole is aligned along both the left and right edges",
+      "+1: The abstract page is on a separate page: the thesis title “A Study of Problems in Standardizing Financial Data Management in Small and Micro Enterprises and Paths for Improvement” appears at the top of the abstract page in SimHei, Chinese font size Xiao’er, bold, and centered",
+      "+1: After one blank line below the thesis title on the abstract page, “Abstract:” and the text following it appear; “Abstract:” is in SimHei, Chinese font size Sihao, and bold; the text following “Abstract:” is in SimSun, Chinese font size Xiaosi, with 1.5 line spacing and justified alignment",
+      "+1: Keywords section on the abstract page: “Keywords:” is in SimHei, Chinese font size Sihao, and bold; the content following “Keywords:” is in SimSun, Chinese font size Xiaosi; each term is separated by a full-width semicolon, and the final term has no punctuation",
+      "+1: All first-level headings in the document are in SimHei, Chinese font size Sanhao, and centered, with the outline level set to the first level",
+      "+1: All second-level headings in the document are in SimHei, Chinese font size Sihao, and left-aligned",
+      "+1: All first- and second-level headings in the document use 2× line spacing",
+      "+1: Except for headings and the references page, all other text in the document is in SimSun, Chinese font size Xiaosi; paragraphs have a first-line indent of 2 characters, 1.5 line spacing, and justified alignment",
+      "+3: Every first-level heading and the content beneath it throughout the document must be separated from the preceding content and start on a new page",
+      "+1: Article page numbers: page numbers appear in the footer from the page containing “Introduction” through the final page; the page-number format is “Page 1,” “Page 2,” and so on, increasing consecutively; they are centered",
+      "+1: The references are on a separate page: the title “References” is in SimHei, Chinese font size Sanhao, centered, with 2× line spacing",
+      "+3: The 6 reference entries below the title on the references page are numbered consecutively with no gaps; there is a one-character space between each number and the following text; Chinese-language text uses Chinese font size Wuhao SimSun, while English-language text uses Chinese font size Wuhao SimSun or Chinese font size Wuhao Times New Roman; single line spacing is used",
+      "+3: The acknowledgments page is on a separate page: the title “Acknowledgments” is in SimHei, Chinese font size Sanhao, with 2× line spacing; the text below the title “Acknowledgments” is in SimSun, Chinese font size Xiaosi, with a first-line indent of 2 characters and 1.5 line spacing"
+    ]
+  }
+}

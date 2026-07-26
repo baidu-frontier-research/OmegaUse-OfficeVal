@@ -1,0 +1,15 @@
+{
+  "id": "officeval_010",
+  "instruction": "Modify the flowchart in the document: delete the fourth row, move the text inside the boxes, and make the flowchart editable.",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 228,
+  "task_price_proxy": 31,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_010/技术路线图.docx",
+      "dest": "技术路线图.docx"
+    }
+  ]
+}

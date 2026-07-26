@@ -1,0 +1,40 @@
+{
+  "id": "officeval_044",
+  "instruction": "In the completed PPT, delete the original text from slide 8 and create a table of contents slide (the table of contents only needs to include the main headings of the subsequent sections, i.e., the section headings indicated by the “red box + arrow” in the image). Set the table of contents so that clicking an entry jumps to the specified slide. (For the title “Table of Contents” on the table of contents slide: use SimSun at font size 96 and center it; use FangSong at font size 44 for the text below.)\nPlace the video I sent you on the left side of slide 9 so that it perfectly covers the left image area (12.06 cm × 14.22 cm). Set an effect so that clicking the image brings up the video, which then automatically starts playing immediately.",
+  "rubrics": {
+    "dim1": [
+      "The submitted deliverable is an editable PPT file",
+      "The delivered PPT has no 2 or more consecutive blank slides and no garbled text occupying more than 1/3 of a slide's area"
+    ],
+    "dim2": [
+      "+1: Slide 8 no longer contains text such as “Lesson 6, First Subsection,” “Motivations for Opening New Sea Routes,” “History Lesson Teaching Presentation Design,” or “Lanchuan City Xingshang Middle School · Lin Muchen”",
+      "+1: The title “Table of Contents” appears on slide 8, and its text is accurate, with no extra or missing words or typographical errors; “Table of Contents” uses SimSun at font size 96, is white or nearly white, is located in the upper half of the dark blue area on the left side of the slide, and is centered",
+      "+1: The table of contents entries on slide 8 fully include the three section titles “Part One: Exploration!,” “Part Two: Discussion,” and “Part Three: Assignment”; all use FangSong at font size 44, with consistent font and font size; they are below the “Table of Contents” title, evenly spaced, and centered as a group within the dark blue area of the slide",
+      "+1: All three table of contents entries on slide 8 have click-to-jump functionality rather than being ordinary static text; clicking “Part One: Exploration!” jumps to slide 9; clicking “Part Two: Discussion” jumps to slide 16; clicking “Part Three: Assignment” jumps to slide 21",
+      "+5: A video is inserted on slide 9, and the video object is 12.06 cm wide and 14.22 cm high, with errors in both width and height not exceeding ±0.3 cm; it is located in the left image area of slide 9 and is a PPT media object rather than a static screenshot; the video is set to play when clicked, rather than playing automatically immediately upon transitioning to slide 9",
+      "-3: Slide 8 has not been changed into a table of contents slide",
+      "-1: The table of contents text on slide 8 is a screenshot or image",
+      "-1: The “Table of Contents” title on slide 8 does not use SimSun or is not font size 96, and its position appears on the left or right side of the slide",
+      "-1: The table of contents entries on slide 8 do not use FangSong or their font size is clearly not 44",
+      "-1: Slide 8 is missing any one or more of “Part One: Exploration!,” “Part Two: Discussion,” and “Part Three: Assignment”",
+      "-3: None of the three table of contents entries on slide 8 have click-to-jump functionality",
+      "-1: No video is inserted on slide 9, or only a screenshot of the video is inserted",
+      "-1: The video on slide 9 cannot be played, or the video resource is missing after delivery",
+      "-1: The video on slide 9 obscures the light beige text card on the right, the top navigation bar, or the slide title “Scenario Introduction: A Letter of Commission from the Port”",
+      "-1: Clicking only displays the video but does not make it play automatically, requiring the user to manually click the play button again",
+      "-1: “Scenario Introduction: A Letter of Commission from the Port” on slide 9 is deleted or moved to slide 8 or to main slide content outside slide 9",
+      "-1: Slide 11 has obvious layout issues, such as the title “Motivation One: Commercial Interests and Visions of Gold” extending beyond the slide, images obscuring text, or cards overlapping",
+      "-1: The PPT slide size does not maintain the 16:9 widescreen aspect ratio and has changed to 4:3 or another ratio",
+      "-1: The “Table of Contents” title is similar in color to the dark blue background and also overlaps an image or the table of contents entries",
+      "-1: The table of contents title and all three table of contents entries on slide 8 are editable text boxes and are screenshots, images, or a composite background",
+      "-1: The table of contents jumps do not work in Slide Show mode; clicking jumps to a blank slide, an external webpage, or an incorrect slide",
+      "-1: The video on slide 9 essentially fully covers the left image area, and the left image area has obvious remnants of the old image, white edges, gaps, or unnecessary borders",
+      "-1: The dark blue navigation bar at the top of slide 9 is deleted or moved to the bottom of the slide, and the navigation bar spans the full width across the top of the slide",
+      "-1: The navigation bar text at the top of slide 9, including “Teaching Philosophy and Intent,” “Pre-Instructional Analysis,” “Teaching Process Design,” and “Teaching Evaluation,” is deleted, changes to blue or nearly blue, or changes to a vertical arrangement",
+      "-1: For the slide 9 title “Scenario Introduction: A Letter of Commission from the Port,” the font is changed to SimSun or a similar font, the font size exceeds 26-30, it is bold, and the color is changed to white or a nearly white light-colored font",
+      "-1: The light beige text card on the right side of slide 9 is deleted; the card is located roughly in the right half of the slide, exceeds 11-13 cm in height and 13-15 cm in width, and has a thin light brown border",
+      "-1: Text inside the right-side text card on slide 9, such as “To the Young Navigation Apprentice:,” “The port warehouses are becoming increasingly crowded,” and “Introduction Objective: Activate students' experience through a port setting and pose the core question of this lesson,” is deleted",
+      "-1: The page number “09” in the bottom-right corner of slide 9 is deleted or obscured by the video"
+    ]
+  }
+}

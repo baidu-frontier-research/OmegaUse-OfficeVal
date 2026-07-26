@@ -1,0 +1,15 @@
+{
+  "id": "officeval_096",
+  "instruction": "I want to create a statistical chart like the one shown in the image, but without any connecting lines. The horizontal axis should cover ages 11–20, and the vertical axis should cover 0–200 cm with intervals of 50. Above the chart, create a Height Statistics Table for Ages 11–20 (with data that can be entered directly). I also want the chart below to automatically display data points as soon as data is entered into the table.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable file is in .xlsx or .xlsm format and can be opened normally."
+    ],
+    "dim2": [
+      "+3: A data table titled “Height Statistics Table for Ages 11–20” or an equivalent title is created at the top of the worksheet, and the ages in the table cover 11, 12, 13, 14, 15, 16, 17, 18, 19, and 20. The height statistics table includes a directly editable height/cm data row or column, with a corresponding editable height input cell for each of the 10 ages. An editable Excel chart based on the height statistics table is created below. After the height data corresponding to any age is modified, the corresponding data point in the chart updates automatically.",
+      "+5: The chart’s horizontal-axis arrow indicates age, the scale range covers ages 11–20, and the horizontal-axis labels show 11, 12, 13, 14, 15, 16, 17, 18, 19, and 20, or equivalent consecutive age tick marks. The vertical-axis arrow indicates height/cm, with a minimum value of 0 or close to 0 and a maximum value of 200 cm or close to 200 cm; the major unit of the vertical axis is 50 cm, displaying 0, 50, 100, 150, and 200, or a tick-mark effect close to this interval.",
+      "+5: The chart displays only data points, with no lines connecting them.",
+      "+1: The chart has a title containing text such as “Height,” “Statistical Chart,” or “Growth Record” that explains the purpose of the chart."
+    ]
+  }
+}

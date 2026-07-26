@@ -1,0 +1,19 @@
+{
+  "id": "officeval_030",
+  "instruction": "The “V2 Graduation Project Thesis Formatting Requirements” document contains comments. Reformat the other document according to those comments; then regenerate a compliant table of contents on the table of contents page, with entries that automatically jump to their corresponding locations when clicked; also add page numbers centered at the bottom of the page. No page numbers are needed on any page before or including the table of contents page.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 152,
+  "task_price_proxy": 45,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_030/V2成果说明书_A.docx",
+      "dest": "V2成果说明书_A.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_030/V2毕业设计论文格式要求.docx",
+      "dest": "V2毕业设计论文格式要求.docx"
+    }
+  ]
+}

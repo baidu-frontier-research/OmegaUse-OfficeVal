@@ -1,0 +1,15 @@
+{
+  "id": "officeval_090",
+  "instruction": "Extract the total weight sums and concrete volume data from all individual worksheets into the Summary worksheet.",
+  "operation_intent": "Extract",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 30,
+  "task_price_proxy": 200,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_090/子表数据提取到汇总表.xlsx",
+      "dest": "子表数据提取到汇总表.xlsx"
+    }
+  ]
+}

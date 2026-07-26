@@ -1,0 +1,19 @@
+{
+  "id": "officeval_068",
+  "instruction": "I need the two files merged and then modified. Delete slides 13, 16, and 18 from the “Integrated Dispatch Console System Operation Introduction” ppt, as they are no longer needed. Then place the remaining slides from the “Integrated Dispatch Console System Operation Introduction” ppt after page 8 of the second PDF. Finally, provide me with a completed PPT file. Use a consistent light-blue color scheme and layout throughout the PPT, and make everything editable.",
+  "operation_intent": "Restructure",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 125,
+  "task_price_proxy": 40,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_068/应急有线人工通信保障网专题汇报.pdf",
+      "dest": "应急有线人工通信保障网专题汇报.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_068/综合调度坐席系统操作介绍.pptx",
+      "dest": "综合调度坐席系统操作介绍.pptx"
+    }
+  ]
+}

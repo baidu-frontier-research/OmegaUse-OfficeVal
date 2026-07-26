@@ -1,0 +1,22 @@
+{
+  "id": "officeval_009",
+  "instruction": "I need the tables revised: when a long table continues onto the next page, its header row must also be repeated on that page. For a table that spans pages, add the three-character text “Continued on next page” at the bottom of the table on the preceding page, positioned as shown in the image.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and opens successfully."
+    ],
+    "dim2": [
+      "+3: A table that spans pages has the text “Continued on next page” on the lower-right side of the page at the bottom of the table.",
+      "+5: All instances of “Continued on next page” in the document are located on the lower-right side of the page, near the bottom of the table and close to the table's right border and bottom border.",
+      "+1: The font color of “Continued on next page” is black, with no other styling.",
+      "+5: The table on each page has three parallel borders: the top and bottom borders are 1.5 pt, and the inner border is 0.75 pt.",
+      "+5: For the table header above “Continued on next page” and the table header below it, the content and the font and font-size formatting of the Chinese text and English numerals are consistent.",
+      "-5: The deliverable contains images.",
+      "-3: In the bold table title above the table, the numeral portion uses the SimSun font.",
+      "-1: Table 5 is not a 9-row by 5-column table.",
+      "-1: In “3.3 Stratified Comparisons and Model Calibration,” the Chinese text is not in size 4 Heiti, does not use 1.3× line spacing, and is not left-aligned.",
+      "-1: The line one blank line below Table 1 does not contain “Note: Categorical variables are presented as n (%), while continuous variables are presented as Mean±SD or M (Q1, Q3) according to their distribution characteristics; the statistic is the χ², t, or Z value.”",
+      "-3: Table 2 has fewer than 40 rows overall."
+    ]
+  }
+}

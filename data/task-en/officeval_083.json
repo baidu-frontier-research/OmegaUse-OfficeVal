@@ -1,0 +1,19 @@
+{
+  "id": "officeval_083",
+  "instruction": "Create a trend chart similar to the one shown in the image, using the data in the spreadsheet. Make it editable, not an image.",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 98,
+  "task_price_proxy": 145,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_083/image (5).png",
+      "dest": "image (5).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_083/出货量对比.xlsx",
+      "dest": "出货量对比.xlsx"
+    }
+  ]
+}

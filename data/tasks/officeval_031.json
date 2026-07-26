@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/031/三年级（下）语文_第四单元达标测试卷.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_031/三年级（下）语文_第四单元达标测试卷.pdf",
       "dest": "三年级（下）语文_第四单元达标测试卷.pdf"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/031/拼音乐园闯关测.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_031/拼音乐园闯关测.docx",
       "dest": "拼音乐园闯关测.docx"
     }
   ]

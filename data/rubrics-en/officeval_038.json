@@ -1,0 +1,25 @@
+{
+  "id": "officeval_038",
+  "instruction": "Please convert the PDF document into an editable Word file, then enter the answers from the last few pages in the parentheses after each question according to the question numbers, while leaving the original font formatting unchanged.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and can be opened normally."
+    ],
+    "dim2": [
+      "+5: Entire Word document: The document fully preserves the content structure of approximately 96 pages, including the title “Comprehensive Review Questions for Multi-Role Personnel,” the section headings “I. Multiple-Choice Questions” and “II. True/False Questions,” 510 multiple-choice questions, 508 true/false questions, and the answer pages for the multiple-choice and true/false questions.",
+      "+5: Entire Word document body objects: On pages 1–96, the question numbers, question text, A–D options, multiple-choice answer letters, true/false answer symbols, and the “Tusi Academy” headers and watermarks can all be directly selected, copied, and edited; full-page content must not be converted into images.",
+      "+3: Page 1 title and section headings: The text “Comprehensive Review Questions for Multi-Role Personnel” retains its original font formatting: SimSun or another similar font, 23–24 pt, not bold, centered, and with one blank line below the title; “I. Multiple-Choice Questions” and “II. True/False Questions” retain left alignment, use SimSun or another similar font at 15–17 pt, and have 0.5 lines of spacing before and 0.5 lines of spacing after.",
+      "+3: The text “Tusi Academy” must appear at the top of every page, formatted as follows: SimSun or another similar font, size 10–11 on the Chinese font-size scale, left-aligned, and in a light gray font color.",
+      "+3: The “Tusi Academy” watermark text in the page background is formatted as follows: a dark gray or black semi-transparent watermark, in a diagonal layout, at 70–74 pt, using SimSun or another similar font.",
+      "+3: Corresponding body text formatting: SimSun or another similar font, left-aligned, 13–14 pt, with single line spacing.",
+      "+5: Completeness of answers to multiple-choice questions 1–510: The parentheses at the end of all 510 multiple-choice questions each contain one answer letter; the parentheses must not be blank or contain two or more letters, “√,” “×,” or any other irrelevant character.",
+      "+5: Location of multiple-choice answers: The answer to each multiple-choice question is entered inside the original full-width parentheses at the end of the question text and displayed as “（A）,” “（B）,” “（C）,” or “（D）”; the answer letter and both parentheses are within the same question paragraph.",
+      "+3: Text formatting of multiple-choice answers: The answer letters A, B, C, and D use the formatting of the corresponding body text: SimSun or another similar font, left-aligned, 13–14 pt, with single line spacing; they are not bold or italicized and have no underline, highlighting, or special color.",
+      "+5: Answers to multiple-choice questions 1–510: The letters in parentheses correspond to the letters following the question numbers in the answer table on pages 92–94, with question 1 shown as “（A）,” question 2 as “（D）,” question 3 as “（C）,” question 4 as “（B）,” question 50 as “（D）,” and question 100 as “（B）.”",
+      "+5: Completeness of answers to true/false questions 1–508: The parentheses at the end of all 508 true/false questions each contain one “√” or “×”; they must not be blank or contain “True,” “False,” “Correct,” “Incorrect,” “T,” “F,” or any letter from A–D.",
+      "+5: Location of true/false answers: The answer to each true/false question is entered inside the original full-width parentheses at the end of the question text and displayed as “（√）” or “（×）”; the answer symbol must not appear before the question number, on the line below the question, or outside the parentheses.",
+      "+3: Text formatting of true/false answers: “√” and “×” use the formatting of the corresponding body text: SimSun or another similar font, left-aligned, 13–14 pt, with single line spacing; no red color, bold, highlighting, underline, or comment is added.",
+      "+5: Answers to true/false questions 1–508: The “√” or “×” in parentheses corresponds to the “√” or “×” following the question number in the answer table. Questions 1–3 are “√,” questions 4–5 are “×,” questions 51–53 are “√,” questions 54–55 are “×,” questions 96–98 are “√,” questions 99–100 are “×,” questions 401–403 are “√,” questions 404–405 are “×,” questions 496–498 are “√,” questions 499–500 are “×,” questions 501–503 are “√,” questions 504–505 are “×,” and questions 506–508 are “√.”"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "officeval_034",
+  "instruction": "Format the document. For the formatting of the individual clauses, follow the layout shown in the images: use two columns, with Chinese and English separated. For the rest of the document, place each Chinese line followed by its English line. Lay out the contract clauses appropriately; multiple clauses may appear on the same page, but no single clause may span two pages. Add page numbers, centered horizontally and vertically within the footer.",
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 188,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_034/bilingual_service_contract_title_no_period.pdf",
+      "dest": "bilingual_service_contract_title_no_period.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_034/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_034/image_002.png",
+      "dest": "image_002.png"
+    }
+  ]
+}

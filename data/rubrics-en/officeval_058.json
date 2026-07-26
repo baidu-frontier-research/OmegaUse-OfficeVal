@@ -1,0 +1,28 @@
+{
+  "id": "officeval_058",
+  "instruction": "Please add small labels to the table-of-contents slide, following the style shown in the image I sent you. In the blank space below each subheading, place three labels arranged from left to right, equally spaced and identical in size (use MiSans, font size 10.5; dark green background with white text). The specific label text is as follows:\nCultural Communication: Confucian Ethics, Narrative Logic, Cultural Discount\nIndustrialization System: Visual Effects Capabilities, Promotion and Distribution Challenges, Industry Chain Gaps\nGlobal Competition: Hollywood, Korean Cinema, Distribution Network\nCognitive Bias: Preconceived Position, Misunderstanding and Misreading, Subject Matter Restrictions",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .ppt or .pptx format and must open, be editable, and play normally.",
+      "The PPT must remain at 8 slides. On Slide 2, add 12 editable rounded labels, while keeping the other slides and all existing content intact.",
+      "The label text and background shapes must be separately selectable and editable; screenshots or full-slide images must not be used to cover the table-of-contents slide.",
+      "Slide 2 must have no serious issues such as overlapping labels, cropped text, objects extending beyond the slide, or labels obscuring existing table-of-contents content.",
+      "If the file cannot be opened, the slide count is incorrect, the table-of-contents slide is entirely uneditable, or the layout is severely disorganized, the score for Dimension 1 is 0."
+    ],
+    "dim2": [
+      "+3: On Slide 2, below the “Cultural Communication” table-of-contents item, the 1st label from the left must read “Confucian Ethics.” The 2nd label must read “Narrative Logic.” The 3rd label must read “Cultural Discount.”",
+      "+3: On Slide 2, below the “Industrial System” table-of-contents item, the 1st label from the left must read “Visual Effects Capabilities.” The 2nd label must read “Promotion and Distribution Challenges.” The 3rd label must read “Industry Chain Gaps.”",
+      "+3: On Slide 2, below the “Global Competition” table-of-contents item, the 1st label from the left must read “Hollywood.” The 2nd label must read “Korean Cinema.” The 3rd label must read “Distribution Network.”",
+      "+3: On Slide 2, below the “Cognitive Bias” table-of-contents item, the 1st label from the left must read “Preconceived Position.” The 2nd label must read “Misunderstanding and Misreading.” The 3rd label must read “Subject Matter Restrictions.”",
+      "+3: Overall label positions on Slide 2: The four groups of labels must each be located in the blank area below the corresponding table-of-contents item text and must not enter the image area on the right or the slide-number area at the bottom. Exactly 3 labels must be placed below each table-of-contents item, with labels in each group arranged from left to right.",
+      "+3: On Slide 2, dimensions of all 12 labels: Each label must be approximately 1.8 to 2.5 cm wide and approximately 0.55 to 0.85 cm high. Label sizes must be consistent within and across groups, with width and height variations not exceeding 0.1 cm. Horizontal spacing must be equal; the recommended spacing is 0.25 to 0.45 cm, and the difference between any two gaps must not exceed 0.1 cm.",
+      "+3: Text in all labels on Slide 2: Use MiSans consistently, with a uniform font size of 10.5 pt. Center the text horizontally and vertically.",
+      "+3: All label shapes on Slide 2: Use capsule shapes or rectangles with highly rounded corners, with no visibly sharp corners. The border must have no outline or must match the fill color. Use a dark green fill and white text, with consistent colors across all 12 labels.",
+      "-5: The labels are created as a single uneditable image, or a screenshot is used to cover the table-of-contents slide.",
+      "-3: Any three or more labels differ in size by more than 0.2 cm.",
+      "-3: Any two or more labels obscure table-of-contents headings, table-of-contents explanatory text, the image on the right, divider lines, or slide numbers.",
+      "-3: The text in any three or more labels is cropped, wrapped, overlapping, or extends beyond the shape boundaries.",
+      "-3: The PPT does not contain 8 slides."
+    ]
+  }
+}

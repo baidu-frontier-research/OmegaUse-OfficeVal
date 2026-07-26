@@ -1,0 +1,15 @@
+{
+  "id": "officeval_077",
+  "instruction": "I only need one PPT slide modified: only the first slide needs to be modified, and the following three slides are reference materials for modifying the first slide.\n1. Fixed content: Keep the three columns under “Intellectual Trajectory” on the first slide visible throughout; do not hide any of them with animations.\nThe images on the first slide and the “Respective Views” content below the images should be hidden using animations.\n\n Step-by-step animation sequence\n 1. Locke:\n- Click 1: Fade in Locke’s “Respective Views” content.\n2. Montesquieu:\n- Click 1: On the current slide, fade in Montesquieu’s portrait + quotation materials (do not navigate to another slide, and keep the background clean without displaying the original table content).\n- Click 2: Fade out the materials.\n- Click 3: Fade in Montesquieu’s “Respective Views” content.\n3. Voltaire:\n- Click 1: On the current slide, fade in Voltaire’s portrait + quotation materials (do not navigate to another slide, and keep the background clean without displaying the original table content).\n- Click 2: Fade out the materials.\n- Click 3: Fade in Voltaire’s “Respective Views” content.\n4. Rousseau:\nSame as the previous two.\n5. Hume:\n- Click 1: Fade in Hume’s “Respective Views” content.\n6. Adam Smith:\n- Click 1: Fade in Adam Smith’s “Respective Views” content.\n7. Kant:\n- Click 1: On the current slide, fade in Kant’s portrait + quotation materials (do not navigate to another slide).\n- Click 2: Fade out the materials.\n- Click 3: Fade in Kant’s “Respective Views” content.\n In other words, 2 (Montesquieu), 3 (Voltaire), 4 (Rousseau), and 7 (Kant) need to display materials; the others do not.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 151,
+  "task_price_proxy": 80,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_077/启蒙运动思想解放.pptx",
+      "dest": "启蒙运动思想解放.pptx"
+    }
+  ]
+}

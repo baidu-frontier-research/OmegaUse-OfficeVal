@@ -1,0 +1,19 @@
+{
+  "id": "officeval_015",
+  "instruction": "Please adjust the answer sheet according to the examination questions and produce a corresponding editable Word version of the answer sheet that matches the examination content.",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 92,
+  "task_price_proxy": 60,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_015/九年级答题卡 (1) (3).docx",
+      "dest": "九年级答题卡 (1) (3).docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_015/初中语文跨年级综合质量检测.docx",
+      "dest": "初中语文跨年级综合质量检测.docx"
+    }
+  ]
+}

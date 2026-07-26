@@ -1,0 +1,15 @@
+{
+  "id": "officeval_056",
+  "instruction": "Recreate this flowchart in a PPT using text boxes and arrow shapes. The completed flowchart must be fully editable, not an image; make it the same size as the image and center it.",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 230,
+  "task_price_proxy": 35,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_056/客户投诉闭环处理流程 (2).png",
+      "dest": "客户投诉闭环处理流程 (2).png"
+    }
+  ]
+}

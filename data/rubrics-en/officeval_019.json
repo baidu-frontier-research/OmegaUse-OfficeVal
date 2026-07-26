@@ -1,0 +1,26 @@
+{
+  "id": "officeval_019",
+  "instruction": "Add a cover page to the exam paper (refer to the images for the specific layout); center the main title in the exam paper and set it in SimHei, Size No. 3. Set Chinese body text in SimSun, Small No. 4, and English text and Arabic numerals in Times New Roman, Small No. 4. Also add page numbers to the exam paper in the format “Chemistry Exam Paper Page x of x”; no page number is required on the cover page. Modify all other formatting according to the template document.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is a Microsoft Word file in .docx format that opens successfully.",
+      "The delivered document contains 7-10 pages."
+    ],
+    "dim2": [
+      "+3: The exam paper uses A4 paper, with the margins set to 2.5 centimeters at the top, 2.5 centimeters at the bottom, 2.5 centimeters on the left, and 2.5 centimeters on the right.",
+      "+1: Page 1 is the cover page, and the two headings “Instructions” and “Part I Multiple-Choice Questions” appear on page 2.",
+      "+3: Every page except the cover page has a page number in the footer, in a format such as “Chemistry Exam Paper Page 1 of 5,” and it is centered.",
+      "+3: The middle of the cover page contains the vertical title “Junior High School Chemistry Mock Examination,” with “Junior/High/School/Chemistry/Mock/Examination” arranged from top to bottom, each segment on a separate line.",
+      "+3: The vertical cover title “Junior High School Chemistry Mock Examination” is set in either non-bold SimHei or bold SimSun, with a font size ranging from Size No. 2 to Small No. 3; it is located within the top two-thirds of the page and horizontally centered.",
+      "+3: The lower half of the cover page contains the following four text labels in order: “Submitting Organization:”, “Subject:”, “Question Writer:”, and “Question Writer’s Contact Number:”. Each label is on a separate line, forming four fields.",
+      "+3: On the cover page, each of the four text labels “Submitting Organization:”, “Subject:”, “Question Writer:”, and “Question Writer’s Contact Number:” has a horizontal line to its right, separated from the label by 1-4 spaces. Each line is a black or dark-colored thin solid line, approximately 5-8 centimeters long, and the right ends of all four lines are aligned.",
+      "+3: For all text on the cover page other than the title, Chinese text is set in SimSun, Small No. 4, while English text and Arabic numerals are set in Times New Roman, Small No. 4.",
+      "+1: The title “Junior High School Chemistry Mock Examination” appears on page 2 and is set in non-bold SimHei, Size No. 3.",
+      "+1: The title “Junior High School Chemistry Mock Examination” on page 2 is centered and uses 1.5 line spacing.",
+      "+5: From page 2 through the final page, all text other than the title uses SimSun, Small No. 4, consistently for Chinese text; this applies to question stems, instructions, text in the score table, question directions, and subjective-question text. English text and numerals are set in Times New Roman, Small No. 4.",
+      "+3: From page 2 through the final page, all headings other than the main title “Junior High School Chemistry Mock Examination” are set in non-bold SimHei, Small No. 3.",
+      "-3: The horizontal lines below the solution process meet any one of the following conditions: the total number of lines is not 6; their lengths are not between 15-17 centimeters; the lines are not all the same length.",
+      "-5: A page in the exam paper contains blank space greater than or equal to 1/3 of the page."
+    ]
+  }
+}

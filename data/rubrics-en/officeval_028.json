@@ -1,0 +1,16 @@
+{
+  "id": "officeval_028",
+  "instruction": "The tables in the document are missing borders, and some tables are also missing headings. Requirements:\n1. Add all missing borders to every table in the document.\n2. Align the text in vertically adjacent cells of the table shown in the image.\n3. At the locations circled in red in the image, add, from left to right in order, “Start Time,” “Professional and Technical Personnel Category,” “Guidance Content,” and “Guidance Status,” with one heading per cell and each heading corresponding to its specific content.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .docx format and can be opened, edited, saved, and printed normally."
+    ],
+    "dim2": [
+      "+3: For the 1st through 20th tables in the document, all four outer border lines—top, bottom, left, and right—are displayed continuously. For the internal horizontal lines of the 1st through 20th tables in the document, there is a continuous border between every pair of vertically adjacent cells. For the internal vertical lines of the 1st through 20th tables in the document, there is a continuous border between every pair of horizontally adjacent cells. The line style is uniformly a single solid line, without mixing dashed, dotted, or double lines. Use black or dark gray lines with a uniform, clearly visible line width, recommended to be approximately 0.5 to 1 pt.",
+      "+3: The table on page 5 has a total of ten rows. Add the text “Start Time,” “Professional and Technical Personnel Category,” “Guidance Content,” and “Guidance Status” to the second, third, fourth, and fifth cells of the sixth row, respectively, using SimSun at Chinese font size No. 5. Center the text horizontally and vertically within each cell, with all text fully visible and not overlapping the borders.",
+      "+5: In the table on page 5, the second column width is 1.64cm throughout, the third column width is 3.18cm throughout, the fourth column width is 7.94cm throughout, and the fifth-cell column width is 2.22cm throughout.",
+      "-5: The tables in the document are converted to images or covered with screenshots, making the content uneditable.",
+      "-3: The document is not 25 pages long, or it contains unrelated blank pages, comments, revision marks, or temporary explanatory text."
+    ]
+  }
+}

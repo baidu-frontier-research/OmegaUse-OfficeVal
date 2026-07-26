@@ -1,0 +1,19 @@
+{
+  "id": "officeval_031",
+  "instruction": "Place the test questions from the PDF into the provided Word template, matching the question formatting in the Word document.",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 255,
+  "task_price_proxy": 45,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_031/三年级（下）语文_第四单元达标测试卷.pdf",
+      "dest": "三年级（下）语文_第四单元达标测试卷.pdf"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_031/拼音乐园闯关测.docx",
+      "dest": "拼音乐园闯关测.docx"
+    }
+  ]
+}

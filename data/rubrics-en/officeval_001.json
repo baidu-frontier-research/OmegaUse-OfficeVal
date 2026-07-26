@@ -1,0 +1,27 @@
+{
+  "id": "officeval_001",
+  "instruction": "Modify the provided Word documents according to the following requirements:\n1. Delete the content under \"Lesson Learning Objectives\" and \"Lesson Assessment Tasks\" (but keep the headings).\n2. Delete all content in the three sections \"Analysis of Lesson Learning Content,\" \"Students' Actual Proficiency Level for the Lesson,\" and \"Explanation of Activity Intent\" (including the headings), as well as all images, and move the table upward.\n3. Delete the parenthetical content after each stage (indicating which objective it aligns with).\n4. Add the title \"III. Learning Process Design\" to the table on the second page; renumber \"Board Plan\" as IV and \"Teaching Reflection\" as V.\n5. Condense all content into a two-page document. Keep the text and images unchanged, and adjust only the font size, line spacing, and spacing between images and text.",
+  "rubrics": {
+    "dim1": [
+      "The delivered files are in Word format, have the .doc extension, and can be opened normally.",
+      "The delivered Word files retain the main structure of the Lesson Learning Plan, and content related to Lesson Topic, Lesson Type, Learning Process Design, Board Plan, and Teaching Reflection can be found."
+    ],
+    "dim2": [
+      "+1: The lesson learning plan contains the \"Lesson Learning Objectives\" heading, with no content under the heading. (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: The lesson learning plan contains the \"Lesson Assessment Tasks\" heading, with no content under the heading. (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: The lesson learning plan does not contain the \"Analysis of Lesson Learning Content\" heading. (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: The lesson learning plan does not contain the \"Students' Actual Proficiency Level for the Lesson\" heading. (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: The lesson learning plan does not contain the \"Explanation of Activity Intent\" heading. (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+3: The lesson learning plan contains no images. (Add 3 points if any one of the eight files meets this criterion, 6 points if two files meet it, and so on.)",
+      "+1: In the lesson learning plan, the \"Learning Process Design\" heading is numbered \"III\". (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: In the lesson learning plan, the \"Board Plan\" heading is numbered \"IV\". (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: The \"Teaching Reflection\" heading is numbered \"V\". (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: In the lesson learning plan, \"Stage 1\" is not followed by \"(Aligned with Objective 1)\". (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: In the lesson learning plan, \"Stage 2\" is not followed by \"(Aligned with Objective 2)\". (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+1: In the lesson learning plan, \"Stage 3\" is not followed by \"(Aligned with Objective 3)\". (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "+5: The lesson learning plan is two pages long. (Add 5 points if any one of the eight files meets this criterion, 10 points if two files meet it, and so on.)",
+      "+5: The table in the lesson learning plan has no discontinuities. (Add 5 points if any one of the eight files meets this criterion, 10 points if two files meet it, and so on.)",
+      "-5: The overall column width of the table is not 17.00-17.30 centimeters. (Deduct 5 points if any one of the eight files meets this criterion, 10 points if two files meet it, and so on.)"
+    ]
+  }
+}

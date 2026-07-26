@@ -1,0 +1,15 @@
+{
+  "id": "officeval_074",
+  "instruction": "Translate all Chinese text in this PowerPoint into English. Do not disrupt the layout or change the image backgrounds.",
+  "operation_intent": "Other",
+  "domain": "Business Operations",
+  "human_labor_time": 237,
+  "task_price_proxy": 95,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_074/农业县低空经济发展方案.pptx",
+      "dest": "农业县低空经济发展方案.pptx"
+    }
+  ]
+}

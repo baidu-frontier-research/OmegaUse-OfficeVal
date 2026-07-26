@@ -23,6 +23,21 @@ subprocess, and writes machine-readable JSON and CSV reports.
 - A serialized Office COM channel on Windows for verifiers `001`, `008`,
   `019`, `022`, `023`, `030`, `039`, `074`, and `081`.
 
+## Dataset Metadata
+
+Task metadata and evaluation rubrics are available under [`data/`](data/) in
+both the original Chinese and English:
+
+- `data/tasks/` and `data/rubrics/` contain the original Chinese records.
+- `data/task-en/` and `data/rubrics-en/` contain the corresponding English
+  translations.
+
+All four directories cover `officeval_001` through `officeval_100`. The input
+artifacts referenced by the task JSON files are hosted in the
+[`task_files/`](https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/tree/main/task_files)
+directory of the OmegaUse-OfficeVal dataset on Hugging Face. See the
+[`data` documentation](data/README.md) for the schemas and download URL format.
+
 
 ## Requirements
 

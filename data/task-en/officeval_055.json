@@ -1,0 +1,15 @@
+{
+  "id": "officeval_055",
+  "instruction": "Turn this image into an editable PPT, not an image.\nAlso make the following adjustments:\n1. Replace the word “assessment” in the second section of the image with “check”.\n2. Replace the content in the “finish” section of the image with The site was back up and stable within 10 minutes, order submissions resumed, and a post-incident review has been scheduled for 4:00 PM this afternoon.",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 188,
+  "task_price_proxy": 45,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_055/website_outage_editable_flow .png",
+      "dest": "website_outage_editable_flow .png"
+    }
+  ]
+}

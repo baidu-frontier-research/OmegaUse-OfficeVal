@@ -1,0 +1,15 @@
+{
+  "id": "officeval_033",
+  "instruction": "Replace every retail price value in the document with the value obtained by multiplying it by 1.1, keep all other formatting unchanged, and output an editable Word document with the replacements completed.",
+  "operation_intent": "Compute",
+  "domain": "Business Operations",
+  "human_labor_time": 307,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_033/家居零售价目册.docx",
+      "dest": "家居零售价目册.docx"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "officeval_084",
+  "instruction": "Could you create a macro button?\nIn the first workbook, create a macro button so that clicking the “Print Credit Slip” button outlined by the red box in the image directly selects the designated area (an area similar to the one shown in the image) in the third Transfer Credit Slip workbook and opens Print Preview.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .xlsm or .xlsx format and can be opened normally.",
+      "The delivered file retains the first data worksheet and the “Transfer Credit Slip” worksheet."
+    ],
+    "dim2": [
+      "+5: Current-row identification logic on the “Check Details” data worksheet: Before clicking the “Print Credit Slip” button, the user selects the row containing any business record in the data table. The macro can identify the corresponding paying organization, account number, amount, date, and other data from that row and use them for display in or printing of the “Transfer Credit Slip” table area.",
+      "+3: Selected-row prompt behavior on the “Check Details” data worksheet: When the button is clicked, if the active cell is not within a valid data row, the macro can display a prompt or stop execution. The prompt contains “Please select a data row,” “Please select the record to print,” or similar wording; it must not directly print a blank slip.",
+      "+5: Selected slip area in the “Transfer Credit Slip” table: After the macro runs, it automatically selects the slip area in the Transfer Credit Slip worksheet. The selected area covers the date at the top; the paying organization, account number, account-opening bank, amount in words, payment acceptance status, fee type, verification type, and corresponding sequence number on the left; and the amount in figures. These correspond to F1:I1, B2：H2, B3:H3, B4:H4, B5:H6, B7, B8:G8, B9:G9, W2, and N6:T6 in the “Transfer Credit Slip” table, with the source being columns A:I of the “Check Details” worksheet. The content on the right, including the “Payee Organization” in the middle section, payee account number, bank name, and purpose description, remains unchanged.",
+      "+5: Print area setting for the “Transfer Credit Slip” table: After the macro runs, it sets the print area to the slip area. The print area is B1:W9 or a cell range covering the complete slip frame; it must not print only a partial amount area, a blank area, or a large blank portion of the entire worksheet.",
+      "-5: The first data worksheet does not contain a clickable “Print Credit Slip” button or control.",
+      "-5: The workbook does not contain a worksheet whose name includes “Transfer Credit Slip.”",
+      "-1: Any two of the following color categories are missing from the Transfer Credit Slip area: the light-yellow area on the left, the dark-green area at the upper right, and the light-blue area at the bottom.",
+      "-1: Transfer Credit Slip verification text: Text such as “Public Lighting Maintenance Fee” and “Slip Verification” in the lower-left area of the slip has been deleted or moved to the top of the slip.",
+      "-1: In the “Check Details” workbook, the width of the “Settlement Account” column exceeds 30 characters or is less than 10 characters."
+    ]
+  }
+}

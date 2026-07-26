@@ -1,0 +1,15 @@
+{
+  "id": "officeval_099",
+  "instruction": "Create a 2-D pie chart for each question in the spreadsheet from Question 4 through the last question, and insert each chart to the right of its corresponding question.",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 96,
+  "task_price_proxy": 10,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_099/调查结果.xlsx",
+      "dest": "调查结果.xlsx"
+    }
+  ]
+}

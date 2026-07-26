@@ -1,0 +1,17 @@
+{
+  "id": "officeval_068",
+  "instruction": "I need the two files merged and then modified. Delete slides 13, 16, and 18 from the “Integrated Dispatch Console System Operation Introduction” ppt, as they are no longer needed. Then place the remaining slides from the “Integrated Dispatch Console System Operation Introduction” ppt after page 8 of the second PDF. Finally, provide me with a completed PPT file. Use a consistent light-blue color scheme and layout throughout the PPT, and make everything editable.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .ppt or .pptx format and can be opened, edited, and presented normally.",
+      "The final PPT contains 25 slides in total."
+    ],
+    "dim2": [
+      "+5: Final file format and slide count: Deliver a .ppt or .pptx file containing 25 slides in total. Slides 1 through 8, in order, are Cover, Table of Contents, Network Positioning and Composition, Typical Support Scenarios, Core Capability Value (I), Core Capability Value (II), Station System and Collaboration Architecture, and Typical Equipment Composition; slides 9 through 20 correspond in order to “Yunlan Dispatch Console Platform,” “Content Structure,” “System Overview: Four-Layer Collaboration of the Dispatch Console,” “Login: Enter the Duty Environment,” “Main Interface: Put Frequently Used Operations on One Screen,” “Focus Rules: Confirm ‘Operation’ First, Then Confirm ‘Voice’,” “Work Order Window: Record First, Then Execute the Call Action,” “Line Status: Use a Visual Panel to Reduce Misoperations,” “Connection Process: From an Incoming Call to Three-Party Communication,” “Transfer and Cross-Operation: Voice Does Not Necessarily Follow the Window,” “Merge and Split: Handle Complex Call Relationships,” and “Directory Lookup: Find the Correct Contact with Less Input”; slides 21 through 23 correspond in order to “Instant Conference: Ad Hoc Collaboration Without Cluttering the Conference List,” “Console Interconnection: For Rapid Communication Within the Team,” and “Main Menu: Reorganized by Business Action.” Slides 24 and 25 correspond in order to “Operating Process and Management Essentials” and “Thank You for Listening.”",
+      "+5: Text on PDF-converted slides: All titles, body text, numbering, and explanatory text on slides 1 through 8 and slides 24 and 25 are editable text boxes. Process boxes, arrows, circles, icons, divider lines, and schematic structures are all editable shapes or editable grouped objects. The text, tables, shapes, process objects, and icons on final slides 9 through 23 remain editable.",
+      "+5: All 25 slides consistently use a light-blue or light-blue gradient background, with no dark black, dark red, or highly saturated backgrounds that clash with the overall style. Titles consistently use dark-blue or teal text, with consistent font, font size, bold formatting, and left alignment. Chinese and English fonts, font sizes, line spacing, and bullet styles in the body text are consistent, and the body text is clear and readable. White, pale-blue, or teal rounded rectangles are used, with consistent border color, line width, and corner radius.",
+      "+5: Page numbers on all 25 slides: Display 1 through 25 consecutively according to the final merged order.",
+      "-3: Text, tables, graphics, or images overlap or extend beyond the slide in any three or more places."
+    ]
+  }
+}

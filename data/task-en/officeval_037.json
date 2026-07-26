@@ -1,0 +1,19 @@
+{
+  "id": "officeval_037",
+  "instruction": "Convert the PDF document to Word format and adjust the formatting of the “Lanqiao City Grade 12 English Exam” document to match the formatting of the “Week 2 Test_Grade 12 English Exam” document.",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 178,
+  "task_price_proxy": 38,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_037/周测二_高三英语试题.docx",
+      "dest": "周测二_高三英语试题.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_037/澜桥市高三英语试题.pdf",
+      "dest": "澜桥市高三英语试题.pdf"
+    }
+  ]
+}

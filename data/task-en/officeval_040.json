@@ -1,0 +1,19 @@
+{
+  "id": "officeval_040",
+  "instruction": "1. Format the document title as follows: LiSu, size No. 2, bold, blue, Glow (Olive Green, 7 pt glow, Accent 3), Shadow (Offset: Top), center alignment, and 20 pt spacing after the paragraph.\n2. Format the body text in KaiTi, size Small No. 4, with a first-line indent of 2 characters, 6 pt spacing after each paragraph, and 1.1 line spacing.\n3. Apply a drop cap to “The Majors Offered Are as Follows” in the third paragraph: position it In margin, set it to drop 2 lines, and set the distance from text to 0.3 cm.\n4. Replace “Department of Intelligent Engineering” with “Department of Intelligent Software Engineering,” and format it in SimSun, size No. 4, bold italic, green, with emphasis marks.\n5. Use the image as the watermark background of the introduction document, apply “Washout,” and set the scale to 100%.",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 190,
+  "task_price_proxy": 23,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_040/Image.png",
+      "dest": "Image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_040/简介素材.docx",
+      "dest": "简介素材.docx"
+    }
+  ]
+}

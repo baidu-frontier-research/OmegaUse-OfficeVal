@@ -1,0 +1,19 @@
+{
+  "id": "officeval_100",
+  "instruction": "Create a stacked column chart, using the provided image as a reference, to compare the registered quantities for the General Administration Section and Service Section, including their total, against the actual verified quantities. Make the chart editable.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .xlsx or .xlsm format and open normally."
+    ],
+    "dim2": [
+      "+3: Chart object: Add 1 editable chart. The chart type must be a 2-D stacked bar chart or 2-D stacked column chart, used to compare the \"registered quantities for the General Administration Section + Service Section + total\" with the \"actual verified quantities.\" The chart must cover 5 resource categories: \"Portable Learning Terminals,\" \"Smart Display Devices,\" \"Network Access Devices,\" \"Multifunction Printing Devices,\" and \"Mobile Data Collection Devices.\" The corresponding data must come from the registered quantities and verified quantities in rows 3-17 of the original table.",
+      "+5: The stacked column for the Service Section and General Administration Section and the column for the verified quantities are adjacent, with a distance of 0-0.1 cm between the two columns.",
+      "+3: Chart category axis: The horizontal axis must display the 5 resource categories \"Portable Learning Terminals,\" \"Smart Display Devices,\" \"Network Access Devices,\" \"Multifunction Printing Devices,\" and \"Mobile Data Collection Devices\" in this order. The text must be displayed horizontally below the column groups and must not be slanted. The vertical axis must display the numbers 0, 5, 10, 15, 20, 25, 30, 35, and 40 in order, with the vertical-axis unit label \"Quantity (units)\" to the left of the numbers.",
+      "+1: Chart title: The chart title must include key information such as \"Comparison of Fixed Asset Registration Quantities (General Administration Section + Service Section) and Verified Quantities\" and clearly convey the comparison between registered quantities and verified quantities.",
+      "+1: Chart legend: The legend must include the 3 series names \"General Administration Section,\" \"Service Section,\" and \"Verified Quantity.\" The legend entries and colors must correspond one-to-one with the chart series.",
+      "+3: Chart colors: The General Administration Section series must use blue or an approximately blue color, the Service Section series must use green or an approximately green color, and the Verified Quantity series must use orange or an approximately orange color. The colors of the three series must be readily distinguishable from one another.",
+      "+5: Labels inside the chart stacks: The column segments for the two stacked series, General Administration Section and Service Section, must display their respective value labels internally. Across the 5 resource categories, the General Administration Section data 6/22/18/12/5 and the Service Section data 9/8/6/3/2 must be identifiable.",
+      "+5: Total labels at the tops of chart columns: The top of each stacked column must display the total registered quantity labels 15, 30, 24, 15, and 7; the tops of the verified quantity columns must display 13, 27, 22, 14, and 6."
+    ]
+  }
+}

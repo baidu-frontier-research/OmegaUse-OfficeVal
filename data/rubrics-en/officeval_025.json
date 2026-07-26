@@ -1,0 +1,26 @@
+{
+  "id": "officeval_025",
+  "instruction": "Modify the document formatting: set the body text to 1× line spacing and the table content to 1.25× line spacing; check the entire document for typos and correct them; modify the heading formatting according to the image requirements; format the table below “(II) Tourism Resource Analysis” to span 2 pages, and do not split any other tables across pages—place each table on 1 page.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is a Microsoft Word file in the accepted .docx format, and the file can be opened normally."
+    ],
+    "dim2": [
+      "+3: The body text in the document uses 1× line spacing.",
+      "+5: The text in all tables uses 1.25-line spacing.",
+      "+3: Level 1 headings use SimSun, Small No. 3, single line spacing, 0.5 lines before, and 0.5 lines after.",
+      "+3: Level 2 headings use SimSun, No. 4, and 1.5-line spacing.",
+      "+3: Level 3 headings use SimSun, Small No. 4, single line spacing, and bold formatting.",
+      "+5: The “(II) Tourism Resource Analysis” table is formatted across 2 pages, with a table header on page 2 that is identical in content and formatting to the one on page 1.",
+      "+1: Each page of the “(II) Tourism Resource Analysis” table has only 3 border lines.",
+      "+5: Only 1 table is formatted across 2 pages; all other tables are formatted on 1 page each.",
+      "-1: Any page after the table of contents page lacks a page number in the footer.",
+      "-1: There is no text content at the center of the cover page.",
+      "-1: Page 2 does not contain Yunling College of Applied Sciences, Project Name, Project Leader, Team Members, Supervising Instructor, Application Date, and Project Type.",
+      "-3: The table below “9.3 Cross-Tabulation of Service Needs and Age” is not 5 rows by 6 columns, and “Handicraft Culture” does not appear in the first row.",
+      "-5: Any of the following conditions is met:",
+      "-3: In the document's table of contents, “I. Market Analysis” appears after “II. Project Introduction,” or the page number for “Chapter 1 Market Analysis” is not 1.",
+      "-1: The first-line indent of the text between “10.5 Decision-Making Behavior” and “10.6 Key Concerns” is not 2 characters."
+    ]
+  }
+}

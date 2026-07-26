@@ -8,7 +8,7 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/090/子表数据提取到汇总表.xlsx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_090/子表数据提取到汇总表.xlsx",
       "dest": "子表数据提取到汇总表.xlsx"
     }
   ]

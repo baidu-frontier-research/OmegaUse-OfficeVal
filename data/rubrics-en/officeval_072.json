@@ -1,0 +1,29 @@
+{
+  "id": "officeval_072",
+  "instruction": "Turn this into a PPT with editable text; the layout, content, and colors should all be roughly the same as the original.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .pptx format, and the file must open, be editable, and play normally."
+    ],
+    "dim2": [
+      "+5: All text throughout the PPT uses Microsoft YaHei or DengXian Bold.",
+      "+5: On Slides 2 through 11, the numbers “01,” “02,” etc. to the left of the top titles are all 14-16 pt.",
+      "+5: On Slides 2 through 11, the top titles such as “Initial Impression of the Class: Light Hidden in Quietness” are all 22-26 pt.",
+      "+5: On Slides 2 through 11, the small text “From Observation to Action,” etc. on the right side of the top title bar is all 12-16 pt.",
+      "+3: Slide 1 cover: “Guided by Light · Nurturing with Heart” is 34-38 pt; “Morning River Class Collaborative Growth Plan” is 18-22 pt; “Class Culture and Student Development Pathway” is 22-26 pt; and “Let quiet efforts be seen, and let small changes be cherished” is 14-18 pt.",
+      "+3: Slide 2: Includes card content such as “Observational Impressions” in 18-22 pt; “Current Situation Scan,” “Class Leadership Beliefs,” and “Core Goals” in 16-20 pt; and the corresponding text below the titles in 14-18 pt.",
+      "+3: Slide 3: Includes “Sparks Awaiting Awakening” and “The Firmest Soil” in 20-24 pt, the text in the two corresponding main sections below the two titles in 12-16 pt, and the breakthrough key text at the bottom in 14-18 pt.",
+      "+3: Slide 4: The center circle contains “Class Motto Glimmers Gather, Growing Toward the Sun,” with “Class Motto” in 20-24 pt and “Glimmers Gather, Growing Toward the Sun” in 22-26 pt; the surrounding text “Discover Glimmers,” “Respond Promptly,” “Peer Mutual Support,” and “Continuous Growth” is all retained in 14-18 pt; and the “Class Leadership Slogan” line at the bottom is 14-18 pt.",
+      "+3: Slide 5: Includes “Starting Stage,” “Connection Stage,” and “Leap Stage” in 12-16 pt; the three stages “Seeing Glimmers,” “Forming a Beam,” and “Self-Illumination” in 16-20 pt; the text below the three stages in 10-14 pt; and the goal description at the bottom in 14-18 pt.",
+      "+3: Slide 6: Includes “Growth’s Inner Drive” in the center, with “Growth’s” in 14-18 pt and “Inner Drive” in 20-24 pt; the four titles “Responsibility Theater,” “Energy Points,” “Partner Alliance,” and “Wish Garden” in the center ring and on the left in 14-18 pt, with the corresponding text below in 10-14 pt; and “Operating Principles” on the right in 16-20 pt, with the corresponding text below in 12-16 pt.",
+      "+3: Slide 7: Includes “Turn the class...points of light.” in 14-18 pt; “Role Claiming,” “Glimmer Observer,” and “Self-Reminder Officer” in 14-18 pt, with the corresponding text below in 10-14 pt; and the expected-outcomes text at the bottom in 12-16 pt.",
+      "+3: Slide 8: Includes “Energy Cycle” in the center, with “Energy” in 16-20 pt and “Cycle” in 22-26 pt; “Earn Points of Light,” “Store in the Light Ledger,” “Redeem Experiences,” and “Review and Upgrade” in 12-16 pt, with the corresponding text below in 10-14 pt; and content such as the “Underlying Rules” line at the bottom in 14-18 pt.",
+      "+3: Slide 9: Includes the hexagonal alliance diagram and, on the right, “Setup Method,” “Core Mechanism,” and “Gentle Agreement” in 14-18 pt, with the corresponding text on the three explanatory cards below in 10-14 pt; on the left, the six sections including “Support,” “Record,” and “Observe” in 14-18 pt; “Alliance” in 18-22 pt; and “Collaboration...illuminate” at the bottom in 14-18 pt.",
+      "+3: Slide 10: Includes “Wish Garden” in 20-24 pt; “I Dare to Speak Up” and “I Can Keep Going” in 14-18 pt, with the corresponding text below in 10-14 pt; and “Upgrade Method” and “Emotional Loop” in 16-20 pt, with the corresponding text below in 12-16 pt, among other content.",
+      "+3: Slide 11: Includes “Confidence Is Speaking Up,” “Habits Are Carrying Over,” and “The Atmosphere Is Warming” in 18-22 pt; the corresponding text below the three cards in 12-16 pt; and the concluding text at the bottom in 14-18 pt.",
+      "+3: Slide 12 closing slide: Retains text including “Education Is a Gentle Illumination” in 30-34 pt; “This answer, silent yet resolute, is slowly being written by each heart willing to try.” in 18-22 pt; and “Thank You for Listening and Walking Alongside Us” in 14-18 pt.",
+      "+3: Slide numbers throughout the PPT: The slide numbers at the bottom right of Slides 2 through 11 are retained, the numbers correspond to the slides, and the font size is 10-12 pt.",
+      "-5: The orange, cyan, and green circular patterns on the slides extend beyond the boundaries."
+    ]
+  }
+}

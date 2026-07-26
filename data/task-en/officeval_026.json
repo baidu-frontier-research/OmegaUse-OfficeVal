@@ -1,0 +1,15 @@
+{
+  "id": "officeval_026",
+  "instruction": "Reformat three-line Tables 5-4 through 5-12 in this file to match the layout style of the example (the example is located at the very end of the tables).",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 84,
+  "task_price_proxy": 50,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_026/项目式协作学习统计表.docx",
+      "dest": "项目式协作学习统计表.docx"
+    }
+  ]
+}

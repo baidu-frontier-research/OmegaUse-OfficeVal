@@ -1,0 +1,15 @@
+{
+  "id": "officeval_067",
+  "instruction": "Modify the PPT by applying a different slide transition to each slide, but use the same transition on the first and last slides.",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 23,
+  "task_price_proxy": 22,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_067/智慧园区再生水管网.pptx",
+      "dest": "智慧园区再生水管网.pptx"
+    }
+  ]
+}

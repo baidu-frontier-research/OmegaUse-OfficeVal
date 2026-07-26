@@ -1,0 +1,15 @@
+{
+  "id": "officeval_038",
+  "instruction": "Please convert the PDF document into an editable Word file, then enter the answers from the last few pages in the parentheses after each question according to the question numbers, while leaving the original font formatting unchanged.",
+  "operation_intent": "Annotate",
+  "domain": "Education & Examination",
+  "human_labor_time": 111,
+  "task_price_proxy": 63,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_038/多岗位从业人员综合复习题_菟思学院.pdf",
+      "dest": "多岗位从业人员综合复习题_菟思学院.pdf"
+    }
+  ]
+}

@@ -8,7 +8,7 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/072/Illuminating_the_Starry_Sky.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_072/Illuminating_the_Starry_Sky.pptx",
       "dest": "Illuminating_the_Starry_Sky.pptx"
     }
   ]

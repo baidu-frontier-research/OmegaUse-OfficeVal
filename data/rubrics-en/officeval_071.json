@@ -1,0 +1,19 @@
+{
+  "id": "officeval_071",
+  "instruction": "Modify the PowerPoint as follows:\nFormat the title on the first slide as WordArt, with a white outline and blue fill.\nChange the layout of the second slide to a left-right layout, with the bird protection tape and bird repeller each occupying half of the slide. Follow the layout shown in the image, place each photo in the blank space at the upper right of its respective section, and use the content from the original PowerPoint.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .pptx format and can be opened, presented, and edited normally."
+    ],
+    "dim2": [
+      "+5: The title “Field Symbiosis Observation” on the first slide is changed to WordArt with a white outline and blue fill.",
+      "+5: Below “Field Protection: Instructions for Using Bird Protection Tape and Bird Repellers” on the second slide, the bird protection tape and bird repeller sections are divided into left and right parts at a 1:1 ratio.",
+      "+5: The bird protection tape and bird repeller sections on the second slide each have one image placed in the blank space at the upper right of their respective section.",
+      "-5: The bird protection tape and bird repeller images on the second slide do not have a 1：1 aspect ratio.",
+      "-5: The background fill on the second slide does not meet the following requirements: the left half, for the bird protection tape, has a dark green fill, and the right half has a light green fill.",
+      "-1: The title “Field Symbiosis Observation” on the first slide has a font size other than 60 points.",
+      "-3: The text “Field Protection: Instructions for Using Bird Protection Tape and Bird Repellers” does not appear at the top of the second slide.",
+      "-3: The bird protection tape section on the second slide is missing any one of the following three items: “Material,” “Principle,” and “Design.”"
+    ]
+  }
+}

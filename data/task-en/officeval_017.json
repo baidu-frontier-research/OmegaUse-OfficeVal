@@ -1,0 +1,19 @@
+{
+  "id": "officeval_017",
+  "instruction": "The PDF document needs a table of contents, with its style based on the reference image.",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 163,
+  "task_price_proxy": 40,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_017/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_017/七年级地理导学案.pdf",
+      "dest": "七年级地理导学案.pdf"
+    }
+  ]
+}

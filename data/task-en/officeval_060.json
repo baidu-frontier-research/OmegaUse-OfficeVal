@@ -1,0 +1,15 @@
+{
+  "id": "officeval_060",
+  "instruction": "Reformat slide 4 of the PPT so that the image arrangement matches the slide's aspect ratio and there are no large blank areas on either side of the slide.",
+  "operation_intent": "Restructure",
+  "domain": "Other",
+  "human_labor_time": 5,
+  "task_price_proxy": 12,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_060/PPT.pptx",
+      "dest": "PPT.pptx"
+    }
+  ]
+}

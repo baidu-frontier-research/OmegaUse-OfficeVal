@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/013/基于Spark的园区能耗分析与可视化系统论文.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_013/基于Spark的园区能耗分析与可视化系统论文.docx",
       "dest": "基于Spark的园区能耗分析与可视化系统论文.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/013/本科毕业论文内容与格式核验承诺书.xlsx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_013/本科毕业论文内容与格式核验承诺书.xlsx",
       "dest": "本科毕业论文内容与格式核验承诺书.xlsx"
     }
   ]

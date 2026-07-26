@@ -1,0 +1,19 @@
+{
+  "id": "officeval_047",
+  "instruction": "Recreate the content shown in this image on slide 19. Do not insert it as an image; it must remain editable for future changes and be centered on the slide. Delete the slide's original content (but do not delete the navigation bar and Logo at the top). Using slide 3 as a reference, adjust the fonts and font sizes on slides 9, 15, 22, 28, and 33. Add title 5, \"Research Conclusions,\" to the table of contents slide. Finally, on slide 1, change the content after the colon in \"Presenter:\" to \"Chen Qiankang Email:896700205@qq.com\".",
+  "operation_intent": "Other",
+  "domain": "Engineering & Technology",
+  "human_labor_time": 68,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_047/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_047/设备状态监测研究汇报 .pptx",
+      "dest": "设备状态监测研究汇报 .pptx"
+    }
+  ]
+}

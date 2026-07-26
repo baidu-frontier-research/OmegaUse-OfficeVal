@@ -1,0 +1,19 @@
+{
+  "id": "officeval_057",
+  "instruction": "Create a one-slide PPT based on the image. Every element must be editable, the size must match the image, and the circled parts must be changed to straight lines.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 132,
+  "task_price_proxy": 40,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_057/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_057/化学式.png",
+      "dest": "化学式.png"
+    }
+  ]
+}

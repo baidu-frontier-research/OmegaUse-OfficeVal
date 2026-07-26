@@ -1,0 +1,22 @@
+{
+  "id": "officeval_032",
+  "instruction": "First, delete the underlined sentence in the image. Then add a “Volunteer Service” section to the résumé, formatted the same as the other sections, with the following content: “2022/1-2: Served as an outstanding volunteer in the community's fight against the epidemic; 2023/7-9: Served as a volunteer in Shandi Village.” Add these two passages on separate lines and keep the formatting consistent with the original document. Finally, add a new line to the Skills and Certifications section containing “2021/11-2023/9: Participated in the Young Marxists Training Program and passed the training.” Keep the résumé to one page; do not let it extend to two pages.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in PDF format and can be opened normally."
+    ],
+    "dim2": [
+      "+3: Page 1, Practical Experience paragraph: The text “The project content focuses on equipment operating-status identification and remote diagnosis, and the original business data has not been retained.” does not appear in the Practical Experience section.",
+      "+3: Page 1, Volunteer Service section title bar: The Volunteer Service section is located in the main content area on the right; a new “Volunteer Service” section is added, with a title-bar style consistent with the “Education,” “Practical Experience,” “Skills, Certifications, and Awards,” and “Study Plan” sections. It uses a deep-green rounded-rectangle bar with a small gold vertical decorative block on the left. The title text uses SimSun or a similar typeface, a No. 5 or approximately No. 5 type size, and is white and bold.",
+      "+5: Page 1, first line of text in the Volunteer Service section: The new text “2022/1-2: Served as an outstanding volunteer in the community's fight against the epidemic” is added as the first line of body text in the Volunteer Service section, using SimSun or a similar typeface, a Small No. 5 or approximately Small No. 5 type size, and black or dark-gray text. Second line of text: The new text “2023/7-9: Served as a volunteer in Shandi Village” is added as the second line of body text in the Volunteer Service section and is displayed on a separate line from the first, with the same typeface, type size, and color as the first line.",
+      "+3: Page 1, Volunteer Service body-text formatting: The two Volunteer Service passages are left-aligned; their line spacing is consistent with the body text in the “Skills, Certifications, and Awards” section; paragraph spacing before and after is 0 pt or consistent with the original résumé body text; and there are no inconsistent bullet points or excessively large line spacing.",
+      "+3: Page 1, Volunteer Service section spacing: The spacing between the Volunteer Service section title and the sections above and below it is single line spacing or approximately single spacing. The spacing between the body text and the title bar is the same as the spacing between lines of body text, and the section does not overlap any other section.",
+      "+5: Page 1, new line in the Skills, Certifications, and Awards section: Add the text “2021/11-2023/9: Participated in the Young Marxists Training Program and passed the training” on a new line in the “Skills, Certifications, and Awards” section, using SimSun or a similar typeface and a Small No. 5 or approximately Small No. 5 type size. It is placed after the section's existing entries and before the next section; it must not be inserted inside the title bar or cover any existing entry.",
+      "+3: Page 1, bullet point for the new line in Skills, Certifications, and Awards: If the existing entries in the “Skills, Certifications, and Awards” section use gold round bullet points, the new line also uses the same gold round bullet point. If the existing entries do not use bullet points, the new line also remains without a bullet point, maintaining consistent formatting.",
+      "-5: The delivered résumé must not have blank space below “Practical Experience” exceeding 50% of the page that causes the résumé to become 2 or more pages.",
+      "-3: None of the text “English Proficiency,” “Tool Proficiency,” or “Overall Performance” is found in the résumé.",
+      "-3: After the new content is added, the body text of the “Study Plan” section is truncated or extends beyond the bottom of the page.",
+      "-3: Page 1, bottom footer: “Study Application Materials · 2026” is covered by body content or disappears entirely."
+    ]
+  }
+}

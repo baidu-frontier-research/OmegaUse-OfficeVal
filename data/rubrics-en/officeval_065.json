@@ -1,0 +1,20 @@
+{
+  "id": "officeval_065",
+  "instruction": "Add an animation like the one in the video to slide 10 of this PowerPoint. Place a multiplication sign at the center of the pink oval, position one spinner on each side, make them the same size and align them, and use a single shared button to control the spinning and pausing of both spinners.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .ppt or .pptx format and can be opened, edited, and presented normally."
+    ],
+    "dim2": [
+      "+5: Number of spinners on slide 10: Place one complete spinner on the left side of the slide and one on the right, for a total of 2. The left spinner contains a circular wheel, multiple colored sectors, and legible numbers or mental arithmetic content. The right spinner contains a circular wheel, multiple colored sectors, and legible numbers or mental arithmetic content. The two spinners have the same diameter, preferably approximately 6 to 7 cm, with a difference between width and height of no more than 0.2 cm. They are positioned symmetrically on either side of the pink oval, with their center points on the same horizontal line.",
+      "+1: Central multiplication sign on slide 10: Place “×” at the center point of the pink oval in the middle of the slide, no more than 0.3 cm from the oval's center.",
+      "+3: Shared control button on slide 10: Place only one primary button on the slide to control both the left and right spinners. It is located between the two spinners or below the central pink oval and is approximately 3 to 5 cm wide and 1 to 1.5 cm high.",
+      "+5: Animation on slide 10: Upon entering the slide, both spinners remain stationary and wait for the user to click the button. When the button is clicked for the first time, the left and right spinners begin spinning simultaneously, with a difference in start times of no more than 0.2 seconds. Both spinners can spin continuously and do not stop automatically. When the button is clicked again, both spinners pause simultaneously, with a difference in pause times of no more than 0.2 seconds. When the same button is clicked again, both spinners can resume spinning from the paused state. The start, pause, and resume times of the two spinners are identical; there is no instance in which one spins while the other remains stationary. While spinning, only each wheel rotates around its own center; neither spinner as a whole shifts, jitters, scales, or exhibits obvious eccentricity.",
+      "+1: Fixed pointers on slide 10: Above each spinner is a pointer aimed at the edge of the wheel; the pointers have the same size and position.",
+      "+1: Central multiplication sign formatting on slide 10: The multiplication sign can be selected and dragged independently, has a font size of approximately 80-90 pt, is bold, and has a font color of white, beige, or light pink.",
+      "+1: Button state text on slide 10: Display “Start,” “Pause,” or “Continue” according to the state, or prompts with equivalent meaning.",
+      "-3: Any spinner exhibits obvious eccentricity, displacement, flickering, or scaling while spinning.",
+      "-5: Slide 10 is covered by a full-slide video or animation, making the spinners and button impossible to edit individually."
+    ]
+  }
+}

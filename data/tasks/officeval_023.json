@@ -8,7 +8,7 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/023/董事會數位素養對企業低碳轉型績效的影響.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_023/董事會數位素養對企業低碳轉型績效的影響.docx",
       "dest": "董事會數位素養對企業低碳轉型績效的影響.docx"
     }
   ]

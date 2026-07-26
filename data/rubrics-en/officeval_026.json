@@ -1,0 +1,20 @@
+{
+  "id": "officeval_026",
+  "instruction": "Reformat three-line Tables 5-4 through 5-12 in this file to match the layout style of the example (the example is located at the very end of the tables).",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is a Microsoft Word file in .docx format, and the file opens normally."
+    ],
+    "dim2": [
+      "+1: Outer borders of Tables 5-4 through 5-12: Retain only the top and bottom outer borders. The top and bottom borders of each table are 1.5 pt solid black lines. (Award +1 point if one three-line table meets this criterion, +2 points if two three-line tables meet it, and so on, up to a maximum of 9 points.)",
+      "+1: Internal borders for grouped headings in Tables 5-4, 5-5, 5-8, 5-9, and 5-12: Only the two grouped headings, \"Levene's Test\" and \"t-test,\" have a bottom border beneath them; there are no internal borders elsewhere. The border style is a 0.75 pt solid black line. (Award +1 point if one three-line table meets this criterion, +2 points if two three-line tables meet it, and so on, up to a maximum of 5 points.)",
+      "+1: Internal borders for grouped column headings in Tables 5-6, 5-7, 5-10, and 5-11: Only the \"t-test\" heading has a bottom border beneath it; there are no internal borders elsewhere. The border style is a 0.75 pt solid black line. (Award +1 point if one three-line table meets this criterion, +2 points if two three-line tables meet it, and so on, up to a maximum of 4 points.)",
+      "-3: Extra vertical borders appear in any table.",
+      "-5: Any table from Table 5-4 through Table 5-12 still uses consecutive spaces, tabs, or a single large cell to simulate multiple columns of data, without forming separate editable cells corresponding to the fields.",
+      "-5: Any table from Table 5-4 through Table 5-12 is converted into an image, screenshot, or non-editable object.",
+      "-3: Any table from Table 5-4 through Table 5-12 spans multiple pages, or any data row is split across pages.",
+      "-3: Dimension names, group names, test times, sample sizes, or statistical values in Tables 5-4 through 5-12 are extensively missing, replaced, or out of order.",
+      "-3: Chinese text within Tables 5-4 through 5-12 is not in SimSun, Small Five size; English text, numbers, and statistical symbols are not in Times New Roman, Small Five size; the font color is not black; or any title is not in bold SimSun, Five size."
+    ]
+  }
+}

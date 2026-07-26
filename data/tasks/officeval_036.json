@@ -8,11 +8,11 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/036/Cedarline_Statement_2025DEC_reordered.pdf",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_036/Cedarline_Statement_2025DEC_reordered.pdf",
       "dest": "Cedarline_Statement_2025DEC_reordered.pdf"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/036/public_ready_statement.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_036/public_ready_statement.docx",
       "dest": "public_ready_statement.docx"
     }
   ]

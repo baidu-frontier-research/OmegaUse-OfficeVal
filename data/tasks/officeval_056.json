@@ -8,7 +8,7 @@
   "price_source": "explicit_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/056/客户投诉闭环处理流程 (2).png",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_056/客户投诉闭环处理流程 (2).png",
       "dest": "客户投诉闭环处理流程 (2).png"
     }
   ]

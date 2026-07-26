@@ -1,0 +1,31 @@
+{
+  "id": "officeval_042",
+  "instruction": "I. Replace the backgrounds of slides 1-2 in the ppt with the images I sent you: set the slide 1 background to 50% transparency and the slide 2 background to 85% transparency. Using transparency will prevent the text from conflicting too much with the background.\nII. Reformat slide 2 of the ppt (I will give you an image; the circled areas in the image need to be changed):\n1. Use bold Arial for the red title, and use blue underlined text for the small headings inside the green box.\n2. Change all small headings from horizontal to vertical, as shown inside the green box in the image.\n3. Adjust the positions of the content inside the pink, yellow, and blue boxes to create the three-column layout shown in the image. Each column must have equal spacing, and the text must not overlap. Center each corresponding heading above its corresponding content. Delete “Evaluation” and its corresponding content.\nIII. Place the music I sent you on the last slide, and position the playback button in the lower-left corner.",
+  "operation_intent": "Beautify",
+  "domain": "Education & Examination",
+  "human_labor_time": 119,
+  "task_price_proxy": 39,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_042/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_042/image_002.png",
+      "dest": "image_002.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_042/image_003.png",
+      "dest": "image_003.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_042/幼儿游戏活动课程设计与实施.pptx",
+      "dest": "幼儿游戏活动课程设计与实施.pptx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_042/钢琴曲.wav",
+      "dest": "钢琴曲.wav"
+    }
+  ]
+}

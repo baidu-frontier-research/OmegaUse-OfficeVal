@@ -1,0 +1,19 @@
+{
+  "id": "officeval_025",
+  "instruction": "Modify the document formatting: set the body text to 1× line spacing and the table content to 1.25× line spacing; check the entire document for typos and correct them; modify the heading formatting according to the image requirements; format the table below “(II) Tourism Resource Analysis” to span 2 pages, and do not split any other tables across pages—place each table on 1 page.",
+  "operation_intent": "Reformat",
+  "domain": "Business Operations",
+  "human_labor_time": 99,
+  "task_price_proxy": 55,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_025/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_025/青岭山居旅居营造计划.docx",
+      "dest": "青岭山居旅居营造计划.docx"
+    }
+  ]
+}

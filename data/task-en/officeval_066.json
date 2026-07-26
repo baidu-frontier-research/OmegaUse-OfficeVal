@@ -1,0 +1,19 @@
+{
+  "id": "officeval_066",
+  "instruction": "Add a new slide at the end of the PPT and create a table from “Various PPT-Related Data Tables” that matches the tables on the preceding slides. Then add another new slide after the table slide and create a line chart (refer to the preceding slides).",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 142,
+  "task_price_proxy": 30,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_066/PPT相关不同数据表.xlsx",
+      "dest": "PPT相关不同数据表.xlsx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_066/表格图表关联数据.pptx",
+      "dest": "表格图表关联数据.pptx"
+    }
+  ]
+}

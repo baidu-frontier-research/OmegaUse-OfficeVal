@@ -1,0 +1,23 @@
+{
+  "id": "officeval_084",
+  "instruction": "Could you create a macro button?\nIn the first workbook, create a macro button so that clicking the “Print Credit Slip” button outlined by the red box in the image directly selects the designated area (an area similar to the one shown in the image) in the third Transfer Credit Slip workbook and opens Print Preview.",
+  "operation_intent": "Other",
+  "domain": "Financial Data",
+  "human_labor_time": 344,
+  "task_price_proxy": 200,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_084/image (5).png",
+      "dest": "image (5).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_084/image (6).png",
+      "dest": "image (6).png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_084/进账单打印.xlsx",
+      "dest": "进账单打印.xlsx"
+    }
+  ]
+}

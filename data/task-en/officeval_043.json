@@ -1,0 +1,15 @@
+{
+  "id": "officeval_043",
+  "instruction": "Recreate the business card as a 2-slide PowerPoint presentation. All elements in the resulting presentation must be editable, except that the QR code in the upper-right corner must be an image. The layout must be identical to that of the original business card.",
+  "operation_intent": "Other",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 400,
+  "task_price_proxy": 82,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_043/image_001.png",
+      "dest": "image_001.png"
+    }
+  ]
+}

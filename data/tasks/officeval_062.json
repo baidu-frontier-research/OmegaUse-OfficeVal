@@ -8,19 +8,19 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/coffee_grind_to_latte_720x960.mp4",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_062/coffee_grind_to_latte_720x960.mp4",
       "dest": "coffee_grind_to_latte_720x960.mp4"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/基础形状.png",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_062/基础形状.png",
       "dest": "基础形状.png"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/晨岚咖啡品牌运营研究.pptx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_062/晨岚咖啡品牌运营研究.pptx",
       "dest": "晨岚咖啡品牌运营研究.pptx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/062/晨岚咖啡店环境介绍.mp4",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_062/晨岚咖啡店环境介绍.mp4",
       "dest": "晨岚咖啡店环境介绍.mp4"
     }
   ]

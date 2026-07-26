@@ -1,0 +1,27 @@
+{
+  "id": "officeval_019",
+  "instruction": "Add a cover page to the exam paper (refer to the images for the specific layout); center the main title in the exam paper and set it in SimHei, Size No. 3. Set Chinese body text in SimSun, Small No. 4, and English text and Arabic numerals in Times New Roman, Small No. 4. Also add page numbers to the exam paper in the format “Chemistry Exam Paper Page x of x”; no page number is required on the cover page. Modify all other formatting according to the template document.",
+  "operation_intent": "Reformat",
+  "domain": "Education & Examination",
+  "human_labor_time": 249,
+  "task_price_proxy": 20,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_019/image_001.png",
+      "dest": "image_001.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_019/image_002.png",
+      "dest": "image_002.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_019/初中化学模拟试题.docx",
+      "dest": "初中化学模拟试题.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_019/模板.docx",
+      "dest": "模板.docx"
+    }
+  ]
+}

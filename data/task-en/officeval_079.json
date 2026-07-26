@@ -1,0 +1,15 @@
+{
+  "id": "officeval_079",
+  "instruction": "Translate the content of the PPT into Mongolian. Do not change any data or layout positions.",
+  "operation_intent": "Other",
+  "domain": "Education & Examination",
+  "human_labor_time": 241,
+  "task_price_proxy": 24,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_079/第二课时课件.pptx",
+      "dest": "第二课时课件.pptx"
+    }
+  ]
+}

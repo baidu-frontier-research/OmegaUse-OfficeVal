@@ -1,0 +1,23 @@
+{
+  "id": "officeval_069",
+  "instruction": "Adjust the sizes and formatting of the boxes and fonts in this PowerPoint presentation, using the provided image as a reference. As shown in the image, make the text and boxes inside the red, pink, and green rectangular outlines match the size and formatting of the respective elements indicated by the arrows of the same color.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .ppt or .pptx format and must open, remain editable, and play as a slideshow normally.",
+      "The text boxes, rectangular boxes, arrows, and connector lines in the flowchart must all remain editable and must not be covered with screenshots.",
+      "If the file cannot be opened, the flowchart as a whole is not editable, or objects are extensively misaligned, the score for Dimension 1 is 0."
+    ],
+    "dim2": [
+      "+3: The outer box for “2023 Management Lead Adjustment Responsibilities Reallocated” is a rounded rectangle approximately 5.08 cm wide and 2.11 cm high, with a light blue background, color code DDE9FF; a dark blue outline, color code 3768B3; and Noto Sans CJK SC font, approximately 13.2 pt, bold, and centered horizontally and vertically.",
+      "+3: The outer box for “2025 Introduction of Compliance and Data Governance Mechanisms” is a rounded rectangle approximately 5.08 cm wide and 2.11 cm high, with a light blue background, color code DDE9FF; a dark blue outline, color code 3768B3; and Noto Sans CJK SC font, approximately 13.2 pt, bold, and centered horizontally and vertically.",
+      "+3: The outer box for “Lin Yuanhang 65% Shareholding Initiated Investment” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high; it has a light blue background, color code DDE9FF; a dark blue outline, color code 3768B3; and Noto Sans CJK SC font inside, approximately 12.3 pt, bold, and centered.",
+      "+3: The outer box for “Zhou Yu'an 35% Shareholding Industry Resources” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high; it has a light blue background, color code DDE9FF; a dark blue outline, color code 3768B3; and Noto Sans CJK SC font inside, approximately 12.3 pt, bold, and centered.",
+      "+3: The outer box for “Zhou Yu'an 30% Shareholding General Manager” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high; it has a light blue background, color code DDE9FF; a dark blue outline, color code 3768B3; and Noto Sans CJK SC font inside, approximately 12.3 pt, bold, and centered.",
+      "+3: The outer box for “Board Decision-Making Level Strategic Approval / Major Contracts” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high; it has a light blue background, color code DDE9FF; a dark blue outline, color code 3768B3; and Noto Sans CJK SC font inside, approximately 12.3 pt, bold, and centered.",
+      "+3: The outer box for “Warehousing and Distribution Pilot Team Integrates Order, Storage Location, and Vehicle Data” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high, with a light pink background, color code F8E3E8; a dark pink outline, color code AD4E66; and Noto Sans CJK SC font, approximately 12 pt, bold, and centered.",
+      "+3: The outer box for “Day-to-Day Operations Process Order Scheduling → Warehousing Fulfillment → Exception Review” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high, with a light pink background, color code F8E3E8; a dark pink outline, color code AD4E66; and Noto Sans CJK SC font, approximately 12 pt, bold, and centered.",
+      "+3: The outer box for “Business Execution Line Zhou Yu'an General Manager” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high, with a light pink background, color code F8E3E8; a dark pink outline, color code AD4E66; and Noto Sans CJK SC font, approximately 12 pt, bold, and centered.",
+      "+3: The outer box for “Supervision and Review Line Xu Zhilan Supervisor” is a rounded rectangle approximately 4.45 cm wide and 2.08 cm high, with a light pink background, color code F8E3E8; a dark pink outline, color code AD4E66; and Noto Sans CJK SC font, approximately 12 pt, bold, and centered."
+    ]
+  }
+}

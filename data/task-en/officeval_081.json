@@ -1,0 +1,19 @@
+{
+  "id": "officeval_081",
+  "instruction": "Create an Excel spreadsheet that achieves what is demonstrated in the video: after a number is entered in one cell, the active cell automatically moves to the next cell, with the cells arranged in a three-column serpentine pattern (the intended result is that entering a number in any cell in the three columns automatically moves the active cell to the next cell in the serpentine direction).",
+  "operation_intent": "Other",
+  "domain": "Other",
+  "human_labor_time": 196,
+  "task_price_proxy": 145,
+  "price_source": "explicit_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_081/VID_20260525_102540.mp4",
+      "dest": "VID_20260525_102540.mp4"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_081/image (3).png",
+      "dest": "image (3).png"
+    }
+  ]
+}

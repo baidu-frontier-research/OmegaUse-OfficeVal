@@ -1,0 +1,19 @@
+{
+  "id": "officeval_003",
+  "instruction": "Modify the provided document. Place every line of text below “Meeting Content” inside the table and add a horizontal line beneath it, using the same horizontal-line style as shown in the image. Then delete the blank lines that contain no text, and keep all other formatting unchanged.",
+  "operation_intent": "Restructure",
+  "domain": "Administrative Affairs",
+  "human_labor_time": 80,
+  "task_price_proxy": 13,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_003/image.png",
+      "dest": "image.png"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_003/部门协调会记录 (1).docx",
+      "dest": "部门协调会记录 (1).docx"
+    }
+  ]
+}

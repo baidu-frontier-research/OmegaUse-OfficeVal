@@ -1,0 +1,18 @@
+{
+  "id": "officeval_094",
+  "instruction": "Create two multi-category nested combined pie charts, one for each of the two sets of score data in the spreadsheet, with an effect similar to the image, using the two categories of inquiry performance and proficiency level.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .xlsx or .xlsm format and can be opened normally."
+    ],
+    "dim2": [
+      "+1: In the workbook, generate one multi-category nested combined pie chart from each of the two sets of score data for “Grade 7 Class 1” and “Grade 7 Class 13,” for a total of 2 charts, and ensure that the two chart titles clearly distinguish “Grade 7 Class 1” from “Grade 7 Class 13.” The data sources for both charts are the score data in A1:Q7 of the corresponding worksheets, covering all non-empty proficiency-level data from “Map Fundamentals” through “Settlement Patterns,” without omitting any major score columns.",
+      "+5: The classification statistics in both charts are correct. If the four score categories “Outstanding Performance,” “Consistently Achieved,” “Basically Achieved,” and “Continuous Improvement” are used as the pie-chart statistical items, then “Map Fundamentals,” “Latitude/Longitude Positioning,” “Terrain Interpretation,” “Climate Elements,” “Regional Differences,” and “Settlement Patterns” serve as the ring levels for the different categories; if the six score categories “Map Fundamentals,” “Latitude/Longitude Positioning,” “Terrain Interpretation,” “Climate Elements,” “Regional Differences,” and “Settlement Patterns” are used as the pie-chart statistical items, then the four score categories “Outstanding Performance,” “Consistently Achieved,” “Basically Achieved,” and “Continuous Improvement” serve as the ring levels for the different categories;",
+      "+1: Each chart has data labels on its slices, displaying at least either values or percentages; the labels do not overlap extensively or obscure the main slices.",
+      "+1: Both charts include legends. The legend text includes or corresponds to the 6 score categories in B1：Q1, including “Map Fundamentals,” “Latitude/Longitude Positioning,” “Terrain Interpretation,” “Climate Elements,” “Regional Differences,” and “Settlement Patterns,” or includes or corresponds to the four proficiency levels in A4:A7, including “Outstanding Performance,” “Consistently Achieved,” “Basically Achieved,” and “Continuous Improvement.”",
+      "+1: The same score category uses a consistent or nearly consistent color scheme in both charts, making it easy to compare the data for the two classes; the charts use at least four colors.",
+      "+1: Chart titles appear above the charts, with the titles “Grade 7 Class 1 Inquiry Scores Multi-Category Nested Pie Chart” and “Grade 7 Class 13 Inquiry Scores Multi-Category Nested Pie Chart,” respectively.",
+      "-1: Errors such as #REF!, #VALUE!, #N/A, or #DIV/0! appear in the workbook and affect the chart data or chart display."
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "officeval_016",
+  "instruction": "I need to format my thesis by following the formatting of the “A Study of Satisfaction with Fresh Food Services in Chenghe Community” document; create a cover page like the one in that document; and add the missing “Statement of Originality and Authorization for Use” page by simply copying and pasting it from the reference document.",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 157,
+  "task_price_proxy": 48,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/image_001.jpg",
+      "dest": "image_001.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/image_002.jpg",
+      "dest": "image_002.jpg"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/小微企业财务数据管理规范化问题及改进路径研究.docx",
+      "dest": "小微企业财务数据管理规范化问题及改进路径研究.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_016/澄禾社区生鲜服务满意度研究.docx",
+      "dest": "澄禾社区生鲜服务满意度研究.docx"
+    }
+  ]
+}

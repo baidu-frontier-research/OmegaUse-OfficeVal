@@ -1,0 +1,32 @@
+{
+  "id": "officeval_037",
+  "instruction": "Convert the PDF document to Word format and adjust the formatting of the “Lanqiao City Grade 12 English Exam” document to match the formatting of the “Week 2 Test_Grade 12 English Exam” document.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable file is in .docx format and can be opened normally."
+    ],
+    "dim2": [
+      "+1: Page setup for the entire Word document: the paper is A4 in portrait orientation, with a width of 21 cm and a height of 29.7 cm; the top, bottom, left, and right margins are all 1.27 cm; the header is 1.00 cm from the top of the page, and the footer is 1.30 cm from the bottom of the page.",
+      "+5: Pagination throughout the Word document: the main content spans 8 pages in total, with continuous content from page 1 through page 8; there must be no blank page 9, and no question content may extend past the bottom of page 8.",
+      "+1: Footer page numbers on every page: a page-number field is displayed in the center of the footer in the format “Page X/Total 8 pages”; Chinese text uses SimSun No. 5, numerals use Times New Roman No. 5, the color is black, and the field is horizontally centered.",
+      "+1: Top-left confidential text on page 1: retain “Top Secret★Before Use” in SimSun No. 5, black, left-aligned, and positioned at the top of the page body.",
+      "+1: Main title on page 1: the text is “Lanqiao City 2026 Grade 12 Second-Semester Quality Assessment” and “English Exam”; Chinese text uses SimSun No. 4, numerals use Times New Roman No. 4, bold, black, and horizontally centered.",
+      "+1: Date text on page 1: the text is “2026, Month 6”; Chinese text uses SimSun Small No. 4, numerals use Times New Roman Small No. 4, black, horizontally centered, and not bold.",
+      "+5: Entire main body: Chinese instructions, section headings, writing requirements, and notes use SimSun Small No. 4; English passages, English questions, options, words, and numerals use Times New Roman Small No. 4, in black.",
+      "+5: Line spacing throughout the main body: all questions, passages, options, and instructional text other than titles use an exact line spacing of 20 pt, with 0 pt before and 0 pt after. Regular paragraphs in English passages have a first-line indent of 2 characters and are justified, with no extra blank lines between paragraphs.",
+      "+3: Question paragraphs: the question numbers and stems for Questions 21—67 are left-aligned, with no first-line indent; the question number, stem, and sentence-ending punctuation are within the same paragraph.",
+      "+5: Multiple-choice option paragraphs: option paragraphs have a first-line indent of 0.74 cm. If options A and B for the same question appear on one line and C and D appear on the next line, A is aligned with C and B is aligned with D. If all options for the same question each appear on a separate line, all options must be aligned with one another.",
+      "+1: Titles on page 1, including “Part II Reading Comprehension (two sections, 50 points in total),” “Section 1 (15 questions; 2.5 points each, 37.5 points in total),” and “Read the following passages and choose the best answer from the four options A, B, C, and D given for each question.”: Chinese text uses SimSun Small No. 4, numerals use Times New Roman Small No. 4, bold, and left-aligned.",
+      "+1: Reading passage labels: the passage labels “A,” “B,” “C,” and “D” each form a separate paragraph and use Times New Roman Small No. 4, bold, and center-aligned.",
+      "+5: Course information table on page 1: create the Programme, Date (2026), Time, Fee (credits), and Main focus content from the PDF as an editable Word table with 5 columns and 5 rows; a screenshot must not be used. The five column widths are 4.30 cm, 3.20 cm, 2.50 cm, 2.70 cm, and 5.76 cm, respectively; the total table width is 18.46 cm, and the table is horizontally centered. The header row and content use Times New Roman Small No. 4; the header row is bold, the data rows are not bold, and all cells are vertically centered. The outer border and all internal horizontal and vertical lines are black 0.5 pt single solid lines.",
+      "+1: Writing Section 1: retain Question 66, “Learning with a Clear Purpose,” the quotation, the three writing points, and the notes in SimSun Small No. 4; numerals and English text use Times New Roman Small No. 4.",
+      "+1: The opening sentence “Learning with a clear purpose matters greatly to Grade 12 students.” uses Times New Roman Small No. 4, bold and italic.",
+      "+1: Answer lines for Section 1: place 3 editable underlined paragraphs below the opening sentence, with each line spanning the width of the main body; the lines use underlined characters in Times New Roman Small No. 4 or paragraph bottom borders.",
+      "+1: Paragraph 1 text and Paragraph 2 text: fully display “Paragraph 1: I sat with him on the bench near the stairway and opened his notebook.” and “When I returned to my own classroom on Monday, I found a small card on my desk.” in Times New Roman Small No. 4, bold.",
+      "+1: Continuation-writing lines: below Paragraph 1 and Paragraph 2, respectively, place 3 editable lines for each paragraph; all lines have the same width and do not extend beyond the left or right page margins.",
+      "-5: The course information table on page 1 is a screenshot or ordinary image rather than an editable Word table.",
+      "-1: Any one of the course name, date, time, fee, or Main focus is missing from the course information table.",
+      "-3: The document contains comments unrelated to the task, red arrows, revision marks, conversion-software watermarks, or newly added blank pages."
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "id": "officeval_074",
+  "instruction": "Translate all Chinese text in this PowerPoint into English. Do not disrupt the layout or change the image backgrounds.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable must be in .pptx format, open normally, remain editable, and play normally.",
+      "The delivered PowerPoint must remain 46 slides long."
+    ],
+    "dim2": [
+      "+1: Slide 1 main title text box: Translate the Chinese title meaning “Qinglan County Agricultural Low-Altitude Application Implementation Plan” as “Qinglan County Agricultural Low-Altitude Application Implementation Plan” or semantically equivalent English.",
+      "+1: Slide 2 contents slide text: The contents title, PART 01 through PART 07, and all section names and descriptions are in English.",
+      "+3: All content text on slides 3 through 46 is in English.",
+      "-1: On the cover slide, the text “Qinglan County Agricultural Low-Altitude Application Implementation Plan” is not set to 32 pt and bold.",
+      "-1: On the cover slide, the text below “Qinglan County Agricultural Low-Altitude Application Implementation Plan” is not set to 13 pt.",
+      "-5: On the PowerPoint title slides (slides 3, 6, 14, 17, 19, 23, and 42), the title text is not set to 34 pt, and the text below the title is not set to 14 pt.",
+      "-5: Text at the slide-number location, such as “01  Plan Cover  ·  Start  →  Next: Contents”, is not set to 7.8 pt.",
+      "-1: On the contents slide, a title such as “PART 01  Project Background” is not set to 11.5 pt, and the text below the title, such as “Policy window and regional conditions”, is not set to 8.4 pt.",
+      "-5: On PowerPoint content slides (all slides except slides 1, 2, 3, 6, 14, 17, 19, 23, 42, and 46 are content slides), the content text is not set to 9.2 pt, and the title text is not set to 12.5 pt and bold."
+    ]
+  }
+}

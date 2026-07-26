@@ -1,0 +1,23 @@
+{
+  "id": "officeval_067",
+  "instruction": "Modify the PPT by applying a different slide transition to each slide, but use the same transition on the first and last slides.",
+  "rubrics": {
+    "dim1": [
+      "The delivered file is in .ppt or .pptx format and can be opened, edited, and presented normally.",
+      "If the file cannot be opened, the number of slides differs significantly from the required count, most slides have no transitions, or the slide content is severely damaged, the score for dimension 1 is 0."
+    ],
+    "dim2": [
+      "+1: Slide 1, the cover slide: Apply one slide transition.",
+      "+1: Slide 35, the closing slide: The transition type, direction, duration, and trigger method are exactly the same as on slide 1.",
+      "+1: Apply a slide transition to every slide from slide 2 through slide 34 (+1 point for one slide with a transition, +2 points for two slides with transitions, and so on).",
+      "+5: Transition uniqueness from slide 2 through slide 34: The \"transition type + direction or subtype\" combinations on all 33 slides are all different from one another. None of slides 2 through 34 uses the transition effect combination shared by slides 1 and 35.",
+      "+5: Transition triggering on all 35 slides: Retain the \"On Mouse Click\" slide-advance function on every slide. Do not enable automatic slide advancement after a fixed time, so the slides do not advance on their own during the presentation. The duration is approximately 0.5 to 1.5 seconds, with a moderate speed and no excessively slow waiting.",
+      "-3: The PPT does not contain 35 slides.",
+      "-3: Existing text, images, tables, charts, or slide numbers on any two or more slides are deleted, moved, or obscured.",
+      "-1: The file contains comments, red markings, temporary explanatory text, or extra blank slides.",
+      "-3: Transition sounds on all 35 slides do not include explosion sounds, applause, or other irrelevant sound effects.",
+      "-3: Presentation effects across all 35 slides: No black screen, white screen, slide flickering, or ghost image of the previous slide appears during transitions.",
+      "-5: Original PPT functionality: Object animations, internal navigation, hyperlinks, or the playback order become nonfunctional as a result of adding slide transitions."
+    ]
+  }
+}

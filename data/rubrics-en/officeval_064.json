@@ -1,0 +1,25 @@
+{
+  "id": "officeval_064",
+  "instruction": "I do not have time to work on this right now. Please place these 12 photos precisely, in order, in the blank areas below the content in the “Core Technologies” PPT, with three photos in each frame. On the first page, arrange one large photo on top and two small photos below; on the second page, arrange two small photos on the left and one large photo on the right. It would be best to also add a light blue border around the title.",
+  "rubrics": {
+    "dim1": [
+      "The deliverable is in .ppt or .pptx format and can be opened, edited, and presented normally.",
+      "The PPT remains at 2 pages, with 3 photos placed in each of the four content frames, for a total of 12 photos.",
+      "All photos are individual image objects that can be selected, cropped, and moved separately; a full-page screenshot must not be used as an overlay.",
+      "Photos do not obscure titles, explanatory text, divider lines, or bottom data, and the pages contain no severe overlaps or cropping.",
+      "If the file cannot be opened, the pages as a whole are not editable, many photos are missing, or the layout is severely disorganized, the score for dimension 1 is 0."
+    ],
+    "dim2": [
+      "+5: A total of 12 images are placed across the two PPT pages, with six images on each PPT page",
+      "+5: In the left “Intelligent Transmission Assembly” frame on Page 1 of the ppt: place the corresponding image, 13.3-13.5cm wide and 2.9-3.1cm high, at the top of the frame; below the large image, place the corresponding photo, 6.5-6.7cm wide and 2.7-2.9cm high, in the left small-image position; below the large image, place the corresponding photo, 6.5-6.6cm wide and 2.8-2.9cm high, in the right small-image position.",
+      "+5: In the right “High-Strength Composite Half Shaft” frame on Page 1 of the ppt: at the top of the frame, place the corresponding image that is 13.3-13.5cm wide and 2.9-3.1cm high, which is the 4th image; below the large image, in the left small-image position, place the corresponding photo that is 6.5-6.7cm wide and 2.7-2.9cm high, which is the 5th photo; below the large image, in the right small-image position, place the corresponding photo that is 6.5-6.6cm wide and 2.8-2.9cm high, which is the 6th photo.",
+      "+5: In the left “Rear Airflow-Guide Assembly” frame on Page 2 of the ppt: place the corresponding photo, 5.1-5.3cm wide and 2.9-3.1cm high, in the upper-left small-image position; place the corresponding photo, 5.1-5.3cm wide and 2.9-3.1cm high, in the lower-left small-image position; place the corresponding photo, 7.9-8.1cm wide and 6.2-6.4cm high, in the large-image position on the right.",
+      "+5: In the right “Lightweight Cockpit Layout” frame on Page 2 of the ppt: place the corresponding photo, 5.1-5.3cm wide and 2.9-3.1cm high, in the upper-left small-image position; place the corresponding photo, 5.1-5.3cm wide and 2.9-3.1cm high, in the lower-left small-image position; place the corresponding photo, 7.9-8.1cm wide and 6.2-6.4cm high, in the large-image position on the right.",
+      "+3: Main titles at the top of Pages 1 and 2: add a light blue composite border around each title; the border must be an editable shape, and the titles must remain clearly readable.",
+      "-5: Any two or more photos obscure module titles, body text, divider lines, or bottom metrics.",
+      "-5: In any three or more locations, the difference in spacing between images exceeds 0.2 cm, or edges are not aligned. (Change to: image edges are not aligned in any three or more locations.)",
+      "-3: In any two or more locations, existing text, numerical values, or module backgrounds are deleted, covered, or moved.",
+      "-1: The file contains comments, red markings, temporary notes, screenshot borders, or extra placeholder objects."
+    ]
+  }
+}

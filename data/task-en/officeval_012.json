@@ -1,0 +1,19 @@
+{
+  "id": "officeval_012",
+  "instruction": "1. Please recreate the table of contents in accordance with the requirements in “Graduation Thesis Format for the Higher Education Self-Study Examination at Dongyue Technical College,” and make it an automatically updatable table of contents.\n2. I have sent you the thesis requirements. Could you also check whether the formatting of my thesis complies with the requirements and, if it does not, correct it?",
+  "operation_intent": "Reformat",
+  "domain": "Academic Papers",
+  "human_labor_time": 114,
+  "task_price_proxy": 33,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_012/东岳技术学院高等教育自学考试毕业论文格式.docx",
+      "dest": "东岳技术学院高等教育自学考试毕业论文格式.docx"
+    },
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_012/城市社区雨水花园参与式维护机制研究.docx",
+      "dest": "城市社区雨水花园参与式维护机制研究.docx"
+    }
+  ]
+}

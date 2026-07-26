@@ -8,35 +8,35 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/01_课时学习方案_观察一位校园志愿者_第一课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/01_课时学习方案_观察一位校园志愿者_第一课时.docx",
       "dest": "01_课时学习方案_观察一位校园志愿者_第一课时.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/02_课时学习方案_方法交流与片段尝试_第一课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/02_课时学习方案_方法交流与片段尝试_第一课时.docx",
       "dest": "02_课时学习方案_方法交流与片段尝试_第一课时.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/03_课时学习方案_身边人物初识.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/03_课时学习方案_身边人物初识.docx",
       "dest": "03_课时学习方案_身边人物初识.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/04_课时学习方案_人物细节描写_第二课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/04_课时学习方案_人物细节描写_第二课时.docx",
       "dest": "04_课时学习方案_人物细节描写_第二课时.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/05_课时学习方案_匠心故事研读.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/05_课时学习方案_匠心故事研读.docx",
       "dest": "05_课时学习方案_匠心故事研读.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/06_课时学习方案_家乡风物介绍_第二课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/06_课时学习方案_家乡风物介绍_第二课时.docx",
       "dest": "06_课时学习方案_家乡风物介绍_第二课时.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/07_课时学习方案_写一个让人记住的人_第一课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/07_课时学习方案_写一个让人记住的人_第一课时.docx",
       "dest": "07_课时学习方案_写一个让人记住的人_第一课时.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/001/08_课时学习方案_习作讲评与修改_第二课时.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/08_课时学习方案_习作讲评与修改_第二课时.docx",
       "dest": "08_课时学习方案_习作讲评与修改_第二课时.docx"
     }
   ]

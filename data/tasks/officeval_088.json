@@ -8,31 +8,31 @@
   "price_source": "estimated_price",
   "origin_files": [
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/云溪5.0 D3滚筒洗衣机产品说明文档.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/云溪5.0 D3滚筒洗衣机产品说明文档.docx",
       "dest": "云溪5.0 D3滚筒洗衣机产品说明文档.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/小天鹅12KG滚筒洗衣机产品说明文档.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/小天鹅12KG滚筒洗衣机产品说明文档.docx",
       "dest": "小天鹅12KG滚筒洗衣机产品说明文档.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/模板.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/模板.docx",
       "dest": "模板.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/米家8KG滚筒洗衣机产品说明文档.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/米家8KG滚筒洗衣机产品说明文档.docx",
       "dest": "米家8KG滚筒洗衣机产品说明文档.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/统帅三桶懒人洗衣机产品说明文档.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/统帅三桶懒人洗衣机产品说明文档.docx",
       "dest": "统帅三桶懒人洗衣机产品说明文档.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/美的8KG波轮洗衣机产品说明文档.docx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/美的8KG波轮洗衣机产品说明文档.docx",
       "dest": "美的8KG波轮洗衣机产品说明文档.docx"
     },
     {
-      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/088/选货汇总表_模板2_已填充 (1).xlsx",
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_088/选货汇总表_模板2_已填充 (1).xlsx",
       "dest": "选货汇总表_模板2_已填充 (1).xlsx"
     }
   ]
