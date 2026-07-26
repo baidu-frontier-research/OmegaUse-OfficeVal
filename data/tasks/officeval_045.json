@@ -4,8 +4,8 @@
   "operation_intent": "Other",
   "domain": "Business Operations",
   "human_labor_time": 43,
-  "task_price_proxy": 75,
-  "price_source": "estimated_price",
+  "task_price_proxy": 25,
+  "price_source": "explicit_price",
   "origin_files": [
     {
       "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/045/electric_toothbrush_vertical_01_clean_360x720.mp4",
