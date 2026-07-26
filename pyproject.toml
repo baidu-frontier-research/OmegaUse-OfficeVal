@@ -10,8 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Omegause Officeval Contributors" },
+    { name = "OmegaUse-OfficeVal Contributors" },
 ]
+
 keywords = ["office", "document", "evaluation", "benchmark", "verifier"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -51,7 +52,15 @@ test = [
 [project.scripts]
 omegause-officeval = "omegause_officeval.cmdline:main"
 
+[project.urls]
+Homepage = "https://omegause-officeval.github.io/"
+Repository = "https://github.com/baidu-frontier-research/OmegaUse-OfficeVal"
+Issues = "https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/issues"
+Documentation = "https://omegause-officeval.github.io/"
+Changelog = "https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/blob/main/CHANGELOG.md"
+
 [tool.hatch.build.targets.wheel]
+
 packages = ["omegause_officeval", "core", "verifiers"]
 
 [tool.hatch.build.targets.sdist]
@@ -60,6 +69,8 @@ include = [
     "/core",
     "/docs",
     "/examples",
+    "/assets",
+
     "/omegause_officeval",
     "/tests",
     "/verifiers",

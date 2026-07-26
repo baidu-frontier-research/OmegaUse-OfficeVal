@@ -1,9 +1,11 @@
 cff-version: 1.2.0
-message: "If you use Omegause Officeval, please cite this software."
-title: "Omegause Officeval"
+message: "If you use OmegaUse-OfficeVal, please cite this software."
+title: "OmegaUse-OfficeVal"
 type: software
 version: 0.1.0
 date-released: 2026-07-16
 license: Apache-2.0
+repository-code: "https://github.com/baidu-frontier-research/OmegaUse-OfficeVal"
+url: "https://omegause-officeval.github.io/"
 authors:
-  - name: "Omegause Officeval Contributors"
+  - name: "OmegaUse-OfficeVal Contributors"

@@ -14,7 +14,9 @@ PUBLIC_DOMAINS = {
     "example.com",
     "example.net",
     "example.org",
+    "github.com",
     "huggingface.co",
+
     "keepachangelog.com",
     "omegause-officeval.github.io",
     "semver.org",

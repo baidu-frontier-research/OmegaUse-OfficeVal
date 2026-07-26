@@ -1,4 +1,4 @@
-# Copyright 2026 Baidu.com, Inc.
+# Copyright 2026 Baidu Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Installed command-line entry point for Omegause Officeval."""
 

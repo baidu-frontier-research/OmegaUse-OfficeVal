@@ -6,7 +6,12 @@
   <a href="https://omegause-officeval.github.io/"><strong>Website</strong></a> &nbsp;•&nbsp;
   <a href="https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Dataset</strong></a> &nbsp;•&nbsp;
   <a href="https://arxiv.org/abs/XXXX.XXXXX"><strong>Paper (coming soon)</strong></a>
+  <br>
+  <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Source</strong></a> &nbsp;•&nbsp;
+  <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/issues"><strong>Issues</strong></a> &nbsp;•&nbsp;
+  <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/releases"><strong>Releases</strong></a>
 </p>
+
 
 OmegaUse-OfficeVal is a Python framework for securely validating, executing,
 and aggregating 100 Office document evaluators. It accepts a ZIP submission,
@@ -14,7 +19,9 @@ checks its structure before extraction, runs each verifier in an isolated
 subprocess, and writes machine-readable JSON and CSV reports.
 
 > This repository contains the evaluation framework and verifier source code.
-> Benchmark documents and submitted Office files are not distributed.
+> Benchmark data is distributed separately through the linked Dataset; user
+> submissions and generated evaluation workspaces are never distributed.
+
 
 ## Benchmark Framework
 
@@ -48,8 +55,19 @@ with fine-grained rubrics and executable verifiers.
 - Microsoft Office on Windows only when the nine COM-required verifiers must
   run.
 
+## Platform Compatibility
+
+| Platform | Normal mode | Office COM | Continuous integration |
+| --- | --- | --- | --- |
+| Windows | Supported | Supported for nine designated verifiers when Microsoft Office is installed | Tested on Python 3.10 and 3.12 |
+| Linux | Supported | Not available; COM-required verifiers are skipped in `auto` mode | Tested on Ubuntu with Python 3.10 and 3.12 |
+| macOS | Expected to work | Not available; COM-required verifiers are skipped in `auto` mode | Not currently covered by CI |
+
+Normal-mode support is based on static document parsing. Platform-specific
+Office rendering and COM automation are available only on Windows.
 
 ## Installation
+
 
 ```bash
 python -m venv .venv
@@ -74,8 +92,8 @@ platforms.
 
 ## Submission Layout
 
-The input must be a ZIP archive whose root contains 100 three-digit task
-directories:
+A complete submission is a ZIP archive whose root contains the 100 task
+directories `officeval_001/` through `officeval_100/`:
 
 ```text
 officeval_001/
@@ -84,8 +102,24 @@ officeval_002/
 officeval_100/
 ```
 
-Each directory contains the Office or PDF files required by its verifier.
-Validation reports unexpected files but never deletes submission content.
+Missing task directories are reported as warnings rather than fatal archive
+errors. If the user confirms evaluation, a missing directory, an empty
+directory, or a directory without a supported document does not enter its
+verifier and receives a normal dimension-one failure with zero score and
+`0.0%` completion.
+
+Supported document extensions are:
+
+- Word: `.docx`
+- Excel: `.xlsx`, `.xlsm`
+- PowerPoint: `.pptx`
+- PDF: `.pdf`
+
+Legacy Office formats `.doc`, `.xls`, and `.ppt` are not supported. They depend
+on platform-specific conversion components and cannot provide consistent
+behavior across Windows, macOS, and Linux. Unexpected content is reported by
+validation but never deleted.
+
 
 ## Usage
 
@@ -139,7 +173,10 @@ details.csv
 ```
 
 The local `results/`, `submissions/`, and `workspaces/` directories are runtime
-state and are ignored by Git.
+state and are ignored by Git. See [Result Format](docs/result-format.md) for
+field definitions, status semantics, scoring rules, and missing-deliverable
+handling.
+
 
 ## Workspace Cleanup
 
@@ -172,8 +209,10 @@ python -m build
 ```
 
 See [Architecture](docs/architecture.md),
-[Verifier Contract](docs/verifier-contract.md), and
+[Verifier Contract](docs/verifier-contract.md),
+[Result Format](docs/result-format.md), and
 [Security Model](docs/security.md) for implementation details.
+
 
 ## Contributing
 

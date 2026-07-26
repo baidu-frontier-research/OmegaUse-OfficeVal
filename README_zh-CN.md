@@ -6,14 +6,20 @@
   <a href="https://omegause-officeval.github.io/"><strong>项目网站</strong></a> &nbsp;•&nbsp;
   <a href="https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Hugging Face 数据集</strong></a> &nbsp;•&nbsp;
   <a href="https://arxiv.org/abs/XXXX.XXXXX"><strong>论文（即将发布）</strong></a>
+  <br>
+  <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal"><strong>源码</strong></a> &nbsp;•&nbsp;
+  <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/issues"><strong>问题反馈</strong></a> &nbsp;•&nbsp;
+  <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/releases"><strong>版本发布</strong></a>
 </p>
+
 
 OmegaUse-OfficeVal 是一个用于安全校验、批量执行和汇总 100 个 Office
 文档评估器的 Python 框架。系统接收 ZIP 提交包，先完成结构和安全检查，
 再在隔离子进程中运行 verifier，并输出 JSON 与 CSV 报告。
 
-> 本仓库只包含评估框架和 verifier 源码，不分发基准文档或用户提交的
-> Office 文件。
+> 本仓库包含评估框架和 verifier 源码；基准数据通过上方 Dataset 单独发布，
+> 不分发用户提交文件或评估产生的工作目录。
+
 
 ## 基准框架
 
@@ -45,8 +51,19 @@ OmegaUse-OfficeVal 将真实长周期 Office 任务采集、经济价值估算�
 - 只有需要运行九个 COM 硬依赖 verifier 时，才要求 Windows 安装
   Microsoft Office。
 
+## 平台兼容性
+
+| 平台 | 普通模式 | Office COM | 持续集成状态 |
+| --- | --- | --- | --- |
+| Windows | 支持 | 安装 Microsoft Office 后支持九个指定 verifier | 已在 Python 3.10 和 3.12 上验证 |
+| Linux | 支持 | 不支持；`auto` 模式会跳过 COM 强依赖项 | 已在 Ubuntu、Python 3.10 和 3.12 上验证 |
+| macOS | 预期支持 | 不支持；`auto` 模式会跳过 COM 强依赖项 | 当前未纳入 CI |
+
+普通模式依赖静态文档解析；平台相关的 Office 渲染和 COM 自动化仅在
+Windows 上可用。
 
 ## 安装
+
 
 ```bash
 python -m venv .venv
@@ -70,7 +87,8 @@ python -m pip install -e ".[test]"
 
 ## 提交包结构
 
-输入必须是 ZIP，根目录包含 100 个三位编号目录：
+完整提交包应为 ZIP，并在根目录包含 `officeval_001/` 至
+`officeval_100/` 共 100 个任务目录：
 
 ```text
 officeval_001/
@@ -79,8 +97,21 @@ officeval_002/
 officeval_100/
 ```
 
-每个目录包含相应 verifier 所需的 Office 或 PDF 文件。预检只报告异常
-内容，不会删除提交文件。
+缺少编号目录会产生 Warning，而不是压缩包级 Fatal。用户确认继续后，
+缺失目录、空目录或目录中没有受支持文档的编号不会进入 verifier，系统会
+生成正常的维度一失败结果，总分和完成度均为 0。
+
+支持的文档扩展名：
+
+- Word：`.docx`
+- Excel：`.xlsx`、`.xlsm`
+- PowerPoint：`.pptx`
+- PDF：`.pdf`
+
+不支持旧版 Office 格式 `.doc`、`.xls`、`.ppt`。这些格式依赖平台相关
+转换组件，无法在 Windows、macOS 和 Linux 上提供一致行为。预检只报告
+异常内容，不会删除提交文件。
+
 
 ## 使用
 
@@ -132,6 +163,9 @@ details.csv
 ```
 
 `results/`、`submissions/` 和 `workspaces/` 是本地运行状态，不纳入版本控制。
+字段定义、状态语义、完成度计算和缺失交付处理见
+[结果格式](docs/result-format.md)。
+
 
 ## 清理工作目录
 
@@ -159,8 +193,10 @@ python -m build
 ```
 
 设计说明见 [架构](docs/architecture.md)、
-[Verifier 接口](docs/verifier-contract.md) 和
+[Verifier 接口](docs/verifier-contract.md)、
+[结果格式](docs/result-format.md) 和
 [安全模型](docs/security.md)。
+
 
 ## 参与贡献
 

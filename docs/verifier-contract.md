@@ -45,7 +45,13 @@ A successful verifier returns one dictionary containing:
 optional evidence. System-level `error`, `timeout`, and `skipped` results are
 created by the batch worker rather than by normal verifier scoring.
 
+For the complete JSON and CSV field definitions, status meanings, completion
+formula, and missing-deliverable behavior, see [Result Format](result-format.md).
+In particular, `status="ok"` means that evaluation completed normally; it does
+not imply that `dim1_pass` is true or that the score is positive.
+
 ## Rules
+
 
 - Do not use absolute local paths.
 - Do not delete or modify submitted files.

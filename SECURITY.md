@@ -7,9 +7,12 @@ current default branch.
 
 ## Reporting a Vulnerability
 
-Do not open a public issue for a suspected vulnerability.
+Do not open a public issue for a suspected vulnerability. Email reports to
+[smart@baidu.com](mailto:smart@baidu.com). Email is the official private
+reporting channel for this project.
 
-Use the repository host's private security advisory feature to report:
+Use a descriptive subject such as `[OmegaUse-OfficeVal Security] <summary>` and
+report:
 
 - archive traversal or extraction bypasses;
 - arbitrary file access or deletion;
@@ -20,8 +23,6 @@ Use the repository host's private security advisory feature to report:
 
 Include the affected version, operating system, reproduction steps, impact,
 and any proposed mitigation. Remove real user documents and secrets from all
-attachments. Maintainers should acknowledge a complete report within seven
-calendar days and coordinate disclosure after a fix is available.
-
-A private contact address may be added here after the public repository and
-security-response mailbox are created.
+attachments. Maintainers will process complete reports as soon as reasonably
+possible, provide status updates during investigation, and coordinate public
+disclosure after a fix is available.

@@ -43,10 +43,11 @@ is officially representing the community in public spaces.
 
 ## Enforcement
 
-Reports should be sent privately through the repository host's moderation or
-security-reporting channels. All complaints will be reviewed and investigated
-promptly and fairly. Community leaders must respect the privacy and security
-of the reporter.
+Reports should be sent privately to [smart@baidu.com](mailto:smart@baidu.com).
+Do not include sensitive reports in a public issue. All complaints will be
+reviewed and investigated promptly and fairly. Community leaders must respect
+the privacy and security of the reporter.
+
 
 ## Attribution
 
