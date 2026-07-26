@@ -93,7 +93,8 @@ def _automation_office_pids() -> set[int]:
         return set()
     cmd = (
         "Get-CimInstance Win32_Process "
-        "-Filter \"Name IN ('WINWORD.EXE','EXCEL.EXE','POWERPNT.EXE')\" "
+        "-Filter \"Name='WINWORD.EXE' OR Name='EXCEL.EXE' "
+        "OR Name='POWERPNT.EXE'\" "
         "| Where-Object CommandLine -Like '* /Automation *' "
         "| Select-Object -ExpandProperty ProcessId"
     )

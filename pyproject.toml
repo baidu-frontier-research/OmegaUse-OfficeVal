@@ -58,8 +58,8 @@ packages = ["omegause_officeval", "core", "verifiers"]
 include = [
     "/.github",
     "/core",
-    "/data",
     "/docs",
+    "/examples",
     "/omegause_officeval",
     "/tests",
     "/verifiers",

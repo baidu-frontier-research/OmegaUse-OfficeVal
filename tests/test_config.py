@@ -21,9 +21,11 @@ def test_com_policy_is_explicit_and_disjoint() -> None:
 
     config.validate_config()
     assert config.COM_REQUIRED_VERIFIER_IDS == frozenset({
-        "011", "023", "039", "081",
+        "001", "008", "019", "022", "023", "030", "039", "074", "081",
     })
+    assert config.COM_FORCED_NORMAL_VERIFIER_IDS == frozenset({"011"})
     assert config.COM_VERIFIER_IDS == config.COM_REQUIRED_VERIFIER_IDS
+
     assert not (
         config.COM_REQUIRED_VERIFIER_IDS
         & config.COM_FORCED_NORMAL_VERIFIER_IDS

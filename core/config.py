@@ -129,15 +129,14 @@ def resolve_com_enabled(com_mode: str | None = None) -> bool:
 
 # 强依赖 COM：禁用 COM 时整项跳过；启用时进入 COM 串行通道。
 COM_REQUIRED_VERIFIER_IDS: frozenset[str] = frozenset({
-    "011", "023", "039", "081",
+    "001", "008", "019", "022", "023", "030", "039", "074", "081",
 })
 
 
 # 存在普通解析路径的 COM 相关 verifier：在所有平台强制使用普通模式。
 # 即使批次启用了 COM，worker 也会向这些脚本传入 OFFICEVAL_COM_ENABLED=0。
 COM_FORCED_NORMAL_VERIFIER_IDS: frozenset[str] = frozenset({
-    "002", "004", "010", "019", "024",
-    "026", "031", "035", "037", "092",
+    "011",
 })
 
 

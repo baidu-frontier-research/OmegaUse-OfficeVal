@@ -19,16 +19,18 @@ subprocess, and writes machine-readable JSON and CSV reports.
 - Isolated subprocess execution with configurable concurrency and timeout.
 - Visible progress, active verifier IDs, execution channel, and elapsed time.
 - Atomic JSON and CSV reports with one result per verifier.
-- Cross-platform normal mode for 96 verifiers.
-- A serialized Office COM channel on Windows for verifiers `011`, `023`,
-  `039`, and `081`.
+- Cross-platform normal mode for 91 verifiers.
+- A serialized Office COM channel on Windows for verifiers `001`, `008`,
+  `019`, `022`, `023`, `030`, `039`, `074`, and `081`.
+
 
 ## Requirements
 
 - Python 3.10 or newer.
 - Windows, macOS, or Linux for normal-mode verification.
-- Microsoft Word and Excel on Windows only when the four COM-required
-  verifiers must run.
+- Microsoft Office on Windows only when the nine COM-required verifiers must
+  run.
+
 
 ## Installation
 
@@ -89,14 +91,17 @@ Common options:
 --com-mode auto|enabled|disabled
 ```
 
-COM modes only affect verifiers `011`, `023`, `039`, and `081`:
+COM modes affect verifiers `001`, `008`, `019`, `022`, `023`, `030`, `039`,
+`074`, and `081`:
 
 - `auto`: enable COM for those verifiers on Windows and skip them elsewhere.
 - `enabled`: require Windows and enable COM for those verifiers.
-- `disabled`: skip those four verifiers on every platform.
+- `disabled`: skip those nine verifiers on every platform.
 
-Every verifier with a static parsing path remains in normal mode even when
-`--com-mode enabled` is selected.
+Verifier `011` keeps a controlled COM fallback, but the scheduler always runs
+it in normal mode with that fallback disabled. Other verifiers do not start
+Office COM.
+
 
 After validation, the CLI displays Fatal and Warning issues and asks for
 explicit confirmation before evaluation starts.

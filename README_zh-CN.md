@@ -17,15 +17,18 @@ Omegause Officeval 是一个用于安全校验、批量执行和汇总 100 个 O
 - verifier 独立子进程运行，并支持配置并发数和超时。
 - 显示进度、当前运行编号、执行通道和耗时。
 - 原子写入编号级 JSON、汇总 JSON 和 CSV。
-- 96 个 verifier 可在 Windows、macOS 和 Linux 上使用普通模式。
-- `011`、`023`、`039`、`081` 在 Windows 上使用串行 Office COM 通道。
+- 91 个 verifier 可在 Windows、macOS 和 Linux 上使用普通模式。
+- `001`、`008`、`019`、`022`、`023`、`030`、`039`、`074`、`081`
+  在 Windows 上使用串行 Office COM 通道。
+
 
 ## 环境要求
 
 - Python 3.10 或更高版本。
 - 普通模式支持 Windows、macOS 和 Linux。
-- 只有需要运行四个 COM 硬依赖 verifier 时，才要求 Windows 安装
-  Microsoft Word 和 Excel。
+- 只有需要运行九个 COM 硬依赖 verifier 时，才要求 Windows 安装
+  Microsoft Office。
+
 
 ## 安装
 
@@ -84,14 +87,16 @@ python -m core --package /absolute/path/to/submission.zip
 --com-mode auto|enabled|disabled
 ```
 
-COM 模式只控制 `011`、`023`、`039`、`081`：
+COM 模式控制 `001`、`008`、`019`、`022`、`023`、`030`、`039`、
+`074`、`081`：
 
 - `auto`：Windows 启用，macOS/Linux 跳过。
-- `enabled`：要求 Windows 并启用这四项。
-- `disabled`：所有平台跳过这四项。
+- `enabled`：要求 Windows 并启用这九项。
+- `disabled`：所有平台跳过这九项。
 
-存在静态解析路径的 verifier 始终使用普通模式，即使指定
-`--com-mode enabled` 也不会启动 Office。
+`011` 保留受控 COM fallback，但调度器始终以普通模式运行并禁用该
+fallback。其他 verifier 不会启动 Office COM。
+
 
 预检完成后，CLI 会列出 Fatal 和 Warning，并要求明确确认后才开始评估。
 
