@@ -1,13 +1,29 @@
-# Omegause Officeval
+# OmegaUse-OfficeVal
 
 [English](README.md)
 
-Omegause Officeval 是一个用于安全校验、批量执行和汇总 100 个 Office
+<p align="center">
+  <a href="https://omegause-officeval.github.io/"><strong>项目网站</strong></a> &nbsp;•&nbsp;
+  <a href="https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Hugging Face 数据集</strong></a> &nbsp;•&nbsp;
+  <a href="https://arxiv.org/abs/XXXX.XXXXX"><strong>论文（即将发布）</strong></a>
+</p>
+
+OmegaUse-OfficeVal 是一个用于安全校验、批量执行和汇总 100 个 Office
 文档评估器的 Python 框架。系统接收 ZIP 提交包，先完成结构和安全检查，
 再在隔离子进程中运行 verifier，并输出 JSON 与 CSV 报告。
 
 > 本仓库只包含评估框架和 verifier 源码，不分发基准文档或用户提交的
 > Office 文件。
+
+## 基准框架
+
+OmegaUse-OfficeVal 将真实长周期 Office 任务采集、经济价值估算与迭代式
+代码验证结合起来，并为脱敏后的任务指令和输入文件配套细粒度评分规则及
+可执行 verifier。
+
+<p align="center">
+  <img src="assets/benchmark-framework.png" alt="OmegaUse-OfficeVal 基准框架" width="100%">
+</p>
 
 ## 功能
 

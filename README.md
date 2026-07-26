@@ -1,14 +1,31 @@
-# Omegause Officeval
+# OmegaUse-OfficeVal
 
 [简体中文](README_zh-CN.md)
 
-Omegause Officeval is a Python framework for securely validating, executing,
+<p align="center">
+  <a href="https://omegause-officeval.github.io/"><strong>Website</strong></a> &nbsp;•&nbsp;
+  <a href="https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Dataset</strong></a> &nbsp;•&nbsp;
+  <a href="https://arxiv.org/abs/XXXX.XXXXX"><strong>Paper (coming soon)</strong></a>
+</p>
+
+OmegaUse-OfficeVal is a Python framework for securely validating, executing,
 and aggregating 100 Office document evaluators. It accepts a ZIP submission,
 checks its structure before extraction, runs each verifier in an isolated
 subprocess, and writes machine-readable JSON and CSV reports.
 
 > This repository contains the evaluation framework and verifier source code.
 > Benchmark documents and submitted Office files are not distributed.
+
+## Benchmark Framework
+
+OmegaUse-OfficeVal combines authentic long-horizon Office task collection,
+economically grounded value estimation, and iterative code-based verification.
+The resulting benchmark pairs de-identified instructions and input artifacts
+with fine-grained rubrics and executable verifiers.
+
+<p align="center">
+  <img src="assets/benchmark-framework.png" alt="OmegaUse-OfficeVal benchmark framework" width="100%">
+</p>
 
 ## Features
 
@@ -22,21 +39,6 @@ subprocess, and writes machine-readable JSON and CSV reports.
 - Cross-platform normal mode for 91 verifiers.
 - A serialized Office COM channel on Windows for verifiers `001`, `008`,
   `019`, `022`, `023`, `030`, `039`, `074`, and `081`.
-
-## Dataset Metadata
-
-Task metadata and evaluation rubrics are available under [`data/`](data/) in
-both the original Chinese and English:
-
-- `data/tasks/` and `data/rubrics/` contain the original Chinese records.
-- `data/task-en/` and `data/rubrics-en/` contain the corresponding English
-  translations.
-
-All four directories cover `officeval_001` through `officeval_100`. The input
-artifacts referenced by the task JSON files are hosted in the
-[`task_files/`](https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/tree/main/task_files)
-directory of the OmegaUse-OfficeVal dataset on Hugging Face. See the
-[`data` documentation](data/README.md) for the schemas and download URL format.
 
 
 ## Requirements

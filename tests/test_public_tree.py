@@ -8,17 +8,21 @@ CHECKED_SUFFIXES = {".py", ".md", ".toml", ".txt", ".yml", ".yaml"}
 IGNORED_PARTS = {"dist", "build", ".pytest_cache"}
 PUBLIC_DOMAINS = {
     "apache.org",
+    "arxiv.org",
     "baidu.com",
     "contributor-covenant.org",
     "example.com",
     "example.net",
     "example.org",
+    "huggingface.co",
     "keepachangelog.com",
+    "omegause-officeval.github.io",
     "semver.org",
 }
 DOMAIN_RE = re.compile(
     r"\b(?:[a-z0-9-]+\.)+"
-    r"(?:com|corp|dev|internal|intranet|io|lan|local|net|org)\b",
+    r"(?:co|com|corp|dev|internal|intranet|io|lan|local|net|org)\b",
+
     re.IGNORECASE,
 )
 IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
