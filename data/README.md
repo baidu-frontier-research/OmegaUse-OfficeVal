@@ -240,7 +240,7 @@ intent, constraints, and task-critical details.
 ## Citation
 
 ```bibtex
-@inproceedings{omegause_officeval_2027,
+@inproceedings{omegause_officeval_2026,
   title     = {OmegaUse-OfficeVal: Benchmarking LLM Agents on Long-Horizon Office-Suite Tasks with Economic Grounding},
   booktile={tech report}
   year = {July, 2026}
