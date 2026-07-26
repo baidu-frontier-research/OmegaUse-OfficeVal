@@ -4,7 +4,7 @@
   "operation_intent": "Other",
   "domain": "Education & Examination",
   "human_labor_time": 125,
-  "task_price_proxy": 70,
+  "task_price_proxy": 105,
   "price_source": "explicit_price",
   "origin_files": [
     {
