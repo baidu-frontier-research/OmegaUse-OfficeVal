@@ -242,7 +242,7 @@ intent, constraints, and task-critical details.
 ```bibtex
 @inproceedings{omegause_officeval_2027,
   title     = {OmegaUse-OfficeVal: Benchmarking LLM Agents on Long-Horizon Office-Suite Tasks with Economic Grounding},
-  booktitle = {Proceedings of the 2027 ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD '27)},
-  year      = {2027}
+  booktile={tech report}
+  year = {July, 2026}
 }
 ```
