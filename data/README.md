@@ -167,6 +167,45 @@ https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resol
 }
 ```
 
+`task-en/officeval_001.json`
+
+```json
+{
+  "id": "officeval_001",
+  "instruction": "Modify the provided Word documents according to the following requirements:\n1. Delete the content under \"Lesson Learning Objectives\" and \"Lesson Assessment Tasks\" (but keep the headings).\n2. ...",
+  "operation_intent": "Restructure",
+  "domain": "Education & Examination",
+  "human_labor_time": 204,
+  "task_price_proxy": 50,
+  "price_source": "estimated_price",
+  "origin_files": [
+    {
+      "url": "https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal/resolve/main/task_files/officeval_001/01_课时学习方案_观察一位校园志愿者_第一课时.docx",
+      "dest": "01_课时学习方案_观察一位校园志愿者_第一课时.docx"
+    }
+  ]
+}
+```
+
+`rubrics-en/officeval_001.json`
+
+```json
+{
+  "id": "officeval_001",
+  "instruction": "Modify the provided Word documents according to the following requirements:\n1. Delete the content under \"Lesson Learning Objectives\" and \"Lesson Assessment Tasks\" (but keep the headings).\n2. ...",
+  "rubrics": {
+    "dim1": [
+      "The delivered files are in Word format, have the .doc extension, and can be opened normally.",
+      "..."
+    ],
+    "dim2": [
+      "+1: The lesson learning plan contains the \"Lesson Learning Objectives\" heading, with no content under the heading. (Add 1 point if any one of the eight files meets this criterion, 2 points if two files meet it, and so on.)",
+      "..."
+    ]
+  }
+}
+```
+
 ## Dataset Statistics
 
 - **Tasks:** 100
