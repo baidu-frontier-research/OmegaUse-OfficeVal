@@ -964,9 +964,6 @@ def dimension_one(info: WordInfo) -> Tuple[bool, List[str]]:
         issues.append("文件不是 .docx")
     elif not info.zip_ok:
         issues.append("docx 包无法正常打开")
-    pages = page_count(info)
-    if not 30 <= pages <= 40:
-        issues.append(f"页数为 {pages}，不在 30-40 页之间")
     # 说明：按用户要求，删除以下维度一检查
     #   - "无连续 2 页以上空白页"
     #   - "无超过 1/3 页面面积乱码"

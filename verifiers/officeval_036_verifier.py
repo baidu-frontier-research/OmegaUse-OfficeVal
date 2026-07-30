@@ -40,57 +40,7 @@ HEADER = ["Date", "Description", "Withdrawals", "Deposits", "Balance"]
 TWIPS_PER_CM = 1440 / 2.54
 EMU_PER_CM = 360000
 
-# 作为 PDF 标准答案的自动化判定基准：1 行期初余额 + 46 行交易 + 1 行期末汇总 = 48 行。
-EXPECTED_RECORDS = [
-    ("01 Dec.", "Balance forward", "", "", "$43,712.48"),
-    ("01 Dec.", "Insurance premium - studio toolkits", "$218.40", "", "$43,494.08"),
-    ("01 Dec.", "Supplier payout - compact label printers", "$184.75", "", "$43,309.33"),
-    ("02 Dec.", "Merchant batch - bamboo organizer trays", "", "$6,870.20", "$50,179.53"),
-    ("02 Dec.", "Merchant batch - LED task lamps", "", "$7,940.00", "$58,119.53"),
-    ("02 Dec.", "Merchant batch - ceramic storage jars", "", "$2,215.35", "$60,334.88"),
-    ("03 Dec.", "Client transfer - folding display stands", "", "$1,135.70", "$61,470.58"),
-    ("05 Dec.", "Marketplace settlement - wool desk mats", "", "$695.42", "$62,166.00"),
-    ("09 Dec.", "Platform fee - travel cable pouches", "$63.25", "", "$62,102.75"),
-    ("10 Dec.", "Client transfer - glass water carafes", "", "$3,420.00", "$65,522.75"),
-    ("11 Dec.", "Utilities payment - workshop power", "$562.90", "", "$64,959.85"),
-    ("12 Dec.", "Payment gateway batch - recycled notebooks", "", "$11,780.50", "$76,740.35"),
-    ("15 Dec.", "Client transfer - countertop spice racks", "", "$2,640.00", "$79,380.35"),
-    ("15 Dec.", "Cheque cleared - portable shelving units", "$3,496.80", "", "$75,883.55"),
-    ("15 Dec.", "ATM cash deposit - weekend sales", "", "$7,530.00", "$83,413.55"),
-    ("15 Dec.", "Remote cheque deposit - acoustic wall panels", "", "$615.90", "$84,029.45"),
-    ("15 Dec.", "Cheque cleared - magnetic whiteboards", "$2,745.60", "", "$81,283.85"),
-    ("15 Dec.", "Bill payment - warehouse heat", "$684.30", "", "$80,599.55"),
-    ("15 Dec.", "Cheque cleared - washable floor runners", "$2,430.00", "", "$78,169.55"),
-    ("15 Dec.", "Cheque cleared - adjustable coat racks", "$3,215.45", "", "$74,954.10"),
-    ("15 Dec.", "Cheque cleared - kraft mailer cartons", "$1,955.20", "", "$72,998.90"),
-    ("15 Dec.", "Cheque cleared - countertop scales", "$3,118.70", "", "$69,880.20"),
-    ("17 Dec.", "Supplier transfer - insulated lunch tins", "$1,022.50", "", "$68,857.70"),
-    ("17 Dec.", "Supplier transfer - silicone cable clips", "$742.80", "", "$68,114.90"),
-    ("17 Dec.", "Supplier transfer - walnut monitor risers", "$1,604.40", "", "$66,510.50"),
-    ("18 Dec.", "Supplier transfer - linen storage bins", "$1,885.00", "", "$64,625.50"),
-    ("18 Dec.", "Cheque cleared - reusable shipping crates", "$2,875.35", "", "$61,750.15"),
-    ("19 Dec.", "Remote cheque deposit - desk organizers", "", "$2,940.75", "$64,690.90"),
-    ("23 Dec.", "Payment gateway batch - clip-on reading lights", "", "$8,210.60", "$72,901.50"),
-    ("24 Dec.", "Wholesale payment - cotton tote sets", "", "$5,476.25", "$78,377.75"),
-    ("24 Dec.", "ATM deposit - cash sales", "", "$6,800.00", "$85,177.75"),
-    ("29 Dec.", "Client transfer - enamel plant tags", "", "$2,125.00", "$87,302.75"),
-    ("29 Dec.", "Client transfer - cork message boards", "", "$3,480.00", "$90,782.75"),
-    ("29 Dec.", "Marketplace settlement - soft-close storage boxes", "", "$2,870.65", "$93,653.40"),
-    ("29 Dec.", "Marketplace settlement - acrylic recipe holders", "", "$1,120.30", "$94,773.70"),
-    ("30 Dec.", "Payment gateway batch - glass spice mills", "", "$4,435.40", "$99,209.10"),
-    ("30 Dec.", "Cheque cleared - collapsible laundry carts", "$9,750.00", "", "$89,459.10"),
-    ("30 Dec.", "Platform fee - leather key trays", "$483.60", "", "$88,975.50"),
-    ("30 Dec.", "Platform fee - brushed metal hooks", "$37.25", "", "$88,938.25"),
-    ("30 Dec.", "Platform fee - canvas tool rolls", "$52.18", "", "$88,886.07"),
-    ("31 Dec.", "Cheque cleared - cedar drawer inserts", "$3,120.70", "", "$85,765.37"),
-    ("31 Dec.", "Cheque cleared - pegboard panels", "$2,948.30", "", "$82,817.07"),
-    ("31 Dec.", "Cheque cleared - wire baskets", "$2,104.90", "", "$80,712.17"),
-    ("31 Dec.", "Cheque cleared - rolling trolleys", "$3,302.75", "", "$77,409.42"),
-    ("31 Dec.", "Cheque cleared - cable trays", "$3,005.45", "", "$74,403.97"),
-    ("31 Dec.", "Cheque cleared - bamboo file holders", "$3,260.20", "", "$71,143.77"),
-    ("31 Dec.", "Monthly service fee - operating account", "$21.00", "", "$71,122.77"),
-    ("31 Dec.", "Closing totals", "$54,891.73", "$82,302.02", "$71,122.77"),
-]
+# 作为 PDF 标准答案的自动化判定基准由维度二各评分点单独定义，此处不再维护 48 行完整记录列表。
 
 
 @dataclass
@@ -347,23 +297,6 @@ def data_records(tbl: ET.Element | None) -> list[tuple[str, str, str, str, str]]
     return out
 
 
-def diff_expected(actual: list[tuple[str, str, str, str, str]]) -> str:
-    if len(actual) != len(EXPECTED_RECORDS):
-        return f"行数不一致：实际 {len(actual)} 行，期望 {len(EXPECTED_RECORDS)} 行"
-    for idx, (got, exp) in enumerate(zip(actual, EXPECTED_RECORDS), start=1):
-        if got != exp:
-            return f"第 {idx} 条记录不一致：实际 {got}，期望 {exp}"
-    return ""
-
-
-def row_heights_consistent(tbl: ET.Element | None) -> CheckResult:
-    if tbl is None:
-        return CheckResult("每一项记录表格行高完全一致", False, "未找到收支记录表格")
-    heights = [row_height(tr) for tr in rows(tbl)[1:]]
-    passed = bool(heights) and len(set(heights)) == 1 and heights[0][0] is not None and heights[0][1] == "exact"
-    return CheckResult("每一项记录的表格行高完全一致，且为固定行高", passed, f"数据行行高集合={sorted(set(heights))}")
-
-
 def dimension1(ctx: DocxContext | None, load_error: str) -> tuple[bool, list[CheckResult], ET.Element | None]:
     checks: list[CheckResult] = []
     if ctx is None:
@@ -372,20 +305,6 @@ def dimension1(ctx: DocxContext | None, load_error: str) -> tuple[bool, list[Che
 
     checks.append(CheckResult("交付文件为 .docx 格式，文件可正常打开", True, "docx zip 包与 word/document.xml 可解析"))
     tbl = find_record_table(ctx)
-
-    actual = data_records(tbl)
-    diff = diff_expected(actual)
-    checks.append(CheckResult(
-        "PDF 中 46 笔交易、1 行期初余额和1行期末汇总均整理到 Word 表格中，共48行数据记录",
-        not diff,
-        diff or "48 行标准记录全部存在",
-    ))
-    checks.append(CheckResult(
-        "所有记录按照 PDF 日期和先后顺序排列，不能遗漏、重复、顺序颠倒或金额错列",
-        not diff,
-        diff or "记录顺序和五列金额均与标准答案一致",
-    ))
-    checks.append(row_heights_consistent(tbl))
     return all(c.passed for c in checks), checks, tbl
 
 

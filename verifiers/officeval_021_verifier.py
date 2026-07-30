@@ -149,21 +149,14 @@ def check_dimension1(filepath):
         return results, False
 
     try:
-        doc = Document(filepath)
+        _ = Document(filepath)
         results.append(("文件可正常打开", True, ""))
     except Exception as e:
         results.append(("文件可正常打开", False, str(e)))
         return results, False
 
-    # 2. 页数检查 (5-9页)
-    page_count = get_page_count_estimate(doc)
-    if 5 <= page_count <= 9:
-        results.append((f"页数介于5-9页（估算{page_count}页）", True, ""))
-    else:
-        results.append((f"页数介于5-9页（估算{page_count}页）", False, "页数不在范围内"))
-        return results, False
-
-    # 说明：按用户要求，删除以下两项维度一检查
+    # 说明：按用户要求，删除以下维度一检查
+    #   - "页数介于5-9页"
     #   - "无连续2页以上空白页/乱码/文字重叠"
     #   - "封面文字、正文、表格、参考文献、签署意见栏均可编辑，不能整篇转成图片或PDF"
 

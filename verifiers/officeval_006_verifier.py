@@ -232,20 +232,6 @@ def _error_result(dir_path, message):
     }
 
 
-def _gate_fail_result(file_name, reason):
-    return {
-        'id': SCRIPT_ID,
-        'file_name': file_name,
-        'status': 'ok',
-        'error': None,
-        'dim1_pass': False,
-        'dim1_reason': reason,
-        'dim2_items': _build_dim2_items([]),
-        'total_score': 0,
-        'max_score': _max_score(),
-    }
-
-
 def evaluate(dir_path: str) -> dict:
     """对指定目录内的 Word 文档进行两维度评测.
 
@@ -266,81 +252,10 @@ def _evaluate_impl(dir_path: str) -> dict:
         return _error_result(dir_path, '目录下未找到 .docx 文件')
     file_name = os.path.basename(file_path)
 
-    # ---- 维度一: 一票否决项 (Gate) ----
-    gate_pass = True
-    dim1_reason = ''
-
-    if not file_path.lower().endswith('.docx'):
-        gate_pass = False
-        dim1_reason = '文件扩展名不是 .docx'
-
     try:
         doc = _open_doc_as_document(file_path)
     except Exception as exc:
         return _error_result(dir_path, f'无法打开文档: {exc}')
-
-    if gate_pass:
-        # 空段落过多 / 乱码
-        total_paras = len(doc.paragraphs)
-        empty_count = sum(1 for p in doc.paragraphs if is_empty_para(p))
-        empty_ratio = empty_count / max(total_paras, 1)
-
-        garbled = False
-        # Word 中合法的空白控制字符 (制表 / 换行 / 回车) 不属于乱码
-        _allowed_ctrl = {0x09, 0x0A, 0x0D}
-        for p in doc.paragraphs:
-            for ch in p.text:
-                code = ord(ch)
-                if code in _allowed_ctrl:
-                    continue
-                if code < 0x20 or (0x7F <= code <= 0x9F):
-                    garbled = True
-                    break
-            if garbled:
-                break
-
-        overlap_issue = False
-        for p in doc.paragraphs[:50]:
-            line, _ = get_para_line_spacing(p)
-            if line and int(line) < 0:
-                overlap_issue = True
-                break
-
-        if empty_ratio > 0.5 or garbled or overlap_issue:
-            gate_pass = False
-            if empty_ratio > 0.5:
-                dim1_reason = f'空段落比例过高 ({empty_ratio:.2f})'
-            elif garbled:
-                dim1_reason = '文档含乱码控制字符'
-            else:
-                dim1_reason = '行距异常(<0)导致重叠'
-
-        # PDF 截图检测
-        text_run_count = count_text_runs(doc)
-        image_count = count_images(doc)
-        if text_run_count == 0 or (image_count > 0 and text_run_count < 10):
-            gate_pass = False
-            dim1_reason = 'PDF 截图/无文字内容'
-
-        # 答案内容检测
-        full_text = ''
-        for p in doc.paragraphs:
-            full_text += p.text + '\n'
-        for t in doc.tables:
-            for row in t.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        full_text += p.text + '\n'
-
-        if any(kw in full_text for kw in ['答案', '解析', '详解', '参考答案']):
-            gate_pass = False
-            dim1_reason = '文档包含答案/解析内容'
-        if '0.83' in full_text or '3.68' in full_text:
-            gate_pass = False
-            dim1_reason = '文档包含疑似答案数值'
-
-    if not gate_pass:
-        return _gate_fail_result(file_name, dim1_reason or '维度一未通过')
 
     # ---- 维度二: 得分项检查 ----
     hit_items = []

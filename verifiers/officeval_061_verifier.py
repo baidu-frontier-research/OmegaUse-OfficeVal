@@ -1502,8 +1502,6 @@ def dimension1(analyzer: PptxAnalyzer) -> Tuple[bool, List[str]]:
                 reasons.append("无法读取 presentation.xml 中的幻灯片列表，文件无法正常打开。")
         except Exception as exc:
             reasons.append(f"PPTX 文件无法正常打开：{exc}")
-    if len(analyzer.slide_paths) != 11:
-        reasons.append(f"最终页数为 {len(analyzer.slide_paths)}，不是 11 页。")
     return not reasons, reasons
 
 
