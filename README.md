@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://omegause-officeval.github.io/"><strong>Website</strong></a> &nbsp;•&nbsp;
   <a href="https://huggingface.co/datasets/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Dataset</strong></a> &nbsp;•&nbsp;
-  <a href="https://arxiv.org/abs/2607.27155"><strong>Paper (coming soon)</strong></a>
+  <a href="https://arxiv.org/abs/2607.27155"><strong>Paper</strong></a>
   <br>
   <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal"><strong>Source</strong></a> &nbsp;•&nbsp;
   <a href="https://github.com/baidu-frontier-research/OmegaUse-OfficeVal/issues"><strong>Issues</strong></a> &nbsp;•&nbsp;
