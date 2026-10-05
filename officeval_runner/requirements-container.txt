@@ -1,0 +1,28 @@
+openai-codex==0.144.4
+lxml==6.1.1
+openpyxl==3.1.5
+Pillow==12.3.0
+pydantic==2.13.4
+pypdf==6.14.2
+python-docx==1.2.0
+python-pptx==1.0.2
+XlsxWriter==3.2.9
+# Libraries Agents kept installing at run time; the read-only rootfs and the
+# small noexec HOME leave no room to install compiled packages there.
+imageio==2.38.0
+imageio-ffmpeg==0.6.0
+matplotlib==3.11.2
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+pdfplumber==0.11.10
+PyMuPDF==1.28.2
+reportlab==5.0.1
+scipy==1.18.1
+# rapidocr-onnxruntime's own dependencies; the Dockerfile installs it with
+# --no-deps so it cannot pull in the GUI build of OpenCV.
+onnxruntime==1.30.0
+pyclipper==1.4.0
+PyYAML==6.0.3
+shapely==2.1.2
+six==1.17.0
+tqdm==4.70.1

@@ -1,0 +1,22 @@
+# One record per model under evaluation: how to call it, and what its tokens cost.
+# Copy this file to .models.yaml (git-ignored) and fill in real credentials.
+# The top-level key is sent to the provider as the model ID and is the value of --model.
+models:
+  deepseek/deepseek-v4-pro-0813:
+    # Required: the provider's OpenAI-compatible endpoint and credentials.
+    base_url: https://example.com/v1
+    api_key: replace-with-bearer-key
+
+    # Optional: set to [text] for models without image input (see README.md).
+    input_modalities: [text]
+    # Optional: omitted fields fall back to the ModelSettings defaults.
+    context_window: 1048576
+    request_max_retries: 4
+    stream_max_retries: 5
+    stream_idle_timeout_ms: 300000
+
+    # Required: official API pricing, in USD per million tokens.
+    pricing:
+      input_per_million_usd: 1.74
+      output_per_million_usd: 3.48
+      cache_read_per_million_usd: 0.145
