@@ -39,8 +39,8 @@ OmegaUse-OfficeVal 将真实长周期 Office 任务采集、经济价值估算�
 - verifier 独立子进程运行，并支持配置并发数和超时。
 - 显示进度、当前运行编号、执行通道和耗时。
 - 原子写入编号级 JSON、汇总 JSON 和 CSV。
-- 91 个 verifier 可在 Windows、macOS 和 Linux 上使用普通模式。
-- `001`、`008`、`019`、`022`、`023`、`030`、`039`、`074`、`081`
+- 94 个 verifier 可在 Windows、macOS 和 Linux 上使用普通模式。
+- `001`、`021`、`023`、`024`、`025`、`039`
   在 Windows 上使用串行 Office COM 通道。
 
 
@@ -48,14 +48,16 @@ OmegaUse-OfficeVal 将真实长周期 Office 任务采集、经济价值估算�
 
 - Python 3.10 或更高版本。
 - 普通模式支持 Windows、macOS 和 Linux。
-- 只有需要运行九个 COM 硬依赖 verifier 时，才要求 Windows 安装
+- 只有需要运行六个 COM 硬依赖 verifier 时，才要求 Windows 安装
   Microsoft Office。
+- Python 运行时依赖统一声明在 [`pyproject.toml`](pyproject.toml)，对应许可证
+  汇总在 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)。
 
 ## 平台兼容性
 
 | 平台 | 普通模式 | Office COM | 持续集成状态 |
 | --- | --- | --- | --- |
-| Windows | 支持 | 安装 Microsoft Office 后支持九个指定 verifier | 已在 Python 3.10 和 3.12 上验证 |
+| Windows | 支持 | 安装 Microsoft Office 后支持六个指定 verifier | 已在 Python 3.10 和 3.12 上验证 |
 | Linux | 支持 | 不支持；`auto` 模式会跳过 COM 强依赖项 | 已在 Ubuntu、Python 3.10 和 3.12 上验证 |
 | macOS | 预期支持 | 不支持；`auto` 模式会跳过 COM 强依赖项 | 当前未纳入 CI |
 
@@ -134,15 +136,15 @@ python -m core --package /absolute/path/to/submission.zip
 --com-mode auto|enabled|disabled
 ```
 
-COM 模式控制 `001`、`008`、`019`、`022`、`023`、`030`、`039`、
-`074`、`081`：
+COM 模式控制 `001`、`021`、`023`、`024`、`025`、`039`：
 
 - `auto`：Windows 启用，macOS/Linux 跳过。
-- `enabled`：要求 Windows 并启用这九项。
-- `disabled`：所有平台跳过这九项。
+- `enabled`：要求 Windows 并启用这六项。
+- `disabled`：所有平台跳过这六项。
 
-`011` 保留受控 COM fallback，但调度器始终以普通模式运行并禁用该
-fallback。其他 verifier 不会启动 Office COM。
+`007` 同样包含 COM 代码路径，但调度器始终以普通模式运行；
+`COM_FORCED_NORMAL_VERIFIER_IDS` 中的 verifier 一律收到
+`OFFICEVAL_COM_ENABLED=0`，其他 verifier 不会启动 Office COM。
 
 
 预检完成后，CLI 会列出 Fatal 和 Warning，并要求明确确认后才开始评估。

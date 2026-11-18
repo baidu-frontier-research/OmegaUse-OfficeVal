@@ -1,1882 +1,1267 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
+# pyright: reportUnknownArgumentType=false, reportMissingImports=false
+# pyright: reportPrivateUsage=false, reportGeneralTypeIssues=false, reportOptionalMemberAccess=false
+"""025 号任务评分器：《青岭山居旅居营造计划》行距 / 错别字 / 标题格式 / 表格分页排版
+
+评分口径（对齐同目录 细则.txt）：
+  维度1 可用与可修改性：交付物为 1 个可正常打开的 .docx，正文与表格为可单独点选编辑的
+        文字与表格（非整页位图），版面未严重错乱；不通过则完成度总分直接记 0。
+  维度2 完成度：19 条加分项（满分 63）+ 23 条减分项（命中即扣，可累计）。
+        加分项只覆盖指令要求且需要实际动手的改动；原文已达标、无需干活的项一律作为减分项，
+        改坏即扣分。max_score = 加分项之和；total_score = 命中加分项 - 命中减分项（下限截到 0）。
+
+说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果，也不调用 sys.exit。
+      主结果统一由 evaluate() -> dict 返回；评估目标固定为“本脚本所在的那个目录”，
+      只认该目录下的 .docx/.doc 交付物，不进入子目录、不检索上级目录、
+      也不接受命令行或入参指定的其它路径。
+表格分页判定优先走 Word COM 真实重排（win32com + Word），取每个表格首/末位置所在页码；
+Word 不可用时退化为按 A4 可用高度 + 单元格文字行数的估算（仅内部记录，返回值固定为
+      id / file_name / status / error / dim1_pass / dim1_reason / dim2_items /
+      total_score / max_score 九个字段，不额外输出 notes）。
 """
-自动评估脚本：对《青岭山居旅居营造计划_格式修改版.docx》按给定打分细则进行自动评分。
-
-评估逻辑：
-- 维度1（可用与可修改性）：若不满足，直接判为 0 分，不再检查维度2。
-- 维度2（完成度）：逐条匹配得分点/扣分点，累加分数。
-
-所有评分点都通过解析 document.xml / 页眉页脚 / 表格 / 图片 等结构自动判断，
-不依赖人工。
-"""
-
-from __future__ import annotations
-
-import json
-
-SCRIPT_ID = "025"
-import math
 import os
 import re
-import sys
-import traceback
+import json
 import zipfile
-from typing import List, Dict, Tuple, Optional
+import collections
 
-import docx
+from docx import Document
 from docx.oxml.ns import qn
-from lxml import etree
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
-W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-NS = {"w": W_NS, "r": R_NS}
+try:
+    import win32com.client as _wc  # Word COM：用于按真实重排结果判定表格跨页
+except Exception:
+    _wc = None
+
+SCRIPT_ID = "025"
+MAX_SCORE_TOTAL = 63
+
+# 本脚本只评估“脚本自身所在的那一个目录”里的交付物：不进子目录、不看上级目录、
+# 也不接受外部传入的其它路径。评测时把本脚本与被评 .docx 放在同一个目录下即可。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ==== 输入文档基线常量（用于判定"指令未涉及、却被改动"的部分）====
+STRICT_SONGTI = ('宋体', 'SimSun', 'NSimSun')
+BASE_TABLE_COUNT = 28          # 表格数
+BASE_TABLE_ROWS = 275          # 全部表格行数合计
+BASE_NONEMPTY_PARAS = 281      # 非空段落数
+BASE_SECTIONS = 3              # 分节数
+BASE_PAGE_FIELDS = 2           # 页眉页脚中 PAGE 域片段数
+BASE_DRAWING = 14              # <w:drawing> 图片数
+BASE_PICT = 9                  # <w:pict> 图片数
+BASE_SONGTI_ASCII = 190        # 非标题正文/表格中西文字体沿用宋体的 run 数
+BASE_DOTTED_PCT_MIN = 55       # 小数点百分比写法应达到的条数（基线 59 处）
+BASE_PAGE_MARGIN_LR = 1800     # 左右页边距 3.18 厘米 = 1800 twips
+BASE_PAGE_MARGIN_TB = 1440     # 上下页边距 2.54 厘米 = 1440 twips
+BASE_PAGE_W = 11906            # A4 宽 210 毫米
+BASE_PAGE_H = 16838            # A4 高 297 毫米
+BASE_EXTENTS = [
+    (9187815, 13303250), (2736215, 1580515), (6818630, 1748790), (2716530, 1030605),
+    (6297295, 1530350), (3558540, 1240155), (6778625, 2430780), (3169920, 833755),
+    (7512050, 5302250), (2373630, 2373630), (3126105, 3118485), (5106670, 5261610),
+    (5274310, 3515995), (5271135, 1637665),
+]
+
+# ==== 表头签名（用于定位各张表格）====
+H_RES = ('主类', '亚类', '基本类型', '旅游资源单体名称')
+H_LEDGER = ('月份', '重点工作', '责任主体', '交付物', '备注')
+H_INNOV = ('创新维度', '具体体现', '不可复制性来源')
+H_SURVEY = ('选项', '小计', '比例')
+H_FUND = ('项目', '金额（万元）', '占比', '资金使用说明')
+H_REV = ('业务线', '营收（万元）', '占比', '核心驱动因素')
+H_COST = ('项目', '第一年（万元）', '第二年（万元）', '第三年（万元）', '说明')
+H_RISK = ('序号', '阶段', '风险预测', '管理对策', '其他')
+H_PRICE = ('业务类型', '目标客群', '业务特点', '价格范围', '典型例子')
+H_TEAM = ('姓名', '专业班级', '学院', '职务', '核心职责')
+H_COURT = ('院落类型', '空间特征与改造要点', '资源依托', '目标客群', '特色服务')
+H_SEASON = ('季节', '核心体验项目', '资源依托', '特色亮点')
+
+# ==== 标题分级（按核心标题文字匹配，容忍编号形式被改写）====
+TITLE_L1 = ['市场分析', '项目简介', '产品与服务', '商业模式', '财务分析',
+            '风险识别与管理对策', '未来前景分析', '团队介绍']
+TITLE_L2 = ['环境分析', '旅游资源分析', '数据分析', '启动背景', '项目简述', '产品架构',
+            '产品内容', '创新点分析', '商业模式', '营销策略', '财务规划',
+            '项目可行性分析', '风险识别与评估', '风险管理对策', '前期', '中期', '后期']
+TITLE_L3 = ['政治环境（Politics）', '经济环境（Economy）', '社会环境（Society）',
+            '技术环境（Technology）', '样本构成分析', '旅居市场现状与潜力',
+            '消费能力与预算结构', '旅居地选择因素分析', '住宿形式偏好', '服务需求偏好',
+            '决策行为分析', '开放题内容分析', '分年龄段交叉分析（补充）', '主要调研结论汇总',
+            '政策层面：', '省域层面：', '市级层面：', '青岭湾村现状', '目标人群',
+            '产品介绍', '项目定位', '产品核心：山居特色院落群', '四大体验板块',
+            '三个阶段', '多方利益分配机制', '扁平化组织架构', '线上获客（核心渠道）',
+            '线下获客（补充渠道）', '财务规划原则', '阶段发展假设', '启动资金预算与使用规划',
+            '定价体系与业务线梳理', '三年收入预测（按业务线拆分）', '年度总成本与费用表',
+            '投资回报与现金流测算', '政策可行性', '市场可行性', '经济可行性', '运营可行性']
+TITLE_L3_ALIAS = {'政策层面': '政策层面：', '省域层面': '省域层面：', '市级层面': '市级层面：'}
+
+# 四级编号小标题（与正文同级，应为宋体小四不加粗）
+LV4_NUMBERED = ['地域分布', '年龄结构', '旅居经历', '对山地村落旅居项目的兴趣度',
+                '每月旅居预算（含住宿+基础餐饮）', '最看重的三项因素（多选）',
+                '倾向的住宿形式', '最有吸引力的服务（多选）', '决定长住前的准备行为（多选）',
+                '关键词分类统计', '预算与年龄的交叉', '市场基本面']
+# 冒号型小标题与提示行（应为宋体小四不加粗）
+LV4_COLON = ['宏观市场规模：', '客群地域来源：', '用户画像：', '核心：山地院落民宿群',
+             '四大体验板块：', '核心定位：', '定位阐释：', '投资回收期测算', '现金流预测',
+             '三大核心因素清晰可见：', '服务需求呈现清晰层次：', '现金流保障措施：']
+BOLD_HINT = ['成员分工：', '指导教师：']
+
+MONTH_LABELS = ['%s月·第%d轮' % (m, k)
+                for m in ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二']
+                for k in (1, 2, 3)]
+INNOV_NAMES = ['资源深度转化', '主客共创', '弹性组合设计', '小体量运营', '在地物产增值', '差异化场景']
+CELL_NOTES = ['跨页表格，便于季度复盘', '院落巡检、活动复盘、农产品清单校对', '低于警戒值暂停扩容']
+KEEP_NUMBERS = ['165', '128', '3.2', '19公里', '28分钟', '32%', '61%', '199', '172',
+                '300', '800', '1450']
+KEEP_NAMES = ['陆修远', '何修晴', '周一行', '赵清澜', '林若楠', '许知瑾', '梁冥香',
+              '旅游管理23级1班']
+
+# ============================ 基础工具 ============================
+
+def _norm(s):
+    """归一化文字：去掉空白与换行，全角空格一并去掉。"""
+    return re.sub(r'[\s　]+', '', s or '')
 
 
-# --------------------------------------------------------------------------------------
-# 工具函数
-# --------------------------------------------------------------------------------------
-
-def read_doc_xml(src: str) -> Tuple[bytes, dict, dict, list, bytes, bytes]:
-    """从 docx 文件读取 document.xml、rels、footers、styles、theme。"""
-    with zipfile.ZipFile(src) as z:
-        names = z.namelist()
-        with z.open("word/document.xml") as f:
-            doc_xml = f.read()
-        rels = {}
-        if "word/_rels/document.xml.rels" in names:
-            with z.open("word/_rels/document.xml.rels") as f:
-                rels_root = etree.fromstring(f.read())
-                for r in rels_root:
-                    rels[r.get("Id")] = (r.get("Type", "").split("/")[-1], r.get("Target"))
-        footers = {}
-        for n in names:
-            if n.startswith("word/footer") and n.endswith(".xml"):
-                with z.open(n) as f:
-                    footers[n] = f.read()
-        styles_xml = b""
-        if "word/styles.xml" in names:
-            with z.open("word/styles.xml") as f:
-                styles_xml = f.read()
-        theme_xml = b""
-        if "word/theme/theme1.xml" in names:
-            with z.open("word/theme/theme1.xml") as f:
-                theme_xml = f.read()
-    return doc_xml, rels, footers, names, styles_xml, theme_xml
-
-
-def para_text(p_el) -> str:
-    """从 w:p 元素中抽取所有 w:t 文本。"""
-    texts = p_el.findall(".//w:t", NS)
-    return "".join((t.text or "") for t in texts)
-
-
-def get_para_run_fonts(p_el, theme_fonts=None, default_east_font=None) -> List[dict]:
-    """获取段落中所有 run 的字体信息（rFonts/sz/b/i 等）。
-
-    - bold：仅当 w:b 存在且 val 不为 0/false/off/none 时为 True（办公软件语义：
-      <w:b/> 或 <w:b w:val="1"/> 表示加粗，<w:b w:val="0"/> 表示显式取消加粗）。
-    - has_text：该 run 是否含有可见文本（w:t），用于区分标题真实文字与空 run。
-    - east_font：中文字体，按办公软件的解析优先级取值：
-        1) run 直接写 w:eastAsia；
-        2) run 用主题引用 w:eastAsiaTheme（用 theme_fonts 解析为真实字体名）；
-        3) 都没有时，回退到文档默认中文字体 default_east_font
-           （docDefaults/Normal 样式继承而来，办公软件即按此渲染）。
-    """
-    theme_fonts = theme_fonts or {}
-    out = []
-    for r in p_el.findall(".//w:r", NS):
-        rpr = r.find("w:rPr", NS)
-        info = {"bold": False, "italic": False, "size_half_pt": None,
-                "ascii_font": None, "east_font": None, "has_text": False}
-        if rpr is not None:
-            b = rpr.find("w:b", NS)
-            if b is not None and b.get(qn("w:val")) not in ("0", "false", "off", "none"):
-                info["bold"] = True
-            if rpr.find("w:i", NS) is not None:
-                info["italic"] = True
-            sz = rpr.find("w:sz", NS)
-            if sz is not None and sz.get(qn("w:val")) is not None:
-                info["size_half_pt"] = int(sz.get(qn("w:val")))
-            rf = rpr.find("w:rFonts", NS)
-            if rf is not None:
-                info["ascii_font"] = rf.get(qn("w:ascii"))
-                east = rf.get(qn("w:eastAsia"))
-                if not east:
-                    # 主题字体引用：eastAsiaTheme -> 真实中文字体
-                    theme_ref = rf.get(qn("w:eastAsiaTheme"))
-                    if theme_ref:
-                        east = theme_fonts.get(theme_ref)
-                info["east_font"] = east
-        # run 上没有显式/主题字体时，回退到文档默认中文字体（继承）
-        if not info["east_font"]:
-            info["east_font"] = default_east_font
-        info["has_text"] = any((t.text or "") for t in r.findall("w:t", NS))
-        out.append(info)
+def _style_chain(style):
+    """沿 w:basedOn 链自底向上返回样式列表。"""
+    out, guard = [], 0
+    while style is not None and guard < 24:
+        out.append(style)
+        guard += 1
+        try:
+            style = style.base_style
+        except Exception:
+            style = None
     return out
 
 
-def get_para_spacing(p_el) -> dict:
-    """获取段落级 spacing（行距 line / 段前 before / 段后 after / beforeLines / afterLines）。"""
-    info = {"line": None, "line_rule": None, "before": None, "after": None,
-            "before_lines": None, "after_lines": None}
-    ppr = p_el.find("w:pPr", NS)
-    if ppr is None:
-        return info
-    sp = ppr.find("w:spacing", NS)
-    if sp is not None:
-        for k in ("line", "before", "after"):
-            v = sp.get(qn(f"w:{k}"))
-            if v is not None:
-                info[k] = int(v)
-        info["line_rule"] = sp.get(qn("w:lineRule"))
-        bl = sp.get(qn("w:beforeLines"))
-        if bl is not None:
-            info["before_lines"] = int(bl)
-        al = sp.get(qn("w:afterLines"))
-        if al is not None:
-            info["after_lines"] = int(al)
-    return info
-
-
-def get_para_indent(p_el) -> dict:
-    """获取段落缩进（首行 leftChars/firstLineChars）。"""
-    info = {"first_line_chars": None, "first_line": None, "left": None}
-    ppr = p_el.find("w:pPr", NS)
-    if ppr is None:
-        return info
-    ind = ppr.find("w:ind", NS)
-    if ind is not None:
-        flc = ind.get(qn("w:firstLineChars"))
-        if flc is not None:
-            try:
-                info["first_line_chars"] = float(flc)
-            except ValueError:
-                pass
-        fl = ind.get(qn("w:firstLine"))
-        if fl is not None:
-            try:
-                info["first_line"] = int(fl)
-            except ValueError:
-                pass
-        lf = ind.get(qn("w:left"))
-        if lf is not None:
-            try:
-                info["left"] = int(lf)
-            except ValueError:
-                pass
-    return info
-
-
-def get_para_alignment(p_el) -> Optional[str]:
-    ppr = p_el.find("w:pPr", NS)
-    if ppr is None:
+def _rpr_attr(el, tag, attr):
+    rPr = el.find(qn('w:rPr'))
+    if rPr is None:
         return None
-    jc = ppr.find("w:jc", NS)
-    return jc.get(qn("w:val")) if jc is not None else None
+    node = rPr.find(qn(tag))
+    if node is None:
+        return None
+    return node.get(qn('w:' + attr)) if attr else ''
 
 
-def _lcs(a: str, b: str) -> str:
-    """最长公共子序列（用于标题下方文本相似度判断）。"""
-    m, n = len(a), len(b)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m):
-        for j in range(n):
-            if a[i] == b[j]:
-                dp[i + 1][j + 1] = dp[i][j] + 1
-            else:
-                dp[i + 1][j + 1] = max(dp[i + 1][j], dp[i][j + 1])
-    i, j = m, n
-    res = []
-    while i > 0 and j > 0:
-        if a[i - 1] == b[j - 1]:
-            res.append(a[i - 1])
-            i -= 1
-            j -= 1
-        elif dp[i - 1][j] >= dp[i][j - 1]:
-            i -= 1
-        else:
-            j -= 1
-    return "".join(reversed(res))
+def _docdefault_rpr(doc, tag, attr):
+    dd = doc.styles.element.find(qn('w:docDefaults'))
+    if dd is None:
+        return None
+    node = dd.find(qn('w:rPrDefault') + '/' + qn('w:rPr') + '/' + qn(tag))
+    if node is None:
+        return None
+    return node.get(qn('w:' + attr)) if attr else ''
 
 
-# --------------------------------------------------------------------------------------
-# 主类
-# --------------------------------------------------------------------------------------
+def _eff_run_attr(doc, run, tag, attr):
+    """run 直接属性 -> 段落样式链 -> docDefaults，逐级回退取有效值。"""
+    v = _rpr_attr(run._element, tag, attr)
+    if v:
+        return v
+    try:
+        base = run._parent.style
+    except Exception:
+        base = None
+    for st in _style_chain(base):
+        v = _rpr_attr(st.element, tag, attr)
+        if v:
+            return v
+    return _docdefault_rpr(doc, tag, attr)
 
-class Evaluator:
-    def __init__(self, path: str):
-        self.path = path
-        self.doc_xml_bytes, self.rels, self.footers, self.zip_names, self.styles_xml_bytes, self.theme_xml_bytes = read_doc_xml(path)
-        self.root = etree.fromstring(self.doc_xml_bytes)
-        self.styles_root = etree.fromstring(self.styles_xml_bytes) if self.styles_xml_bytes else None
-        self.theme_fonts = self._parse_theme_fonts(self.theme_xml_bytes)
-        self.default_east_font = self._parse_default_east_font()
-        self.body = self.root.find("w:body", NS)
-        self.body_children = list(self.body)
-        self.paras: List = []
-        self.tables: List = []
-        for ch in self.body_children:
-            tag = ch.tag.split("}")[-1]
-            if tag == "p":
-                self.paras.append(ch)
-            elif tag == "tbl":
-                self.tables.append(ch)
-        self.hit_results: List[str] = []
-        self.dimension1_pass: bool = True
-        self.dimension1_reasons: List[str] = []
-        self.score: int = 0
 
-    @staticmethod
-    def _parse_theme_fonts(theme_xml_bytes: bytes) -> Dict[str, str]:
-        """解析 theme1.xml，得到主题字体引用名 -> 真实中文字体名 的映射。
+def _eff_size(doc, run):
+    """有效字号（磅）。"""
+    v = _eff_run_attr(doc, run, 'w:sz', 'val')
+    try:
+        return int(v) / 2.0
+    except (TypeError, ValueError):
+        return None
 
-        Word/WPS 里 rFonts 常以主题引用指定字体（如 eastAsiaTheme="minorEastAsia"），
-        真实字体在 theme1.xml 的 fontScheme 中定义：majorFont/minorFont 下
-        <a:ea> 或按 <a:font script="Hans"> 给出中文字体。这里建立：
-          majorEastAsia / minorEastAsia -> 对应中文(Hans)字体名。
-        """
-        mapping: Dict[str, str] = {}
-        if not theme_xml_bytes:
-            return mapping
-        A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+def _eff_bold(doc, run):
+    """有效加粗：w:b 存在且 val 不为 0/false 视为加粗。"""
+    for el in [run._element] + [st.element for st in _style_chain(_safe_style(run))]:
+        rPr = el.find(qn('w:rPr'))
+        if rPr is None:
+            continue
+        node = rPr.find(qn('w:b'))
+        if node is not None:
+            return node.get(qn('w:val')) not in ('0', 'false', 'off')
+    return False
+
+
+def _safe_style(run):
+    try:
+        return run._parent.style
+    except Exception:
+        return None
+
+
+def _eff_eastasia(doc, run):
+    return _eff_run_attr(doc, run, 'w:rFonts', 'eastAsia')
+
+
+def _eff_ascii(doc, run):
+    for attr in ('ascii', 'hAnsi'):
+        v = _rpr_attr(run._element, 'w:rFonts', attr)
+        if v:
+            return v
+    for st in _style_chain(_safe_style(run)):
+        for attr in ('ascii', 'hAnsi'):
+            v = _rpr_attr(st.element, 'w:rFonts', attr)
+            if v:
+                return v
+    for attr in ('ascii', 'hAnsi'):
+        v = _docdefault_rpr(doc, 'w:rFonts', attr)
+        if v:
+            return v
+    return None
+
+
+def _ppr_attr(el, tag, attr):
+    pPr = el.find(qn('w:pPr'))
+    if pPr is None:
+        return None
+    node = pPr.find(qn(tag))
+    if node is None:
+        return None
+    return node.get(qn('w:' + attr))
+
+
+def _eff_para_attr(doc, para, tag, attr):
+    v = _ppr_attr(para._element, tag, attr)
+    if v is not None:
+        return v
+    try:
+        base = para.style
+    except Exception:
+        base = None
+    for st in _style_chain(base):
+        v = _ppr_attr(st.element, tag, attr)
+        if v is not None:
+            return v
+    dd = doc.styles.element.find(qn('w:docDefaults'))
+    if dd is not None:
+        pd = dd.find(qn('w:pPrDefault') + '/' + qn('w:pPr'))
+        if pd is not None:
+            node = pd.find(qn(tag))
+            if node is not None:
+                return node.get(qn('w:' + attr))
+    return None
+
+def _line_mult(doc, para):
+    """有效行距倍数；返回 (倍数, 规则)。规则为 auto 时倍数 = w:line / 240。"""
+    rule = _eff_para_attr(doc, para, 'w:spacing', 'lineRule')
+    line = _eff_para_attr(doc, para, 'w:spacing', 'line')
+    if line is None:
+        return (1.0, rule or 'auto')
+    try:
+        line = int(line)
+    except ValueError:
+        return (None, rule)
+    if rule in (None, 'auto'):
+        return (line / 240.0, 'auto')
+    return (line / 240.0, rule)
+
+
+def _is_mult(doc, para, target, tol=0.06):
+    mult, rule = _line_mult(doc, para)
+    return rule == 'auto' and mult is not None and abs(mult - target) <= tol
+
+
+def _runs(para):
+    return [r for r in para.runs if r.text.strip()]
+
+
+def _dedup_cells(row):
+    """按 tc 去重，横向合并单元格只算一次。"""
+    seen, out = set(), []
+    try:
+        cells = row.cells
+    except Exception:
+        return out
+    for c in cells:
+        if id(c._tc) in seen:
+            continue
+        seen.add(id(c._tc))
+        out.append(c)
+    return out
+
+
+def _core_title(text):
+    """剥掉各种编号前缀，得到核心标题文字。"""
+    pat = re.compile(r'^\s*(?:[（(][一二三四五六七八九十\d]+[）)]'
+                     r'|[一二三四五六七八九十]+[、.．]'
+                     r'|\d+(?:[.．]\d+)*[、.．]?)\s*')
+    s = (text or '').strip()
+    prev = None
+    while s != prev:
+        prev = s
+        s = pat.sub('', s, count=1).strip()
+    return _norm(s)
+
+
+def _has_visible_border(doc, tbl_el):
+    """表格是否呈现可见边框：显式 tblBorders 优先，其次看表格样式名。"""
+    sides = ('top', 'left', 'bottom', 'right', 'insideH', 'insideV')
+    tblPr = tbl_el.find(qn('w:tblPr'))
+    if tblPr is not None:
+        bd = tblPr.find(qn('w:tblBorders'))
+        if bd is not None:
+            for node in bd:
+                if node.tag.split('}')[-1] not in sides:
+                    continue
+                if node.get(qn('w:val')) not in (None, 'nil', 'none'):
+                    return True
+            return False
+    name = ''
+    try:
+        name = Table(tbl_el, doc).style.name or ''
+    except Exception:
+        name = ''
+    return ('Grid' in name) or ('网格' in name)
+
+def _table_cells(tb):
+    """整表去重后的单元格列表（横向、纵向合并只算一次）。"""
+    seen, out = set(), []
+    try:
+        rows = list(tb.rows)
+    except Exception:
+        return out
+    for row in rows:
+        for c in _dedup_cells(row):
+            if id(c._tc) in seen:
+                continue
+            seen.add(id(c._tc))
+            out.append(c)
+    return out
+
+
+def _grid_cols(tbl_el):
+    g = tbl_el.find(qn('w:tblGrid'))
+    if g is None:
+        return []
+    out = []
+    for c in g.findall(qn('w:gridCol')):
         try:
-            root = etree.fromstring(theme_xml_bytes)
+            out.append(int(c.get(qn('w:w')) or 0))
+        except ValueError:
+            out.append(0)
+    return out
+
+
+def _table_pages_by_word(file_path):
+    """用 Word COM 重排后取每个表格首/末所在页码，返回 [(起页, 止页), ...] 或 None。"""
+    if _wc is None:
+        return None
+    app = doc = None
+    try:
+        app = _wc.DispatchEx('Word.Application')
+        app.Visible = False
+        app.DisplayAlerts = 0
+        doc = app.Documents.Open(os.path.abspath(file_path), ReadOnly=True,
+                                 AddToRecentFiles=False)
+        spans = []
+        for i in range(1, int(doc.Tables.Count) + 1):
+            rng = doc.Tables(i).Range
+            start = int(doc.Range(rng.Start, rng.Start).Information(3))
+            end = int(doc.Range(rng.End, rng.End).Information(3))
+            spans.append((start, end))
+        return spans
+    except Exception:
+        return None
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
         except Exception:
-            return mapping
-        for kind, key in (("majorFont", "majorEastAsia"), ("minorFont", "minorEastAsia")):
-            fs = root.find(".//" + A + kind)
-            if fs is None:
-                continue
-            font = None
-            ea = fs.find(A + "ea")
-            if ea is not None and ea.get("typeface"):
-                font = ea.get("typeface")
-            if not font:
-                for f in fs.findall(A + "font"):
-                    if f.get("script") == "Hans" and f.get("typeface"):
-                        font = f.get("typeface")
-                        break
-            if font:
-                mapping[key] = font
-        return mapping
-
-    def _parse_default_east_font(self) -> Optional[str]:
-        """解析文档默认中文字体（供 run 无显式字体时回退）。
-
-        取值优先级（贴合办公软件继承链）：
-          1) styles.xml 的 docDefaults/rPrDefault/rFonts 的 w:eastAsia；
-             若是主题引用 w:eastAsiaTheme，则用 theme_fonts 解析。
-          2) 默认段落样式(Normal, w:default=1)的 rPr/rFonts 同样处理。
-        """
-        if self.styles_root is None:
-            return None
-
-        def font_from_rfonts(rf) -> Optional[str]:
-            if rf is None:
-                return None
-            east = rf.get(qn("w:eastAsia"))
-            if east:
-                return east
-            ref = rf.get(qn("w:eastAsiaTheme"))
-            if ref:
-                return self.theme_fonts.get(ref)
-            return None
-
-        # 1) docDefaults
-        dd = self.styles_root.find("w:docDefaults", NS)
-        if dd is not None:
-            f = font_from_rfonts(dd.find(".//w:rPrDefault//w:rFonts", NS))
-            if f:
-                return f
-        # 2) 默认段落样式(Normal)
-        for s in self.styles_root.findall("w:style", NS):
-            if s.get(qn("w:type")) == "paragraph" and s.get(qn("w:default")) == "1":
-                f = font_from_rfonts(s.find(".//w:rPr//w:rFonts", NS))
-                if f:
-                    return f
-        return None
-
-    # ---------- 维度 1 ----------
-    def check_dimension1(self) -> bool:
-        """可用与可修改性。"""
-        full_text = "".join(para_text(p) for p in self.paras)
-        has_cover = bool(re.search(r"栖云青岭|乡村旅居|传统村落|营造计划", full_text))
-        has_toc = ("TOC" in self.doc_xml_bytes.decode("utf-8", errors="ignore")
-                   or "目录" in full_text)
-        has_main_chapter = bool(re.search(
-            r"一[、,．. ]市场分析|二[、,．. ]项目简介|三[、,．. ]产品与服务|"
-            r"四[、,．. ]商业模式|五[、,．. ]财务分析|六[、,．. ]风险识别|"
-            r"七[、,．. ]未来前景|八[、,．. ]团队介绍", full_text))
-        has_images = len([n for n in self.zip_names if n.startswith("word/media/")]) > 0
-        has_tables = len(self.tables) > 0
-        has_page_number = any(b"PAGE" in f for f in self.footers.values())
-
-        miss = []
-        if not has_cover:
-            miss.append("未保留封面")
-        if not has_toc:
-            miss.append("未保留目录")
-        if not has_main_chapter:
-            miss.append("未保留正文章节")
-        if not has_images:
-            miss.append("未保留图片")
-        if not has_tables:
-            miss.append("未保留表格")
-        if not has_page_number:
-            miss.append("未保留页码")
+            pass
+        try:
+            if app is not None:
+                app.Quit()
+        except Exception:
+            pass
 
 
-        # 说明：按用户要求，删除维度一中"无连续空白页 / 无大面积乱码 /
-        # 无大面积文字重叠 / 无表格或图片严重遮挡正文"这部分检查，仅保留
-        # "保留封面/目录/正文章节/图片/表格/页码等原有主要组成部分"。
+def _estimate_spans(ctx):
+    """Word 不可用时的退化估算：按 A4 可用高度与单元格文字行数推算表格占几页。"""
+    sec = ctx['doc'].sections[0]
+    usable_pt = (sec.page_height.pt - sec.top_margin.pt - sec.bottom_margin.pt)
+    spans = []
+    for info in ctx['tables']:
+        cols = [w for w in info['gridcols'] if w >= 170] or [8300]
+        total_pt = 0.0
+        for row in info['rowcells']:
+            maxline = 1
+            for idx, cell in enumerate(row):
+                width_pt = cols[min(idx, len(cols) - 1)] / 20.0 - 10.8
+                sz = info['maxsize'] or 12.0
+                per = max(1.0, width_pt / max(1.0, sz))
+                txt = _norm(cell.text)
+                need = max(1, int(len(txt) / per + 0.999))
+                maxline = max(maxline, need)
+            total_pt += maxline * (info['maxsize'] or 12.0) * 1.25 * 1.2 + 2.0
+        spans.append((1, max(1, int(total_pt / usable_pt + 0.999))))
+    return [(1, s[1]) for s in spans]
 
-        if miss:
-            self.dimension1_pass = False
-            self.dimension1_reasons = miss
-        return self.dimension1_pass
+# ============================ 上下文构建 ============================
 
-    # ---------- 辅助：定位标题/章节 ----------
-    def classify_paragraphs(self) -> Dict[int, str]:
-        labels: Dict[int, str] = {}
-        for i, p in enumerate(self.paras):
-            t = para_text(p).strip()
-            if not t:
-                continue
-            if re.match(r"^[一二三四五六七八九十]+[、,．.]", t):
-                labels[i] = "L1"
-            elif re.match(r"^（[一二三四五六七八九十]+）", t):
-                labels[i] = "L2"
-            # 三级标题：仅整数编号 "1." "2." "3." 形式（点后紧跟非数字，
-            # 从而排除 "1.1"、"2.1" 这类更下一级(四级)标题）。
-            elif re.match(r"^\d+[、,．.](?!\d)", t) and len(t) < 30:
-                labels[i] = "L3"
-        return labels
+def _build_ctx(file_path):
+    doc = Document(file_path)
+    ctx = {'doc': doc, 'file_path': file_path, 'notes': []}
 
-    def get_all_paragraph_text(self) -> str:
-        return "\n".join(para_text(p) for p in self.paras)
+    # --- 表格信息 ---
+    tables = []
+    for child in doc.element.body.iterchildren():
+        if child.tag != qn('w:tbl'):
+            continue
+        tb = Table(child, doc)
+        try:
+            rows = list(tb.rows)
+        except Exception:
+            rows = []
+        rowcells = [_dedup_cells(r) for r in rows]
+        header = tuple(_norm(c.text) for c in (rowcells[0] if rowcells else []))
+        cells = _table_cells(tb)
+        cparas, cruns, sizes = [], [], []
+        for c in cells:
+            for p in c.paragraphs:
+                cparas.append(p)
+                for r in _runs(p):
+                    cruns.append(r)
+                    sz = _eff_size(doc, r)
+                    if sz:
+                        sizes.append(sz)
+        trPr0 = rows[0]._tr.find(qn('w:trPr')) if rows else None
+        tables.append({
+            'el': child, 'tb': tb, 'nrows': len(rows), 'header': header,
+            'rowcells': rowcells, 'cells': cells, 'cparas': cparas, 'cruns': cruns,
+            'sizes': sizes, 'minsize': min(sizes) if sizes else None,
+            'maxsize': max(sizes) if sizes else None,
+            'gridcols': _grid_cols(child),
+            'bordered': _has_visible_border(doc, child),
+            'tblheader': trPr0 is not None and trPr0.find(qn('w:tblHeader')) is not None,
+            'cantsplit': len(child.findall('.//' + qn('w:cantSplit'))),
+        })
+    ctx['tables'] = tables
+    ctx['total_rows'] = sum(t['nrows'] for t in tables)
 
-    # ---------- 维度 2：检查项 ----------
-    def _body_start_para_index(self) -> int:
-        """返回"正文"起始段落在 self.paras 中的索引。
+    # --- 标题分级（按核心文字有序匹配，容忍编号被改写）---
+    cmap = collections.defaultdict(list)
+    for lv, pool in ((1, TITLE_L1), (2, TITLE_L2), (3, TITLE_L3)):
+        for name in pool:
+            cmap[_norm(name)].append(lv)
+    for alias, real in TITLE_L3_ALIAS.items():
+        if _norm(alias) not in cmap:
+            cmap[_norm(alias)].append(3)
+    heads = {1: [], 2: [], 3: []}
+    hset = set()
+    used = collections.Counter()
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if not t or len(t) > 40 or t.endswith('。'):
+            continue
+        c = _core_title(t)
+        if c not in cmap:
+            continue
+        lvls = cmap[c]
+        lv = lvls[min(used[c], len(lvls) - 1)]
+        used[c] += 1
+        heads[lv].append(p)
+        hset.add(id(p._element))
+    ctx['heads'] = heads
+    ctx['hset'] = hset
+    # --- 段落分类 ---
+    lv4_pool = [_norm(x) for x in LV4_NUMBERED]
+    colon_pool = [_norm(x) for x in LV4_COLON]
+    bold_pool = [_norm(x) for x in BOLD_HINT]
+    narrative, lv4num, lv4colon, boldhint, nonempty = [], [], [], [], []
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if not t:
+            continue
+        nonempty.append(p)
+        if id(p._element) in hset:
+            continue
+        n = _norm(t)
+        if len(n) <= 40 and any(n.endswith(k) for k in lv4_pool):
+            lv4num.append(p)
+        elif len(n) <= 40 and any(n.endswith(k) for k in colon_pool):
+            lv4colon.append(p)
+        elif len(n) <= 40 and any(n.endswith(k) for k in bold_pool):
+            boldhint.append(p)
+        elif len(t) >= 25 and not t.endswith('：'):
+            narrative.append(p)
+    ctx['narrative'] = narrative
+    ctx['lv4num'] = lv4num
+    ctx['lv4colon'] = lv4colon
+    ctx['boldhint'] = boldhint
+    ctx['nonempty'] = nonempty
 
-        细则口径：正文从**目录页之后**开始（封面、信息页、目录都不算正文）。
-        做法：在 body 顺序中定位目录(TOC 域，通常在 <w:sdt> 里)所在位置，
-        取其之后第一个段落作为正文起点；找不到目录时，退回到第二个分节符
-        (封面、信息页之后)之后，仍找不到则从 0 开始。
-        """
-        bc = self.body_children
+    # --- 全文文字（正文 + 表格）---
+    parts = [p.text for p in doc.paragraphs]
+    for info in ctx['tables']:
+        for c in info['cells']:
+            parts.append(c.text)
+    ctx['text'] = '\n'.join(parts)
 
-        def is_toc_node(node) -> bool:
-            for it in node.findall(".//w:instrText", NS):
-                if it.text and "TOC" in it.text:
-                    return True
-            for fs in node.findall(".//w:fldSimple", NS):
-                if "TOC" in (fs.get(qn("w:instr")) or ""):
-                    return True
+    # --- 图片、分节、页眉页脚 ---
+    body_xml = doc.element.body.xml
+    ctx['n_drawing'] = body_xml.count('<w:drawing>')
+    ctx['n_pict'] = body_xml.count('<w:pict>')
+    ctx['extents'] = [(int(a), int(b)) for a, b in
+                      re.findall(r'<wp:extent cx="(\d+)" cy="(\d+)"', body_xml)]
+    hf_page, hf_text = 0, []
+    for s in doc.sections:
+        for part in (s.header, s.footer):
+            hf_page += len(re.findall(r'\bPAGE\b', part._element.xml))
+        hf_text += [p.text.strip() for p in s.header.paragraphs if p.text.strip()]
+        hf_text += [p.text.strip() for p in s.footer.paragraphs if p.text.strip()]
+    ctx['hf_page_fields'] = hf_page
+    ctx['hf_text'] = hf_text
+    ctx['n_sections'] = len(doc.sections)
+
+    # --- 表格分页跨页数 ---
+    spans = _table_pages_by_word(file_path)
+    if spans is not None and len(spans) == len(tables):
+        ctx['span_source'] = 'word'
+    else:
+        spans = _estimate_spans(ctx)
+        ctx['span_source'] = 'estimate'
+        ctx['notes'].append('Word 不可用，表格跨页数由 A4 可用高度估算')
+    for info, sp in zip(tables, spans):
+        info['page_from'], info['page_to'] = sp
+        info['span'] = max(1, sp[1] - sp[0] + 1)
+    return ctx
+
+# ============================ 表格定位 ============================
+
+def _hp(header, sig):
+    """表头前若干列是否与签名一致。"""
+    sig = tuple(_norm(x) for x in sig)
+    return tuple(header[:len(sig)]) == sig
+
+
+def _find(ctx, sig):
+    return [t for t in ctx['tables'] if _hp(t['header'], sig)]
+
+
+def _res_tables(ctx):
+    """旅游资源表（含被拆分后失去表头的续表）。"""
+    out = []
+    for t in ctx['tables']:
+        h = t['header']
+        if _hp(h, H_RES):
+            out.append(t)
+        elif (len(h) == 4 and t['nrows'] >= 10
+              and re.match(r'^[A-F][一-龥]', h[0] or '')):
+            out.append(t)
+    return out
+
+
+def _age_court_team(ctx):
+    out = []
+    for t in ctx['tables']:
+        h = t['header']
+        if not h:
+            continue
+        if h[0] == '年龄段' or _hp(h, H_COURT) or _hp(h, H_SEASON) or _hp(h, H_TEAM):
+            out.append(t)
+    return out
+
+
+def _grid_group(ctx):
+    out = []
+    for t in ctx['tables']:
+        h = t['header']
+        if not h:
+            continue
+        if (_hp(h, H_SURVEY) or _hp(h, H_FUND) or _hp(h, H_REV)
+                or (h[0] == '年度' and len(h) > 1 and '期初现金' in h[1])):
+            out.append(t)
+    return out
+
+
+# ============================ 维度1 ============================
+
+# 交付物只接受 .docx：细则要求交付「1 个可正常打开的 Word 文档（.docx）」，其余
+# 格式（.doc / .docm / .rtf / .odt / .pdf 等）一律在维度一判不通过。
+_ACCEPTED_EXT = '.docx'
+# 目录里没有 .docx 时，这些扩展名仍收作被评对象，交给维度一判不通过（总分记 0），
+# 而不是当成「没有交付物」直接跳过评测。
+_WRONG_FMT_EXTS = ('.doc', '.docm', '.dotx', '.dotm', '.dot', '.rtf', '.odt',
+                   '.wps', '.pages', '.pdf')
+
+
+def _fmt_reject(file_path):
+    """维度1的格式门禁：交付物必须是可正常打开的 .docx（OOXML 文档包）。
+
+    不通过返回原因文本，通过返回 None。判定与 Word 的“能不能双击打开”对齐：
+    扩展名须为 .docx，文件须是 zip 容器，且包内含 word/document.xml。
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext != _ACCEPTED_EXT:
+        return '交付物为 %s 格式，只接受 .docx 文档' % (ext or '无扩展名')
+    if not zipfile.is_zipfile(file_path):
+        return '交付物不是有效的 .docx 包（无法作为 zip 容器打开）'
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            names = set(zf.namelist())
+    except Exception as exc:
+        return '交付物无法作为 .docx 打开：%s: %s' % (type(exc).__name__, exc)
+    if 'word/document.xml' not in names:
+        return '交付物包内缺少 word/document.xml，不是 Word 文档'
+    return None
+
+
+def _dim1(ctx):
+    n_para = len(ctx['nonempty'])
+    n_tbl = len(ctx['tables'])
+    n_char = len(_norm(ctx['text']))
+    if n_para < 60:
+        return False, '可单独点选的正文段落仅 %d 个，正文疑似被转为位图或大面积丢失' % n_para
+    if n_tbl < 5:
+        return False, '可编辑表格仅 %d 张（基线 28 张），表格疑似被转为图片或大量丢失' % n_tbl
+    if n_char < 5000:
+        return False, '可提取文字仅 %d 字，内容疑似严重缺失' % n_char
+    for i, t in enumerate(ctx['tables']):
+        if t['nrows'] == 0:
+            return False, '第 %d 张表格行结构无法解析，版面严重错乱' % (i + 1)
+    return True, ''
+
+# ============================ 加分项 ============================
+
+def _p01(ctx):
+    """全部正文叙述段落为单倍行距。"""
+    ps = ctx['narrative']
+    if len(ps) < 120:
+        return False
+    ok = sum(1 for p in ps if _is_mult(ctx['doc'], p, 1.0))
+    return ok >= len(ps) * 0.95
+
+
+def _p02(ctx):
+    """提示行与说明段落同样单倍，全文无遗漏的 1.5 倍行距正文段落。"""
+    d = ctx['doc']
+    hints = ctx['lv4num'] + ctx['lv4colon'] + ctx['boldhint']
+    if len(hints) < 20:
+        return False
+    if any(not _is_mult(d, p, 1.0) for p in hints):
+        return False
+    lv2 = {id(p._element) for p in ctx['heads'][2]}
+    for p in ctx['nonempty']:
+        if id(p._element) in lv2:
+            continue
+        mult, rule = _line_mult(d, p)
+        if rule == 'auto' and mult is not None and mult >= 1.4:
             return False
+    return True
 
-        # 目录之后第一个 body 子元素的位置
-        toc_body_idx = None
-        for i, ch in enumerate(bc):
-            if is_toc_node(ch):
-                toc_body_idx = i
-                break
 
-        if toc_body_idx is not None:
-            # 统计 body 中该位置之前的段落数 = 正文首段在 self.paras 的索引
-            return sum(1 for ch in bc[:toc_body_idx + 1]
-                       if ch.tag.split("}")[-1] == "p")
+def _p03(ctx):
+    """全部表格单元格文字为 1.25 倍行距。"""
+    d, tot, ok = ctx['doc'], 0, 0
+    for t in ctx['tables']:
+        for p in t['cparas']:
+            if not p.text.strip():
+                continue
+            tot += 1
+            if _is_mult(d, p, 1.25, 0.05):
+                ok += 1
+    return tot > 0 and ok >= tot * 0.98
 
-        # 无目录：退回到第二个分节符（封面、信息页）之后
-        sect_para_positions = []
-        for k, p in enumerate(self.paras):
-            ppr = p.find("w:pPr", NS)
-            if ppr is not None and ppr.find("w:sectPr", NS) is not None:
-                sect_para_positions.append(k)
-        if len(sect_para_positions) >= 2:
-            return sect_para_positions[1] + 1
-        return 0
 
-    def check_body_line_spacing_1x(self) -> bool:
-        """+3：文档中正文文本间距为1倍
+def _check_heads(ctx, level, count, size=None, bold=None, songti=True):
+    d, hs = ctx['doc'], ctx['heads'][level]
+    if len(hs) != count:
+        return False
+    for p in hs:
+        rs = _runs(p)
+        if not rs:
+            return False
+        for r in rs:
+            if songti and (_eff_eastasia(d, r) or '') not in STRICT_SONGTI:
+                return False
+            if size is not None:
+                sz = _eff_size(d, r)
+                if sz is None or abs(sz - size) > 0.26:
+                    return False
+            if bold is not None and _eff_bold(d, r) != bold:
+                return False
+    return True
 
-        细则：文档正文文本行距为 1 倍（单倍行距）。**正文从目录页之后开始**
-        （封面、信息页、目录不计入正文）。
-        判定：正文区域内所有正文段落（非空、非一/二/三级标题）行距必须均为 1 倍；
-        只要有任意一个正文段落不是 1 倍行距，即不得分。
 
-        在办公软件（Word/WPS）中，1 倍行距的表示方式：
-          - w:spacing line="240" lineRule="auto"（240 = 1 行，auto 表示倍数行距）
-          - 或未设置任何行距（无 w:spacing/无 line），此时渲染为单倍行距。
-        1.5 倍为 line="360"，2 倍为 line="480"，均判为不合格。
-        """
-        labels = self.classify_paragraphs()
-        start = self._body_start_para_index()  # 正文起点（目录页之后）
+def _head_sizes(ctx, level):
+    d, out = ctx['doc'], set()
+    for p in ctx['heads'][level]:
+        for r in _runs(p):
+            sz = _eff_size(d, r)
+            if sz:
+                out.add(round(sz, 1))
+    return out
 
-        def is_single_spacing(sp) -> bool:
-            line = sp.get("line")
-            rule = sp.get("line_rule")
-            # 完全未设置行距：办公软件按单倍渲染
-            if line is None:
+
+def _p04(ctx):
+    """8 处一级标题为宋体、小三（15磅）。"""
+    return _check_heads(ctx, 1, 8, size=15.0)
+
+
+def _p05(ctx):
+    """8 处一级标题为单倍行距。"""
+    hs = ctx['heads'][1]
+    return len(hs) == 8 and all(_is_mult(ctx['doc'], p, 1.0) for p in hs)
+
+
+def _p06(ctx):
+    """8 处一级标题段前 0.5 行、段后 0.5 行（按行设置）。"""
+    d, hs = ctx['doc'], ctx['heads'][1]
+    if len(hs) != 8:
+        return False
+    for p in hs:
+        before = _eff_para_attr(d, p, 'w:spacing', 'beforeLines')
+        after = _eff_para_attr(d, p, 'w:spacing', 'afterLines')
+        try:
+            if abs(int(before) - 50) > 2 or abs(int(after) - 50) > 2:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _p07(ctx):
+    """17 处二级标题为宋体、四号（14磅）。"""
+    return _check_heads(ctx, 2, 17, size=14.0)
+
+
+def _p08(ctx):
+    """39 处三级标题为宋体、小四（12磅）。"""
+    return _check_heads(ctx, 3, 39, size=12.0)
+
+
+def _p09(ctx):
+    """三级标题为加粗。"""
+    return _check_heads(ctx, 3, 39, bold=True, songti=False)
+
+
+def _p10(ctx):
+    """三级标题为单倍行距。"""
+    hs = ctx['heads'][3]
+    return len(hs) == 39 and all(_is_mult(ctx['doc'], p, 1.0) for p in hs)
+
+
+def _p11(ctx):
+    """正文与表格中的"运盈"均改为"运营"。"""
+    t = ctx['text']
+    return '运盈' not in t and '运营重点' in t and '小体量运营' in t
+
+
+def _p12(ctx):
+    """"测祘"改为"测算"。"""
+    t = ctx['text']
+    return '测祘' not in t and '测算口径' in t
+
+
+def _p13(ctx):
+    """以顿号充当小数点的百分比均改为小数点写法。"""
+    t = ctx['text']
+    dun = re.findall(r'\d+、\d+\s*%', t)
+    dot = re.findall(r'\d+\.\d+\s*%', t)
+    return not dun and len(dot) >= BASE_DOTTED_PCT_MIN
+
+
+def _p14(ctx):
+    """资源表为一个连续表格（36行），跨两页排布。"""
+    rs = _res_tables(ctx)
+    return len(rs) == 1 and rs[0]['nrows'] == 36 and rs[0]['span'] == 2
+
+
+def _p15(ctx):
+    """资源表在续排处重复显示表头行。"""
+    rs = _res_tables(ctx)
+    return len(rs) == 1 and rs[0]['tblheader']
+
+def _p16(ctx):
+    """月度台账 37 行与创新维度 7 行内容无删减，台账完整排布在三页上。"""
+    led, inn = _find(ctx, H_LEDGER), _find(ctx, H_INNOV)
+    if len(led) != 1 or len(inn) != 1:
+        return False
+    if led[0]['nrows'] != 37 or inn[0]['nrows'] != 7:
+        return False
+    t = ctx['text']
+    if any(m not in t for m in MONTH_LABELS):
+        return False
+    if any(n not in t for n in INNOV_NAMES):
+        return False
+    return led[0]['span'] == 3
+
+
+def _p17(ctx):
+    """月度台账 5 列、创新维度 3 列，不再共用同一组列宽产生空列错位。"""
+    led, inn = _find(ctx, H_LEDGER), _find(ctx, H_INNOV)
+    if len(led) != 1 or len(inn) != 1:
+        return False
+    vl = [w for w in led[0]['gridcols'] if w >= 170]
+    vi = [w for w in inn[0]['gridcols'] if w >= 170]
+    return (len(vl) == 5 and len(vi) == 3
+            and len(led[0]['header']) == 5 and len(inn[0]['header']) == 3)
+
+
+def _p18(ctx):
+    """除资源表与创新点分析下方两表外，其余表格均完整落在同一页内。"""
+    exempt = {id(t['el']) for t in _res_tables(ctx) + _find(ctx, H_LEDGER) + _find(ctx, H_INNOV)}
+    others = [t for t in ctx['tables'] if id(t['el']) not in exempt]
+    return bool(others) and all(t['span'] == 1 for t in others)
+
+
+def _p19(ctx):
+    """采用跨页断行/重复标题行/分页位置等排版手段，未删减表格行列或内容。"""
+    if len(ctx['tables']) != BASE_TABLE_COUNT or ctx['total_rows'] != BASE_TABLE_ROWS:
+        return False
+    rs, led, inn = _res_tables(ctx), _find(ctx, H_LEDGER), _find(ctx, H_INNOV)
+    if len(rs) != 1 or rs[0]['nrows'] != 36:
+        return False
+    if len(led) != 1 or led[0]['nrows'] != 37 or len(inn) != 1 or inn[0]['nrows'] != 7:
+        return False
+    n_th = sum(1 for t in ctx['tables'] if t['tblheader'])
+    n_cs = sum(t['cantsplit'] for t in ctx['tables'])
+    n_keep = len(ctx['doc'].element.body.findall('.//' + qn('w:keepNext')))
+    return n_cs > 0 or n_th >= 5 or n_keep >= 600
+
+
+# ============================ 减分项 ============================
+
+def _d01(ctx):
+    """左右页边距不满足 3.18 厘米。"""
+    for s in ctx['doc'].sections:
+        for v in (s.left_margin, s.right_margin):
+            if v is None or abs(int(v.twips) - BASE_PAGE_MARGIN_LR) > 30:
                 return True
-            # 倍数行距：line=240 即 1 倍
-            if rule in (None, "auto"):
-                return line == 240
-            # atLeast / exact（固定值/最小值）不属于"1 倍"倍数行距
-            return False
+    return False
 
-        count = 0
-        for i, p in enumerate(self.paras):
-            if i < start:            # 跳过封面、信息页、目录（非正文）
-                continue
-            t = para_text(p).strip()
-            if not t:            # 跳过空段落
-                continue
-            if i in labels:      # 跳过一/二/三级标题
-                continue
-            # 该段属于正文文本，逐一检查其行距
-            count += 1
-            if not is_single_spacing(get_para_spacing(p)):
-                return False
-        # 若没有可判定的正文段落，则无法确认满足细则，不得分
-        if count == 0:
-            return False
+
+def _d02(ctx):
+    """纸张与上下页边距不满足 A4、上下 2.54 厘米。"""
+    for s in ctx['doc'].sections:
+        if s.page_width is None or abs(int(s.page_width.twips) - BASE_PAGE_W) > 40:
+            return True
+        if s.page_height is None or abs(int(s.page_height.twips) - BASE_PAGE_H) > 40:
+            return True
+        for v in (s.top_margin, s.bottom_margin):
+            if v is None or abs(int(v.twips) - BASE_PAGE_MARGIN_TB) > 30:
+                return True
+    return False
+
+
+def _d03(ctx):
+    """17 处二级标题不满足 1.5 倍行距（原文已达标，被改动即为破坏）。"""
+    hs = ctx['heads'][2]
+    if len(hs) != 17:
         return True
+    return any(not _is_mult(ctx['doc'], p, 1.5, 0.05) for p in hs)
 
-    def check_table_line_spacing_1_25(self) -> bool:
-        """+5：所有表格中的文本行距均为1.25倍
 
-        细则：文档中所有表格里的（文本）段落行距都必须是 1.25 倍。
-        判定：遍历每一个表格内的每一个段落，只要有任意一个段落的行距
-        不是 1.25 倍，即不得分；全部为 1.25 倍才得分。
-
-        在办公软件（Word/WPS）中，1.25 倍行距的表示方式：
-          - w:spacing line="300" lineRule="auto"（300 = 1.25 行，auto 表示倍数行距）
-        其它情况均判为不合格：
-          - 未设置行距（无 w:spacing 或无 line）→ 办公软件按单倍(1.0)渲染，不是 1.25 倍
-          - lineRule="exact"/"atLeast"（固定值/最小值磅数）→ 不是倍数行距
-          - line 为其它值（如 240=1倍、360=1.5倍、480=2倍）
-        """
-
-        def is_1_25_spacing(sp) -> bool:
-            line = sp.get("line")
-            rule = sp.get("line_rule")
-            # 必须是倍数行距(auto)，且 line=300（即 1.25 倍）
-            if rule in (None, "auto"):
-                return line == 300
-            return False
-
-        any_para = False
-        for tbl in self.tables:
-            for p in tbl.findall(".//w:p", NS):
-                any_para = True
-                if not is_1_25_spacing(get_para_spacing(p)):
-                    return False
-        # 无表格或表格内无段落时，无法确认满足细则，不得分
-        if not any_para:
-            return False
+def _small_title_bad(ctx, paras, size, bold, least, font=True):
+    d = ctx['doc']
+    if len(paras) < least:
         return True
+    for p in paras:
+        for r in _runs(p):
+            sz = _eff_size(d, r)
+            if sz is None or abs(sz - size) > 0.26:
+                return True
+            if _eff_bold(d, r) != bold:
+                return True
+            if font and (_eff_eastasia(d, r) or '') not in STRICT_SONGTI:
+                return True
+    return False
 
-    def check_l1_heading_style(self) -> bool:
-        """+3：一级标题为宋体、小三号、单倍行距；段前0.5行、段后0.5行
 
-        细则拆解（每个点都要满足）：
-          1) 字体为宋体（中文 eastAsia = 宋体/SimSun）
-          2) 字号为小三号 = 15pt = 30 half-pt（w:sz val="30"）
-          3) 行距为单倍（1 倍）
-          4) 段前 0.5 行
-          5) 段后 0.5 行
-        判定：所有一级标题都必须同时满足以上 5 点；任意一个标题不满足即不得分。
+def _d04(ctx):
+    """四级编号小标题不满足宋体小四（12磅）不加粗。"""
+    return _small_title_bad(ctx, ctx['lv4num'], 12.0, False, 8)
 
-        在办公软件（Word/WPS）中的有效表示：
-          - 单倍行距：w:spacing line="240" lineRule="auto"，或未设置行距（默认单倍）
-          - 段前/段后 0.5 行：以"行"为单位，存储为 w:beforeLines="50" / w:afterLines="50"
-            （行单位以百分之一行计，50 即 0.5 行）。注意 w:before/w:after 是以
-            twips(磅) 为单位的固定间距，不能等价于"0.5 行"，故必须用 *Lines 判定。
-        """
-        labels = self.classify_paragraphs()
-        l1_indices = [i for i, lb in labels.items() if lb == "L1"]
-        if not l1_indices:
-            return False
-        for i in l1_indices:
-            p = self.paras[i]
-            fonts = get_para_run_fonts(p, self.theme_fonts, self.default_east_font)
-            sp = get_para_spacing(p)
 
-            # 1) 宋体：所有设置了中文字体的 run 必须是宋体
-            east_fonts = [f.get("east_font") for f in fonts
-                          if f.get("east_font") is not None]
-            if not east_fonts or any(ef not in ("宋体", "SimSun") for ef in east_fonts):
-                return False
+def _d05(ctx):
+    """冒号型小标题与提示行不满足宋体小四（12磅）不加粗。"""
+    return _small_title_bad(ctx, ctx['lv4colon'], 12.0, False, 8)
 
-            # 2) 小三号(30 half-pt)：所有设置了字号的 run 必须是 30
-            sizes = [f.get("size_half_pt") for f in fonts
-                     if f.get("size_half_pt") is not None]
-            if not sizes or any(s != 30 for s in sizes):
-                return False
 
-            # 3) 单倍行距：line=240/auto，或未设置行距
-            line = sp.get("line")
-            rule = sp.get("line_rule")
-            if line is not None:
-                if not (line == 240 and rule in (None, "auto")):
-                    return False
+def _d06(ctx):
+    """"成员分工：""指导教师："不满足五号（10.5磅）加粗。"""
+    return _small_title_bad(ctx, ctx['boldhint'], 10.5, True, 2, font=False)
 
-            # 4) 段前 0.5 行；5) 段后 0.5 行（必须以"行"为单位存储）
-            if sp.get("before_lines") != 50:
-                return False
-            if sp.get("after_lines") != 50:
-                return False
+
+def _d07(ctx):
+    """西文字体不满足 Times New Roman 与宋体并存（被统一替换）。"""
+    d, n = ctx['doc'], 0
+    for p in d.paragraphs:
+        if id(p._element) in ctx['hset']:
+            continue
+        for r in p.runs:
+            if re.search(r'[A-Za-z0-9]', r.text) and (_eff_ascii(d, r) or '') in STRICT_SONGTI:
+                n += 1
+    for t in ctx['tables']:
+        for r in t['cruns']:
+            if re.search(r'[A-Za-z0-9]', r.text) and (_eff_ascii(d, r) or '') in STRICT_SONGTI:
+                n += 1
+    return n < BASE_SONGTI_ASCII * 0.5
+
+
+def _d08(ctx):
+    """正文叙述段落不满足宋体小四（12磅）、首行缩进 2 字符、两端对齐。"""
+    d, ps = ctx['doc'], ctx['narrative']
+    if not ps:
         return True
-
-    def check_l2_heading_style(self) -> bool:
-        """+3：二级标题为宋体、四号、1.5倍行距
-
-        细则拆解（每个点都要满足）：
-          1) 字体为宋体（中文 eastAsia = 宋体/SimSun）
-          2) 字号为四号 = 14pt = 28 half-pt（w:sz val="28"）
-          3) 行距为 1.5 倍
-        判定：所有二级标题都必须同时满足以上 3 点；任意一个不满足即不得分。
-
-        在办公软件（Word/WPS）中的有效表示：
-          - 1.5 倍行距：w:spacing line="360" lineRule="auto"（360 = 1.5 行，auto 表示倍数行距）
-        """
-        labels = self.classify_paragraphs()
-        l2_indices = [i for i, lb in labels.items() if lb == "L2"]
-        if not l2_indices:
-            return False
-        for i in l2_indices:
-            p = self.paras[i]
-            fonts = get_para_run_fonts(p, self.theme_fonts, self.default_east_font)
-            sp = get_para_spacing(p)
-
-            # 1) 宋体：所有设置了中文字体的 run 必须是宋体
-            east_fonts = [f.get("east_font") for f in fonts
-                          if f.get("east_font") is not None]
-            if not east_fonts or any(ef not in ("宋体", "SimSun") for ef in east_fonts):
-                return False
-
-            # 2) 四号(28 half-pt)：所有设置了字号的 run 必须是 28
-            sizes = [f.get("size_half_pt") for f in fonts
-                     if f.get("size_half_pt") is not None]
-            if not sizes or any(s != 28 for s in sizes):
-                return False
-
-            # 3) 1.5 倍行距：line=360 且 lineRule=auto
-            if not (sp.get("line") == 360 and sp.get("line_rule") in (None, "auto")):
-                return False
-        return True
-
-    def check_l3_heading_style(self) -> bool:
-        """+3：三级标题为宋体、小四、单倍行距、加粗
-
-        细则拆解（每个点都要满足）：
-          1) 字体为宋体（中文 eastAsia = 宋体/SimSun）
-          2) 字号为小四 = 12pt = 24 half-pt（w:sz val="24"）
-          3) 行距为单倍（1 倍）
-          4) 加粗
-        判定：所有三级标题都必须同时满足以上 4 点；任意一个不满足即不得分。
-
-        在办公软件（Word/WPS）中的有效表示：
-          - 单倍行距：w:spacing line="240" lineRule="auto"，或未设置行距（默认单倍）
-          - 加粗：run 上有 w:b（w:b val 未设或为 "1"/"true"/"on" 表示开启；
-            val 为 "0"/"false"/"none" 表示显式关闭）
-        """
-        labels = self.classify_paragraphs()
-        l3_indices = [i for i, lb in labels.items() if lb == "L3"]
-        if not l3_indices:
-            return False
-        for i in l3_indices:
-            p = self.paras[i]
-            fonts = get_para_run_fonts(p, self.theme_fonts, self.default_east_font)
-            sp = get_para_spacing(p)
-
-            # 1) 宋体：所有设置了中文字体的 run 必须是宋体
-            east_fonts = [f.get("east_font") for f in fonts
-                          if f.get("east_font") is not None]
-            if not east_fonts or any(ef not in ("宋体", "SimSun") for ef in east_fonts):
-                return False
-
-            # 2) 小四(24 half-pt)：所有设置了字号的 run 必须是 24
-            sizes = [f.get("size_half_pt") for f in fonts
-                     if f.get("size_half_pt") is not None]
-            if not sizes or any(s != 24 for s in sizes):
-                return False
-
-            # 3) 单倍行距：line=240/auto，或未设置行距
-            line = sp.get("line")
-            rule = sp.get("line_rule")
-            if line is not None:
-                if not (line == 240 and rule in (None, "auto")):
-                    return False
-
-            # 4) 加粗：所有含文本的 run 都必须加粗
-            text_fonts = [f for f in fonts if f.get("has_text")]
-            if not text_fonts or any(not f.get("bold") for f in text_fonts):
-                return False
-        return True
-
-    def find_tourism_resource_table(self) -> Optional:
-        """定位'（二）旅游资源分析'下方的表格（首行包含'主类'/'亚类'等）。"""
-        for i, ch in enumerate(self.body_children):
-            if ch.tag.split("}")[-1] != "p":
-                continue
-            t = para_text(ch).strip()
-            if "（二）旅游资源分析" in t:
-                for nxt in self.body_children[i + 1:]:
-                    if nxt.tag.split("}")[-1] == "tbl":
-                        rows = nxt.findall("w:tr", NS)
-                        if rows:
-                            first_text = "".join(t.text or "" for t in rows[0].findall(".//w:t", NS))
-                            if "主类" in first_text or "亚类" in first_text or "资源名称" in first_text:
-                                return nxt
+    bad = 0
+    for p in ps:
+        okf = True
+        for r in _runs(p):
+            sz = _eff_size(d, r)
+            if (_eff_eastasia(d, r) or '') not in STRICT_SONGTI or sz is None \
+                    or abs(sz - 12.0) > 0.26:
+                okf = False
                 break
-        return None
+        okj = _eff_para_attr(d, p, 'w:jc', 'val') == 'both'
+        oki = (_eff_para_attr(d, p, 'w:ind', 'firstLineChars') == '200'
+               or (_eff_para_attr(d, p, 'w:ind', 'firstLine') or '') in ('420', '480'))
+        if not (okf and okj and oki):
+            bad += 1
+    return bad > len(ps) * 0.2
 
-    def find_tourism_resource_tables(self) -> list:
-        """收集"（二）旅游资源分析"表格对应的**所有物理表格**。
 
-        该表在办公软件中被拆成相邻的多个 <w:tbl>（第1页 + 分页符 + 续表），
-        中间仅隔含分页符的空段落、且表头一致。为把它们当作同一张逻辑表处理，
-        这里从首个物理表起，向后合并"仅隔空段落"的、表头相同的相邻表格。
-        """
-        first = self.find_tourism_resource_table()
-        if first is None:
-            return []
+def _d09(ctx):
+    """表格文字出现小于五号（9磅）的字号。"""
+    return any(t['minsize'] is not None and t['minsize'] < 8.9 for t in ctx['tables'])
 
-        def header_sig(tbl) -> str:
-            rows = tbl.findall("w:tr", NS)
-            if not rows:
-                return ""
-            return "|".join("".join(t.text or "" for t in tc.findall(".//w:t", NS))
-                            for tc in rows[0].findall("w:tc", NS))
 
-        # body 中所有表格的位置
-        positions = [(i, ch) for i, ch in enumerate(self.body_children)
-                     if ch.tag.split("}")[-1] == "tbl"]
-        pos_of = {id(ch): i for i, ch in positions}
-        start_idx = pos_of.get(id(first))
-        sig = header_sig(first)
+def _d10(ctx):
+    """资源表、月度台账表、创新维度表不满足无边框排版。"""
+    group = _res_tables(ctx) + _find(ctx, H_LEDGER) + _find(ctx, H_INNOV)
+    return any(t['bordered'] for t in group)
 
-        result = [first]
-        # 找到 first 在 positions 中的序号
-        order = [k for k, (i, ch) in enumerate(positions) if i == start_idx]
-        if not order:
-            return result
-        k = order[0]
-        while k + 1 < len(positions):
-            cur_bidx = positions[k][0]
-            nxt_bidx, nxt_tbl = positions[k + 1]
-            # 两表之间只夹空段落（视觉上是续表，非独立新表）
-            only_blank = True
-            for ch in self.body_children[cur_bidx + 1:nxt_bidx]:
-                if ch.tag.split("}")[-1] != "p" or para_text(ch).strip():
-                    only_blank = False
-                    break
-            if only_blank and header_sig(nxt_tbl) == sig and sig != "":
-                result.append(nxt_tbl)
-                k += 1
-            else:
-                break
+
+def _d11(ctx):
+    """交叉分析表、院落类型表、季节表、团队表不满足无边框排版。"""
+    return any(t['bordered'] for t in _age_court_team(ctx))
+
+
+def _d12(ctx):
+    """调研表、启动资金表、三张收入表、现金流表不满足带网格边框排版。"""
+    group = _grid_group(ctx)
+    return (not group) or any(not t['bordered'] for t in group)
+
+def _d13(ctx):
+    """资源表不满足仅含一行表头、总计 36 行（被拆表并新增重复表头行）。"""
+    rs = _res_tables(ctx)
+    if not rs:
+        return True
+    heads = sum(1 for t in rs if _hp(t['header'], H_RES))
+    return heads != 1 or sum(t['nrows'] for t in rs) != 36
+
+
+def _d14(ctx):
+    """表格列宽与列数不满足与表头项数一致（空列、列被合并或整体缩窄）。"""
+    sec = ctx['doc'].sections[0]
+    usable = int(sec.page_width.twips) - int(sec.left_margin.twips) - int(sec.right_margin.twips)
+    for t in ctx['tables']:
+        if not t['header'] or _hp(t['header'], H_LEDGER) or _hp(t['header'], H_INNOV):
+            continue  # 台账/创新维度两表的列结构由加分项 P18 单独评判
+        vis = [w for w in t['gridcols'] if w >= 170]
+        if len(vis) != len(t['header']):
+            return True
+        if sum(t['gridcols']) < usable * 0.6:
+            return True
+    return False
+
+
+def _d15(ctx):
+    """表格单元格文字被压行截断，或表头与数据行行距不一致。"""
+    d = ctx['doc']
+    for t in ctx['tables']:
+        head, data = set(), set()
+        for i, row in enumerate(t['rowcells']):
+            for c in row:
+                for p in c.paragraphs:
+                    if not p.text.strip():
+                        continue
+                    mult, rule = _line_mult(d, p)
+                    if rule != 'auto':
+                        return True
+                    (head if i == 0 else data).add(round(mult or 0, 2))
+        if head and data and head != data:
+            return True
+    return False
+
+
+def _d16(ctx):
+    """资源表分类与资源名称被改写。"""
+    rows = []
+    for t in _res_tables(ctx):
+        for row in t['rowcells']:
+            rows.append([_norm(c.text) for c in row])
+
+    def pick(key):
+        return [r for r in rows if len(r) >= 4 and key in r[2] and '·' not in r[3]]
+
+    a, b, c = pick('EAA土木院落'), pick('EBB老粮仓广场'), pick('FAA驿站遗址')
+    if not (a and b and c):
+        return True
+    if not a[0][0].startswith('F'):
+        return True
+    if not b[0][0].startswith('F') or b[0][3] != '松火节、水源节':
+        return True
+    return c[0][3] != '松火节、水源节'
+
+
+def _d17(ctx):
+    """表格单元格内的说明文字未完整保留。"""
+    t = _norm(ctx['text'])
+    return any(_norm(k) not in t for k in CELL_NOTES)
+
+
+def _d18(ctx):
+    """正文文字、段落顺序与章节结构未完整保留。"""
+    if len(ctx['nonempty']) < BASE_NONEMPTY_PARAS * 0.95:
+        return True
+    if len(ctx['heads'][1]) != 8 or len(ctx['heads'][2]) != 17:
+        return True
+    return len(ctx['heads'][3]) < 38
+
+
+def _d19(ctx):
+    """封面图片与数据图表插图未全部保留、位置与大小改变。"""
+    if ctx['n_drawing'] != BASE_DRAWING or ctx['n_pict'] != BASE_PICT:
+        return True
+    return sorted(ctx['extents']) != sorted(BASE_EXTENTS)
+
+
+def _d20(ctx):
+    """表格数量与行数未完整保留（存在被删除的表格或被删减的数据行）。"""
+    return len(ctx['tables']) < BASE_TABLE_COUNT or ctx['total_rows'] < BASE_TABLE_ROWS
+
+
+def _d21(ctx):
+    """数值、姓名与班级信息未保持不变。"""
+    t = ctx['text']
+    return any(k not in t for k in KEEP_NUMBERS + KEEP_NAMES)
+
+
+def _d22(ctx):
+    """页眉、页脚与页码未保持无自定义内容的既有设置。"""
+    return bool(ctx['hf_text']) or ctx['hf_page_fields'] != BASE_PAGE_FIELDS
+
+
+def _d23(ctx):
+    """未保持全文 3 个节的分节设置。"""
+    return ctx['n_sections'] != BASE_SECTIONS
+
+# ============================ 规则表 ============================
+
+_PLUS_RULES = [
+    (5, '全部正文叙述段落（约200个段落）为单倍行距（1.0倍）', _p01),
+    (1, '"成员分工：""指导教师：""三大核心因素清晰可见：""现金流保障措施："等提示行与图表下方说明段落同样落实单倍行距，全文无遗漏的1.5倍行距正文段落', _p02),
+    (5, '全部表格的单元格文字为1.25倍行距（含调研表、交叉分析表、成本费用表、风险表、团队表等全部表格）', _p03),
+    (5, '"市场分析""项目简介""产品与服务""商业模式""财务分析""风险识别与管理对策""未来前景分析""团队介绍"共8处一级标题为宋体、小三（15磅）', _p04),
+    (3, '上述8处一级标题为单倍行距', _p05),
+    (3, '上述8处一级标题段前0.5行、段后0.5行（按"行"设置，非固定磅值）', _p06),
+    (5, '"环境分析""旅游资源分析""数据分析""启动背景"等共17处二级标题为宋体、四号（14磅）', _p07),
+    (5, '"政治环境（Politics）""样本构成分析""政策层面""线下获客（补充渠道）""运营可行性"等约38处三级标题为宋体、小四（12磅）', _p08),
+    (3, '上述三级标题为加粗', _p09),
+    (3, '上述三级标题为单倍行距', _p10),
+    (3, '正文"本项目的运盈重点..."与表格"小体量运盈"中的"运盈"均改为"运营"', _p11),
+    (1, '正文"避免测祘口径不一致"中的"测祘"改为"测算"', _p12),
+    (3, '调研统计表与财务表中以顿号充当小数点的百分比（"24、12%""33、67%"等约60处）均改为小数点写法', _p13),
+    (5, '"（二）旅游资源分析"下方"主类|亚类|基本类型|旅游资源单体名称"资源表为一个连续表格（1行表头+35行数据，共36行），跨两页排布', _p14),
+    (1, '该资源表在第二页续排处重复显示"主类|亚类|基本类型|旅游资源单体名称"表头行', _p15),
+    (5, '"创新点分析"下方表格内容完整排布在三页上——月度台账37行（一月·第1轮至十二月·第3轮）与创新维度7行行数与文字均无删减', _p16),
+    (3, '"创新点分析"下方表格的列结构与表头一一对应——月度台账部分为5列、创新维度部分为3列，不再出现空列、错位与并入同一表格框的情形', _p17),
+    (3, '除"（二）旅游资源分析"与"创新点分析"下方两处表格外，其余表格均完整落在同一页内，未被拆到两页显示', _p18),
+    (1, '为实现指定的分页效果，采用了关闭"允许跨页断行"、设置重复标题行、调整表格前后分页位置等排版手段，未删减表格行列或表格内容', _p19),
+]
+_MINUS_RULES = [
+    (-3, '正文页左右页边距不满足 3.18 厘米（被改为 2.5 厘米一类数值）', _d01),
+    (-1, '纸张与上下页边距不满足 A4（宽210毫米、高297毫米）、上下 2.54 厘米', _d02),
+    (-3, '"环境分析""旅游资源分析""数据分析""启动背景"等17处二级标题不满足1.5倍行距', _d03),
+    (-1, '"1.1 地域分布""1.2 年龄结构""2.1 旅居经历"等编号小标题不满足宋体小四（12磅）不加粗（被放大为四号14磅一类字号）', _d04),
+    (-1, '"2.1宏观市场规模：""3.2四大体验板块：""7.2现金流预测"等冒号型小标题与"三大核心因素清晰可见：""现金流保障措施："等提示行不满足宋体小四（12磅）不加粗', _d05),
+    (-1, '"成员分工：""指导教师："不满足五号（10.5磅）加粗', _d06),
+    (-3, '正文与表格中的数字、英文（如"48""199""19公里""32%""Politics""Wi-Fi""OTA""IP"）不满足西文字体保持 Times New Roman 与宋体两种并存（约190处随中文一并使用宋体的数字与英文被统一替换为 Times New Roman 一类西文字体）', _d07),
+    (-3, '正文叙述段落不满足宋体小四（12磅）、首行缩进2字符、两端对齐', _d08),
+    (-5, '表格文字出现小于五号（9磅）的字号——如 4.5磅、6.5磅、7磅、7.5磅、8.5磅（为使表格落在一页内将字号适度下调至五号9磅及以上不扣分）', _d09),
+    (-3, '"主类|亚类|基本类型|旅游资源单体名称"资源表、"月份|重点工作|责任主体|交付物|备注"月度台账表、"创新维度|具体体现|不可复制性来源"表不满足无边框排版（被添加网格实线边框）', _d10),
+    (-1, '"年龄段|1800元以下|..."等交叉分析表、"院落类型|..."表、"季节|核心体验项目|..."表、"姓名|专业班级|学院|职务|核心职责"团队表不满足无边框排版', _d11),
+    (-1, '"选项|小计|比例"系列调研表、"项目|金额（万元）|占比|资金使用说明"启动资金表、"业务线|营收（万元）|占比|核心驱动因素"三张收入表、"年度|期初现金（万元）|..."表不满足带网格边框排版', _d12),
+    (-1, '资源表不满足全表仅含一行"主类|亚类|基本类型|旅游资源单体名称"表头、共36行（被拆成两个独立表格并新增一行重复表头，总行数变为37行）', _d13),
+    (-1, '表格列宽与列数不满足与表头项数一致（出现空列、列被合并或表格被整体缩窄留白）', _d14),
+    (-1, '表格单元格文字被压行截断，或同一表格内表头行与数据行的行距不一致', _d15),
+    (-3, '资源表中"EA 传统民居|EAA 土木院落|青岭老院群"与"EB 公共空间|EBB 老粮仓广场|松火节、水源节"两行的主类列不满足以"F"开头，"FA 物质遗存|FAA 驿站遗址"行的旅游资源单体名称不满足为"松火节、水源节"（分类与资源名称被改写为"E 建筑设施""旧驿厅遗址"一类内容）', _d16),
+    (-3, '表格单元格内的说明文字不满足完整保留（如"跨页表格，便于季度复盘""院落巡检、活动复盘、农产品清单校对""低于警戒值暂停扩容"等被删改或压缩改写）', _d17),
+    (-3, '正文文字、段落顺序与章节结构不满足完整保留（存在删除、改写、合并或重新排序的段落与章节）', _d18),
+    (-3, '封面图片与"1.1 地域分布""2.1 旅居经历"等小标题下方的数据图表插图不满足全部保留、位置与大小不变', _d19),
+    (-3, '表格数量与行数不满足完整保留（存在被删除的表格或被删减的数据行）', _d20),
+    (-1, '"165万元""128万元""3.2年""19公里""28分钟""32%""61%"等数值与"陆修远""何修晴""周一行""赵清澜""林若楠""许知瑾""梁冥香"等姓名、"旅游管理23级1班"等班级信息不满足保持不变', _d21),
+    (-1, '页眉、页脚与页码不满足保持无自定义内容的既有设置（新增页眉文字、页码或删除既有设置）', _d22),
+    (-1, '不满足全文3个节的分节设置（新增分节符改变了页面方向、纸张或页码编排）', _d23),
+]
+
+_MAX_DELTAS_ORDER = [s for s, _d, _f in _PLUS_RULES] + [s for s, _d, _f in _MINUS_RULES]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+assert len(_PLUS_RULES) == 19 and len(_MINUS_RULES) == 23
+
+# ============================ 主流程 ============================
+
+def _run(fn, ctx):
+    try:
+        return bool(fn(ctx)), ''
+    except Exception as exc:
+        return False, '检查异常：%s: %s' % (type(exc).__name__, exc)
+
+
+def _zero_items():
+    return [{'rule': desc, 'max_delta': score, 'delta': 0, 'hit': False}
+            for score, desc, _fn in _PLUS_RULES + _MINUS_RULES]
+
+
+def _find_target_file(dir_path):
+    """仅在给定目录本身定位交付物（不进入子目录），忽略 ~$/. 开头的临时隐藏文件。
+
+    优先取 .docx；一个都没有时退而取 .doc/.rtf/.odt/.pdf 等其他格式，好让维度一
+    能就“格式不对”判不通过，而不是报“没找到交付物”。"""
+    try:
+        names = os.listdir(dir_path)
+    except OSError:
+        names = []
+    files = sorted(f for f in names
+                   if not f.startswith('~$') and not f.startswith('.')
+                   and os.path.isfile(os.path.join(dir_path, f)))
+    cands = [f for f in files if f.lower().endswith(_ACCEPTED_EXT)]
+    if not cands:
+        cands = [f for f in files if f.lower().endswith(_WRONG_FMT_EXTS)]
+    if not cands:
+        raise FileNotFoundError('目录中未找到 .docx 文件：%s' % dir_path)
+    return os.path.join(dir_path, cands[0])
+
+
+def _evaluate_impl(file_path, result):
+    # 维度一的第一道门禁：交付物格式只接受 .docx，不合格就地判 0，不再解析内容
+    reject = _fmt_reject(file_path)
+    if reject:
+        result['dim1_pass'] = False
+        result['dim1_reason'] = reject
+        result['dim2_items'] = _zero_items()
+        result['total_score'] = 0
         return result
 
-    def check_tourism_table_two_pages_with_header(self) -> bool:
-        """+5：“（二）旅游资源分析”表格排版为 2 页，第 2 页出现和第 1 页内容、格式均相同的表头
-
-        细则要点（严格化）：
-          (i)  表格恰好排版为 **2 页**（不是 3 页以上，也不是 1 页）；
-          (ii) 第 2 页顶端出现与第 1 页表头**内容 + 格式**完全一致的表头。
-
-        判定两种合规实现路径：
-          A) 物理分段续表：作者把该表拆成相邻的 <w:tbl>，中间只夹含分页符 <w:br
-             w:type="page"/> 的空段落；且后续表格首行（表头）与首表首行的内容签名
-             和视觉签名都一致。要求恰好 2 段（>2 段视为 3 页以上，判不通过）。
-          B) 自动续表：单个 <w:tbl>，首行设置 <w:tblHeader/>（Word/WPS 才会在下一
-             页自动重复该表头），且估算渲染高度 total_h 满足
-                 page_h < total_h <= 2 * page_h
-             即恰好跨 2 页（>2*page_h 视为 3 页以上）。
-
-        任一路径成立即通过；否则不通过。
-        """
-        first = self.find_tourism_resource_table()
-        if first is None:
-            return False
-
-        bc = self.body_children
-        positions = [(i, ch) for i, ch in enumerate(bc)
-                     if ch.tag.split("}")[-1] == "tbl"]
-        if not positions:
-            return False
-
-        def _row_content_sig(row) -> str:
-            return "|".join("".join((t.text or "") for t in tc.findall(".//w:t", NS))
-                            for tc in row.findall("w:tc", NS))
-
-        def _row_visual_sig(row) -> tuple:
-            """行的视觉签名：单元格结构 + 每个单元格首段/首 run 的字体样式。
-            用于严格判定"格式相同的表头"。"""
-            cells_sig = []
-            for tc in row.findall("w:tc", NS):
-                tcpr = tc.find("w:tcPr", NS)
-                grid = w = shd_fill = valign = None
-                borders_sig = ""
-                if tcpr is not None:
-                    gs = tcpr.find("w:gridSpan", NS)
-                    if gs is not None:
-                        grid = gs.get(qn("w:val"))
-                    tcw = tcpr.find("w:tcW", NS)
-                    if tcw is not None:
-                        w = (tcw.get(qn("w:w")), tcw.get(qn("w:type")))
-                    shd = tcpr.find("w:shd", NS)
-                    if shd is not None:
-                        shd_fill = (shd.get(qn("w:fill")), shd.get(qn("w:val")),
-                                    shd.get(qn("w:color")))
-                    va = tcpr.find("w:vAlign", NS)
-                    if va is not None:
-                        valign = va.get(qn("w:val"))
-                    tcb = tcpr.find("w:tcBorders", NS)
-                    if tcb is not None:
-                        parts = []
-                        for side in ("top", "left", "bottom", "right",
-                                     "insideH", "insideV"):
-                            e = tcb.find(f"w:{side}", NS)
-                            if e is not None:
-                                parts.append((side, e.get(qn("w:val")),
-                                              e.get(qn("w:sz")),
-                                              e.get(qn("w:color"))))
-                        borders_sig = tuple(parts)
-                # 首段的段落对齐 + 首个含文字 run 的字体样式
-                p = tc.find("w:p", NS)
-                jc = font_sig = None
-                if p is not None:
-                    ppr = p.find("w:pPr", NS)
-                    if ppr is not None:
-                        jc_el = ppr.find("w:jc", NS)
-                        if jc_el is not None:
-                            jc = jc_el.get(qn("w:val"))
-                    for r in p.findall(".//w:r", NS):
-                        if not any((t.text or "") for t in r.findall("w:t", NS)):
-                            continue
-                        rpr = r.find("w:rPr", NS)
-                        b_on = i_on = False
-                        sz = ascii_f = east_f = None
-                        if rpr is not None:
-                            b = rpr.find("w:b", NS)
-                            if b is not None and b.get(qn("w:val")) not in (
-                                    "0", "false", "off", "none"):
-                                b_on = True
-                            if rpr.find("w:i", NS) is not None:
-                                i_on = True
-                            sz_el = rpr.find("w:sz", NS)
-                            if sz_el is not None:
-                                sz = sz_el.get(qn("w:val"))
-                            rf = rpr.find("w:rFonts", NS)
-                            if rf is not None:
-                                ascii_f = rf.get(qn("w:ascii"))
-                                east_f = rf.get(qn("w:eastAsia"))
-                        font_sig = (b_on, i_on, sz, ascii_f, east_f)
-                        break
-                cells_sig.append((grid, w, shd_fill, valign, borders_sig,
-                                  jc, font_sig))
-            return tuple(cells_sig)
-
-        def _only_pagebreak_between(a_idx: int, b_idx: int) -> bool:
-            """两个相邻表格之间仅含分页符的空段落（视觉即"下一页续表"）。"""
-            saw_break = False
-            for ch in bc[a_idx + 1:b_idx]:
-                if ch.tag.split("}")[-1] != "p":
-                    return False
-                if para_text(ch).strip():
-                    return False
-                for br in ch.findall(".//w:br", NS):
-                    if br.get(qn("w:type")) == "page":
-                        saw_break = True
-            return saw_break
-
-        first_rows = first.findall("w:tr", NS)
-        if not first_rows:
-            return False
-        head_content = _row_content_sig(first_rows[0])
-        head_visual = _row_visual_sig(first_rows[0])
-        if not head_content.strip("|"):
-            return False
-
-        # 路径 A：物理分段续表 —— 从首表起沿正文向后合并"仅隔分页符 + 表头一致"的相邻表。
-        pos_of = {id(ch): i for i, ch in positions}
-        start_bidx = pos_of.get(id(first))
-        order = [k for k, (i, _) in enumerate(positions) if i == start_bidx]
-        if not order:
-            return False
-        group_tbls = [first]
-        k = order[0]
-        while k + 1 < len(positions):
-            cur_bidx = positions[k][0]
-            nxt_bidx, nxt_tbl = positions[k + 1]
-            nxt_rows = nxt_tbl.findall("w:tr", NS)
-            if not nxt_rows:
-                break
-            if (_only_pagebreak_between(cur_bidx, nxt_bidx)
-                    and _row_content_sig(nxt_rows[0]) == head_content
-                    and _row_visual_sig(nxt_rows[0]) == head_visual):
-                group_tbls.append(nxt_tbl)
-                k += 1
-            else:
-                break
-
-        if len(group_tbls) >= 2:
-            # 恰好 2 段：第 2 段就是"第 2 页"，且表头内容+格式与第 1 页一致
-            return len(group_tbls) == 2
-
-        # 路径 B：单表 + <w:tblHeader/> 自动续表
-        tbl_pr = first.find("w:tblPr", NS)  # 保留，供后续如需诊断
-        _ = tbl_pr
-        first_row_pr = first_rows[0].find("w:trPr", NS)
-        has_tbl_header = (first_row_pr is not None
-                          and first_row_pr.find("w:tblHeader", NS) is not None)
-        if not has_tbl_header:
-            return False  # 无 tblHeader，Word/WPS 不会在下一页重复表头
-        page_h = self._page_content_height()
-        total_h = self._table_height(first)
-        # 严格 2 页：total_h 超过 1 页正文高度，但不超过 2 页
-        return page_h < total_h <= 2 * page_h
-
-    def _style_tbl_borders(self, style_id):
-        """沿表格样式的 basedOn 链，取该样式定义的 w:tblBorders（就近优先）。"""
-        if self.styles_root is None or not style_id:
-            return None
-        by_id = {}
-        for s in self.styles_root.findall("w:style", NS):
-            sid = s.get(qn("w:styleId"))
-            if sid is not None:
-                by_id[sid] = s
-        seen = set()
-        cur = style_id
-        while cur and cur not in seen:
-            seen.add(cur)
-            s = by_id.get(cur)
-            if s is None:
-                break
-            b = s.find(".//w:tblPr/w:tblBorders", NS)
-            if b is not None:
-                return b
-            based = s.find("w:basedOn", NS)
-            cur = based.get(qn("w:val")) if based is not None else None
-        return None
-
-    def _page_content_height(self) -> int:
-        """页面正文区高度（twips）：pgSz.h - 上下页边距。"""
-        page_h = 15840
-        sect = self.body.find("w:sectPr", NS)
-        if sect is not None:
-            pg = sect.find("w:pgSz", NS)
-            mar = sect.find("w:pgMar", NS)
-            if pg is not None and pg.get(qn("w:h")):
-                h = int(pg.get(qn("w:h")))
-                top = int(mar.get(qn("w:top"))) if (mar is not None and mar.get(qn("w:top"))) else 0
-                bot = int(mar.get(qn("w:bottom"))) if (mar is not None and mar.get(qn("w:bottom"))) else 0
-                page_h = max(1, h - top - bot)
-        return page_h
-
-    def _table_height(self, tbl) -> int:
-        """估算表格在办公软件中的渲染高度（twips）。
-
-        逐行取"单元格中最高的一列"作为行高：每个单元格按其段落数、每段字号与
-        行距（line/lineRule）折算行高，并加上单元格上下边距。字号越小、行数虽多
-        也可能只占很小高度，从而正确反映"小字号表格一页放得下"的真实排版。
-        """
-        def para_height(p) -> float:
-            szs = []
-            for r in p.findall(".//w:r", NS):
-                rpr = r.find("w:rPr", NS)
-                sz = rpr.find("w:sz", NS) if rpr is not None else None
-                if sz is not None and sz.get(qn("w:val")):
-                    szs.append(int(sz.get(qn("w:val"))))
-            fs_pt = (max(szs) / 2.0) if szs else 10.5  # 半磅->磅；默认约五号
-            sp = get_para_spacing(p)
-            line = sp.get("line")
-            rule = sp.get("line_rule")
-            if line and rule in (None, "auto"):
-                lh = fs_pt * 20 * (line / 240.0)       # 倍数行距，240=单倍
-            elif line and rule in ("exact", "atLeast"):
-                lh = max(int(line), fs_pt * 20)          # 固定/最小磅值
-            else:
-                lh = fs_pt * 20 * 1.15                    # 默认单倍略含行间距
-            n_lines = 1 + len(p.findall(".//w:br", NS))
-            return lh * n_lines
-
-        total = 0.0
-        for tr in tbl.findall("w:tr", NS):
-            row_h = 0.0
-            for tc in tr.findall("w:tc", NS):
-                cell_h = sum(para_height(p) for p in tc.findall("w:p", NS))
-                row_h = max(row_h, cell_h)
-            # 行高下限：w:trHeight（exact 为固定值，atLeast 为最小值）。
-            # 内容折算高度小于该下限时，实际渲染以下限为准。
-            trpr = tr.find("w:trPr", NS)
-            th = trpr.find("w:trHeight", NS) if trpr is not None else None
-            if th is not None and th.get(qn("w:val")):
-                min_h = int(th.get(qn("w:val")))
-                rule = th.get(qn("w:hRule"))
-                if rule == "exact":
-                    row_h = min_h
-                else:  # atLeast / 默认
-                    row_h = max(row_h, min_h)
-            total += row_h + 60  # 单元格上下边距近似
-        return int(total)
-
-    def check_only_one_table_two_pages(self) -> bool:
-        """+5：仅有一个表格分 2 页排版，其他表格均为一页排版
-
-        细则拆解（严格化）：
-          1) 恰好有 1 个（逻辑）表格是"分 **2** 页排版"——不是 1 页，也不是 3 页以上；
-          2) 其余所有（逻辑）表格都是"**一** 页排版"（既非跨页也非多页）。
-
-        任一表格若排到 3 页及以上，或有 2 个以上表格跨页，均不满足。
-
-        判定（不启用 COM，仅由 OOXML 推导每个逻辑表的"占用页数"）：
-          先把相邻的物理续表（仅隔含分页符的空段落、表头一致）合并成逻辑组，
-          再对每个逻辑组估算页数 pages：
-            (a) 物理分段续表：每一段落在各自一页，pages = 段数（len(group)）。
-            (b) 单个 <w:tbl>：按字号/行距估算渲染高度 total_h，
-                pages = max(1, ceil(total_h / page_h))。
-                （仅凭行数会误判——小字号表格几十行仍可容于一页。）
-          最终要求：恰好 1 个逻辑组 pages == 2，其余所有逻辑组 pages == 1。
-        """
-        NSp = NS
-
-        def header_sig(tbl) -> str:
-            rows = tbl.findall("w:tr", NSp)
-            if not rows:
-                return ""
-            return "|".join("".join(t.text or "" for t in tc.findall(".//w:t", NSp))
-                            for tc in rows[0].findall("w:tc", NSp))
-
-        def only_pagebreak_between(a_idx: int, b_idx: int) -> bool:
-            """两个相邻表格之间只夹着空段落，且其中含分页符。"""
-            saw_break = False
-            for ch in self.body_children[a_idx + 1:b_idx]:
-                if ch.tag.split("}")[-1] != "p":
-                    return False
-                if para_text(ch).strip():
-                    return False
-                for br in ch.findall(".//w:br", NSp):
-                    if br.get(qn("w:type")) == "page":
-                        saw_break = True
-            return saw_break
-
-        page_h = self._page_content_height()
-
-        tbl_positions = [(i, ch) for i, ch in enumerate(self.body_children)
-                         if ch.tag.split("}")[-1] == "tbl"]
-        if not tbl_positions:
-            return False
-
-        # (b) 合并"分页符续表"为逻辑组
-        groups = []
-        used = set()
-        for k in range(len(tbl_positions)):
-            if k in used:
-                continue
-            group = [tbl_positions[k]]
-            used.add(k)
-            while True:
-                last_idx = group[-1][0]
-                nxt = None
-                for j in range(len(tbl_positions)):
-                    if j in used:
-                        continue
-                    if tbl_positions[j][0] > last_idx:
-                        nxt = j
-                        break
-                if nxt is None:
-                    break
-                nxt_idx, nxt_tbl = tbl_positions[nxt]
-                if (only_pagebreak_between(last_idx, nxt_idx)
-                        and header_sig(group[-1][1]) == header_sig(nxt_tbl)
-                        and header_sig(nxt_tbl) != ""):
-                    group.append((nxt_idx, nxt_tbl))
-                    used.add(nxt)
-                else:
-                    break
-            groups.append(group)
-
-        def group_pages(group) -> int:
-            """逻辑组占用页数：物理续表按段数；单表按渲染高度向上取整。"""
-            if len(group) >= 2:
-                return len(group)  # 每一续表段各占一页
-            total_h = self._table_height(group[0][1])
-            if page_h <= 0:
-                return 1
-            return max(1, math.ceil(total_h / page_h))
-
-        pages_list = [group_pages(g) for g in groups]
-        # 任一表格 3 页及以上 → 不满足（rubric 明确是"分 2 页"）
-        if any(p >= 3 for p in pages_list):
-            return False
-        two_page_count = sum(1 for p in pages_list if p == 2)
-        one_page_count = sum(1 for p in pages_list if p == 1)
-        # 恰好 1 个表格 2 页，其余全部 1 页
-        return two_page_count == 1 and one_page_count == len(pages_list) - 1
-
-
-    def check_tourism_table_three_borders_per_page(self) -> bool:
-        """+1：“（二）旅游资源分析”表格每一页只有三条边框线（三线表：顶线 + 表头下线 + 底线）
-
-        细则语义（针对办公软件实际渲染）：
-          该表被作者物理拆成相邻的多个 <w:tbl>（每个 <w:tbl> 对应"一页"），
-          每一页的表格应恰好呈现 3 条水平边框线，且没有任何竖直边框线——
-          这是学术论文里的"三线表"外观：顶线、表头分割线、底线。
-
-        判定（不启用 COM，仅由 OOXML 边框声明推导）：
-          对每一个物理表分别计算"实际会被绘制的边框条数"：
-            水平线总数 = 顶边框(1) + 相邻行间被绘制的横线条数 + 底边框(1)
-            竖直线数量 = 左/右/insideV 或任何单元格竖向边框
-          单元格级 tcBorders 覆盖表级 tblBorders；表级为空时按 tblStyle
-          继承（通过 _style_tbl_borders 沿 basedOn 链就近取值）。
-          每张物理表都必须满足：水平线数 == 3 且 竖直线数 == 0。
-        """
-        tables = self.find_tourism_resource_tables()
-        if not tables:
-            return False
-
-        def _drawn(el) -> bool:
-            """<w:xxx w:val="..."> 是否表示"会被绘制"——非 nil/none 即视为绘制。"""
-            if el is None:
-                return False
-            return el.get(qn("w:val")) not in ("nil", "none")
-
-        def _tbl_default_borders(tbl):
-            """表级默认 6 方位边框（tblBorders 或沿样式 basedOn 链继承）。
-            返回 dict: {side: bool_drawn}"""
-            sides = ("top", "left", "bottom", "right", "insideH", "insideV")
-            tblpr = tbl.find("w:tblPr", NS)
-            borders = tblpr.find("w:tblBorders", NS) if tblpr is not None else None
-            if borders is None and tblpr is not None:
-                ts = tblpr.find("w:tblStyle", NS)
-                borders = self._style_tbl_borders(
-                    ts.get(qn("w:val")) if ts is not None else None)
-            out = {s: False for s in sides}
-            if borders is None:
-                return out
-            for s in sides:
-                out[s] = _drawn(borders.find(f"w:{s}", NS))
-            return out
-
-        def _cell_border(tc, side: str, tbl_default: dict) -> bool:
-            """单元格在指定方位是否会绘制边框——tcBorders 优先，否则回退表级默认。"""
-            tcpr = tc.find("w:tcPr", NS)
-            tcb = tcpr.find("w:tcBorders", NS) if tcpr is not None else None
-            if tcb is not None:
-                el = tcb.find(f"w:{side}", NS)
-                if el is not None:
-                    return _drawn(el)
-            return bool(tbl_default.get(side, False))
-
-        def _page_borders_ok(tbl) -> bool:
-            rows = tbl.findall("w:tr", NS)
-            if not rows:
-                return False
-            tbl_def = _tbl_default_borders(tbl)
-
-            # ---- 水平线：顶线 / 行间线 / 底线 ----
-            top_drawn = any(_cell_border(tc, "top", tbl_def)
-                            for tc in rows[0].findall("w:tc", NS))
-            bot_drawn = any(_cell_border(tc, "bottom", tbl_def)
-                            for tc in rows[-1].findall("w:tc", NS))
-            between = 0
-            for i in range(len(rows) - 1):
-                upper_cells = rows[i].findall("w:tc", NS)
-                lower_cells = rows[i + 1].findall("w:tc", NS)
-                line_here = (
-                    any(_cell_border(tc, "bottom", tbl_def) for tc in upper_cells)
-                    or any(_cell_border(tc, "top", tbl_def) for tc in lower_cells)
-                    or tbl_def.get("insideH", False)
-                )
-                if line_here:
-                    between += 1
-            h_total = int(top_drawn) + between + int(bot_drawn)
-
-            # ---- 竖直线：左/右/insideV，任何单元格竖向边框都算 ----
-            v_any = False
-            if tbl_def.get("left") or tbl_def.get("right") or tbl_def.get("insideV"):
-                v_any = True
-            if not v_any:
-                for tr in rows:
-                    for tc in tr.findall("w:tc", NS):
-                        if (_cell_border(tc, "left", tbl_def)
-                                or _cell_border(tc, "right", tbl_def)):
-                            v_any = True
-                            break
-                    if v_any:
-                        break
-
-            return h_total == 3 and not v_any
-
-        # 每一物理表（= 每一页）都必须满足"3 条水平线 + 0 条竖直线"
-        return all(_page_borders_ok(t) for t in tables)
-
-    def check_any_page_no_page_number(self) -> bool:
-        """-1：从目录页开始任意页无页码
-
-        细则：从"目录页"开始的任意一页若没有页码，即扣分（目录页之前的封面、
-        信息页不在考察范围内）。
-        判定：定位目录(TOC 域)所在的节，从该节起逐节检查其生效页脚是否含页码域(PAGE)；
-        只要目录页及其之后存在任一页没有带页码的页脚，即满足扣分条件。目录页之前的节
-        （封面、信息页）即使无页码也不计。
-
-        在办公软件（WPS/Word）中的有效判定要点：
-          - 页脚通过节的 <w:footerReference> 关联到 footerN.xml；type 可为
-            default（默认）、first（首页）、even（偶数页）。
-          - 页码是页脚中的 PAGE 域：<w:fldSimple w:instr="...PAGE..."> 或
-            <w:instrText>PAGE</w:instrText>（footer 的 XML 含 "PAGE" 即视为有页码）。
-          - **页脚继承**：某节缺某类型 footerReference 时沿用前一节的同类页脚。
-            为保证继承正确，继承状态从文档第一个节开始累积，但**只从目录页所在节起**
-            才据此判违规。
-          - **首页页脚**：仅当该节设置了 <w:titlePg/> 时，first 型页脚才对首页生效。
-        """
-        # 目录(TOC 域)所在的 body 位置
-        toc_body_idx = None
-        for i, ch in enumerate(self.body_children):
-            found = False
-            for it in ch.findall(".//w:instrText", NS):
-                if it.text and "TOC" in it.text:
-                    found = True
-                    break
-            if not found:
-                for fs in ch.findall(".//w:fldSimple", NS):
-                    if "TOC" in (fs.get(qn("w:instr")) or ""):
-                        found = True
-                        break
-            if found:
-                toc_body_idx = i
-                break
-
-        # 按文档顺序取出各节的 sectPr，并记录该节结束(所含最后一个 body 子元素)的位置
-        sects = []       # (sectPr, end_body_idx)
-        for i, ch in enumerate(self.body_children):
-            if ch.tag.split("}")[-1] == "p":
-                ppr = ch.find("w:pPr", NS)
-                if ppr is not None and ppr.find("w:sectPr", NS) is not None:
-                    sects.append((ppr.find("w:sectPr", NS), i))
-        body_sect = self.body.find("w:sectPr", NS)
-        if body_sect is not None:
-            sects.append((body_sect, len(self.body_children)))
-        if not sects:
-            return True  # 没有任何节/页脚
-
-        # 目录所在节的序号：第一个 end_body_idx >= 目录位置的节；找不到目录则从第 0 节起
-        toc_section_idx = 0
-        if toc_body_idx is not None:
-            for k, (_, end_idx) in enumerate(sects):
-                if end_idx >= toc_body_idx:
-                    toc_section_idx = k
-                    break
-
-        def footer_has_page(rid) -> bool:
-            if not rid:
-                return False
-            tgt = self.rels.get(rid)
-            if not tgt or not str(tgt[1]).startswith("footer"):
-                return False
-            fp = "word/" + tgt[1]
-            return fp in self.footers and b"PAGE" in self.footers[fp]
-
-        def refs_by_type(sect) -> dict:
-            out = {}
-            for r in sect.findall("w:footerReference", NS):
-                out[r.get(qn("w:type"))] = r.get(f"{{{R_NS}}}id")
-            return out
-
-        # 从第一个节起累积继承，但只从目录页所在节起判违规
-        inherited_default = None
-        inherited_first = None
-        for k, (sect, _end) in enumerate(sects):
-            refs = refs_by_type(sect)
-            cur_default = refs.get("default", inherited_default)
-            cur_first = refs.get("first", inherited_first)
-
-            if k >= toc_section_idx:  # 目录页及之后的节才考察页码
-                has_title_pg = sect.find("w:titlePg", NS) is not None
-                if not footer_has_page(cur_default):
-                    return True
-                if has_title_pg and not footer_has_page(cur_first):
-                    return True
-
-            inherited_default = cur_default
-            inherited_first = cur_first
-
-        return False
-
-    def check_cover_no_center_text(self) -> bool:
-        """-1：封面居中位置没有文本内容
-
-        细则：封面（文档第一节/首页）的"居中位置"没有任何文本内容，即扣分。
-        判定：封面区域内必须存在**确实位于页面水平居中位置**的文本承载物；仅有
-        文本框而位置不在居中区域的不算数。任一以下成立即"居中位置有文本" → 不扣分：
-
-          A) 普通段落 <w:pPr><w:jc w:val="center"/> 且该段落含可见文字（含义等于
-             版心水平居中的段落）。
-          B) DrawingML 浮动文本框 <w:drawing><wp:anchor>：内含 <w:txbxContent>
-             且其 <wp:positionH> 满足以下之一：
-                (i)  <wp:align>center</wp:align>（在 relativeFrom 参考系居中）；
-                (ii) <wp:posOffset>+<wp:extent cx="…"> 计算出的框中心与该
-                     参考系中心相差不超过 0.5cm。
-          C) DrawingML 内嵌文本框 <wp:inline>：位置跟随其所在段落，段落
-             jc=center 即视为居中。
-          D) VML 形状 <w:pict><v:shape/v:rect …>：其 style 含
-             mso-position-horizontal:center；或由 left+width 计算得到的框中心
-             与页面/版心中心相差不超过 0.5cm。
-
-        以上均不满足才扣分。全部通过 OOXML 属性解析，不使用 COM。
-        """
-        WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-        A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
-        V_NS = "urn:schemas-microsoft-com:vml"
-        NSX = {"w": W_NS, "wp": WP_NS, "a": A_NS, "v": V_NS}
-
-        # ---- 页面几何（twips）----
-        page_w = 12240
-        margin_l = margin_r = 0
-        body_sect = self.body.find("w:sectPr", NS)
-        if body_sect is not None:
-            pg = body_sect.find("w:pgSz", NS)
-            mar = body_sect.find("w:pgMar", NS)
-            if pg is not None and pg.get(qn("w:w")):
-                page_w = int(pg.get(qn("w:w")))
-            if mar is not None:
-                if mar.get(qn("w:left")):
-                    margin_l = int(mar.get(qn("w:left")))
-                if mar.get(qn("w:right")):
-                    margin_r = int(mar.get(qn("w:right")))
-
-        TWIP_PER_CM = 1440 / 2.54
-        TOL_TWIP = int(0.5 * TWIP_PER_CM)  # 0.5cm ≈ 283 twip
-        EMU_PER_TWIP = 635  # 914400 EMU/in ÷ 1440 twip/in
-
-        def _emu_int(s) -> int:
-            try:
-                return int(s)
-            except Exception:
-                return 0
-
-        def _emu_to_twip(v: int) -> int:
-            return int(round(v / EMU_PER_TWIP))
-
-        # ---- 定位封面区域：第一处 sectPr 所在段落之前(含) ----
-        first_sect_idx = None
-        for i, ch in enumerate(self.body_children):
-            if ch.tag.split("}")[-1] == "p":
-                ppr = ch.find("w:pPr", NS)
-                if ppr is not None and ppr.find("w:sectPr", NS) is not None:
-                    first_sect_idx = i
-                    break
-        if first_sect_idx is None:
-            first_sect_idx = min(len(self.body_children) - 1, 5)
-
-        def _drawing_anchor_centered(drawing_el) -> bool:
-            """DrawingML 浮动文本框的 <wp:positionH> 是否在参考系水平居中。"""
-            anchor = drawing_el.find(".//wp:anchor", NSX)
-            if anchor is None:
-                return False
-            posH = anchor.find("wp:positionH", NSX)
-            if posH is None:
-                return False
-            # (i) 显式 align=center
-            align_el = posH.find("wp:align", NSX)
-            if align_el is not None and (align_el.text or "").strip().lower() == "center":
-                return True
-            # (ii) posOffset + extent 数值居中
-            off_el = posH.find("wp:posOffset", NSX)
-            extent = anchor.find("wp:extent", NSX)
-            if off_el is None or extent is None:
-                return False
-            off_twip = _emu_to_twip(_emu_int((off_el.text or "0").strip()))
-            cx_twip = _emu_to_twip(_emu_int(extent.get("cx") or "0"))
-            rel = (posH.get("relativeFrom") or "").lower()
-            if rel == "margin" or rel == "column":
-                ref_left, ref_right = margin_l, page_w - margin_r
-            elif rel == "leftmargin":
-                ref_left, ref_right = 0, margin_l
-            elif rel == "rightmargin":
-                ref_left, ref_right = page_w - margin_r, page_w
-            elif rel == "character":
-                return False  # 相对字符位置，无法判定居中
-            else:  # page / outsideMargin / insideMargin / 未声明
-                ref_left, ref_right = 0, page_w
-            ref_center = (ref_left + ref_right) / 2
-            box_center = ref_left + off_twip + cx_twip / 2
-            return abs(box_center - ref_center) <= TOL_TWIP
-
-        def _vml_shape_centered(pict_el) -> bool:
-            """VML 形状：style 中 mso-position-horizontal:center，或 left+width 居中。"""
-            def _parse_len_twip(s: str):
-                s = (s or "").strip().lower()
-                if not s:
-                    return None
-                num, i = "", 0
-                if i < len(s) and s[i] in "+-":
-                    num += s[i]; i += 1
-                while i < len(s) and (s[i].isdigit() or s[i] == "."):
-                    num += s[i]; i += 1
-                try:
-                    val = float(num)
-                except Exception:
-                    return None
-                unit = s[i:].strip()
-                if unit in ("", "pt"):
-                    return val * 20  # 1pt = 20 twip
-                if unit == "in":
-                    return val * 1440
-                if unit == "cm":
-                    return val * TWIP_PER_CM
-                if unit == "mm":
-                    return val * TWIP_PER_CM / 10
-                if unit == "px":
-                    return val * 15  # 96dpi: 1px = 0.75pt = 15 twip
-                return val * 20
-
-            for shape in pict_el.iter():
-                tag = shape.tag.split("}")[-1]
-                if tag not in ("shape", "rect", "roundrect", "oval", "group"):
-                    continue
-                if shape.find(".//w:txbxContent", NS) is None:
-                    continue
-                style = shape.get("style") or ""
-                props = {}
-                for part in style.split(";"):
-                    if ":" in part:
-                        k, v = part.split(":", 1)
-                        props[k.strip().lower()] = v.strip().lower()
-                if props.get("mso-position-horizontal") == "center":
-                    return True
-                left = _parse_len_twip(props.get("left", ""))
-                width = _parse_len_twip(props.get("width", ""))
-                if left is None or width is None:
-                    continue
-                origin = props.get("mso-position-horizontal-relative", "page")
-                if origin == "margin":
-                    ref_left, ref_right = margin_l, page_w - margin_r
-                else:
-                    ref_left, ref_right = 0, page_w
-                ref_center = (ref_left + ref_right) / 2
-                box_center = ref_left + left + width / 2
-                if abs(box_center - ref_center) <= TOL_TWIP:
-                    return True
-            return False
-
-        def _txbx_has_visible_text(node) -> bool:
-            for tb in node.findall(".//w:txbxContent", NS):
-                for t in tb.findall(".//w:t", NS):
-                    if (t.text or "").strip():
-                        return True
-            return False
-
-        for ch in self.body_children[:first_sect_idx + 1]:
-            if ch.tag.split("}")[-1] != "p":
-                continue
-
-            # 收集文本框内的 w:t，便于 A 项排除文本框文字
-            txbx_texts = set()
-            for tb in ch.findall(".//w:txbxContent", NS):
-                for t in tb.findall(".//w:t", NS):
-                    txbx_texts.add(id(t))
-
-            # B) DrawingML 浮动文本框：由 wp:positionH 精确判居中
-            for drw in ch.findall(".//w:drawing", NS):
-                if drw.find(".//wp:anchor", NSX) is None:
-                    continue
-                if not _txbx_has_visible_text(drw):
-                    continue
-                if _drawing_anchor_centered(drw):
-                    return False
-
-            # C) DrawingML 内嵌文本框：位置随段落，段落 jc=center 才算居中
-            for drw in ch.findall(".//w:drawing", NS):
-                if drw.find(".//wp:inline", NSX) is None:
-                    continue
-                if not _txbx_has_visible_text(drw):
-                    continue
-                if get_para_alignment(ch) == "center":
-                    return False
-
-            # D) VML 文本框
-            for pict in ch.findall(".//w:pict", NS):
-                if not _txbx_has_visible_text(pict):
-                    continue
-                if _vml_shape_centered(pict):
-                    return False
-
-            # A) 段落自身水平居中且含可见文字（排除文本框内文字）
-            direct = "".join(t.text or "" for t in ch.findall(".//w:t", NS)
-                             if id(t) not in txbx_texts)
-            if direct.strip() and get_para_alignment(ch) == "center":
-                return False
-
-        return True
-
-    def check_page2_missing_fields(self) -> bool:
-        """-1：第2页没有出现 云岭应用学院、项目名称、项目负责人、团队成员、指导老师、申报日期、项目类型
-
-        细则：第 2 页缺少上述 7 个字段中的任意一个，即扣分（必须 7 个全部出现才不扣）。
-        判定：取"第 2 页"区域文本，逐一检查 7 个字段是否出现；只要有任一缺失即扣分。
-
-        在办公软件（WPS/Word）中的有效判定：
-          - 页面由分节/分页确定。封面为第 1 节（第一处 sectPr 之前），第 2 页信息页为
-            第 1 处 sectPr 之后、第 2 处 sectPr（含）之前的区域。仅统计该区域文本，
-            不把封面（第 1 页）内容算进来。
-          - 文字可能位于普通段落，也可能位于文本框(txbxContent)；两者都要纳入取词，
-            与办公软件中"该页可见文字"一致。
-        """
-        sect_prs_in_paras = []
-        for i, ch in enumerate(self.body_children):
-            if ch.tag.split("}")[-1] == "p":
-                ppr = ch.find("w:pPr", NS)
-                if ppr is not None and ppr.find("w:sectPr", NS) is not None:
-                    sect_prs_in_paras.append(i)
-        if len(sect_prs_in_paras) < 2:
-            # 没有第 2 节，无法构成"第 2 页信息页" → 视为该页缺失，扣分
-            return True
-        first_sect_idx = sect_prs_in_paras[0]
-        second_sect_idx = sect_prs_in_paras[1]
-
-        # 仅取第 2 页区域（第 1 处 sectPr 之后 到 第 2 处 sectPr 含）的文本，
-        # 含普通段落与文本框内文字。
-        page2_text = ""
-        for ch in self.body_children[first_sect_idx + 1:second_sect_idx + 1]:
-            if ch.tag.split("}")[-1] == "p":
-                page2_text += para_text(ch) + "\n"
-
-        fields = ["云岭应用学院", "项目名称", "项目负责人", "团队成员", "指导老师",
-                  "申报日期", "项目类型"]
-        missing = [f for f in fields if f not in page2_text]
-        return len(missing) > 0
-
-    def find_table_after_paragraph(self, anchor_text: str):
-        """找到包含 anchor_text 的段落之后的第一个表格。"""
-        anchor_idx = None
-        for i, ch in enumerate(self.body_children):
-            if ch.tag.split("}")[-1] == "p" and anchor_text in para_text(ch):
-                anchor_idx = i
-                break
-        if anchor_idx is None:
-            return None
-        for ch in self.body_children[anchor_idx + 1:]:
-            if ch.tag.split("}")[-1] == "tbl":
-                return ch
-        return None
-
-    def check_9_3_table_shape(self) -> bool:
-        """-3：“9.3 服务需求与年龄的交叉”下方表格不是五行六列、第一行没有出现“手作文化”
-
-        扣分条件（满足任意一项即扣 3 分）：
-          A) 该表格不是"五行六列"（行数≠5 或 列数≠6）
-          B) 该表格第一行没有出现"手作文化"
-        另：若 9.3 下方根本没有表格，视为不满足"五行六列/含手作文化"，同样扣分。
-
-        在办公软件（WPS/Word）中的有效判定：
-          - 行数 = <w:tr> 的个数。
-          - 列数：以表格网格 <w:tblGrid>/<w:gridCol> 的列数为准（这是办公软件里表格的
-            真实列数）；同时校验第一行按 gridSpan 展开后的逻辑列数一致，避免被合并单元格
-            误导。两者取能反映"六列"的值来判断。
-          - "手作文化"：取第一行所有单元格文本合并后是否包含该词。
-        """
-        tbl = self.find_table_after_paragraph("9.3 服务需求与年龄的交叉")
-        if tbl is None:
-            return True  # 没有表格 → 不满足要求，扣分
-        rows = tbl.findall("w:tr", NS)
-
-        # A) 五行六列
-        # 行数必须为 5
-        if len(rows) != 5:
-            return True
-        # 列数：优先按 tblGrid 的 gridCol 数；无 tblGrid 时按第一行 gridSpan 展开
-        grid = tbl.find("w:tblGrid", NS)
-        if grid is not None:
-            n_cols = len(grid.findall("w:gridCol", NS))
-        else:
-            n_cols = 0
-            for tc in rows[0].findall("w:tc", NS):
-                tcpr = tc.find("w:tcPr", NS)
-                gs = tcpr.find("w:gridSpan", NS) if tcpr is not None else None
-                n_cols += int(gs.get(qn("w:val"), "1")) if gs is not None else 1
-        if n_cols != 6:
-            return True
-
-        # B) 第一行是否出现"手作文化"
-        first_text = "".join(t.text or "" for t in rows[0].findall(".//w:t", NS))
-        if "手作文化" not in first_text:
-            return True
-
-        return False
-
-    def check_chapter1_violations(self) -> bool:
-        """-5：满足以下任意一项即扣 5 分：
-        1) 文档中没有出现“第一章市场分析”标题及下方文本
-        2) 文档出现相同的两个标题，并且标题下方文本有超过 50% 的内容一致
-        3) “第一章市场分析”位于“第二章项目简介”之后
-
-        三点为 OR 关系（任一满足即扣分），均针对办公软件文档实际内容判定。
-        本文档章节以"一、市场分析""二、项目简介"形式书写，等价于"第一章市场分析"
-        "第二章项目简介"，判定时两种写法都接受。标题以段落文本识别（办公软件里
-        章节标题即独立段落），下方文本 = 该标题段之后、下一个同级标题段之前的正文。
-        """
-        CH1 = ("第一章市场分析", "一、市场分析")
-        CH2 = ("第二章项目简介", "二、项目简介")
-
-        def is_l1_title(t: str) -> bool:
-            return (len(t) < 40
-                    and (re.match(r"^[一二三四五六七八九十]+[、,．.]", t) is not None
-                         or re.match(r"^第[一二三四五六七八九十]+章", t) is not None))
-
-        # 章节标题段落索引（按文档顺序）
-        title_indices = [i for i, p in enumerate(self.paras)
-                         if is_l1_title(para_text(p).strip())]
-
-        def find_first(idx_names) -> Optional[int]:
-            for i in title_indices:
-                t = para_text(self.paras[i]).strip()
-                if any(name in t for name in idx_names):
-                    return i
-            return None
-
-        def body_below(title_i: int) -> str:
-            """标题段之后、到下一个 L1 标题段之前的正文（下方文本）。"""
-            chunk = []
-            for j in range(title_i + 1, len(self.paras)):
-                tj = para_text(self.paras[j]).strip()
-                if is_l1_title(tj):
-                    break
-                chunk.append(tj)
-            return "".join(chunk)
-
-        ch1_i = find_first(CH1)
-        ch2_i = find_first(CH2)
-
-        # 1) 没有"第一章市场分析"标题，或其下方没有文本
-        if ch1_i is None:
-            return True
-        if not body_below(ch1_i).strip():
-            return True
-
-        # 3) "第一章市场分析" 位于 "第二章项目简介" 之后（按标题出现顺序）
-        if ch2_i is not None and ch1_i > ch2_i:
-            return True
-
-        # 2) 出现相同的两个标题，且两处标题下方文本 > 50% 一致
-        title_positions: Dict[str, List[int]] = {}
-        for i in title_indices:
-            t = para_text(self.paras[i]).strip()
-            title_positions.setdefault(t, []).append(i)
-        for title, positions in title_positions.items():
-            if len(positions) < 2:
-                continue
-            a = body_below(positions[0])
-            b = body_below(positions[1])
-            if not a or not b:
-                continue
-            longer, shorter = (a, b) if len(a) >= len(b) else (b, a)
-            # 以较短一方为基准的最长公共子序列占比衡量"内容一致度"
-            ratio = len(_lcs(shorter, longer)) / len(shorter)
-            if ratio > 0.5:
-                return True
-
-        return False
-
-    def _toc_entries(self) -> list:
-        """提取目录(TOC)的缓存条目文本，按目录中出现顺序返回。
-
-        办公软件（WPS/Word）里目录是一个 TOC 域，其可见内容被缓存为若干段落，
-        通常包裹在内容控件 <w:sdt>/<w:sdtContent> 中，每个目录项占一个段落，
-        末尾带页码，如"一、市场分析2"。这里定位含 TOC 指令(instrText 里的 'TOC'
-        或 fldSimple 的 instr 含 'TOC')的 sdt，取其内部段落文本作为目录条目。
-        找不到 sdt 包裹时，回退到含 TOC 域的段落所在区域。
-        """
-        for sdt in self.root.findall(".//w:sdt", NS):
-            is_toc = False
-            for it in sdt.findall(".//w:instrText", NS):
-                if it.text and "TOC" in it.text:
-                    is_toc = True
-                    break
-            if not is_toc:
-                for fs in sdt.findall(".//w:fldSimple", NS):
-                    if "TOC" in (fs.get(qn("w:instr")) or ""):
-                        is_toc = True
-                        break
-            if is_toc:
-                content = sdt.find("w:sdtContent", NS)
-                scope = content if content is not None else sdt
-                return [para_text(p) for p in scope.findall(".//w:p", NS)]
-        return []
-
-    def check_toc_chapter1_violations(self) -> bool:
-        """-3：文档目录部分满足以下任意一项即扣 3 分：
-        1) 目录中“第一章市场分析”出现在“第二章项目简介”之后
-        2) 目录中“第一章市场分析”的页码不是 1
-
-        判定针对办公软件中的目录(TOC 域缓存条目)。本文档章节以"一、市场分析"
-        "二、项目简介"书写，与"第一章市场分析""第二章项目简介"等价，两种写法都接受。
-        目录每个条目为一段，形如"一、市场分析2"（末尾数字为页码）。
-        """
-        entries = self._toc_entries()
-        if not entries:
-            return False  # 无目录域可判定时不据此扣分
-
-        CH1 = ("第一章市场分析", "一、市场分析")
-        CH2 = ("第二章项目简介", "二、项目简介")
-
-        def find_entry(names):
-            for i, e in enumerate(entries):
-                s = e.strip()
-                if any(n in s for n in names):
-                    return i, s
-            return None, None
-
-        i1, e1 = find_entry(CH1)
-        i2, e2 = find_entry(CH2)
-
-        # 目录中没有第一章条目，无法满足"页码为1/在第二章之前"，按违规处理
-        if i1 is None:
-            return True
-
-        # 1) 目录顺序：第一章在第二章之后
-        if i2 is not None and i1 > i2:
-            return True
-
-        # 2) 第一章页码不是 1：取该目录条目末尾的页码数字
-        nums = re.findall(r"\d+", e1)
-        page_num = int(nums[-1]) if nums else None
-        if page_num != 1:
-            return True
-
-        return False
-
-    def _style_first_line_chars(self, style_id):
-        """沿段落样式的 basedOn 链，取该样式定义的首行缩进字符数 firstLineChars。"""
-        if self.styles_root is None:
-            style_id = None
-        by_id = {}
-        if self.styles_root is not None:
-            for s in self.styles_root.findall("w:style", NS):
-                sid = s.get(qn("w:styleId"))
-                if sid is not None:
-                    by_id[sid] = s
-        # 无显式样式时，回退到默认段落样式(w:default=1 且 type=paragraph)
-        cur = style_id
-        if cur is None and self.styles_root is not None:
-            for s in self.styles_root.findall("w:style", NS):
-                if s.get(qn("w:type")) == "paragraph" and s.get(qn("w:default")) == "1":
-                    cur = s.get(qn("w:styleId"))
-                    break
-        seen = set()
-        while cur and cur not in seen:
-            seen.add(cur)
-            s = by_id.get(cur)
-            if s is None:
-                break
-            ind = s.find(".//w:pPr/w:ind", NS)
-            if ind is not None:
-                flc = ind.get(qn("w:firstLineChars"))
-                if flc is not None:
-                    try:
-                        return float(flc)
-                    except ValueError:
-                        return None
-            based = s.find("w:basedOn", NS)
-            cur = based.get(qn("w:val")) if based is not None else None
-        return None
-
-    def check_10_5_10_6_indent(self) -> bool:
-        """-1：“10.5 决策行为”与“10.6 核心顾虑”之间的文本首行缩进不是2字符
-
-        细则：介于"10.5 决策行为"与"10.6 核心顾虑"两个小节标题之间的正文文本，
-        其首行缩进若不是 2 字符，即扣分。只要该区间存在任一正文段落的首行缩进≠2字符，
-        即满足扣分条件。
-
-        在办公软件（WPS/Word）中的有效判定：
-          - "2 字符"首行缩进的规范表示是 w:ind 的 w:firstLineChars="200"
-            （字符单位以百分之一字符计，200 = 2 字符）。这是与字号无关的"按字符"缩进，
-            与固定磅值 w:firstLine（twips）不同。
-          - 段落可能未直接设置缩进，而是**继承段落样式**（本文档默认 Normal 样式即定义了
-            firstLineChars=200）。因此当段落自身无 firstLineChars 时，要沿其样式(含默认
-            段落样式)的 basedOn 链解析继承值，才能得到办公软件里实际渲染的缩进。
-        """
-        idx_105 = None
-        idx_106 = None
-        for i, p in enumerate(self.paras):
-            t = para_text(p).strip()
-            if "10.5 决策行为" in t:
-                idx_105 = i
-            elif "10.6 核心顾虑" in t:
-                idx_106 = i
-        # 找不到两个标题或之间没有正文，无法判定 → 不扣分
-        if idx_105 is None or idx_106 is None or idx_106 <= idx_105 + 1:
-            return False
-
-        for i in range(idx_105 + 1, idx_106):
-            p = self.paras[i]
-            if not para_text(p).strip():
-                continue  # 空段落不算正文
-            ind = get_para_indent(p)
-            chars = ind.get("first_line_chars")
-            if chars is None:
-                # 段落未直接设置：取样式继承的首行缩进字符数
-                ppr = p.find("w:pPr", NS)
-                ps = ppr.find("w:pStyle", NS) if ppr is not None else None
-                chars = self._style_first_line_chars(ps.get(qn("w:val")) if ps is not None else None)
-            # 首行缩进不是 2 字符(firstLineChars=200) → 违规
-            if chars is None or abs(chars - 200) > 1:
-                return True
-        return False
-
-    # ---------- 主流程 ----------
-    # 维度 2 评分项定义：(方法名, 规则描述, 分值增量)
-    # 正数为得分点（命中即加分），负数为扣分点（命中即扣分）
-    DIM2_RULES: List[Tuple[str, str, int]] = [
-        ("check_body_line_spacing_1x", "文档中正文文本间距为1倍", 3),
-        ("check_table_line_spacing_1_25", "所有表格中的文本行距均为1.25倍", 5),
-        ("check_l1_heading_style", "一级标题为宋体、小三号、单倍行距；段前0.5行、段后0.5行", 3),
-        ("check_l2_heading_style", "二级标题为宋体、四号、1.5倍行距", 3),
-        ("check_l3_heading_style", "三级标题为宋体、小四、单倍行距、加粗", 3),
-        ("check_tourism_table_two_pages_with_header", "“（二）旅游资源分析”表格排版为2页", 5),
-        ("check_tourism_table_three_borders_per_page", "“（二）旅游资源分析”表格每一页只有三条边框线", 1),
-        ("check_only_one_table_two_pages", "仅有一个表格分2页排版，其他表格均为一页排版", 5),
-        ("check_any_page_no_page_number", "任意页无页码页脚", -1),
-        ("check_cover_no_center_text", "封面居中位置没有文本内容", -1),
-        ("check_page2_missing_fields",
-         "第2页没有出现云岭应用学院、项目名称、项目负责人、团队成员、指导老师、申报日期、项目类型", -1),
-        ("check_9_3_table_shape",
-         "“9.3 服务需求与年龄的交叉”下方表格不是五行六列、第一行没有出现“手作文化”", -3),
-        ("check_chapter1_violations",
-         "满足以下任意一项：文档中没有出现“第一章市场分析”标题及下方文本；文档出现相同的两个标题并且标题下方文本有超过50%的内容一致；“第一章市场分析”位于“第二章项目简介”之后",
-         -5),
-        ("check_toc_chapter1_violations",
-         "文档中的目录部分：出现“第一章市场分析”在“第二章项目简介”之后或者“第一章市场分析”的页码不是1",
-         -3),
-        ("check_10_5_10_6_indent",
-         "“10.5 决策行为”与“10.6 核心顾虑”之间的文本首行缩进不是2字符", -1),
-    ]
-
-    def run(self) -> Dict:
-        file_name = os.path.basename(self.path)
-        # 总分 = 所有加分项之和（只计正分值，不含扣分项）
-        max_score = sum(delta for _, _, delta in self.DIM2_RULES if delta > 0)
-
-        if not self.check_dimension1():
-            self.dimension1_pass = False
-            return {
-                "id": "025",
-                "file_name": file_name,
-                "status": "ok",
-                "error": None,
-                "dim1_pass": False,
-                "dim1_reason": "；".join(self.dimension1_reasons),
-                "dim2_items": [],
-                "total_score": 0,
-                "max_score": max_score,
-            }
-
-        dim2_items: List[dict] = []
+    ctx = _build_ctx(file_path)
+    dim1_pass, dim1_reason = _dim1(ctx)
+    result['dim1_pass'] = dim1_pass
+    result['dim1_reason'] = dim1_reason
+
+    results, details = [], []
+    for score, desc, fn in _PLUS_RULES:
+        hit, detail = _run(fn, ctx)
+        results.append('+%d：%s' % (score if hit else 0, desc))
+        details.append(detail)
+    for score, desc, fn in _MINUS_RULES:
+        hit, detail = _run(fn, ctx)
+        results.append('-%d：%s' % (abs(score) if hit else 0, desc))
+        details.append(detail)
+
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError('dim2 项数不一致：results=%d vs order=%d'
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+
+    dim2_items, total_score = [], 0
+    for raw, max_delta, _detail in zip(results, _MAX_DELTAS_ORDER, details):
+        head, _sep, rule = raw.partition('：')
+        try:
+            delta = int(head.replace('+', '').strip())
+        except ValueError:
+            delta = 0
+        hit = delta != 0
+        dim2_items.append({'rule': rule, 'max_delta': max_delta,
+                           'delta': max_delta if hit else 0, 'hit': hit})
+        total_score += (max_delta if hit else 0)
+
+    if not dim1_pass:
+        for item in dim2_items:
+            item['delta'] = 0
+            item['hit'] = False
         total_score = 0
-        for method_name, rule_desc, delta in self.DIM2_RULES:
-            hit = bool(getattr(self, method_name)())
-            actual_delta = delta if hit else 0
-            total_score += actual_delta
-            dim2_items.append({
-                "rule": rule_desc,
-                "max_delta": delta,
-                "delta": actual_delta,
-                "hit": hit,
-                "detail": "",
-            })
 
-        return {
-            "id": "025",
-            "file_name": file_name,
-            "status": "ok",
-            "error": None,
-            "dim1_pass": True,
-            "dim1_reason": "",
-            "dim2_items": dim2_items,
-            "total_score": total_score,
-            "max_score": max_score,
-        }
+    result['dim2_items'] = dim2_items
+    result['total_score'] = max(0, total_score)
+    return result
 
+def evaluate(dir_path=None):
+    """评估交付目录下的唯一交付物。
 
-def _locate_docx(dir_path: str) -> Optional[str]:
-    """在给定目录中定位待评估的 .docx 文件。
+    dir_path 为待评估目录；未传入时退回本脚本所在目录（_SCRIPT_DIR），
+    既不进入子目录，也不会去别的目录找文件。
 
-    约定：批量 runner 传入"脚本所在目录路径"，脚本自己在该目录下找唯一的 docx。
-    过滤 Office 打开时留下的临时锁文件（以 ~$ 开头）。目录内若存在多个 .docx，
-    优先取文件名与目录名最接近的一个，避免选到备份文件。
+    交付物只接受 .docx：目录内优先取 .docx；若只交了 .doc / .rtf / .odt / .pdf 等
+    其他格式，仍把它收作被评对象，由维度一判不通过（dim1_pass=False、total_score
+    记 0、max_score 仍取满分），而不是当成“没有交付物”跳过评测。
     """
-    if not dir_path or not os.path.isdir(dir_path):
-        return None
-    candidates = [n for n in os.listdir(dir_path)
-                  if n.lower().endswith(".docx") and not n.startswith("~$")]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return os.path.join(dir_path, candidates[0])
-    # 多个候选：优先取不含"备份/副本/backup/copy"关键字的
-    def prefer(name: str) -> int:
-        lower = name.lower()
-        return 0 if any(k in lower or k in name for k in
-                        ("备份", "副本", "backup", "copy")) else 1
-    candidates.sort(key=lambda n: (-prefer(n), len(n)))
-    return os.path.join(dir_path, candidates[0])
-
-
-def evaluate(dir_path: str) -> dict:
-    """统一评估入口：传入脚本所在目录路径，脚本自行在该目录中定位并评估 docx。
-
-    返回结构见《脚本接口差异与统一建议.md》§2.2。
-    发生异常时返回 status="error"，不抛出，不 print 主结果。
-    """
-    max_score = sum(delta for _, _, delta in Evaluator.DIM2_RULES if delta > 0)
-    file_path = _locate_docx(dir_path)
-    file_name = os.path.basename(file_path) if file_path else ""
-    if file_path is None:
-        return {
-            "id": "025",
-            "file_name": "",
-            "status": "error",
-            "error": f"未在目录中找到 .docx 文件: {dir_path!r}",
-            "dim1_pass": False,
-            "dim1_reason": "",
-            "dim2_items": [],
-            "total_score": 0,
-            "max_score": max_score,
-        }
+    dir_path = dir_path if dir_path and os.path.isdir(dir_path) else _SCRIPT_DIR
+    result = {
+        'id': SCRIPT_ID,
+        'file_name': '',
+        'status': 'ok',
+        'error': None,
+        'dim1_pass': False,
+        'dim1_reason': '',
+        'dim2_items': [],
+        'total_score': 0,
+        'max_score': MAX_SCORE_TOTAL,
+    }
     try:
-        return Evaluator(file_path).run()
-    except (etree.XMLSyntaxError, zipfile.BadZipFile) as e:
-        return {
-            "id": "025",
-            "file_name": file_name,
-            "status": "ok",
-            "error": None,
-            "dim1_pass": False,
-            "dim1_reason": f"文档结构损坏，无法正常解析：{type(e).__name__}: {e}",
-            "dim2_items": [],
-            "total_score": 0,
-            "max_score": max_score,
-        }
-    except Exception as e:
-        return {
-            "id": "025",
-            "file_name": file_name,
-            "status": "error",
-            "error": f"{type(e).__name__}: {e}",
-            "dim1_pass": False,
-            "dim1_reason": "",
-            "dim2_items": [],
-            "total_score": 0,
-            "max_score": max_score,
-        }
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError('目录不存在或不是目录：%s' % dir_path)
+        file_path = _find_target_file(dir_path)
+        result['file_name'] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 找不到被评估文件：error 只回传纯文本原因（不带异常类名），维度一根本没进入
+        # 判定，dim1_pass 与 dim1_reason 一律留空（空字符串，而非 False），
+        # dim2 不出项，满分一并归零。
+        result['status'] = 'error'
+        result['error'] = str(exc)
+        result['file_name'] = ''
+        result['dim1_pass'] = ''
+        result['dim1_reason'] = ''
+        result['dim2_items'] = []
+        result['total_score'] = 0
+        result['max_score'] = 0
+        return result
+    except Exception as exc:
+        if type(exc).__name__ in ('XMLSyntaxError', 'ParseError', 'BadZipFile') or (
+            isinstance(exc, KeyError) and 'There is no item named' in str(exc)
+        ):
+            # 交付文件自身结构/XML 损坏：属于维度一不通过（正常 0 分），不是脚本错误
+            result['status'] = 'ok'
+            result['error'] = None
+            result['dim1_pass'] = False
+            result['dim1_reason'] = '交付文件结构不完整，无法正常打开：%s: %s' % (
+                type(exc).__name__, exc,
+            )
+            result['dim2_items'] = _zero_items()
+            result['total_score'] = 0
+            return result
+        result['status'] = 'error'
+        result['error'] = '脚本运行异常：%s: %s' % (type(exc).__name__, exc)
+        result['dim1_pass'] = False
+        result['dim1_reason'] = result['error']
+        result['dim2_items'] = _zero_items()
+        result['total_score'] = 0
+        return result
 
 
-if __name__ == "__main__":
-    # 仅用于本地调试：从命令行读取目录路径并打印 JSON 结果；
-    # 未传参时默认使用脚本自身所在目录。
-    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    # ensure_ascii=True：中文以 \uXXXX 转义，避免 Windows cp1252 控制台崩溃
-    print(json.dumps(evaluate(_dir), ensure_ascii=True, indent=2))
+if __name__ == '__main__':
+    # 不接受命令行目录参数：评估目标固定为本脚本所在目录
+    print(json.dumps(evaluate(), ensure_ascii=False, indent=2))

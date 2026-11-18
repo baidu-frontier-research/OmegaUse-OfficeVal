@@ -28,10 +28,11 @@ Validation never deletes unexpected submission content.
 ## Scheduling
 
 Normal verifiers run through a bounded parallel channel. Verifiers `001`,
-`008`, `019`, `022`, `023`, `030`, `039`, `074`, and `081` require Office COM
-and share a serial channel on Windows. Verifier `011` keeps a controlled COM
-fallback but is forced into normal mode. All verifiers that can use static
-parsing are forced into normal mode, even when batch COM mode is enabled.
+`021`, `023`, `024`, `025`, and `039` require Office COM and share a serial
+channel on Windows. Verifier `007` also contains a COM code path but is forced
+into normal mode, together with the other IDs listed in
+`COM_FORCED_NORMAL_VERIFIER_IDS`. All verifiers that can use static parsing
+are forced into normal mode, even when batch COM mode is enabled.
 
 
 The worker passes `OFFICEVAL_COM_ENABLED=1` only to a COM-required verifier on

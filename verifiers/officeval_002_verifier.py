@@ -1,2882 +1,1943 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingTypeArgument=false, reportImplicitStringConcatenation=false, reportDeprecated=false, reportExplicitAny=false, reportGeneralTypeIssues=false, reportArgumentType=false, reportAttributeAccessIssue=false, reportPrivateUsage=false, reportOptionalMemberAccess=false, reportOptionalSubscript=false, reportOptionalIterable=false, reportOptionalCall=false
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportImplicitStringConcatenation=false, reportGeneralTypeIssues=false, reportArgumentType=false, reportAttributeAccessIssue=false
 """
-Word文档自动评估脚本
-根据打分细则对Word文档进行自动评估
+页眉横线调整任务 —— 完成度自动评分脚本
+
+对外唯一入口(见 "脚本接口差异与统一建议.md" §2.1/§2.2):
+    def evaluate(file_path: str) -> dict
+        - file_path 既可是任务目录(自动定位其中的 .docx), 也可是单个 .docx;
+        - 返回规范化 dict(id / file_name / status / error / dim1_pass /
+          dim1_reason / dim2_items / total_score / max_score);
+        - 主结果只走 return, 不 print、不改 sys.stdout、不 sys.exit、不硬编码路径。
+
+    if __name__ == "__main__": 仅用于本地调试, 调用 evaluate(sys.argv[1]) 后
+    把规范化 dict 以 JSON 打印到 stdout。
+
+    内部评分逻辑(Docx 解析 / score / report / 各校验项判定语义)保持不变,
+    仅在文件末尾新增统一对外接口层。
+
+评分依据《细则.docx》:
+  维度一 可用与可修改性: 仅核验文件可否正常打开(不可打开则总分0)
+  维度二 完成度:
+    加分项(来自指令任务, 满分 13):
+      +5 摘要及之后页眉横线 = 与PDF一致(thinThickMediumGap, sz=18/2.25pt 双线)
+      +3 摘要之前页眉横线全部删除(none / 无 pBdr)
+      +3 在摘要前正确断开分节(摘要前后分属不同节)
+      +1 横线分界点恰在摘要页(前无线、摘要页起有线)
+      +1 单双数页页眉横线一致(关闭奇偶页页眉或 even 同步)
+    减分项(指令只要求改页眉横线; 凡改到横线以外即为多余修改):
+      共 55 条, 与《细则.docx》"二、减分项"逐条对应, 分 11 组:
+        中文封面 6 / 英文封面 5 / 声明页 6 / 摘要与 Abstract 6 /
+        目录与前置内容控件 5 / 正文各级标题 4 /
+        正文段落与参考文献、附录、致谢 5 / 图表与题注 5 /
+        页面设置 3 / 页眉文字与页脚页码 5 / 通用破坏 5
+      每条判定都直接比对细则写明的绝对格式值(字体/字号/加粗/下划线/对齐/
+      行距/缩进/段前段后/纸张/页边距/图片尺寸/表格行列/字数等), 不需要原始
+      输入文档作参照; 命中一条扣对应分, 可累计。
+      字体名按同义归并(SimSun≡宋体, SimHei≡黑体), 避免不同 Word 语言版本
+      存名方式不同造成误判。
+      首行缩进按原始输入文档的记录方式比对: 原文以 w:firstLineChars 记录的段落
+      (如声明、摘要、Abstract)按"N 字符"比对; 原文以 w:firstLine 绝对值记录的
+      段落(如正文各章、参考文献、附录、致谢, 值为 480 twips = 0.85 厘米)按厘米
+      比对。两种单位互相等值改写(如 WPS 另存会把绝对值归一为字符数)排版结果
+      相同, 均视为未改动。
+
+无第三方依赖(仅用标准库解析 docx=zip+xml)。
 """
+import sys, zipfile, re, json
+import xml.etree.ElementTree as ET
 
-import os
-import sys
-import re
-import json
-import glob
-import contextlib
-from docx import Document
-from docx.oxml.ns import qn
-from docx.shared import Pt, Twips, Emu
+W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+def w(tag): return f'{{{W}}}{tag}'
+
+# PDF 参照基准(细则量化基准): 粗线约2.25pt, 双线细+粗
+PDF_SZ = 18            # 2.25pt = 8*2.25
+PDF_STYLE = 'thinThickMediumGap'
+
+# ---- 细则写明的绝对量 ----
+TEXTLEN = 12525            # 可见文字字数
+TEXT_TOL = 0.01            # 允许偏差 ±1%
+N_IMG = 4                  # 内嵌图片张数
+TBL_SHAPE = [(5, [1] * 5), (3, [1] * 3), (5, [3] * 5), (6, [3] * 6)]
+N_PAGEFLD = 8              # 页脚 PAGE 域数量
+HDR_TEXT = '澄湖理工大学硕士学位论文'
+FTR_TEXT = '城市社区微气候韧性评价与公共空间更新研究'
+FTR_ALIGN = [('right', 'right', 240), ('right', 'right', 120),
+             ('left', 'left', 180), ('right', 'right', 300)]
+PG_SZ = (11906, 16838)                       # A4
+PG_MAR_FRONT = dict(top=1440, bottom=1440, left=1803, right=1803)
+PG_MAR_MAIN = dict(top=1440, bottom=1440, left=1701, right=1587)
+PG_HDR_FTR = (850, 992)                      # 页眉 15mm / 页脚 17.5mm
+IMG_CM = [(7.13, 2.07), (10.56, 6.41), (13.80, 8.38), (12.70, 8.38)]
+KEEP_VALUES = ['唐知遥', '许怀砚 教授', '工学硕士', '75264', '2024AQ0926',
+               'Tang Zhi Yao', 'Professor Xu Huai yan', 'Master of Engineering']
 
 
-class WordDocumentEvaluator:
-    """Word文档评估器"""
+class Docx:
+    """轻量 docx 读取: 只解析评分需要的部分。"""
+    def __init__(self, path):
+        self.path = path
+        self.ok = False
+        self.err = None
+        try:
+            self.zf = zipfile.ZipFile(path)
+            self.document = self._xml('word/document.xml')
+            self.settings = self._xml_opt('word/settings.xml')
+            self.rels = self._read('word/_rels/document.xml.rels')
+            self.ok = True
+        except Exception as e:
+            self.err = str(e)
 
-    def __init__(self, file_path, skip_page_check=False):
-        self.file_path = file_path
-        # 供 python-docx 实际打开的路径；只支持 .docx，因此始终等于 file_path。
-        self.open_path: str = file_path
-        # 兼容旧调用签名保留 skip_page_check 形参，但维度一已删除页数检查，
-        # 该参数在评估流程中不再被读取
-        self.skip_page_check = skip_page_check
-        self.doc = None
-        # 穿透 w:sdt 的扁平文档索引（在维度2开始时构建）
-        self._flat_paragraphs = []
-        self._flat_para_elements = []
-        self._flat_tables = []
-        self._flat_sections = []
-        self._flat_sect_pr_elements = []
-        self._para_section_index = []
-        self.chinese_abstract_para_idx = -1
-        self.english_abstract_para_idx = -1
-        self.outline_para_idx = -1
-        # 分页检查固定使用节级静态回退（不依赖任何渲染引擎）。
-        self._word_pagination = None  # 始终为 None，保留字段以兼容下游读取处
-        self.results = {
-            'dimension1_passed': True,
-            'dimension1_failures': [],
-            'dimension2_scores': [],
-            'dimension2_deductions': [],
-            'total_score': 0,
-            'hit_points': []
+    def _read(self, name):
+        try:
+            return self.zf.read(name).decode('utf-8', 'ignore')
+        except KeyError:
+            return ''
+
+    def _xml(self, name):
+        return ET.fromstring(self.zf.read(name))
+
+    def _xml_opt(self, name):
+        try:
+            return ET.fromstring(self.zf.read(name))
+        except KeyError:
+            return None
+
+    # --- rId -> header 文件 映射 ---
+    def rid_to_header(self):
+        m = {}
+        for rid, tgt in re.findall(r'Id="([^"]+)"[^>]*Target="(header\d+\.xml)"', self.rels):
+            m[rid] = 'word/' + tgt
+        for tgt, rid in re.findall(r'Target="(header\d+\.xml)"[^>]*Id="([^"]+)"', self.rels):
+            m[rid] = 'word/' + tgt
+        return m
+
+    def header_bottom(self, headerfile):
+        """返回该页眉段落底边框 dict 或 None(无横线)。"""
+        xml = self._read(headerfile)
+        mb = re.search(r'<w:bottom\b[^>]*/>', xml)
+        if not mb:
+            return None
+        seg = mb.group(0)
+        val = re.search(r'w:val="([^"]*)"', seg)
+        sz = re.search(r'w:sz="([^"]*)"', seg)
+        val = val.group(1) if val else ''
+        sz = int(sz.group(1)) if sz else 0
+        if val == 'none' or sz == 0:
+            return None
+        return {'val': val, 'sz': sz}
+
+    def sections(self):
+        """按出现顺序返回各 sectPr 的 (字符位置, {type:rid}). document 末尾 sectPr 也计入。"""
+        raw = self.zf.read('word/document.xml').decode('utf-8', 'ignore')
+        secs = []
+        for m in re.finditer(r'<w:sectPr\b.*?</w:sectPr>|<w:sectPr\b[^>]*/>', raw, re.S):
+            refs = {}
+            for hr in re.finditer(r'<w:headerReference\b[^>]*/>', m.group(0)):
+                t = re.search(r'w:type="([^"]*)"', hr.group(0))
+                i = re.search(r'r:id="([^"]*)"', hr.group(0))
+                if t and i:
+                    refs[t.group(1)] = i.group(1)
+            secs.append((m.start(), refs))
+        return raw, secs
+
+    def abstract_pos(self):
+        raw = self.zf.read('word/document.xml').decode('utf-8', 'ignore')
+        for kw in ['摘  要', '摘 要', '摘要']:
+            i = raw.find(kw)
+            if i >= 0:
+                return raw, i
+        return raw, -1
+
+    def abstract_idx(self):
+        """"摘  要"标题段的段落序号(与 sects_ranged 同一序号空间); 找不到返回 -1。
+
+        判定分节点是否紧邻摘要必须用段落序号: sectPr 在 XML 里的字符位置只能
+        说明"分节符在摘要之前", 无法区分"紧接摘要之前"与"提前若干段"。
+        """
+        body = self.document.find(w('body'))
+        idx, found, loose = [0], [-1], [-1]
+
+        def walk(node):
+            for ch in list(node):
+                if ch.tag == w('p'):
+                    if found[0] < 0:
+                        txt = re.sub(r'\s+', '', ''.join(
+                            t.text or '' for t in ch.iter(w('t'))))
+                        if txt == '摘要':
+                            found[0] = idx[0]
+                        elif loose[0] < 0 and '摘要' in txt and len(txt) <= 8:
+                            loose[0] = idx[0]
+                    idx[0] += 1
+                elif ch.tag == w('sectPr'):
+                    continue
+                else:
+                    walk(ch)
+
+        walk(body)
+        return found[0] if found[0] >= 0 else loose[0]
+
+    def even_odd_headers(self):
+        if self.settings is None:
+            return False
+        return self.settings.find(w('evenAndOddHeaders')) is not None
+
+    def body_text(self):
+        parts = []
+        body = self.document.find(w('body'))
+        for t in body.iter(w('t')):
+            parts.append(t.text or '')
+        return ''.join(parts)
+
+    def counts(self):
+        raw = self.zf.read('word/document.xml').decode('utf-8', 'ignore')
+        return {
+            'sdt': raw.count('<w:sdt>'),
+            'drawing': raw.count('<w:drawing>'),
+            'tbl': raw.count('<w:tbl>'),
         }
 
-    def evaluate(self):
-        """执行评估"""
-        print("=" * 60)
-        print("Word文档自动评估报告")
-        print("=" * 60)
-        print(f"文件: {os.path.basename(self.file_path)}")
-        print()
+    def footers_sig(self):
+        sig = []
+        for name in sorted(self.zf.namelist()):
+            if re.match(r'word/footer\d+\.xml', name):
+                sig.append((name.split('/')[-1], len(self._read(name))))
+        return sig
 
-        # 维度1评估
-        if not self._evaluate_dimension1():
-            self.results['dimension1_passed'] = False
-            self._print_results()
-            return
+    # ---------- 自包含完整性核查(无需原始输入文件) ----------
+    def _all_raw_parts(self):
+        """document 及所有 header/footer 的原始 xml 文本, 供跨部件核查。"""
+        parts = {'word/document.xml':
+                 self.zf.read('word/document.xml').decode('utf-8', 'ignore')}
+        for n in self.zf.namelist():
+            if re.match(r'word/(header|footer)\d+\.xml', n):
+                parts[n] = self._read(n)
+        return parts
 
-        # 维度2评估
-        self._evaluate_dimension2()
+    def rels_map(self):
+        """document.xml 的 rId -> (类型末段, Target)。"""
+        m = {}
+        for tag in re.findall(r'<Relationship\b[^>]*?/>', self.rels):
+            rid = re.search(r'Id="([^"]+)"', tag)
+            typ = re.search(r'Type="([^"]*)"', tag)
+            tgt = re.search(r'Target="([^"]*)"', tag)
+            if rid:
+                t = typ.group(1).rsplit('/', 1)[-1] if typ else ''
+                m[rid.group(1)] = (t, tgt.group(1) if tgt else '')
+        return m
 
-        # 计算总分
-        self._calculate_total_score()
+    def _part_rels(self, part):
+        """任意部件(如 word/header2.xml)对应的 rId -> Target。"""
+        folder, _, fname = part.rpartition('/')
+        txt = self._read(f'{folder}/_rels/{fname}.rels')
+        m = {}
+        for tag in re.findall(r'<Relationship\b[^>]*?/>', txt):
+            rid = re.search(r'Id="([^"]+)"', tag)
+            tgt = re.search(r'Target="([^"]*)"', tag)
+            if rid:
+                m[rid.group(1)] = tgt.group(1) if tgt else ''
+        return m
 
-        # 打印结果
-        self._print_results()
+    # ---------- 绝对量核查所需的结构信息 ----------
+    def text_len(self):
+        return len(self.body_text())
 
-    def _evaluate_dimension1(self):
-        """维度1：可用与可修改性评估"""
-        print("-" * 40)
-        print("维度1：可用与可修改性")
-        print("-" * 40)
+    def dangling(self):
+        """document.xml 内引用了但 rels 中不存在的 rId(悬挂引用)。"""
+        raw = self.zf.read('word/document.xml').decode('utf-8', 'ignore')
+        rels = self.rels_map()
+        used = set(re.findall(r'r:(?:id|embed|link)="([^"]+)"', raw))
+        return sorted(u for u in used if u not in rels)
 
-        # 检查1：文件格式
-        if not self._check_file_format():
-            self.results['dimension1_failures'].append("文件格式不符合要求（需为.doc或.docx格式）")
-            return False
-        print("[PASS] 文件格式检查：.docx格式")
+    def sdt_info(self):
+        """(内容控件总数, 内容为空的个数)。"""
+        total = broken = 0
+        body = self.document.find(w('body'))
+        for sdt in body.iter(w('sdt')):
+            total += 1
+            content = sdt.find(w('sdtContent'))
+            if content is None or len(list(content)) == 0:
+                broken += 1
+        return total, broken
 
-        # 检查2：文件可正常打开
-        if not self._check_file_openable():
-            self.results['dimension1_failures'].append("文件无法正常打开")
-            return False
-        print("[PASS] 文件打开检查：文件可正常打开")
-
-        # 注：原维度一"页数=21"检查已按交付要求删除
-
-        print()
-        return True
-
-    def _evaluate_dimension2(self):
-        """维度2：完成度评估"""
-        print("-" * 40)
-        print("维度2：完成度")
-        print("-" * 40)
-
-        # 先深度遍历构建段落/表格文档序索引（穿透 w:sdt/w:sdtContent）
-        self._build_flat_document_index()
-
-        # 获取关键页面位置
-        self._find_key_pages()
-
-        # 初始化普通分页回退状态，不探测 Word COM。
-        self._probe_word_pagination()
-
-        # 得分点评估
-        self._check_header_lines_before_abstract()  # +3
-        self._check_header_lines_after_abstract()   # +5
-        self._check_header_line_position()          # +5
-
-        # 扣分点评估
-        self._check_header_text()                   # -1
-        self._check_footer_text()                   # -1
-        self._check_page_number()                   # -1
-        self._check_page_number_format()            # -1
-        self._check_page_order()                    # -1
-        self._check_heading1_format()               # -1
-        self._check_heading2_format()               # -1
-        self._check_heading3_format()               # -1
-        self._check_paragraph_format()              # -1
-        self._check_table_borders()                 # -3
-
-    def _build_flat_document_index(self):
-        """深度遍历 body 的顶层元素（穿透 w:sdt/w:sdtContent），
-        构建按文档流顺序的段落/表格/节索引。作用域与 python-docx 的
-        doc.paragraphs / doc.tables 一致：仅收集正文顶层段落与表格，
-        不下沉到表格单元格内部。
-
-        与 python-docx 内置遍历的不同：结构化文档标签（w:sdt/w:sdtContent）
-        里的段落、表格、以及节末尾的 sectPr 会被穿透收集，从而覆盖被
-        "内容控件"包裹的摘要/目录等标题段和被 sdt 隐藏的分节。
-
-        产出：
-          - self._flat_paragraphs: List[Paragraph]，按文档流顺序
-          - self._flat_para_elements: List[<w:p>]，与上表一一对应
-          - self._flat_tables: List[Table]，按文档流顺序
-          - self._flat_sections: List[Section]，按文档流顺序；每个元素
-            由文档流中一个 sectPr（无论嵌在 p/pPr 内还是 body 尾部，也
-            无论是否被 sdt 包裹）构造而来。这是本脚本的"节"权威口径，
-            所有维度2的节遍历必须使用它，而不是 self.doc.sections。
-          - self._para_section_index: List[int]，与 _flat_paragraphs
-            一一对应，记录该段落所属节的索引（与 _flat_sections 对齐）
-        """
-        from docx.text.paragraph import Paragraph
-        from docx.table import Table
-        from docx.section import Section
-
-        self._flat_paragraphs = []
-        self._flat_para_elements = []
-        self._flat_tables = []
-        self._flat_sections = []
-        self._flat_sect_pr_elements = []
-        self._para_section_index = []
-
-        sect_idx = [0]  # 用列表包装以便在闭包内修改
-        part = self.doc.part
-
-        def walk(container):
-            for child in container.iterchildren():
-                tag = child.tag.split('}')[-1]
-                if tag == 'p':
-                    self._flat_paragraphs.append(Paragraph(child, self.doc))
-                    self._flat_para_elements.append(child)
-                    self._para_section_index.append(sect_idx[0])
-                    pPr = child.find(qn('w:pPr'))
-                    if pPr is not None:
-                        sp = pPr.find(qn('w:sectPr'))
-                        if sp is not None:
-                            self._flat_sect_pr_elements.append(sp)
-                            self._flat_sections.append(Section(sp, part))
-                            sect_idx[0] += 1
-                elif tag == 'tbl':
-                    self._flat_tables.append(Table(child, self.doc))
-                elif tag == 'sdt':
-                    sdt_content = child.find(qn('w:sdtContent'))
-                    if sdt_content is not None:
-                        walk(sdt_content)
-                elif tag == 'sectPr':
-                    # body 末尾的 sectPr 对应最后一节
-                    self._flat_sect_pr_elements.append(child)
-                    self._flat_sections.append(Section(child, part))
-                    sect_idx[0] += 1
-
-        walk(self.doc.element.body)
-
-    def _check_file_format(self):
-        """检查文件格式"""
-        ext = os.path.splitext(self.file_path)[1].lower()
-        return ext == '.docx'
-
-    def _check_file_openable(self):
-        """检查文件可正常打开"""
-        try:
-            self.doc = Document(self.open_path)
-            return True
-        except Exception as e:
-            print(f"打开文件失败: {e}")
-            return False
-
-    def _get_page_count(self):
-        """获取页数（智能估算方法）"""
-        from docx.enum.section import WD_SECTION
-
-        # 方法1：统计段前分页（Word中段前分页的段落会开始新页）
-        # 这是最可靠的分页检测方法
-        page_break_before_count = 0
-        for p in self.doc.paragraphs:
-            if p._element.pPr is not None:
-                page_break_before = p._element.pPr.find(qn('w:pageBreakBefore'))
-                if page_break_before is not None:
-                    val = page_break_before.get(qn('w:val'))
-                    # 如果val不存在或为"1"/"on"/"true"，则启用段前分页
-                    if val in [None, "1", "on", "true"]:
-                        page_break_before_count += 1
-
-        # 方法2：统计手动分页符（w:br type="page"）
-        manual_breaks = 0
-        for p in self.doc.paragraphs:
-            xml_str = p._element.xml
-            if '<w:br' in xml_str and 'w:type="page"' in xml_str:
-                manual_breaks += 1
-
-        # 方法3：统计新页分节符（WD_SECTION.NEW_PAGE）
-        new_page_sections = sum(
-            1 for s in self._flat_sections
-            if s.start_type == WD_SECTION.NEW_PAGE
-        )
-
-        # 计算总页数
-        # 首页 + 段前分页 + 手动分页符 + (新页分节符 - 1)
-        # 因为第一个节不需要额外分页
-        estimated_pages = 1 + page_break_before_count + manual_breaks + (new_page_sections - 1)
-
-        # 如果页数过多（>50），可能是检测算法有问题，使用备用方法
-        if estimated_pages > 50:
-            # 备用方法：基于内容长度
-            total_chars = sum(len(p.text) for p in self.doc.paragraphs)
-            # 每页约1500-2000字符（考虑图片、表格等）
-            backup_pages = max(1, total_chars // 1800)
-            return backup_pages
-
-        return estimated_pages
-
-    def _find_key_pages(self):
-        """找到中文摘要、英文摘要、目录页在文档中的位置
-
-        依据办公软件中"看到"的标题文字定位这三个关键页：
-          - 中文摘要标题段落：含"摘要"或"摘 要"字样，不含 Abstract；
-            且非目录条目（无制表符引导页码、无末尾"…数字"式页码占位）
-          - 英文摘要标题段落：文本以 Abstract/ABSTRACT 出现，同样排除目录条目
-          - 目录标题段落：文本为"目录"或"目 录"，排除正文中偶然出现的"目录"引用
-        取每类别在文档中最早出现的匹配段落索引；同时记录其所属节索引。
-
-        使用 _build_flat_document_index 构建的扁平段落序列，穿透 w:sdt/
-        w:sdtContent 结构化文档标签容器，覆盖被"内容控件"包裹的标题段。
-        """
-        self.chinese_abstract_para_idx = -1
-        self.english_abstract_para_idx = -1
-        self.outline_para_idx = -1
-
-        for i, p in enumerate(self._flat_paragraphs):
-            text = p.text.strip()
-            if not text or len(text) >= 30:
+    def footer_info(self):
+        """页脚: 缺失引用 / 域配对 / PAGE 域数量 / 各页脚(对齐, 缩进, 字号, 文字)。"""
+        raw = self.zf.read('word/document.xml').decode('utf-8', 'ignore')
+        names = set(self.zf.namelist())
+        rels = self.rels_map()
+        missing = []
+        for rid in sorted(set(re.findall(r'<w:footerReference\b[^>]*r:id="([^"]+)"', raw))):
+            tgt = rels.get(rid, ('', ''))[1]
+            if not tgt or ('word/' + tgt) not in names:
+                missing.append(rid)
+        begin = sep = end = page = 0
+        parts = []
+        for n in sorted(names):
+            if not re.match(r'word/footer\d+\.xml', n):
                 continue
-            # 目录条目常见特征：含制表符、或"…"引导、或末尾以空白+数字结尾
-            if ('\t' in p.text
-                    or '……' in text
-                    or '…' in text
-                    or re.search(r'\s+\d+\s*$', text)):
+            x = self._read(n)
+            begin += len(re.findall(r'w:fldCharType="begin"', x))
+            sep += len(re.findall(r'w:fldCharType="separate"', x))
+            end += len(re.findall(r'w:fldCharType="end"', x))
+            page += len(re.findall(r'\bPAGE\b', x))
+            jc = re.findall(r'<w:jc w:val="(\w+)"/>', x)
+            ind = re.search(r'<w:ind[^/]*/>', x)
+            li = ri = None
+            if ind:
+                mi = re.search(r'w:left="(-?\d+)"', ind.group(0))
+                mr = re.search(r'w:right="(-?\d+)"', ind.group(0))
+                li = int(mi.group(1)) if mi else None
+                ri = int(mr.group(1)) if mr else None
+            szs = sorted(set(int(v) for v in re.findall(r'<w:sz w:val="(\d+)"/>', x)))
+            txt = ''.join(re.findall(r'<w:t[^>]*>([^<]*)</w:t>', x))
+            parts.append({'name': n.split('/')[-1], 'jc': jc[0] if jc else None,
+                          'left': li, 'right': ri, 'sz': szs, 'text': txt})
+        return {'missing': missing, 'begin': begin, 'separate': sep, 'end': end,
+                'page': page, 'parts': parts}
+
+    def header_parts(self):
+        """各 header 部件: (文件名, 文字, jc, sz集合, 字体集合, 是否加粗)。"""
+        out = []
+        for n in sorted(self.zf.namelist()):
+            if not re.match(r'word/header\d+\.xml', n):
                 continue
+            x = self._read(n)
+            txt = ''.join(re.findall(r'<w:t[^>]*>([^<]*)</w:t>', x))
+            jc = re.findall(r'<w:jc w:val="(\w+)"/>', x)
+            szs = sorted(set(int(v) for v in re.findall(r'<w:sz w:val="(\d+)"/>', x)))
+            ea = sorted(set(re.findall(r'w:eastAsia="([^"]+)"', x)))
+            asc = sorted(set(re.findall(r'w:ascii="([^"]+)"', x)))
+            line = re.findall(r'<w:spacing[^/]*w:line="(\d+)"', x)
+            bold = bool(re.search(r'<w:b(?: w:val="(?!0|false|off)[^"]*")?/>', x))
+            out.append({'name': n.split('/')[-1], 'text': txt,
+                        'jc': jc[0] if jc else None, 'sz': szs,
+                        'ea': ea, 'ascii': asc, 'bold': bold,
+                        'line': int(line[0]) if line else None})
+        return out
 
-            normalized = re.sub(r'\s+', '', text)
+    def img_info(self):
+        """(图片处数, 无法解析的 embed, [(宽cm, 高cm)])。"""
+        names = set(self.zf.namelist())
+        bad, sizes = [], []
+        n_img = 0
+        for part, x in self._all_raw_parts().items():
+            prels = self._part_rels(part)
+            for rid in re.findall(r'r:embed="([^"]+)"', x):
+                n_img += 1
+                tgt = prels.get(rid)
+                resolved = ('word/' + tgt.lstrip('/').replace('../', '')) if tgt else None
+                if not resolved or resolved not in names:
+                    bad.append((part.split('/')[-1], rid))
+        raw = self.zf.read('word/document.xml').decode('utf-8', 'ignore')
+        for m in re.finditer(r'<wp:extent cx="(\d+)" cy="(\d+)"', raw):
+            sizes.append((round(int(m.group(1)) / 360000.0, 2),
+                          round(int(m.group(2)) / 360000.0, 2)))
+        return n_img, bad, sizes
 
-            # 中文摘要
-            if (self.chinese_abstract_para_idx == -1
-                    and '摘要' in normalized
-                    and 'abstract' not in text.lower()):
-                self.chinese_abstract_para_idx = i
-                continue
-            # 英文摘要
-            if (self.english_abstract_para_idx == -1
-                    and re.match(r'(?i)^abstract\b', text)):
-                self.english_abstract_para_idx = i
-                continue
-            # 目录
-            if self.outline_para_idx == -1 and normalized in ('目录', '目次'):
-                self.outline_para_idx = i
-                continue
+    def tbl_shapes(self):
+        shapes = []
+        body = self.document.find(w('body'))
+        for tbl in body.iter(w('tbl')):
+            rows = tbl.findall(w('tr'))
+            shapes.append((len(rows), [len(r.findall(w('tc'))) for r in rows]))
+        return shapes
 
-    def _check_page_order(self):
-        """检查中文摘要、英文摘要、目录页顺序 (-1分)
+    def tbl_borders(self, idx):
+        """第 idx 个表格的 tblBorders 各边 val(缺省视为 nil)。"""
+        body = self.document.find(w('body'))
+        tbls = list(body.iter(w('tbl')))
+        if idx >= len(tbls):
+            return {}
+        bd = tbls[idx].find(w('tblPr'))
+        bd = bd.find(w('tblBorders')) if bd is not None else None
+        out = {}
+        if bd is not None:
+            for e in list(bd):
+                out[e.tag.split('}')[1]] = e.get(w('val'))
+        return out
 
-        细则：中文摘要页、英文摘要页、目录页不是此先后顺序
+    def _sect_dict(self, sp):
+        d = {'pgSz': None, 'pgMar': {}, 'fmt': None, 'refs': {}}
+        sz = sp.find(w('pgSz'))
+        if sz is not None:
+            d['pgSz'] = (int(sz.get(w('w')) or 0), int(sz.get(w('h')) or 0))
+        mar = sp.find(w('pgMar'))
+        if mar is not None:
+            for k in ('top', 'bottom', 'left', 'right', 'header', 'footer'):
+                v = mar.get(w(k))
+                if v is not None:
+                    d['pgMar'][k] = int(v)
+        num = sp.find(w('pgNumType'))
+        if num is not None:
+            d['fmt'] = num.get(w('fmt'))
+        for hr in sp.findall(w('headerReference')):
+            d['refs'][hr.get(w('type'))] = hr.get(f'{{{R}}}id')
+        return d
 
-        判定规则：办公软件中三者按文档流依次出现，先后关系必须为
-          中文摘要 → 英文摘要 → 目录
-        - 三者任一未能在文档中定位到，则视为不满足此先后顺序
-        - 使用段落在文档中的自然顺序索引（等同于办公软件从上到下阅读顺序）
-        """
-        has_issue = False
+    def sects_ranged(self):
+        """各节: 覆盖的段落序号区间 [start, end] + 页面属性(段落序号与 Fmt.paras 一致)。"""
+        body = self.document.find(w('body'))
+        order = []
+        pi = [0]
 
-        if (self.chinese_abstract_para_idx == -1
-                or self.english_abstract_para_idx == -1
-                or self.outline_para_idx == -1):
-            has_issue = True
-        elif not (self.chinese_abstract_para_idx
-                  < self.english_abstract_para_idx
-                  < self.outline_para_idx):
-            has_issue = True
+        def walk(node):
+            for ch in list(node):
+                if ch.tag == w('p'):
+                    idx = pi[0]
+                    pi[0] += 1
+                    pPr = ch.find(w('pPr'))
+                    sp = pPr.find(w('sectPr')) if pPr is not None else None
+                    if sp is not None:
+                        order.append((idx, sp))
+                elif ch.tag == w('sectPr'):
+                    order.append((max(pi[0] - 1, 0), ch))
+                else:
+                    walk(ch)
 
-        if has_issue:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：中文摘要页、英文摘要页、目录页不是此先后顺序"
-            )
-            print("[-1] 中文摘要页、英文摘要页、目录页不是此先后顺序")
+        walk(body)
+        out, start = [], 0
+        for end, sp in order:
+            d = self._sect_dict(sp)
+            d.update({'start': start, 'end': end})
+            out.append(d)
+            start = end + 1
+        return out
+
+
+
+
+def effective_default_headers_by_region(dx):
+    """把各节的 default 页眉按 '摘要之前 / 摘要及之后' 分类, 并判定分节点位置。
+
+    两点关键判据:
+    1) 节的归属按其覆盖的**段落区间**判定, 不按 sectPr 自身的字符位置。若某节
+       起点在摘要之前、终点在摘要之后(跨过摘要), 说明摘要之前还有若干页沿用该
+       节的页眉, 其横线同时作用于两部分, 故 before 与 after 都要计入。
+    2) 未写 headerReference 的节沿用前一节的页眉(OOXML 继承规则), 需先解析出
+       每节实际生效的 default 引用, 否则会漏判这些节的横线。
+
+    返回 (before, after, i_abs, secs, split_ok, why)。
+    """
+    i_abs = dx.abstract_idx()
+    secs = dx.sects_ranged()
+    rid2h = dx.rid_to_header()
+
+    eff, inherited = [], {}
+    for s in secs:
+        refs = dict(inherited)
+        refs.update({k: v for k, v in s['refs'].items() if v})
+        eff.append(refs)
+        inherited = refs
+
+    before, after, straddle = [], [], False
+    for s, refs in zip(secs, eff):
+        rid = refs.get('default')
+        if not rid:
+            continue
+        hb = dx.header_bottom(rid2h.get(rid, ''))
+        if i_abs < 0 or s['start'] >= i_abs:
+            after.append(hb)
+        elif s['end'] < i_abs:
+            before.append(hb)
         else:
-            print("[PASS] 中文摘要页、英文摘要页、目录页顺序符合要求")
+            straddle = True
+            before.append(hb)
+            after.append(hb)
 
-    def _get_paragraph_section_index(self, target_para_idx):
-        """根据段落索引（扁平索引，穿透 w:sdt）推断其所属节索引"""
-        if target_para_idx < 0 or self.doc is None:
-            return -1
-        if target_para_idx >= len(self._para_section_index):
-            return -1
-        return self._para_section_index[target_para_idx]
+    # 分节点是否紧接"摘  要"之前: 摘要须是其所在节的第一段(其前只允许空段)
+    if i_abs < 0:
+        split_ok, why = False, '未定位到"摘  要"标题段'
+    else:
+        host = next((s for s in secs if s['start'] <= i_abs <= s['end']), None)
+        if host is None:
+            split_ok, why = False, '未解析到摘要所在的节'
+        elif host is secs[0]:
+            split_ok, why = False, '摘要仍与封面、声明页同属第一节, 摘要之前未断开分节'
+        elif straddle:
+            n = i_abs - host['start']
+            split_ok = False
+            why = (f'分节符提前了 {n} 段: 摘要所在节从第 {host["start"]} 段起, '
+                   f'把声明页等前置内容一并并入了"摘要及之后"的节')
+        else:
+            prev = secs[secs.index(host) - 1]
+            ty = prev.get('type') or 'nextPage'
+            if ty not in ('nextPage', 'oddPage', 'evenPage'):
+                split_ok, why = False, f'摘要前的分节符类型为 {ty}, 摘要未另起一页'
+            else:
+                split_ok = True
+                why = f'分节符紧接"摘  要"之前(摘要为第 {i_abs} 段, 亦为该节首段)'
+    return before, after, i_abs, secs, split_ok, why
 
-    def _has_page_break_before_paragraph(self, target_para_idx):
-        """判断目标段落（扁平索引）所在节内，其之前是否存在物理分页。
 
-        用于节级回退场景下识别"摘要标题与摘要所在节的节首之间还有更早
-        物理页"的情况（例如封面/前置内容与摘要共享同一节，仅用分页符
-        或段前分页隔开，而不是分节符）。仅在目标段落所属节的范围内向前
-        扫描，扫描到该节起始处即停止，不越节判断。
+# ==================== 生效格式解析引擎(段落/文字最终格式) ====================
+PKEYS = ('jc', 'line', 'lineRule', 'before', 'after', 'beforeLines', 'afterLines',
+         'firstLine', 'firstLineChars', 'left', 'leftChars', 'right', 'rightChars', 'hanging')
+RKEYS = ('ea', 'ascii', 'sz', 'b', 'u')
 
-        检测依据（与 _get_page_count 的分页符探测口径一致，改为扫描
-        _flat_paragraphs/_flat_para_elements 以覆盖被 w:sdt 包裹的段落）：
-          - 目标段落自身或其之前的同节段落设置了 w:pageBreakBefore
-          - 目标段落之前的同节段落中出现手动分页符 <w:br w:type="page"/>
-        任一命中即认为摘要所在节内、摘要标题之前还存在其它物理页。
-        """
-        if target_para_idx < 0 or target_para_idx >= len(self._flat_para_elements):
-            return False
-        sec_idx = self._get_paragraph_section_index(target_para_idx)
-        if sec_idx < 0:
-            return False
+# 不同 Word 语言版本对同一字体存名不同, 归并后比对以免误判
+FONT_ALIAS = {
+    'SimSun': '宋体', '宋体': '宋体', 'NSimSun': '宋体',
+    'SimHei': '黑体', '黑体': '黑体',
+    'FangSong': '仿宋', '仿宋': '仿宋', 'KaiTi': '楷体', '楷体': '楷体',
+    'FZXiaoBiaoSong-B05S': '方正小标宋简体', '方正小标宋简体': '方正小标宋简体',
+    'Times New Roman': 'Times New Roman', 'TimesNewRoman': 'Times New Roman',
+}
 
-        # 目标段落自身若设置了"段前分页"，说明它另起一页，
-        # 即它前面（同节内）必然还有页面。
-        target_el = self._flat_para_elements[target_para_idx]
-        pPr = target_el.find(qn('w:pPr'))
-        if pPr is not None:
-            pbb = pPr.find(qn('w:pageBreakBefore'))
-            if pbb is not None:
-                val = pbb.get(qn('w:val'))
-                if val in (None, '1', 'on', 'true'):
-                    return True
 
-        # 向前回溯同节内的段落，寻找手动分页符或段前分页标记
-        i = target_para_idx - 1
-        while i >= 0 and self._para_section_index[i] == sec_idx:
-            el = self._flat_para_elements[i]
-            p_pPr = el.find(qn('w:pPr'))
-            if p_pPr is not None:
-                pbb = p_pPr.find(qn('w:pageBreakBefore'))
-                if pbb is not None:
-                    val = pbb.get(qn('w:val'))
-                    if val in (None, '1', 'on', 'true'):
-                        return True
-            if '<w:br' in el.xml and 'w:type="page"' in el.xml:
-                return True
-            i -= 1
-        return False
+def fnorm(name):
+    if not name:
+        return None
+    return FONT_ALIAS.get(name.strip(), name.strip())
 
-    def _probe_word_pagination(self):
-        """分页信息固定走节级静态回退，不依赖任何渲染引擎。"""
-        self._word_pagination = None
 
-    def _page_to_section_index(self, page_no):
-        """给定物理页号，返回其所属的扁平节索引；未知返回 -1。"""
-        wp = self._word_pagination
-        if wp is None:
-            return -1
-        for i, (first_p, last_p) in enumerate(wp['section_pages']):
-            if first_p <= page_no <= last_p:
+def _A(e, n):
+    return e.get(w(n))
+
+
+def pPr_dict(pPr):
+    d = {}
+    if pPr is None:
+        return d
+    jc = pPr.find(w('jc'))
+    if jc is not None:
+        d['jc'] = _A(jc, 'val')
+    sp = pPr.find(w('spacing'))
+    if sp is not None:
+        for k in ('line', 'lineRule', 'before', 'after', 'beforeLines', 'afterLines'):
+            v = _A(sp, k)
+            if v is not None:
+                d[k] = v
+    ind = pPr.find(w('ind'))
+    if ind is not None:
+        for k in ('firstLine', 'firstLineChars', 'left', 'leftChars',
+                  'right', 'rightChars', 'hanging'):
+            v = _A(ind, k)
+            if v is not None:
+                d[k] = v
+    return d
+def rPr_dict(rPr):
+    d = {}
+    if rPr is None:
+        return d
+    rf = rPr.find(w('rFonts'))
+    if rf is not None:
+        if _A(rf, 'eastAsia'):
+            d['ea'] = _A(rf, 'eastAsia')
+        if _A(rf, 'ascii'):
+            d['ascii'] = _A(rf, 'ascii')
+    sz = rPr.find(w('sz'))
+    if sz is not None:
+        d['sz'] = _A(sz, 'val')
+    b = rPr.find(w('b'))
+    if b is not None:
+        d['b'] = _A(b, 'val') not in ('0', 'false', 'off')
+    u = rPr.find(w('u'))
+    if u is not None:
+        d['u'] = _A(u, 'val')
+    return d
+
+
+class Fmt:
+    """按 docDefaults → 样式 basedOn 链 → 直接 pPr/rPr 的顺序解析生效格式。"""
+    def __init__(self, zf, document):
+        self.zf = zf
+        self.doc = document
+        try:
+            self.sx = ET.fromstring(zf.read('word/styles.xml'))
+        except Exception:
+            self.sx = None
+        self.styles = {}
+        self.dflt_p, self.dflt_r = {}, {}
+        self.default_pstyle = None
+        if self.sx is None:
+            return
+        dd = self.sx.find(w('docDefaults'))
+        if dd is not None:
+            pd = dd.find(w('pPrDefault'))
+            if pd is not None:
+                self.dflt_p = pPr_dict(pd.find(w('pPr')))
+            rd = dd.find(w('rPrDefault'))
+            if rd is not None:
+                self.dflt_r = rPr_dict(rd.find(w('rPr')))
+        for st in self.sx.findall(w('style')):
+            sid = _A(st, 'styleId')
+            bo = st.find(w('basedOn'))
+            self.styles[sid] = {'type': _A(st, 'type'),
+                                'basedOn': _A(bo, 'val') if bo is not None else None,
+                                'pPr': pPr_dict(st.find(w('pPr'))),
+                                'rPr': rPr_dict(st.find(w('rPr')))}
+            if _A(st, 'default') in ('1', 'true') and _A(st, 'type') == 'paragraph':
+                self.default_pstyle = sid
+    def chain(self, sid):
+        out, seen = [], set()
+        while sid and sid in self.styles and sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+            sid = self.styles[sid]['basedOn']
+        return list(reversed(out))
+
+    def eff_p(self, pPr):
+        ps = pPr.find(w('pStyle')) if pPr is not None else None
+        sid = _A(ps, 'val') if ps is not None else self.default_pstyle
+        d = dict(self.dflt_p)
+        for s in self.chain(sid):
+            d.update(self.styles[s]['pPr'])
+        d.update(pPr_dict(pPr))
+        return d, sid
+
+    def eff_r(self, sid, rPr):
+        d = dict(self.dflt_r)
+        for s in self.chain(sid):
+            d.update(self.styles[s]['rPr'])
+        if rPr is not None:
+            rs = rPr.find(w('rStyle'))
+            if rs is not None:
+                for s in self.chain(_A(rs, 'val')):
+                    d.update(self.styles[s]['rPr'])
+            d.update(rPr_dict(rPr))
+        return d
+
+    def paras(self, root=None):
+        """按文档顺序返回段落记录(会进入 w:sdt 与表格)。"""
+        root = self.doc.find(w('body')) if root is None else root
+        out = []
+        counter = [0]
+
+        def walk(node, tbl):
+            for ch in list(node):
+                if ch.tag == w('tbl'):
+                    counter[0] += 1
+                    walk(ch, counter[0] - 1)
+                elif ch.tag == w('p'):
+                    pPr = ch.find(w('pPr'))
+                    ep, sid = self.eff_p(pPr)
+                    runs = []
+                    for r in ch.iter(w('r')):
+                        t = ''.join(x.text or '' for x in r.iter(w('t')))
+                        if not t.strip():
+                            continue
+                        runs.append((t, self.eff_r(sid, r.find(w('rPr')))))
+                    txt = ''.join(x.text or '' for x in ch.iter(w('t')))
+                    out.append({'i': len(out), 't': txt, 'p': ep, 'sid': sid,
+                                'runs': runs, 'tbl': tbl,
+                                'img': next(ch.iter(w('drawing')), None) is not None})
+                else:
+                    walk(ch, tbl)
+
+        walk(root, None)
+        return out
+
+    def part(self, name):
+        """解析 header/footer 等部件内的段落(样式继承同正文)。"""
+        try:
+            return self.paras(ET.fromstring(self.zf.read(name)))
+        except Exception:
+            return []
+# ==================== 绝对格式比对助手 ====================
+TWIPS_CM = 1440 / 2.54     # 1 厘米 = 566.93 twips
+
+
+def gjc(p):
+    return p.get('jc') or 'left'
+
+
+def gi(d, k, dflt=0):
+    try:
+        return int(d.get(k) or dflt)
+    except (TypeError, ValueError):
+        return dflt
+
+
+def _sp_tw(p, key):
+    """段前/段后的生效磅值(twips); 以行为单位的 xxxLines 非 0 时优先。"""
+    lines = gi(p, key + 'Lines', 0)
+    if lines:
+        return int(lines * 240 / 100)
+    return gi(p, key, 0)
+
+
+def _first_chars(p, sz_half):
+    """首行缩进的生效值(字符); 只写 w:firstLine 绝对值时按字号折算。"""
+    fc = p.get('firstLineChars')
+    if fc is not None:
+        return int(fc) / 100.0
+    per = max((sz_half / 2.0) * 20.0, 1.0)
+    return gi(p, 'firstLine', 0) / per
+
+
+def _first_tw(p, sz_half):
+    """首行缩进的生效值(twips); 以字符为单位的 firstLineChars 按字号折算。
+
+    原始文档正文一类段落的缩进本就是绝对值(w:firstLine="480" = 0.85 厘米),
+    细则对这些段落写明的也是厘米值, 故按 twips 比对; 若模型改成等值的
+    w:firstLineChars(如 WPS 另存会做此归一), 折算后数值相同, 同样视为未改动。
+    """
+    fc = p.get('firstLineChars')
+    if fc is not None:
+        return int(fc) / 100.0 * (sz_half / 2.0) * 20.0
+    return gi(p, 'firstLine', 0)
+
+
+def _left_tw(p, sz_half):
+    lc = p.get('leftChars')
+    if lc is not None:
+        return int(lc) / 100.0 * (sz_half / 2.0) * 20.0
+    return gi(p, 'left', 0)
+
+
+def pbad(rec, jc=None, line=None, before=None, after=None, first=None,
+         first_cm=None, left=None, right=None, sz_half=24):
+    """返回该段落与期望绝对值不符之处的说明列表。
+
+    first    期望首行缩进为 N 字符(文档以 w:firstLineChars 记录的段落);
+    first_cm 期望首行缩进为 N 厘米(文档以 w:firstLine 绝对值记录的段落)。
+    """
+    p, bad = rec['p'], []
+    tag = repr(rec['t'].strip()[:10])
+    if jc is not None and gjc(p) != jc:
+        bad.append(f'{tag} 对齐={gjc(p)}(应{jc})')
+    if line is not None:
+        rule, val = (p.get('lineRule') or 'auto'), gi(p, 'line', 240)
+        if rule != line[0] or abs(val - line[1]) > 4:
+            bad.append(f'{tag} 行距={rule}/{val}(应{line[0]}/{line[1]})')
+    if before is not None and abs(_sp_tw(p, 'before') - before) > 12:
+        bad.append(f"{tag} 段前={_sp_tw(p, 'before')}(应{before} twips)")
+    if after is not None and abs(_sp_tw(p, 'after') - after) > 12:
+        bad.append(f"{tag} 段后={_sp_tw(p, 'after')}(应{after} twips)")
+    if first is not None and abs(_first_chars(p, sz_half) - first) > 0.2:
+        bad.append(f'{tag} 首行缩进={_first_chars(p, sz_half):.2f}字符(应{first}字符)')
+    if first_cm is not None and abs(_first_tw(p, sz_half) - first_cm * TWIPS_CM) > 24:
+        bad.append(f'{tag} 首行缩进={_first_tw(p, sz_half) / TWIPS_CM:.2f}厘米(应{first_cm}厘米)')
+    if left is not None and abs(_left_tw(p, sz_half) - left) > 24:
+        bad.append(f'{tag} 左缩进={_left_tw(p, sz_half):.0f}(应{left} twips)')
+    if right is not None and abs(gi(p, 'right', 0) - right) > 24:
+        bad.append(f"{tag} 右缩进={gi(p, 'right', 0)}(应{right} twips)")
+    return bad
+def rbad(rec, ea=None, asc=None, sz=None, b=None, u=None, pick=None):
+    """返回该段落内文字(run)与期望绝对值不符之处的说明列表。"""
+    bad = []
+    for t, r in rec['runs']:
+        if pick is not None and not pick(t):
+            continue
+        tag = repr(t.strip()[:10])
+        if ea is not None and re.search(r'[一-鿿]', t):
+            got = fnorm(r.get('ea'))
+            if got != fnorm(ea):
+                bad.append(f'{tag} 中文字体={got}(应{ea})')
+        if asc is not None and re.search(r'[A-Za-z]', t):
+            got = fnorm(r.get('ascii'))
+            if got != fnorm(asc):
+                bad.append(f'{tag} 西文字体={got}(应{asc})')
+        if sz is not None and gi(r, 'sz', 20) != sz:
+            bad.append(f"{tag} 字号={gi(r, 'sz', 20) / 2:.1f}磅(应{sz / 2:.1f}磅)")
+        if b is not None and bool(r.get('b')) != b:
+            bad.append(f'{tag} 加粗={bool(r.get("b"))}(应{b})')
+        if u is not None:
+            got = r.get('u') or 'none'
+            if got != u:
+                bad.append(f'{tag} 下划线={got}(应{u})')
+    return bad
+
+
+def verdict(label, targets, bad, want_n=None):
+    """三态判定: 找不到对象→None(未核查); 有不符→False(扣分); 否则→True。"""
+    if not targets:
+        return None, f'{label}: 未找到对应段落/对象, 未核查(内容缺失由通用破坏项判定)'
+    if want_n is not None and len(targets) != want_n:
+        bad = [f'共 {len(targets)} 处(应 {want_n} 处)'] + list(bad)
+    if bad:
+        more = f' 等共 {len(bad)} 处不符' if len(bad) > 4 else ''
+        return False, f'{label}: ' + '; '.join(bad[:4]) + more
+    return True, f'{label}: {len(targets)} 处均满足细则写明的绝对格式'
+
+
+RX_CH = r'^[一二三四]、\S'
+RX_SEC = r'^\d\.\d(?!\.)\s'
+RX_SUB = r'^\d\.\d\.\d\s'
+RX_FIG = r'^图\d-\d'
+RX_TBL = r'^表\d-\d'
+RX_REF = r'^\[\d+\]'
+RX_THESIS = r'^Master.s Degree Thesis$'
+CH_TITLES = ['一、研究基础与背景', '二、社区微气候韧性评价体系构建',
+             '三、典型社区样本实证分析', '四、更新路径与结论']
+# 必须存在的各部分: (名称, 定位正则)
+SECT_MUST = ([('中文封面', r'^硕士学位论文$'), ('英文封面', RX_THESIS),
+              ('学术成果原创性声明', r'^学术成果原创性声明$'),
+              ('学术成果使用授权声明', r'^学术成果使用授权声明$'),
+              ('摘要', r'^摘\s*要$'), ('Abstract', r'^Abstract$'), ('目录', r'^目\s*录$')]
+             + [(t, '^' + t + '$') for t in CH_TITLES]
+             + [('结语', r'^结\s*语$'), ('参考文献', r'^参考文献$'),
+                ('附录', r'^附\s*录$'), ('致谢', r'^致\s*谢$')])
+class Layout:
+    """按细则的分区(封面/声明/摘要/目录/正文/文后)组织段落, 供各减分项定位对象。"""
+    def __init__(self, dx):
+        self.dx = dx
+        self.fmt = Fmt(dx.zf, dx.document)
+        self.ps = self.fmt.paras()
+        self.txt = [r['t'].strip() for r in self.ps]
+        self.i_abs = self.idx(r'^摘\s*要$')
+        self.i_kw = self.idx(r'^关键词')
+        self.i_en = self.idx(r'^Abstract$')
+        self.i_kws = self.idx(r'^Keywords')
+        self.i_toc = self.idx(r'^目\s*录$')
+        self.i_ch1 = self.idx('^' + CH_TITLES[0] + '$')
+        self.i_end = self.idx(r'^结\s*语$')
+        self.i_ref = self.idx(r'^参考文献$')
+        self.i_apx = self.idx(r'^附\s*录$')
+        self.i_thx = self.idx(r'^致\s*谢$')
+        self.i_grant = self.idx(r'^学术成果使用授权声明$')
+
+    def idx(self, pat, start=0):
+        for i in range(start, len(self.ps)):
+            if re.search(pat, self.txt[i]):
                 return i
         return -1
 
-    def _get_page_header(self, sec_idx, kind, odd_even):
-        """按 (节, 显示场景) 返回办公软件实际渲染的页眉对象。
+    def sel(self, pat, lo=0, hi=None, tbl='any'):
+        hi = len(self.ps) if hi is None else hi
+        if lo < 0 or hi < 0:
+            return []
+        out = []
+        for r in self.ps[lo:hi]:
+            if tbl == 'none' and r['tbl'] is not None:
+                continue
+            if tbl == 'only' and r['tbl'] is None:
+                continue
+            if re.search(pat, r['t'].strip()):
+                out.append(r)
+        return out
 
-        - kind ∈ {'default','even','first'}
-        - 未启用奇偶不同时，'even' 一律回退为 'default'
-        - 未启用首页不同时，'first' 一律回退为 'default'
-        - 沿"与上一节链接"关系回溯到实际显示的对象
+    def tbl(self, i):
+        return [r for r in self.ps if r['tbl'] == i]
+
+    def tbl_rows(self, i):
+        """把第 i 个表格的单元格段落按行分组(依据行内单元格数由 shape 给出)。"""
+        cells = self.tbl(i)
+        shapes = self.dx.tbl_shapes()
+        if i >= len(shapes):
+            return []
+        rows, k = [], 0
+        for ncol in shapes[i][1]:
+            rows.append(cells[k:k + ncol])
+            k += ncol
+        return rows
+
+    def headers(self):
+        """被各节引用的页眉: [(类型, 部件名, 段落记录, 所属节)]。"""
+        rid2h = self.dx.rid_to_header()
+        out = []
+        for s in self.dx.sects_ranged():
+            for ty, rid in s['refs'].items():
+                part = rid2h.get(rid)
+                if part:
+                    out.append((ty, part, self.fmt.part(part), s))
+        return out
+
+    def sect_of(self, i):
+        """覆盖段落序号 i 的节。"""
+        for s in self.dx.sects_ranged():
+            if s['start'] <= i <= s['end']:
+                return s
+        return None
+
+    def sect_kinds(self):
+        """各节 + 其所属部分: margin(front/main) 与页码格式(roman/arabic)。
+
+        以节的起始段落落在哪一部分判定, 与文档实际分节数量无关: 起始段落在
+        "Abstract"之前的节属封面部分(左右各 31.8 毫米), 其余属正文部分。
         """
-        if sec_idx < 0 or sec_idx >= len(self._flat_sections):
-            return None
-        section = self._flat_sections[sec_idx]
-        if kind == 'even' and not odd_even:
-            kind = 'default'
-        if kind == 'first':
-            try:
-                if not getattr(
-                    section, 'different_first_page_header_footer', False
-                ):
-                    kind = 'default'
-            except Exception:
-                kind = 'default'
-        try:
-            if kind == 'default':
-                raw = section.header
-            elif kind == 'even':
-                raw = section.even_page_header
-            elif kind == 'first':
-                raw = section.first_page_header
-            else:
-                raw = section.header
-        except Exception:
-            return None
-        return self._resolve_effective_header(raw, sec_idx, kind)
+        out = []
+        for s in self.dx.sects_ranged():
+            mar = 'front' if (self.i_en < 0 or s['start'] < self.i_en) else 'main'
+            num = 'roman' if (self.i_ch1 >= 0 and s['start'] < self.i_ch1) else 'arabic'
+            out.append((s, mar, num))
+        return out
 
-    def _classify_page_kind(self, page_no, sec_idx, odd_even):
-        """判定某物理页面在其所在节内实际用的是哪个页眉场景。
+    def find_tbl(self, first_cell):
+        """按表头首格文字定位表格序号(表格被增删时仍能对上)。"""
+        for i in range(len(self.dx.tbl_shapes())):
+            cells = self.tbl(i)
+            if cells and cells[0]['t'].strip() == first_cell:
+                return i
+        return None
 
-        返回 'first' / 'even' / 'default'（default 即"奇数页/唯一页眉"）。
-        """
-        if sec_idx < 0 or self._word_pagination is None:
-            # 无法判定；按奇偶回退
-            if odd_even and page_no % 2 == 0:
-                return 'even'
-            return 'default'
-        section = self._flat_sections[sec_idx]
-        first_p, _ = self._word_pagination['section_pages'][sec_idx]
-        try:
-            diff_first = bool(getattr(
-                section, 'different_first_page_header_footer', False
-            ))
-        except Exception:
-            diff_first = False
-        if diff_first and page_no == first_p:
-            return 'first'
-        if odd_even and page_no % 2 == 0:
-            return 'even'
-        return 'default'
+    def between(self, lo, hi):
+        """区间内的非空普通段落(不含表格单元格)。"""
+        if lo < 0 or hi < 0 or hi <= lo:
+            return []
+        return [r for r in self.ps[lo + 1:hi] if r['t'].strip() and r['tbl'] is None]
 
-    def _enumerate_pages_after_abstract(self):
-        """列出"摘要页及摘要页之后"的每个物理页面对应的 (页号, 节索引, 场景)。
+    def body_paras(self):
+        """正文各章的普通段落(排除标题、图表题注、表格单元格)。"""
+        if self.i_ch1 < 0:
+            return []
+        hi = self.i_end if self.i_end > 0 else len(self.ps)
+        out = []
+        for r in self.ps[self.i_ch1:hi]:
+            t = r['t'].strip()
+            if r['tbl'] is not None or not t:
+                continue
+            if re.search(RX_CH, t) or re.search(RX_SEC, t) or re.search(RX_SUB, t):
+                continue
+            if re.search(RX_FIG, t) or re.search(RX_TBL, t):
+                continue
+            out.append(r)
+        return out
+# ==================== 减分项(55 条, 与《细则.docx》"二、减分项"逐条对应) ====================
+RULES = []
 
-        依赖 self._word_pagination；无 COM 分页信息时返回 None，调用方回退到
-        节级颗粒度检查。
-        """
-        wp = self._word_pagination
-        if wp is None:
-            return None
-        abs_page = wp.get('abstract_zh_page')
-        total = wp.get('total_pages')
-        if not abs_page or not total:
-            return None
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
-        result = []
-        for page_no in range(abs_page, total + 1):
-            sec_i = self._page_to_section_index(page_no)
-            kind = self._classify_page_kind(page_no, sec_i, odd_even)
-            result.append((page_no, sec_i, kind))
+
+def rule(code, pts):
+    def deco(fn):
+        RULES.append((code, pts, fn))
+        return fn
+    return deco
+
+
+def has_u(recs):
+    """每段是否都有加单下划线的取值 run。"""
+    bad = []
+    for r in recs:
+        if not any((x[1].get('u') or 'none') == 'single' for x in r['runs']):
+            bad.append(f"{r['t'].strip()[:10]!r} 取值未加单下划线")
+    return bad
+
+
+def near(a, b, tol):
+    return a is not None and b is not None and abs(a - b) <= tol
+
+
+# ---------- 【中文封面】 ----------
+@rule('-1 中文封面"密级/分类号/机构代码/编号"四行格式被改', -1)
+def d01(dx, L):
+    t = L.sel(r'^(密\s*级|分\s*类\s*号|机构代码|编\s*号)\s*[：:]', tbl='none')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='left', line=('auto', 360), first=1.5, sz_half=24)
+        bad += rbad(r, ea='宋体', asc='宋体', sz=24, b=False)
+    return verdict('中文封面密级等四行', t, bad, want_n=4)
+
+
+@rule('-1 中文封面"硕士学位论文"格式被改', -1)
+def d02(dx, L):
+    t = L.sel(r'^硕士学位论文$')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='left', line=('auto', 360), first=1, sz_half=72)
+        bad += rbad(r, ea='黑体', sz=72, b=False)
+    return verdict('中文封面"硕士学位论文"', t, bad)
+
+
+@rule('-1 中文封面题名格式被改', -1)
+def d03(dx, L):
+    t = L.sel(r'^城市社区微气候韧性评价与公共空间更新研究$')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='left', line=('auto', 360), sz_half=52)
+        bad += rbad(r, ea='方正小标宋简体', sz=52, b=False)
+    return verdict('中文封面题名', t, bad)
+@rule('-1 中文封面校名图形被删除/替换/缩放', -1)
+def d04(dx, L):
+    n, bad_embed, sizes = dx.img_info()
+    if not sizes:
+        return False, '未检出任何内嵌图形, 封面校名图形已被删除'
+    got = sizes[0]
+    if bad_embed:
+        return False, f'图片关系引用失效 {bad_embed[:2]}, 图形无法显示'
+    if not (near(got[0], IMG_CM[0][0], 0.2) and near(got[1], IMG_CM[0][1], 0.2)):
+        return False, (f'封面首个图形 {got[0]}×{got[1]} 厘米, '
+                       f'与 {IMG_CM[0][0]}×{IMG_CM[0][1]} 厘米不符, 已被缩放或替换')
+    return True, f'封面校名图形 {got[0]}×{got[1]} 厘米, 嵌入式版式与尺寸均满足'
+
+
+@rule('-1 中文封面申请人/指导教师/学位类别三行格式被改', -1)
+def d05(dx, L):
+    t = L.sel(r'^(学位申请人|指\s*导\s*教\s*师|学\s*位\s*类\s*别)\s*[：:]')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first=3, sz_half=28)
+        bad += rbad(r, ea='黑体', asc='Times New Roman', sz=28, b=False)
+    bad += has_u(t)
+    return verdict('中文封面申请人信息三行', t, bad, want_n=3)
+
+
+@rule('-1 中文封面 5 行 1 列无框线表格结构被改变', -1)
+def d06(dx, L):
+    shapes = dx.tbl_shapes()
+    if not shapes:
+        return False, '文档内已无表格, 承载申请人信息的 5 行 1 列表格被删除或拆为普通段落'
+    if shapes[0] != TBL_SHAPE[0]:
+        return False, f'第 1 个表格为 {shapes[0]}, 与 5 行 1 列不符'
+    bd = dx.tbl_borders(0)
+    vis = {k: v for k, v in bd.items() if v not in (None, 'nil', 'none')}
+    if vis:
+        return False, f'该表被加上可见框线 {vis}'
+    return True, '中文封面 5 行 1 列无框线表格结构完整、无可见框线'
+
+
+# ---------- 【英文封面】 ----------
+@rule('-1 英文封面 Classified Index 等四行格式被改', -1)
+def d07(dx, L):
+    t = L.sel(r'^(Classified Index|U\.D\.C\.|CODE|No\.)')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='left', line=('auto', 360), sz_half=24)
+        bad += rbad(r, asc='Times New Roman', sz=24, b=True)
+    return verdict('英文封面 Classified Index 等四行', t, bad, want_n=4)
+@rule("-1 英文封面 Master's Degree Thesis 格式被改", -1)
+def d08(dx, L):
+    t = L.sel(RX_THESIS)
+    bad = []
+    for r in t:
+        bad += pbad(r, line=('auto', 191), before=204, left=814, sz_half=71)
+        bad += rbad(r, asc='Times New Roman', sz=71, b=True)
+    return verdict("英文封面 Master's Degree Thesis", t, bad)
+
+
+@rule('-1 英文封面题名格式被改', -1)
+def d09(dx, L):
+    t = L.sel(r'^Research on Microclimate Resilience')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='center', line=('auto', 240), before=150, sz_half=52)
+        bad += rbad(r, asc='Times New Roman', sz=52, b=True)
+    return verdict('英文封面题名', t, bad)
+
+
+@rule('-1 英文封面 Applicant/Supervisor/Degree Category 三行格式被改', -1)
+def d10(dx, L):
+    t = L.sel(r'^(Applicant|Supervisor|Degree Category)\s*[：:]')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), sz_half=28)
+        bad += rbad(r, asc='Times New Roman', sz=28, b=True)
+    bad += has_u(t)
+    return verdict('英文封面申请人信息三行', t, bad, want_n=3)
+
+
+@rule('-1 英文封面三行首行缩进或 3 行 1 列无框线表格结构被改变', -1)
+def d11(dx, L):
+    t = L.sel(r'^(Applicant|Supervisor|Degree Category)\s*[：:]')
+    bad = []
+    for r in t:
+        want = 1 if r['t'].strip().startswith('Degree Category') else 4
+        bad += pbad(r, first=want, sz_half=28)
+    shapes = dx.tbl_shapes()
+    if len(shapes) < 2:
+        bad.append('3 行 1 列表格缺失或已被拆为普通段落')
+    elif shapes[1] != TBL_SHAPE[1]:
+        bad.append(f'第 2 个表格为 {shapes[1]}, 与 3 行 1 列不符')
+    else:
+        vis = {k: v for k, v in dx.tbl_borders(1).items()
+               if v not in (None, 'nil', 'none')}
+        if vis:
+            bad.append(f'该表被加上可见框线 {vis}')
+    return verdict('英文封面三行缩进与 3 行 1 列表格', t, bad, want_n=3)
+# ---------- 【学术成果原创性声明与使用授权声明页】 ----------
+@rule('-1 声明页"澄湖理工大学"格式被改', -1)
+def d12(dx, L):
+    t = L.sel(r'^澄湖理工大学$')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='center', line=('auto', 480), first=2, sz_half=36)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=36, b=True)
+    return verdict('声明页"澄湖理工大学"', t, bad)
+
+
+@rule('-1 "学术成果原创性声明"标题格式被改', -1)
+def d13(dx, L):
+    t = L.sel(r'^学术成果原创性声明$')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='center', line=('auto', 480), sz_half=32)
+        bad += rbad(r, sz=32, b=True)
+    return verdict('"学术成果原创性声明"标题', t, bad)
+
+
+@rule('-1 原创性声明正文格式被改', -1)
+def d14(dx, L):
+    t = L.sel(r'^本人郑重确认')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first=2, sz_half=24)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=24, b=False)
+    return verdict('原创性声明正文', t, bad)
+
+
+@rule('-1 声明页签名行格式被改', -1)
+def d15(dx, L):
+    t = L.sel(r'^(撰写人签名|指导人签名)')
+    bad = []
+    for r in t:
+        i = r['i']
+        sz = 21 if (L.i_grant < 0 or i < L.i_grant) else 28
+        bad += pbad(r, line=('auto', 480), first=0, left=0, sz_half=sz)
+        bad += rbad(r, ea='宋体', sz=sz, b=False,
+                    pick=lambda s: s.strip() not in ('年', '月', '日'))
+    return verdict('声明页签名行', t, bad, want_n=3)
+
+
+@rule('-1 "学术成果使用授权声明"标题格式被改', -1)
+def d16(dx, L):
+    t = L.sel(r'^学术成果使用授权声明$')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='center', line=('exact', 460), sz_half=32)
+        bad += rbad(r, sz=32, b=True)
+    return verdict('"学术成果使用授权声明"标题', t, bad)
+
+
+@rule('-1 授权声明两段正文格式被改', -1)
+def d17(dx, L):
+    t = L.sel(r'^(本人了解学校关于|本论文可在规定范围内)')
+    bad = []
+    for r in t:
+        bad += pbad(r, line=('auto', 480), first_cm=0.85, sz_half=24)
+        bad += rbad(r, ea='宋体', sz=24, b=False)
+    return verdict('授权声明两段正文', t, bad, want_n=2)
+# ---------- 【摘要与 Abstract】 ----------
+@rule('-1 "摘  要"标题格式或字间两空格被改', -1)
+def d18(dx, L):
+    t = L.sel(r'^摘\s*要$')
+    bad = []
+    for r in t:
+        if r['t'].strip() != '摘  要':
+            bad.append(f"标题为 {r['t'].strip()!r}, 未保留\"摘\"\"要\"之间的两个空格")
+        bad += pbad(r, jc='center', sz_half=36)
+        bad += rbad(r, ea='黑体', asc='Times New Roman', sz=36, b=False)
+    return verdict('"摘  要"标题', t, bad)
+
+
+@rule('-1 摘要两段正文格式被改', -1)
+def d19(dx, L):
+    t = L.between(L.i_abs, L.i_kw)
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first=2, sz_half=24)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=24, b=False)
+    return verdict('摘要两段正文', t, bad, want_n=2)
+
+
+@rule('-1 中文关键词行格式或词条间两空格被改', -1)
+def d20(dx, L):
+    t = L.sel(r'^关键词')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', sz_half=24)
+        bad += rbad(r, sz=24, b=False)
+        bad += rbad(r, ea='黑体', pick=lambda s: s.strip().startswith('关键词'))
+        bad += rbad(r, ea='宋体', pick=lambda s: not s.strip().startswith('关键词'))
+        if len(re.findall(r'\S {2}\S', r['t'])) < 4:
+            bad.append('词条之间未保留两个空格')
+    return verdict('中文关键词行', t, bad)
+
+
+@rule('-1 "Abstract"标题格式被改', -1)
+def d21(dx, L):
+    t = L.sel(r'^Abstract$')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='center', sz_half=36)
+        bad += rbad(r, asc='Times New Roman', sz=36, b=True)
+    return verdict('"Abstract"标题', t, bad)
+
+
+@rule('-1 Abstract 三段正文格式被改', -1)
+def d22(dx, L):
+    t = L.between(L.i_en, L.i_kws)
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first=2, sz_half=24)
+        bad += rbad(r, asc='Times New Roman', sz=24, b=False)
+    return verdict('Abstract 三段正文', t, bad, want_n=3)
+
+
+@rule('-1 Keywords 行格式或词条间两空格被改', -1)
+def d23(dx, L):
+    t = L.sel(r'^Keywords')
+    bad = []
+    for r in t:
+        bad += rbad(r, asc='Times New Roman', sz=24)
+        bad += rbad(r, b=True, pick=lambda s: s.strip().startswith('Keywords'))
+        bad += rbad(r, b=False, pick=lambda s: not s.strip().startswith('Keywords'))
+        if len(re.findall(r'\S {2}\S', r['t'])) < 4:
+            bad.append('词条之间未保留两个空格')
+    return verdict('Keywords 行', t, bad)
+# ---------- 【目录与前置内容控件】 ----------
+RX_TOC1 = r'^(摘\s+要|Abstract|[一二三四]、|结\s+语|参考文献|附\s+录|致\s+谢)'
+
+
+@rule('-1 "目  录"标题格式或字间两空格被改', -1)
+def d24(dx, L):
+    t = L.sel(r'^目\s*录$')
+    bad = []
+    for r in t:
+        if r['t'].strip() != '目  录':
+            bad.append(f"标题为 {r['t'].strip()!r}, 未保留\"目\"\"录\"之间的两个空格")
+        bad += pbad(r, jc='center', sz_half=32)
+        bad += rbad(r, ea='黑体', asc='Times New Roman', sz=32, b=True)
+    return verdict('"目  录"标题', t, bad)
+
+
+@rule('-1 目录 10 条一级条目格式被改', -1)
+def d25(dx, L):
+    t = L.sel(RX_TOC1, L.i_toc + 1, L.i_ch1, tbl='none') if L.i_toc >= 0 else []
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), left=0, sz_half=24)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=24, b=True,
+                    pick=lambda s: not s.strip().isdigit())
+    return verdict('目录一级条目', t, bad, want_n=10)
+
+
+@rule('-1 目录 12 条二级条目格式被改', -1)
+def d26(dx, L):
+    t = L.sel(RX_SEC, L.i_toc + 1, L.i_ch1, tbl='none') if L.i_toc >= 0 else []
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), left=420, sz_half=24)
+        bad += rbad(r, ea='宋体', sz=24, b=False)
+    return verdict('目录二级条目', t, bad, want_n=12)
+
+
+@rule('-1 目录条目数量不足 22 行或条目文字/页码数字被改写', -1)
+def d27(dx, L):
+    if L.i_toc < 0 or L.i_ch1 < 0:
+        return None, '未定位到目录区, 未核查'
+    t = [r for r in L.ps[L.i_toc + 1:L.i_ch1]
+         if r['t'].strip() and r['tbl'] is None]
+    bad = []
+    if len(t) != 22:
+        bad.append(f'目录共 {len(t)} 行(应 22 行: 10 条一级 + 12 条二级)')
+    nopage = [r['t'].strip()[:14] for r in t if not re.search(r'\d\s*$', r['t'].strip())]
+    if nopage:
+        bad.append(f'条目末尾页码数字缺失: {nopage[:3]}')
+    return verdict('目录条目完整性', t, bad)
+
+
+@rule('-1 前置内容未整体保留在 1 个内容控件(SDT)中', -1)
+def d28(dx, L):
+    total, broken = dx.sdt_info()
+    if total < 1:
+        return False, '内容控件(SDT)已被删除或解除为普通段落, 前置版式被拆散'
+    if broken:
+        return False, f'{total} 个内容控件中 {broken} 个内容为空, 前置版式被破坏'
+    return True, f'前置内容仍完整保留在 {total} 个内容控件中'
+# ---------- 【正文各级标题】 ----------
+@rule('-1 4 个章标题格式被改', -1)
+def d29(dx, L):
+    t = L.sel(RX_CH, L.i_ch1, L.i_end if L.i_end > 0 else None, tbl='none')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='center', line=('auto', 360), before=240, after=240, sz_half=32)
+        bad += rbad(r, ea='黑体', asc='Times New Roman', sz=32, b=True)
+    return verdict('章标题', t, bad, want_n=4)
+
+
+@rule('-1 12 个节标题格式被改', -1)
+def d30(dx, L):
+    t = L.sel(RX_SEC, L.i_ch1, L.i_end if L.i_end > 0 else None, tbl='none')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='left', line=('auto', 360), before=120, after=120,
+                    first=0, sz_half=28)
+        bad += rbad(r, ea='黑体', sz=28, b=True)
+    return verdict('节标题', t, bad, want_n=12)
+
+
+@rule('-1 17 个三级标题格式被改', -1)
+def d31(dx, L):
+    t = L.sel(RX_SUB, L.i_ch1, L.i_end if L.i_end > 0 else None, tbl='none')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='left', line=('auto', 360), before=60, after=60,
+                    first=0, sz_half=24)
+        bad += rbad(r, ea='黑体', sz=24, b=True)
+    return verdict('三级标题', t, bad, want_n=17)
+
+
+@rule('-1 "结  语""参考文献""附  录""致  谢"四个标题格式被改', -1)
+def d32(dx, L):
+    t = []
+    for pat, want in ((r'^结\s*语$', '结  语'), (r'^参考文献$', '参考文献'),
+                      (r'^附\s*录$', '附  录'), (r'^致\s*谢$', '致  谢')):
+        t += [(r, want) for r in L.sel(pat, L.i_end if L.i_end > 0 else 0, None, 'none')]
+    bad = []
+    for r, want in t:
+        if r['t'].strip() != want:
+            bad.append(f"标题为 {r['t'].strip()!r}, 未保留原有的两个空格")
+        bad += pbad(r, jc='center', line=('auto', 360), before=240, after=240,
+                    first=0, sz_half=32)
+        bad += rbad(r, ea='黑体', sz=32, b=True)
+    return verdict('文后四个标题', t, bad, want_n=4)
+# ---------- 【正文段落与参考文献、附录、致谢】 ----------
+@rule('-1 正文各章段落格式被改', -1)
+def d33(dx, L):
+    t = L.body_paras()
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first_cm=0.85,
+                    before=0, after=0, sz_half=24)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=24, b=False)
+    return verdict('正文各章段落', t, bad)
+
+
+@rule('-1 参考文献 18 条格式被改或序号被重排', -1)
+def d34(dx, L):
+    t = L.sel(RX_REF, L.i_ref, L.i_apx if L.i_apx > 0 else None, tbl='none')
+    bad = []
+    nums = [int(re.match(r'^\[(\d+)\]', r['t'].strip()).group(1)) for r in t]
+    if nums != list(range(1, 19)):
+        bad.append(f'序号为 {nums[:6]}…, 与 [1]~[18] 连续编号不符')
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first_cm=0.85, sz_half=24)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=24, b=False)
+    return verdict('参考文献条目', t, bad, want_n=18)
+
+
+@rule('-1 "附录A""附录B"两行标题格式被改', -1)
+def d35(dx, L):
+    t = L.sel(r'^附录[AB]')
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first_cm=0.85,
+                    before=0, after=0, sz_half=24)
+        bad += rbad(r, ea='宋体', sz=24, b=True)
+    return verdict('附录 A/B 标题行', t, bad, want_n=2)
+
+
+@rule('-1 附录 A、附录 B 之下的说明段落格式被改', -1)
+def d36(dx, L):
+    hi = L.i_thx if L.i_thx > 0 else len(L.ps)
+    t = [r for r in L.between(L.i_apx, hi) if not re.match(r'^附录[AB]', r['t'].strip())]
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first_cm=0.85, sz_half=24)
+        bad += rbad(r, ea='宋体', sz=24, b=False)
+    return verdict('附录说明段落', t, bad, want_n=2)
+
+
+@rule('-1 致谢段落格式被改', -1)
+def d37(dx, L):
+    t = L.between(L.i_thx, len(L.ps))
+    bad = []
+    for r in t:
+        bad += pbad(r, jc='both', line=('auto', 360), first_cm=0.85, sz_half=24)
+        bad += rbad(r, ea='宋体', sz=24, b=False)
+    return verdict('致谢段落', t, bad, want_n=2)
+# ---------- 【图表与题注】 ----------
+@rule('-1 三条图题格式/位置/序名间两空格被改', -1)
+def d38(dx, L):
+    t = L.sel(RX_FIG, tbl='none')
+    bad = []
+    for r in t:
+        if not re.match(r'^图\d-\d {2}\S', r['t'].strip()):
+            bad.append(f"{r['t'].strip()[:12]!r} 图序与图名之间未空两格")
+        prev = [x for x in L.ps[:r['i']] if x['t'].strip() or x['img']]
+        if not (prev and prev[-1]['img']):
+            bad.append(f"{r['t'].strip()[:12]!r} 未位于所属图形的下方")
+        bad += pbad(r, jc='center', sz_half=21)
+        bad += rbad(r, ea='宋体', asc='Times New Roman', sz=21)
+    return verdict('三条图题', t, bad, want_n=3)
+
+
+@rule('-1 两条表题格式/位置/序名间两空格被改', -1)
+def d39(dx, L):
+    t = L.sel(RX_TBL, tbl='none')
+    bad = []
+    for r in t:
+        if not re.match(r'^表\d-\d {2}\S', r['t'].strip()):
+            bad.append(f"{r['t'].strip()[:12]!r} 表序与表名之间未空两格")
+        nxt = [x for x in L.ps[r['i'] + 1:] if x['t'].strip() or x['tbl'] is not None]
+        if not (nxt and nxt[0]['tbl'] is not None):
+            bad.append(f"{r['t'].strip()[:12]!r} 未位于所属表格的正上方")
+        bad += pbad(r, jc='center', sz_half=21)
+        bad += rbad(r, ea='宋体', sz=21)
+    return verdict('两条表题', t, bad, want_n=2)
+
+
+@rule('-1 三幅正文插图被删除/替换/缩放或引用失效', -1)
+def d40(dx, L):
+    n, bad_embed, sizes = dx.img_info()
+    if len(sizes) < 4:
+        return False, f'仅检出 {len(sizes)} 处图形(应 4 处: 封面 1 幅 + 正文 3 幅), 插图被删除'
+    if bad_embed:
+        return False, f'图片关系引用失效 {bad_embed[:2]}, 插图显示为红叉'
+    bad = []
+    for k in (1, 2, 3):
+        want, got = IMG_CM[k], sizes[k]
+        if not (near(got[0], want[0], 0.2) and near(got[1], want[1], 0.2)):
+            bad.append(f'第 {k} 幅正文插图 {got[0]}×{got[1]} 厘米(应 {want[0]}×{want[1]} 厘米)')
+    if bad:
+        return False, '正文插图尺寸被改: ' + '; '.join(bad)
+    return True, '三幅正文插图尺寸与引用均完好'
+GRID = ('top', 'left', 'bottom', 'right', 'insideH', 'insideV')
+GRID_FULL = dict.fromkeys(GRID, 'single')
+GRID_TB = {'top': 'single', 'bottom': 'single', 'left': 'none',
+           'right': 'none', 'insideH': 'none', 'insideV': 'none'}
+NAME_CN = {'top': '上框线', 'left': '左框线', 'bottom': '下框线',
+           'right': '右框线', 'insideH': '内部横线', 'insideV': '内部竖线'}
+
+
+def grid_bad(dx, ti, want=None):
+    """表格框线与细则写明的绝对值(单线/无线)逐条比对。"""
+    want, bd, out = want or GRID_FULL, dx.tbl_borders(ti), []
+    for k in GRID:
+        got = bd.get(k) or 'none'
+        if got != want[k]:
+            out.append(f'{NAME_CN[k]}={got}'
+                       f"(应 {'single 单线' if want[k] == 'single' else 'none 无线'})")
+    return out
+
+
+def cells_bad(rows, sz, line, before=None, after=None, ea='宋体', asc=None):
+    bad = []
+    for ri, row in enumerate(rows):
+        for c in row:
+            bad += pbad(c, jc='center' if ri == 0 else 'left', line=line,
+                        before=before, after=after, sz_half=sz)
+            bad += rbad(c, ea=ea, asc=asc, sz=sz, b=(ri == 0))
+    return bad
+
+
+@rule('-1 "表1-1"表格结构或表内文字格式被改', -1)
+def d41(dx, L):
+    ti = L.find_tbl('阶段')
+    if ti is None:
+        return None, '未定位到"表1-1"(表头首格"阶段"), 未核查'
+    rows = L.tbl_rows(ti)
+    bad = []
+    if dx.tbl_shapes()[ti] != TBL_SHAPE[2]:
+        bad.append(f'表格为 {dx.tbl_shapes()[ti]}(应 5 行 3 列)')
+    hdr = [c['t'].strip() for c in rows[0]] if rows else []
+    if hdr != ['阶段', '主要任务', '阶段成果']:
+        bad.append(f'表头为 {hdr}(应 阶段/主要任务/阶段成果)')
+    bad += grid_bad(dx, ti)
+    bad += cells_bad(rows, 21, ('auto', 312), ea='宋体', asc='Times New Roman')
+    return verdict('"表1-1"表格', rows, bad, want_n=5)
+
+
+@rule('-1 "表2-1"表格结构、权重取值或表内文字格式被改', -1)
+def d42(dx, L):
+    ti = L.find_tbl('评价指标')
+    if ti is None:
+        return None, '未定位到"表2-1"(表头首格"评价指标"), 未核查'
+    rows = L.tbl_rows(ti)
+    bad = []
+    if dx.tbl_shapes()[ti] != TBL_SHAPE[3]:
+        bad.append(f'表格为 {dx.tbl_shapes()[ti]}(应 6 行 3 列)')
+    hdr = [c['t'].strip() for c in rows[0]] if rows else []
+    if hdr != ['评价指标', '观测与判定要点', '建议权重']:
+        bad.append(f'表头为 {hdr}(应 评价指标/观测与判定要点/建议权重)')
+    wts = [row[2]['t'].strip() for row in rows[1:] if len(row) > 2]
+    if wts != ['25%', '20%', '15%', '20%', '20%']:
+        bad.append(f'建议权重列为 {wts}(应 25%/20%/15%/20%/20%)')
+    bad += grid_bad(dx, ti, GRID_TB)
+    bad += cells_bad(rows, 19, ('auto', 240), before=0, after=0, ea='宋体')
+    return verdict('"表2-1"表格', rows, bad, want_n=6)
+# ---------- 【页面设置】 ----------
+@rule('-1 纸张不再是 A4', -1)
+def d43(dx, L):
+    secs = dx.sects_ranged()
+    bad = [f"第 {i + 1} 节 pgSz={s['pgSz']}(应 {PG_SZ} twips 即 210×297 毫米)"
+           for i, s in enumerate(secs)
+           if not (s['pgSz'] and near(s['pgSz'][0], PG_SZ[0], 20)
+                   and near(s['pgSz'][1], PG_SZ[1], 20))]
+    return verdict('纸张', secs, bad)
+
+
+@rule('-1 页边距被改', -1)
+def d44(dx, L):
+    kinds = L.sect_kinds()
+    bad = []
+    for i, (s, mar, _) in enumerate(kinds):
+        want = PG_MAR_FRONT if mar == 'front' else PG_MAR_MAIN
+        got = s['pgMar']
+        for k in ('top', 'bottom', 'left', 'right'):
+            if not near(got.get(k), want[k], 12):
+                bad.append(f'第 {i + 1} 节'
+                           f'({"封面至中文摘要" if mar == "front" else "英文摘要及之后"})'
+                           f' {k}={got.get(k)}(应 {want[k]} twips)')
+    return verdict('页边距', kinds, bad)
+
+
+@rule('-1 页眉/页脚距边界被改', -1)
+def d45(dx, L):
+    secs = dx.sects_ranged()
+    bad = []
+    for i, s in enumerate(secs):
+        if not near(s['pgMar'].get('header'), PG_HDR_FTR[0], 12):
+            bad.append(f"第 {i + 1} 节 页眉距边界={s['pgMar'].get('header')}"
+                       f'(应 {PG_HDR_FTR[0]} twips 即 15 毫米)')
+        if not near(s['pgMar'].get('footer'), PG_HDR_FTR[1], 12):
+            bad.append(f"第 {i + 1} 节 页脚距边界={s['pgMar'].get('footer')}"
+                       f'(应 {PG_HDR_FTR[1]} twips 即 17.5 毫米)')
+    return verdict('页眉/页脚距边界', secs, bad)
+
+
+# ---------- 【页眉文字与页脚页码】 ----------
+@rule('-1 页眉文字被改写/删除/加粗/改对齐', -1)
+def d46(dx, L):
+    hs = [(ty, part, ps) for ty, part, ps, s in L.headers()
+          if ty != 'first' and any(r['t'].strip() for r in ps)]
+    bad = []
+    for ty, part, ps in hs:
+        for r in ps:
+            if not r['t'].strip():
+                continue
+            if r['t'].strip() != HDR_TEXT:
+                bad.append(f"{part.split('/')[-1]} 页眉文字={r['t'].strip()[:16]!r}(应{HDR_TEXT!r})")
+            bad += pbad(r, jc='center', sz_half=21)
+            bad += rbad(r, ea='宋体', asc='Times New Roman', b=False)
+    return verdict('页眉文字', hs, bad)
+@rule('-1 封面首页页眉出现文字(该页页眉应保持空白)', -1)
+def d47(dx, L):
+    secs = dx.sects_ranged()
+    if not secs:
+        return None, '未解析到分节信息, 未核查'
+    rid2h = dx.rid_to_header()
+    rid = secs[0]['refs'].get('first')
+    if not rid:
+        return False, '首节未设置"首页不同"页眉, 封面首页将显示与其他页相同的页眉文字'
+    ps = L.fmt.part(rid2h.get(rid, ''))
+    txt = ''.join(r['t'] for r in ps).strip()
+    if txt:
+        return False, f'封面首页页眉出现文字 {txt[:20]!r}, 该页页眉应保持空白'
+    return True, '封面首页页眉保持空白(横线形态由加分项判定)'
+
+
+@rule('-1 页脚文字/对齐/缩进被改', -1)
+def d48(dx, L):
+    fi = dx.footer_info()
+    parts = [p for p in fi['parts'] if p['text'].strip()]
+    bad = []
+    for p in parts:
+        if FTR_TEXT not in p['text']:
+            bad.append(f"{p['name']} 页脚文字={p['text'][:18]!r}(应含{FTR_TEXT!r})")
+        if 18 not in p['sz']:
+            bad.append(f"{p['name']} 字号={[s / 2 for s in p['sz']]}磅(应含 9 磅)")
+    got = sorted((p['jc'] or 'left', 'left' if p['left'] else 'right',
+                  p['left'] or p['right'] or 0) for p in parts)
+    want = sorted(FTR_ALIGN)
+    if got != want:
+        bad.append(f'四个页脚的对齐/缩进为 {got}(应 {want})')
+    return verdict('页脚文字与对齐缩进', parts, bad, want_n=4)
+
+
+@rule('-1 页脚页码不再由 PAGE 域自动生成', -1)
+def d49(dx, L):
+    fi = dx.footer_info()
+    if fi['missing']:
+        return False, f"引用的页脚部件 {fi['missing']} 缺失, 页脚被删除"
+    if fi['begin'] != fi['end']:
+        return False, (f"域标记不配对(begin={fi['begin']}, end={fi['end']}), "
+                       f'页码将显示为错误代码')
+    if fi['page'] != N_PAGEFLD:
+        return False, f"PAGE 域 {fi['page']} 个(应 {N_PAGEFLD} 个), 页码被删除或改为静态数字"
+    return True, f"PAGE 域 {fi['page']} 个, begin/separate/end 标记配对完好"
+
+
+@rule('-1 页码编号格式(罗马数字/阿拉伯数字)被改', -1)
+def d50(dx, L):
+    kinds = L.sect_kinds()
+    bad, seen = [], None
+    for i, (s, _, num) in enumerate(kinds):
+        got = s['fmt'] or seen
+        want = 'upperRoman' if num == 'roman' else 'decimal'
+        if got is not None and got != want:
+            bad.append(f'第 {i + 1} 节编号={got}(应 {want})')
+        seen = got
+    return verdict('页码编号格式', kinds, bad)
+# ---------- 【通用破坏】 ----------
+@rule('-3 文字内容被增删或改写', -3)
+def d51(dx, L):
+    n = dx.text_len()
+    tol = max(1, int(TEXTLEN * TEXT_TOL))
+    if abs(n - TEXTLEN) > tol:
+        return False, (f'可见文字 {n} 字, 超出 {TEXTLEN}±{tol} 字范围, '
+                       f'属非格式性的内容增删或改写')
+    return True, f'可见文字 {n} 字, 在 {TEXTLEN}±{tol} 字范围内, 内容未被增删改写'
+
+
+@rule('-3 图片、表格等对象被删除或破坏', -3)
+def d52(dx, L):
+    n_img, bad_embed, sizes = dx.img_info()
+    shapes = dx.tbl_shapes()
+    bad = []
+    if bad_embed:
+        bad.append(f'图片关系引用失效 {bad_embed[:2]}')
+    if n_img != N_IMG:
+        bad.append(f'内嵌图片 {n_img} 张(应 {N_IMG} 张)')
+    if shapes != TBL_SHAPE:
+        bad.append(f'表格行列结构 {shapes}(应 {TBL_SHAPE})')
+    if bad:
+        return False, '对象被删除或破坏: ' + '; '.join(bad)
+    return True, f'内嵌图片 {n_img} 张、表格 {len(shapes)} 个行列结构均完好'
+
+
+@rule('-3 段落或整节内容被删除导致内容缺失', -3)
+def d53(dx, L):
+    bad = []
+    miss = [name for name, pat in SECT_MUST if L.idx(pat) < 0]
+    if miss:
+        bad.append(f'缺失部分: {miss}')
+    hi = L.i_end if L.i_end > 0 else None
+    for pat, want, label in ((RX_CH, 4, '章标题'), (RX_SEC, 12, '节标题'),
+                             (RX_SUB, 17, '三级标题')):
+        got = len(L.sel(pat, L.i_ch1, hi, tbl='none')) if L.i_ch1 >= 0 else 0
+        if got != want:
+            bad.append(f'{label} {got} 个(应 {want} 个)')
+    if bad:
+        return False, '内容缺失: ' + '; '.join(bad)
+    return True, '各部分齐全, 章 4 个、节 12 个、三级标题 17 个数量未变'
+
+
+@rule('-1 姓名、编号、日期等信息的数值被改动', -1)
+def d54(dx, L):
+    text = dx.body_text()
+    miss = [v for v in KEEP_VALUES if v.replace(' ', '') not in text.replace(' ', '')]
+    if miss:
+        return False, f'以下信息数值已被改动或删除: {miss}'
+    return True, f'{len(KEEP_VALUES)} 项姓名/编号等信息数值均与细则写明的取值一致'
+
+
+@rule('-1 文档出现指向缺失部件的悬挂引用', -1)
+def d55(dx, L):
+    dang = dx.dangling()
+    fi = dx.footer_info()
+    bad = []
+    if dang:
+        bad.append(f'document.xml 引用了不存在的关系 {dang[:4]}')
+    if fi['missing']:
+        bad.append(f"页脚部件缺失 {fi['missing']}")
+    rid2h = dx.rid_to_header()
+    names = set(dx.zf.namelist())
+    for s in dx.sects_ranged():
+        for ty, rid in s['refs'].items():
+            part = rid2h.get(rid)
+            if not part or part not in names:
+                bad.append(f'页眉引用 {rid}({ty}) 指向缺失部件')
+    if bad:
+        return False, '关系断裂, Word 打开时可能提示需要修复: ' + '; '.join(bad)
+    return True, '图片/页眉/页脚等关系引用均可解析, 无悬挂引用'
+
+
+
+def score(target_path, input_path=None):
+    """input_path 仅为兼容旧调用而保留: 减分项已改为直接比对细则写明的绝对值。"""
+    dx = Docx(target_path)
+    result = {'file': target_path, 'items': [], 'add': 0, 'sub': 0, 'total': 0,
+              'openable': dx.ok, 'max_add': 13}
+
+    def rec(code, pts, ok, note):
+        result['items'].append({'code': code, 'points': pts, 'passed': ok, 'note': note})
+
+    if not dx.ok:
+        result['note'] = f'文件无法打开: {dx.err}; 维度一不通过, 总分 0'
         return result
 
-    def _check_header_lines_before_abstract(self):
-        """检查摘要前所有页面页眉是否没有横线 (+3分)
+    result['note_ref'] = '减分项判据: 《细则.docx》"二、减分项"写明的绝对格式值(共 %d 条)' % len(RULES)
 
-        细则：摘要（中文"摘要"两字标题）所在页之前的所有物理页面，页眉处
-        没有横线。摘要页本身即使有横线也不构成扣分点（那是 +5 分要求的
-        横线所在页）。
+    before, after, abs_i, secs, split_ok, split_why = \
+        effective_default_headers_by_region(dx)
 
-        覆盖范围（优先按物理页粒度）：
-          - 若 Word COM 分页信息可用（_word_pagination.abstract_zh_page）：
-            枚举物理页号 1 .. abstract_zh_page - 1 的每一页，对每一页取
-            其所在节及其在办公软件中实际生效的页眉场景（default/even/first），
-            沿"与上一节链接"关系回溯到实际显示的页眉对象；仅这些页眉
-            纳入检查。摘要页所在节即使被更早的页共享，也只检查那些更早的
-            物理页对应的页眉场景，不会把摘要页本身对应的页眉纳入。
-          - 若 COM 分页不可用（未安装 Word / pywin32），回退到节级颗粒度：
-            检查索引严格小于"摘要标题所在节"的所有节的所有页眉；若摘要
-            所在节内、摘要标题段落之前还检测到分页符/段前分页（即摘要
-            与更早的物理页共享同一节），该节自身的页眉也纳入检查，避免
-            "没有更早的节"被误判为"没有摘要前页面"而直接放过。
-          - 对每个"摘要前"节，按办公软件实际显示逻辑收集所有会出现的页眉：
-              * 默认页眉（无奇偶设置时用于所有页；启用奇偶不同则用于奇数页）
-              * 偶数页页眉（启用"奇偶页不同"时用于偶数页；未定义则偶数页
-                复用默认页眉）
-              * 首页页眉（节启用"首页不同"时用于该节首页）
-          - 对每个页眉，沿"与上一节链接"关系回溯到实际显示的对象
-        判定"页眉处有横线"（任一命中即视为该页眉不通过）：
-          - 页眉任意段落的 w:pBdr 中存在可见的 top / bottom / between 边框
-            （可见 = val 不为空/none/nil，且 sz>0）
-          - 页眉内含表格，且表格任意单元格具有可见 top / bottom / insideH
-            边框（这些都会在办公软件中显示为一根横线）
-        """
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[+0] 摘要前页面页眉横线检查未通过：文档为空")
-            return
+    # +5 摘要及之后 与 PDF 一致
+    after_lines = [b for b in after if b is not None]
+    ok5 = len(after_lines) > 0 and all(
+        b['val'] == PDF_STYLE and b['sz'] == PDF_SZ for b in after_lines)
+    detail5 = ', '.join(f"{b['val']}/sz{b['sz']}" for b in after_lines) or '无横线'
+    rec('+5 摘要后横线与PDF一致', 5, ok5, f'摘要及之后生效横线: {detail5}')
 
-        if self.chinese_abstract_para_idx < 0:
-            print("[+0] 摘要前页面页眉横线检查未通过：未定位到摘要标题")
-            return
+    # +3 摘要之前 全部删除
+    ok3a = len(before) > 0 and all(b is None for b in before)
+    if ok3a:
+        note3a = '全部为无'
+    else:
+        got = ', '.join(f"{b['val']}/sz{b['sz']}" if b else '无' for b in before)
+        note3a = (got or '无对应节') + '(其中任一处有线即不得分)'
+    rec('+3 摘要前横线删除', 3, ok3a, '摘要之前生效横线: ' + note3a)
 
-        abstract_sec_idx = self._get_paragraph_section_index(
-            self.chinese_abstract_para_idx
-        )
-        if abstract_sec_idx < 0:
-            print("[+0] 摘要前页面页眉横线检查未通过：未能定位摘要所在节")
-            return
+    # +3 摘要前正确分节: 分节符须紧接"摘  要"之前, 前置内容不得并入后半部分
+    rec('+3 摘要前正确分节', 3, split_ok, f'共 {len(secs)} 节; {split_why}')
 
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
+    # +1 分界点恰在摘要页 (摘要前节均无线, 摘要所在节起有线, 且分节点紧邻摘要)
+    ok1a = ok3a and split_ok and (after[0] is not None if after else False)
+    rec('+1 分界点在摘要页', 1, ok1a,
+        '摘要前无线且摘要所在节起即有线' if ok1a else '分界点不在摘要页')
 
-        offending = []
+    # +1 单双数页一致
+    #    前提: 横线已按要求处理(摘要之前无线、摘要及之后有线);
+    #    页眉下方本就没有横线、或前后两部分未按要求区分时不得分。
+    even_on = dx.even_odd_headers()
+    has_line_after = len(after_lines) > 0
+    if not (ok3a and has_line_after):
+        ok1b = False
+        why = ('摘要及之后各页页眉下方无横线' if not has_line_after
+               else '摘要之前各页页眉下方仍有横线')
+        note1b = f'横线尚未按要求处理({why}), 不具备"单双数页横线一致"的前提, 不得分'
+    elif not even_on:
+        ok1b = True
+        note1b = '已关闭奇偶页页眉, 单双页共用同一横线'
+    else:
+        # even 开启: 需 even 与 default 每节底边框一致
+        rid2h = dx.rid_to_header()
+        consistent = True
+        for s in secs:
+            d = s['refs'].get('default'); e = s['refs'].get('even')
+            if e:
+                bd = dx.header_bottom(rid2h.get(d, '')) if d else None
+                be = dx.header_bottom(rid2h.get(e, ''))
+                if bd != be:
+                    consistent = False
+        ok1b = consistent
+        note1b = '奇偶页页眉开启且已同步' if consistent else '奇偶页页眉开启但不一致'
+    rec('+1 单双数页横线一致', 1, ok1b, note1b)
 
-        # 优先：按物理页粒度枚举"摘要页之前"的每一页
-        wp = self._word_pagination
-        abs_page_raw = wp.get('abstract_zh_page') if wp else None
-        abs_page = abs_page_raw if isinstance(abs_page_raw, int) else None
+    result['add'] = sum(i['points'] for i in result['items'] if i['points'] > 0 and i['passed'])
 
-        if abs_page is not None and abs_page > 0:
-            if abs_page == 1:
-                # 摘要就在第1页——不存在摘要前物理页面，按通过处理
-                self.results['dimension2_scores'].append(3)
-                self.results['hit_points'].append("+3：摘要前所有页面页眉处没有横线")
-                print("[+3] 摘要前所有页面页眉处没有横线")
-                return
-            for page_no in range(1, abs_page):
-                sec_i = self._page_to_section_index(page_no)
-                kind = self._classify_page_kind(page_no, sec_i, odd_even)
-                header = self._get_page_header(sec_i, kind, odd_even)
-                if header is None:
-                    continue
-                if self._header_has_horizontal_line(header):
-                    offending.append(f"第{page_no}页({kind}, 节{sec_i})页眉")
+    # ---------- 减分项: 逐条比对细则写明的绝对格式值(无需原始输入作参照) ----------
+    #   passed=True  → 已核查, 与细则写明的绝对值一致, 未触发扣分(实得0)
+    #   passed=False → 检出指令未要求的多余改动, 触发扣分
+    #   passed=None  → 对象缺失等无法核查的情形(内容缺失另由通用破坏项判定)
+    try:
+        L = Layout(dx)
+    except Exception as e:
+        L = None
+        result['note_ref'] = f'格式解析失败({e}), 减分项未核查'
+    if L is not None:
+        for code, pts, fn in RULES:
+            try:
+                ok, note = fn(dx, L)
+            except Exception as e:
+                ok, note = None, f'该项核查异常({type(e).__name__}: {e}), 未计分'
+            rec(code, pts, ok, note)
 
-            if not offending:
-                self.results['dimension2_scores'].append(3)
-                self.results['hit_points'].append("+3：摘要前所有页面页眉处没有横线")
-                print("[+3] 摘要前所有页面页眉处没有横线")
+    result['sub'] = sum(i['points'] for i in result['items']
+                        if i['points'] < 0 and i['passed'] is False)
+    # 不设下限: 加分项不得分而减分项累计时, 总分可为负数(如实反映多余改动的代价)
+    result['total'] = result['add'] + result['sub']
+    return result
+
+
+def report(res):
+    lines = []
+    lines.append(f"评测文件: {res['file']}")
+    if not res['openable']:
+        lines.append(f"  [维度一] 文件无法打开 → 总分 0")
+        lines.append(f"  {res.get('note','')}")
+        return '\n'.join(lines)
+    lines.append(f"  [维度一] 可正常打开 ✓")
+    lines.append(f"  [维度二] 逐条判定:")
+    for it in res['items']:
+        if it['points'] > 0:
+            # 加分项
+            if it['passed']:
+                verdict = f"得分 ✓  得 +{it['points']}"
+                got = it['points']
             else:
-                print(f"[+0] 摘要前页面页眉横线检查未通过: {offending}")
-            return
-
-        # 回退：节级颗粒度——检查严格早于摘要节的所有节；
-        # 此外，摘要所在节内部也可能存在"摘要前"的物理页（用分页符/
-        # 段前分页与摘要标题段落分隔，而非分节符），这些页面共享
-        # 摘要所在节的页眉对象，必须一并纳入检查，不能因为"没有更早的
-        # 节"就直接判通过（那样会漏检与摘要同节的封面/前置页页眉）。
-        sections_to_check = list(range(abstract_sec_idx))
-        if self._has_page_break_before_paragraph(self.chinese_abstract_para_idx):
-            sections_to_check.append(abstract_sec_idx)
-
-        if not sections_to_check:
-            # 严格早于摘要节的节为空，且摘要所在节内摘要标题前也没有
-            # 检测到分页符——确认摘要就是该节第1页，不存在摘要前页面
-            self.results['dimension2_scores'].append(3)
-            self.results['hit_points'].append("+3：摘要前所有页面页眉处没有横线")
-            print("[+3] 摘要前所有页面页眉处没有横线")
-            return
-
-        for i in sections_to_check:
-            section = self._flat_sections[i]
-
-            headers_to_check = []
-
-            default_header = self._resolve_effective_header(
-                section.header, i, 'default'
-            )
-            if default_header is not None:
-                if odd_even:
-                    headers_to_check.append(
-                        (default_header, f"节{i}奇数页页眉")
-                    )
-                    try:
-                        even_raw = section.even_page_header
-                    except Exception:
-                        even_raw = None
-                    even_header = self._resolve_effective_header(
-                        even_raw, i, 'even'
-                    )
-                    if even_header is not None:
-                        headers_to_check.append(
-                            (even_header, f"节{i}偶数页页眉")
-                        )
-                    else:
-                        headers_to_check.append(
-                            (default_header, f"节{i}偶数页页眉(复用默认)")
-                        )
-                else:
-                    headers_to_check.append(
-                        (default_header, f"节{i}页眉")
-                    )
-
-            try:
-                if getattr(section, 'different_first_page_header_footer', False):
-                    first_raw = section.first_page_header
-                    first_header = self._resolve_effective_header(
-                        first_raw, i, 'first'
-                    )
-                    if first_header is not None:
-                        headers_to_check.append(
-                            (first_header, f"节{i}首页页眉")
-                        )
-            except Exception:
-                pass
-
-            for header, label in headers_to_check:
-                if self._header_has_horizontal_line(header):
-                    offending.append(label)
-
-        if not offending:
-            self.results['dimension2_scores'].append(3)
-            self.results['hit_points'].append("+3：摘要前所有页面页眉处没有横线")
-            print("[+3] 摘要前所有页面页眉处没有横线")
+                verdict = f"不得分 ✗  得 0 (满分+{it['points']})"
+                got = 0
         else:
-            print(f"[+0] 摘要前页面页眉横线检查未通过: {offending}")
-
-    def _header_has_horizontal_line(self, header):
-        """页眉中是否出现横线（段落横向边框 或 表格横向边框）"""
-        if header is None:
-            return False
-        # 段落 w:pBdr 中的 top/bottom/between 边框
-        for paragraph in header.paragraphs:
-            pPr = paragraph._element.pPr
-            if pPr is None:
-                continue
-            pBdr = pPr.find(qn('w:pBdr'))
-            if pBdr is None:
-                continue
-            for border in pBdr:
-                name = border.tag.split('}')[-1]
-                if name in ('top', 'bottom', 'between'):
-                    if self._is_visible_border(border):
-                        return True
-        # 页眉内表格产生的横线
-        for table in header.tables:
-            if self._table_has_visible_horizontal_line(table):
-                return True
-        return False
-
-    def _table_has_visible_horizontal_line(self, table):
-        """表格是否会在办公软件中呈现出横线"""
-        # 表级默认边框：top/bottom/insideH
-        tblPr = table._element.tblPr
-        if tblPr is not None:
-            tblBorders = tblPr.find(qn('w:tblBorders'))
-            if tblBorders is not None:
-                for name in ('top', 'bottom', 'insideH'):
-                    b = tblBorders.find(qn(f'w:{name}'))
-                    if self._is_visible_border(b):
-                        return True
-        # 单元格边框：top/bottom
-        for row in table.rows:
-            for cell in row.cells:
-                tcPr = cell._tc.tcPr
-                if tcPr is None:
-                    continue
-                tcBorders = tcPr.find(qn('w:tcBorders'))
-                if tcBorders is None:
-                    continue
-                for name in ('top', 'bottom'):
-                    b = tcBorders.find(qn(f'w:{name}'))
-                    if self._is_visible_border(b):
-                        return True
-                # 嵌套表格递归
-                for nested in cell.tables:
-                    if self._table_has_visible_horizontal_line(nested):
-                        return True
-        return False
-
-    # ==== "两条平行横线" 相关的判定辅助 =====================================
-
-    # Word/WPS 内置的会渲染为"两条水平平行线"的复合边框样式
-    # 键：val 值；值：(top_ratio, bottom_ratio) —— 办公软件中该复合边框在
-    # 屏幕上从上到下呈现的两条线的粗细比例（与实际观察一致）
-    # 说明：OOXML 中 thick-thin/thin-thick 命名表示从段落文本一侧向外的
-    # 延展顺序；用作页眉/段落下边框(w:bottom)时，靠近文本的方向是上方，
-    # 因此 "thickThin*"（thick 先/thin 后）在办公软件里实际呈现为
-    # 上薄下厚，"thinThick*" 呈现为上厚下薄。
-    _DOUBLE_LINE_STYLES = {
-        # val: (top_ratio, bottom_ratio) —— 办公软件视觉从上到下比例
-        'double':               (1, 1),  # 上下等粗
-        'thickThinSmallGap':    (1, 3),  # 上薄下厚
-        'thickThinMediumGap':   (1, 3),
-        'thickThinLargeGap':    (1, 3),
-        'thinThickSmallGap':    (3, 1),  # 上厚下薄
-        'thinThickMediumGap':   (3, 1),
-        'thinThickLargeGap':    (3, 1),
-    }
-
-    def _is_black_border_color(self, color):
-        """办公软件中该颜色是否呈现为黑色"""
-        if color is None:
-            return True  # 未设 = auto = 黑
-        c = str(color).strip().lower()
-        if c in ('auto', 'black', '000000', '000'):
-            return True
-        # 允许 #000 / #000000 写法
-        if c.startswith('#'):
-            c = c[1:]
-        if c == '000000':
-            return True
-        return False
-
-    def _lines_from_double_border(self, border):
-        """给定一个 val 为复合双线样式的边框，返回 (上线粗pt, 下线粗pt, color)
-
-        计算模型：w:sz 单位为 1/8 磅，办公软件渲染时按样式内置比例
-        将 sz 分配给上/下两条线（gap 忽略于粗细计算）。
-        """
-        val = border.get(qn('w:val'))
-        if val not in self._DOUBLE_LINE_STYLES:
-            return None
-        try:
-            sz = int(border.get(qn('w:sz')) or '0')
-        except (ValueError, TypeError):
-            sz = 0
-        if sz <= 0:
-            return None
-        color = border.get(qn('w:color'))
-        top_r, bottom_r = self._DOUBLE_LINE_STYLES[val]
-        total_pt = sz / 8.0
-        top_pt = total_pt * top_r / (top_r + bottom_r)
-        bottom_pt = total_pt * bottom_r / (top_r + bottom_r)
-        return top_pt, bottom_pt, color
-
-    def _extract_two_parallel_lines(self, paragraph):
-        """从段落 pBdr 中提取"两条平行横线"的粗细与颜色
-
-        返回 (上线pt, 下线pt, [颜色列表])；找不到时返回 None。
-        兼容两种表达方式：
-          1) 单个复合双线边框（top/bottom/between 之一，val ∈ 双线样式集）
-          2) 段落同时设置了可见的 top + bottom 两条单线边框
-        """
-        pPr = paragraph._element.pPr
-        if pPr is None:
-            return None
-        pBdr = pPr.find(qn('w:pBdr'))
-        if pBdr is None:
-            return None
-
-        # 方式1：单个复合双线边框
-        for border in pBdr:
-            name = border.tag.split('}')[-1]
-            if name not in ('top', 'bottom', 'between'):
-                continue
-            info = self._lines_from_double_border(border)
-            if info is not None:
-                top_pt, bottom_pt, color = info
-                return top_pt, bottom_pt, [color]
-
-        # 方式2：top + bottom 两条单线边框都可见
-        top_b = pBdr.find(qn('w:top'))
-        bottom_b = pBdr.find(qn('w:bottom'))
-        if (top_b is not None and bottom_b is not None
-                and self._is_visible_border(top_b)
-                and self._is_visible_border(bottom_b)):
-            try:
-                top_sz = int(top_b.get(qn('w:sz')) or '0')
-                bottom_sz = int(bottom_b.get(qn('w:sz')) or '0')
-            except (ValueError, TypeError):
-                return None
-            if top_sz > 0 and bottom_sz > 0:
-                return (
-                    top_sz / 8.0,
-                    bottom_sz / 8.0,
-                    [top_b.get(qn('w:color')), bottom_b.get(qn('w:color'))],
-                )
-        return None
-
-    def _header_has_valid_double_line(self, header, label, details):
-        """检查页眉是否具有满足细则的双横线"""
-        if header is None:
-            details.append(f"{label}不存在")
-            return False
-        # 头里所有段落只要有一个满足即可
-        for paragraph in header.paragraphs:
-            info = self._extract_two_parallel_lines(paragraph)
-            if info is None:
-                continue
-            top_pt, bottom_pt, colors = info
-
-            # 颜色：所有涉及的颜色都必须呈黑色
-            if not all(self._is_black_border_color(c) for c in colors):
-                details.append(
-                    f"{label}横线颜色不是黑色(colors={colors})"
-                )
-                return False
-
-            # 下横线粗细不超过1.5磅
-            if bottom_pt > 1.5 + 1e-6:
-                details.append(
-                    f"{label}下横线{bottom_pt:.3f}pt 超过1.5磅"
-                )
-                return False
-
-            # 上横线粗细不低于下横线的3倍
-            if bottom_pt <= 0:
-                details.append(f"{label}下横线粗细为0")
-                return False
-            if top_pt + 1e-6 < 3 * bottom_pt:
-                details.append(
-                    f"{label}上横线{top_pt:.3f}pt 不足下横线{bottom_pt:.3f}pt 的3倍"
-                )
-                return False
-            return True
-        details.append(f"{label}未检出两条平行横线")
-        return False
-
-    def _check_header_lines_after_abstract(self):
-        """检查摘要页及摘要页后所有页面页眉的双横线 (+5分)
-
-        细则：摘要页及摘要页后所有页面，页眉处存在两条相互平行的横线；
-              颜色为黑色；上横线的粗细不低于下横线的3倍；下横线粗细不超过
-              1.5磅
-
-        覆盖范围：
-          - 通过 _get_paragraph_section_index 定位中文摘要标题所在节
-            abstract_sec；摘要页及之后 = 索引 >= abstract_sec 的所有节
-            （若未找到摘要，则视为从第 1 节起）
-          - 每个节按办公软件实际显示逻辑收集所有会出现的页眉：
-              * 默认页眉（无奇偶设置用于所有页；启用奇偶不同用于奇数页）
-              * 偶数页页眉（启用"奇偶页不同"时；未定义则偶数页复用默认）
-              * 首页页眉（节启用"首页不同"时）
-          - 沿"与上一节链接"关系回溯到实际显示的页眉对象
-        每个页眉必须至少有一个段落其 pBdr 满足全部四项要求：
-          (1) 两条相互平行的横线：
-              * 单个复合双线边框：val ∈ {double, thickThinSmallGap,
-                thickThinMediumGap, thickThinLargeGap, thinThickSmallGap,
-                thinThickMediumGap, thinThickLargeGap}
-              * 或段落同时设置了可见 top + 可见 bottom 单线边框
-          (2) 颜色为黑色：所有涉及边框的 color 为 auto / 000000 / black
-          (3) 上横线粗细 ≥ 3 × 下横线粗细
-          (4) 下横线粗细 ≤ 1.5磅
-              （线粗根据 w:sz 与办公软件实际渲染比例换算：
-               复合双线样式内置的粗细比例 double=1:1、thickThin*=3:1、
-               thinThick*=1:3；两条单线边框直接用各自的 sz/8 磅）
-        """
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[+0] 摘要页及摘要页后页眉双横线检查未通过：文档为空")
-            return
-
-        abstract_sec_idx = self._get_paragraph_section_index(
-            self.chinese_abstract_para_idx
-        )
-        if abstract_sec_idx < 0:
-            abstract_sec_idx = 1
-
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
-
-        details = []
-        all_passed = True
-
-        # 优先按物理页粒度逐页检查（Word COM 精确分页可用时）
-        pages_to_check = self._enumerate_pages_after_abstract()
-        if pages_to_check is not None:
-            for page_no, sec_i, kind in pages_to_check:
-                header = self._get_page_header(sec_i, kind, odd_even)
-                label = f"第{page_no}页({kind}, 节{sec_i})页眉"
-                if not self._header_has_valid_double_line(
-                    header, label, details
-                ):
-                    all_passed = False
-
-            if all_passed:
-                self.results['dimension2_scores'].append(5)
-                self.results['hit_points'].append(
-                    "+5：摘要页及摘要页后所有页面页眉处存在两条相互平行的黑色横线，"
-                    "上横线粗细不低于下横线的3倍，下横线粗细不超过1.5磅"
-                )
-                print("[+5] 摘要页及摘要页后页眉双横线符合要求")
+            # 减分项: 三态 —— passed=False 触发扣分; True 已核查未触发; None 未核查
+            if it['passed'] is False:
+                verdict = f"触发扣分 ✗  扣 {it['points']}"
+                got = it['points']
+            elif it['passed'] is True:
+                verdict = f"已核查未触发 ✓  实得 0 (风险 {it['points']})"
+                got = 0
             else:
-                print(f"[+0] 摘要页及摘要页后页眉双横线检查未通过: {details}")
-            return
+                verdict = f"未核查 —  实得 0 (风险 {it['points']})"
+                got = 0
+        lines.append(f"    - {it['code']}")
+        lines.append(f"        判定: {verdict}   实得 {got:+d}")
+        lines.append(f"        依据: {it['note']}")
+    if res.get('note_ref'):
+        lines.append(f"  注: {res['note_ref']}")
+    lines.append(f"  ---")
+    lines.append(f"  加分合计 {res['add']} / {res['max_add']}   减分合计 {res['sub']}")
+    lines.append(f"  >>> 完成度总分 = {res['total']} / {res['max_add']}")
+    return '\n'.join(lines)
 
-        # 回退：节级颗粒度（要求节内所有会出现的页眉均满足）
-        for i in range(abstract_sec_idx, len(self._flat_sections)):
-            section = self._flat_sections[i]
 
-            headers_to_check = []
-            default_header = self._resolve_effective_header(
-                section.header, i, 'default'
-            )
-            if default_header is not None:
-                if odd_even:
-                    headers_to_check.append(
-                        (default_header, f"节{i}奇数页页眉")
-                    )
-                    try:
-                        even_raw = section.even_page_header
-                    except Exception:
-                        even_raw = None
-                    even_header = self._resolve_effective_header(
-                        even_raw, i, 'even'
-                    )
-                    if even_header is not None:
-                        headers_to_check.append(
-                            (even_header, f"节{i}偶数页页眉")
-                        )
-                    else:
-                        headers_to_check.append(
-                            (default_header, f"节{i}偶数页页眉(复用默认)")
-                        )
-                else:
-                    headers_to_check.append(
-                        (default_header, f"节{i}页眉")
-                    )
-            try:
-                if getattr(section, 'different_first_page_header_footer', False):
-                    first_raw = section.first_page_header
-                    first_header = self._resolve_effective_header(
-                        first_raw, i, 'first'
-                    )
-                    if first_header is not None:
-                        headers_to_check.append(
-                            (first_header, f"节{i}首页页眉")
-                        )
-            except Exception:
-                pass
-
-            for header, label in headers_to_check:
-                if not self._header_has_valid_double_line(
-                    header, label, details
-                ):
-                    all_passed = False
-
-        if all_passed:
-            self.results['dimension2_scores'].append(5)
-            self.results['hit_points'].append(
-                "+5：摘要页及摘要页后所有页面页眉处存在两条相互平行的黑色横线，"
-                "上横线粗细不低于下横线的3倍，下横线粗细不超过1.5磅"
-            )
-            print("[+5] 摘要页及摘要页后页眉双横线符合要求")
+def auto_discover(dirpath):
+    """扫描目录下的 .docx, 区分'输入文件'与'待评测文件'。
+    含'输入'关键字(或文件名以 input 开头)的视为原始输入。"""
+    import os
+    docs = [f for f in os.listdir(dirpath)
+            if f.lower().endswith('.docx') and not f.startswith('~$')]
+    inputs, targets = [], []
+    for f in docs:
+        low = f.lower()
+        if '输入' in f or low.startswith('input') or '原始' in f:
+            inputs.append(f)
         else:
-            print(f"[+0] 摘要页及摘要页后页眉双横线检查未通过: {details}")
-
-    def _check_header_line_position(self):
-        """检查所有页页眉横线位于页眉文本下方，间距1-4字符 (+5分)
-
-        细则：所有页页眉位置上的横线位于页眉文本下方，与页眉文本间距
-              在1-4字符之间
-
-        覆盖范围：
-          - 遍历所有节
-          - 每节按办公软件实际显示逻辑收集所有会出现的页眉：
-              * 默认页眉（无奇偶设置用于所有页；启用奇偶不同用于奇数页）
-              * 偶数页页眉（启用"奇偶页不同"时；未定义则偶数页复用默认）
-              * 首页页眉（节启用"首页不同"时）
-          - 沿"与上一节链接"关系回溯到实际显示的页眉对象
-          - 只针对"页眉位置上存在横线"的页眉判定；不存在横线的页眉不适用
-            该条评分点，跳过（例如摘要前页眉本身就无横线的情况）
-        "横线位于页眉文本下方" 判定：
-          - 段落 pBdr 中的可见边框必须出现在 <w:bottom>（或复合双线边框
-            放在 bottom 位置）
-          - 若同一页眉段落还带有可见 <w:top> / <w:between> 边框，则说明存在
-            不在文本下方的横线，判定失败
-        "与页眉文本间距在1-4字符之间" 判定：
-          - 边框的 w:space 属性单位为磅（0-31），代表办公软件中横线与
-            该段落文本的物理距离
-          - 不再把"字符"直接等同于该页眉段落字号；此处采用 Word 中文
-            文档常用的默认字符宽度口径：1字符 = 10.5磅（五号字 em 宽）
-          - 将 w:space 的物理距离换算为字符数，满足 1 ≤ 字符数 ≤ 4 通过
-        """
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[+0] 页眉横线位置检查未通过：文档为空")
-            return
-
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
-
-        details = []
-        checked_any = False
-        all_passed = True
-
-        for i, section in enumerate(self._flat_sections):
-            headers_to_check = []
-            default_header = self._resolve_effective_header(
-                section.header, i, 'default'
-            )
-            if default_header is not None:
-                if odd_even:
-                    headers_to_check.append(
-                        (default_header, f"节{i}奇数页页眉")
-                    )
-                    try:
-                        even_raw = section.even_page_header
-                    except Exception:
-                        even_raw = None
-                    even_header = self._resolve_effective_header(
-                        even_raw, i, 'even'
-                    )
-                    if even_header is not None:
-                        headers_to_check.append(
-                            (even_header, f"节{i}偶数页页眉")
-                        )
-                    else:
-                        headers_to_check.append(
-                            (default_header, f"节{i}偶数页页眉(复用默认)")
-                        )
-                else:
-                    headers_to_check.append(
-                        (default_header, f"节{i}页眉")
-                    )
-            try:
-                if getattr(section, 'different_first_page_header_footer', False):
-                    first_raw = section.first_page_header
-                    first_header = self._resolve_effective_header(
-                        first_raw, i, 'first'
-                    )
-                    if first_header is not None:
-                        headers_to_check.append(
-                            (first_header, f"节{i}首页页眉")
-                        )
-            except Exception:
-                pass
-
-            for header, label in headers_to_check:
-                ok, tested, reason = self._header_line_position_ok(header, label)
-                if tested:
-                    checked_any = True
-                    if not ok:
-                        all_passed = False
-                        details.append(reason)
-
-        # 若没有任何页眉有横线，说明整份文档不存在页眉横线，此评分点不成立
-        if not checked_any:
-            print("[+0] 页眉横线位置检查未通过：未在任何页眉发现横线")
-            return
-
-        if all_passed:
-            self.results['dimension2_scores'].append(5)
-            self.results['hit_points'].append(
-                "+5：所有页页眉位置上的横线位于页眉文本下方，与页眉文本间距在1-4字符之间"
-            )
-            print("[+5] 所有页页眉横线位置符合要求")
-        else:
-            print(f"[+0] 页眉横线位置检查未通过: {details}")
-
-    def _header_line_position_ok(self, header, label):
-        """检查单个页眉的横线位置
-
-        返回 (是否通过, 是否检测到横线, 失败原因)
-        """
-        if header is None:
-            return True, False, ""
-        tested = False
-        for paragraph in header.paragraphs:
-            pPr = paragraph._element.pPr
-            if pPr is None:
-                continue
-            pBdr = pPr.find(qn('w:pBdr'))
-            if pBdr is None:
-                continue
-
-            # 收集本段落存在的可见横向边框（top / bottom / between）
-            visible_top = self._is_visible_border(pBdr.find(qn('w:top')))
-            visible_between = self._is_visible_border(pBdr.find(qn('w:between')))
-            bottom_border = pBdr.find(qn('w:bottom'))
-            visible_bottom = self._is_visible_border(bottom_border)
-
-            if not (visible_top or visible_between or visible_bottom):
-                continue
-
-            tested = True
-
-            # 存在不在文本下方的横线
-            if visible_top:
-                return False, True, f"{label}存在文本上方的横线(w:top)"
-            if visible_between:
-                return False, True, f"{label}存在段落间的横线(w:between)"
-
-            # 到此存在下方横线
-            if bottom_border is None:
-                return False, True, f"{label}未找到 w:bottom 边框"
-            try:
-                space_pt = int(bottom_border.get(qn('w:space')) or '0')
-            except (ValueError, TypeError):
-                space_pt = 0
-            char_width_pt = 10.5
-            space_chars = space_pt / char_width_pt
-            if not (1 - 1e-6 <= space_chars <= 4 + 1e-6):
-                return False, True, (
-                    f"{label}横线间距{space_pt}磅(约{space_chars:.2f}字符)，"
-                    "不在1-4字符之间"
-                )
-            # 该段落通过；继续检查同页眉其他段落是否有违反项
-        return True, tested, ""
-
-    def _check_header_text(self):
-        """检查页眉文本是否为"澄湖理工大学硕士学位论文"且居中 (-1分)
-
-        细则：任意一页页眉文本内容不是"澄湖理工大学硕士学位论文"或不在居中位置
-
-        覆盖范围：
-          - 遍历所有节
-          - 每节检查在办公软件中实际会显示的所有页眉：
-              * 默认页眉（奇数页/无奇偶设置时非首页页面显示）
-              * 首页页眉（当节启用"首页不同"时首页显示）
-              * 偶数页页眉（当文档启用"奇偶页不同"时偶数页显示）
-          - 若页眉标记为"与上一节链接"（is_linked_to_previous），则回溯到最近
-            实际定义了该类型页眉的上级节，取其真实显示的内容
-          - 页眉可能含多个段落，取所有非空段落的可见文本拼接
-        判定规则：
-          - 该显示内容 strip 后必须严格等于"澄湖理工大学硕士学位论文"
-          - 所有承载文本的非空段落对齐方式必须解析为 CENTER（居中），
-            解析过程支持段落直接设置及沿样式继承链（含 base_style）追溯
-        """
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-        expected_text = "澄湖理工大学硕士学位论文"
-
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[PASS] 页眉文本符合要求")
-            return
-
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
-
-        has_issue = False
-        fail_reason = ""
-
-        for i, section in enumerate(self._flat_sections):
-            headers_to_check = [(section.header, 'default', f"节{i}默认页眉")]
-
-            # 首页页眉：仅当该节启用"首页不同"时，首页实际显示的是它
-            try:
-                if getattr(section, 'different_first_page_header_footer', False):
-                    headers_to_check.append(
-                        (section.first_page_header, 'first', f"节{i}首页页眉")
-                    )
-            except Exception:
-                pass
-
-            # 偶数页页眉：仅当文档启用"奇偶页不同"时，偶数页实际显示的是它
-            try:
-                if odd_even:
-                    headers_to_check.append(
-                        (section.even_page_header, 'even', f"节{i}偶数页页眉")
-                    )
-            except Exception:
-                pass
-
-            for header, kind, label in headers_to_check:
-                effective = self._resolve_effective_header(header, i, kind)
-                if effective is None:
-                    continue
-
-                non_empty_paragraphs = [
-                    p for p in effective.paragraphs if p.text.strip()
-                ]
-                visible_text = ''.join(
-                    p.text.strip() for p in non_empty_paragraphs
-                )
-
-                if visible_text != expected_text:
-                    has_issue = True
-                    fail_reason = (
-                        f"{label}文本为\"{visible_text}\"，"
-                        f"不等于\"{expected_text}\""
-                    )
-                    break
-
-                for p in non_empty_paragraphs:
-                    align = self._resolve_paragraph_alignment(p)
-                    if align != WD_ALIGN_PARAGRAPH.CENTER:
-                        has_issue = True
-                        fail_reason = f"{label}文本不在居中位置"
-                        break
-                if has_issue:
-                    break
-            if has_issue:
-                break
-
-        if has_issue:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append("-1：任意一页页眉文本内容不是\"澄湖理工大学硕士学位论文\"或不在居中位置")
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 页眉文本符合要求")
-
-    def _resolve_effective_header(self, header, section_idx, kind):
-        """沿"与上一节链接"关系回溯，返回办公软件实际显示的页眉对象
-
-        kind: 'default' | 'first' | 'even'
-        """
-        if header is None:
-            return None
-        try:
-            linked = header.is_linked_to_previous
-        except Exception:
-            linked = False
-        if not linked or section_idx <= 0:
-            return header
-        prev_section = self._flat_sections[section_idx - 1]
-        if kind == 'first':
-            prev_header = prev_section.first_page_header
-        elif kind == 'even':
-            prev_header = prev_section.even_page_header
-        else:
-            prev_header = prev_section.header
-        return self._resolve_effective_header(prev_header, section_idx - 1, kind)
-
-    def _resolve_paragraph_alignment(self, paragraph):
-        """解析段落最终生效的对齐方式：直接设置 -> 段落样式 -> 样式 base_style 链"""
-        align = paragraph.paragraph_format.alignment
-        if align is not None:
-            return align
-        try:
-            style = paragraph.style
-        except Exception:
-            return None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                pf = style.paragraph_format
-            except Exception:
-                pf = None
-            if pf is not None and pf.alignment is not None:
-                return pf.alignment
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        return None
-
-    def _check_footer_text(self):
-        """检查页脚文本和对齐方式 (-1分)
-
-        细则：目录页后所有页面不满足以下任意一项：
-          - 页脚文本没有出现"城市社区微气候韧性评价与公共空间更新研究"
-          - 奇数页页脚文本不是左对齐
-          - 偶数页页脚文本不是右对齐
-
-        覆盖范围：
-          - 定位到"目录"所在节，其后续节视为"目录页后"页面所在节
-          - 每节按办公软件实际显示逻辑取所有会出现的页脚：
-              * 默认页脚 —— 未启用"奇偶页不同"时用于所有页；启用时用于奇数页
-              * 偶数页页脚 —— 启用"奇偶页不同"且未链接上一节时用于偶数页
-              * 首页页脚 —— 节启用"首页不同"且未链接上一节时用于该节首页
-          - 沿"与上一节链接"关系回溯到实际显示的页脚对象
-          - 页脚可能含多个段落，取所有非空段落
-        判定规则：
-          - 每个显示中的页脚，所有非空段落的可见文本合并后必须包含
-            "城市社区微气候韧性评价与公共空间更新研究"
-          - 奇数页对应的每个非空段落对齐方式必须解析为 LEFT
-          - 偶数页对应的每个非空段落对齐方式必须解析为 RIGHT
-          - 首页页脚（无法判定其在奇/偶）：允许 LEFT 或 RIGHT，文本必须存在
-          - 若启用"奇偶页不同"但仅有默认页脚（无偶数页页脚定义），
-            则偶数页仍复用默认页脚，需分别通过奇/偶两套对齐判定 → 无法同时满足
-        """
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-        expected_text = "城市社区微气候韧性评价与公共空间更新研究"
-
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[PASS] 页脚文本符合要求")
-            return
-
-        outline_section_idx = self._get_paragraph_section_index(self.outline_para_idx)
-        if outline_section_idx < 0:
-            # 未找到目录，无法判定"目录页后"，按通过处理
-            print("[PASS] 页脚文本符合要求")
-            return
-
-        start_section = outline_section_idx + 1
-        if start_section >= len(self._flat_sections):
-            print("[PASS] 页脚文本符合要求")
-            return
-
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
-
-        has_issue = False
-        fail_reason = ""
-
-        for i in range(start_section, len(self._flat_sections)):
-            section = self._flat_sections[i]
-
-            # 组装本节实际会显示的页脚：(footer对象, 显示场景, 描述)
-            # 场景：'odd'=奇数页 / 'even'=偶数页 / 'all'=所有页 / 'first'=首页
-            footers_to_check = []
-
-            default_footer = self._resolve_effective_footer(section.footer, i, 'default')
-            if default_footer is not None:
-                if odd_even:
-                    # 启用奇偶不同：默认页脚仅用于奇数页
-                    footers_to_check.append((default_footer, 'odd', f"节{i}奇数页页脚"))
-                    # 偶数页页脚
-                    try:
-                        even_raw = section.even_page_footer
-                    except Exception:
-                        even_raw = None
-                    even_footer = self._resolve_effective_footer(even_raw, i, 'even')
-                    if even_footer is not None:
-                        footers_to_check.append((even_footer, 'even', f"节{i}偶数页页脚"))
-                    else:
-                        # 启用奇偶不同但未定义偶数页页脚 → 偶数页复用默认页脚
-                        footers_to_check.append((default_footer, 'even', f"节{i}偶数页页脚(复用默认)"))
-                else:
-                    footers_to_check.append((default_footer, 'all', f"节{i}默认页脚"))
-
-            # 首页页脚
-            try:
-                if getattr(section, 'different_first_page_header_footer', False):
-                    first_raw = section.first_page_footer
-                    first_footer = self._resolve_effective_footer(first_raw, i, 'first')
-                    if first_footer is not None:
-                        footers_to_check.append((first_footer, 'first', f"节{i}首页页脚"))
-            except Exception:
-                pass
-
-            for footer, scene, label in footers_to_check:
-                non_empty_paragraphs = [
-                    p for p in footer.paragraphs if p.text.strip()
-                ]
-                visible_text = ''.join(p.text for p in non_empty_paragraphs)
-
-                # 1) 文本必须出现
-                if expected_text not in visible_text:
-                    has_issue = True
-                    fail_reason = f"{label}未出现\"{expected_text}\""
-                    break
-
-                # 2) 对齐方式判定
-                if scene == 'odd':
-                    required = {WD_ALIGN_PARAGRAPH.LEFT}
-                    require_desc = "左对齐"
-                elif scene == 'even':
-                    required = {WD_ALIGN_PARAGRAPH.RIGHT}
-                    require_desc = "右对齐"
-                elif scene == 'all':
-                    # 未启用奇偶页不同：同一页脚要同时满足奇数页左对齐+偶数页右对齐 → 不可能
-                    has_issue = True
-                    fail_reason = (
-                        f"{label}未启用\"奇偶页不同\"，"
-                        f"无法同时满足奇数页左对齐、偶数页右对齐"
-                    )
-                    break
-                else:  # 'first' —— 首页可能奇可能偶，允许左或右
-                    required = {WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.RIGHT}
-                    require_desc = "左对齐或右对齐"
-
-                for p in non_empty_paragraphs:
-                    align = self._resolve_paragraph_alignment(p)
-                    if align not in required:
-                        has_issue = True
-                        fail_reason = f"{label}文本不是{require_desc}"
-                        break
-                if has_issue:
-                    break
-            if has_issue:
-                break
-
-        if has_issue:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：目录页后所有页面不满足以下任意一项：页脚文本没有出现"
-                "\"城市社区微气候韧性评价与公共空间更新研究\"；"
-                "奇数页页脚文本不是左对齐；偶数页页脚文本不是右对齐"
-            )
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 页脚文本符合要求")
-
-    def _resolve_effective_footer(self, footer, section_idx, kind):
-        """沿"与上一节链接"关系回溯，返回办公软件实际显示的页脚对象
-
-        kind: 'default' | 'first' | 'even'
-        """
-        if footer is None:
-            return None
-        try:
-            linked = footer.is_linked_to_previous
-        except Exception:
-            linked = False
-        if not linked or section_idx <= 0:
-            return footer
-        prev_section = self._flat_sections[section_idx - 1]
-        if kind == 'first':
-            prev_footer = prev_section.first_page_footer
-        elif kind == 'even':
-            prev_footer = prev_section.even_page_footer
-        else:
-            prev_footer = prev_section.footer
-        return self._resolve_effective_footer(prev_footer, section_idx - 1, kind)
-
-    def _check_page_number(self):
-        """检查页脚居中位置是否有页码 (-1分)
-
-        细则：任意一页页脚居中位置没有出现页码
-
-        覆盖范围：
-          - 遍历所有节
-          - 每节按办公软件实际显示逻辑取所有会出现的页脚：
-              * 默认页脚（未启用"奇偶页不同"时用于所有页；启用时用于奇数页）
-              * 偶数页页脚（启用"奇偶页不同"且已定义时用于偶数页；
-                启用但未定义则偶数页复用默认页脚）
-              * 首页页脚（节启用"首页不同"时用于该节首页）
-          - 沿"与上一节链接"关系回溯到办公软件实际显示的页脚对象
-          - 页脚中可能同时存在普通段落 和/或 表格（Word 内置三列页脚采用表格）
-        判定"居中位置出现页码"（满足其一即视为该页脚通过）：
-          (A) 存在页码，且其所在段落对齐方式解析为 CENTER
-          (B) 存在页码，且所在段落使用制表符将其定位到该段落的居中制表位
-              （制表位来自段落直接设置或样式继承链；Word 内置"Footer/页脚"
-                样式默认包含页面中心的居中制表位，视为具有居中制表位）
-          (C) 存在页码，且其位于页脚表格中间那一列的单元格内
-              （递归包含嵌套表格）
-        "页码"识别（覆盖办公软件产生页码的全部途径）：
-          - <w:fldSimple w:instr="... PAGE ..."/> （简单域）
-          - 三段式域：<w:fldChar begin/> + <w:instrText>...PAGE...</w:instrText>
-            + <w:fldChar end/>
-          - 纯数字文本（如"5"、" 5 "）
-          - "第 X 页"、"Page X"、"- X -" 等常见页码文本模板
-        """
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[PASS] 页脚有页码")
-            return
-
-        try:
-            odd_even = self.doc.settings.odd_and_even_pages_header_footer
-        except Exception:
-            odd_even = False
-
-        missing_label = None
-
-        for i, section in enumerate(self._flat_sections):
-            footers_to_check = []
-
-            default_footer = self._resolve_effective_footer(
-                section.footer, i, 'default'
-            )
-            if default_footer is not None:
-                if odd_even:
-                    footers_to_check.append((default_footer, f"节{i}奇数页页脚"))
-                    try:
-                        even_raw = section.even_page_footer
-                    except Exception:
-                        even_raw = None
-                    even_footer = self._resolve_effective_footer(
-                        even_raw, i, 'even'
-                    )
-                    if even_footer is not None:
-                        footers_to_check.append(
-                            (even_footer, f"节{i}偶数页页脚")
-                        )
-                    else:
-                        footers_to_check.append(
-                            (default_footer, f"节{i}偶数页页脚(复用默认)")
-                        )
-                else:
-                    footers_to_check.append((default_footer, f"节{i}页脚"))
-
-            try:
-                if getattr(section, 'different_first_page_header_footer', False):
-                    first_raw = section.first_page_footer
-                    first_footer = self._resolve_effective_footer(
-                        first_raw, i, 'first'
-                    )
-                    if first_footer is not None:
-                        footers_to_check.append(
-                            (first_footer, f"节{i}首页页脚")
-                        )
-            except Exception:
-                pass
-
-            for footer, label in footers_to_check:
-                if not self._footer_has_center_page_number(footer):
-                    missing_label = label
-                    # 诊断输出：打印该页脚的实际内容，便于定位问题
-                    print(f"    [调试] {label}未通过居中页码检查，内容如下：")
-                    para_count = 0
-                    for pi, p in enumerate(footer.paragraphs):
-                        align = self._resolve_paragraph_alignment(p)
-                        has_pn = self._paragraph_has_page_number(p)
-                        print(
-                            f"      段落{pi}: text={p.text!r} "
-                            f"align={align} 含页码={has_pn}"
-                        )
-                        para_count += 1
-                    if para_count == 0:
-                        print("      (无段落)")
-                    for ti, table in enumerate(footer.tables):
-                        col_count = len(table.columns)
-                        print(f"      表格{ti}: 列数={col_count}")
-                        for ri, row in enumerate(table.rows):
-                            for ci, cell in enumerate(row.cells):
-                                cell_text = '\n'.join(
-                                    p.text for p in cell.paragraphs
-                                )
-                                has_pn = any(
-                                    self._paragraph_has_page_number(p)
-                                    for p in cell.paragraphs
-                                )
-                                print(
-                                    f"        行{ri}列{ci}: text={cell_text!r} "
-                                    f"含页码={has_pn}"
-                                )
-                    break
-            if missing_label:
-                break
-
-        if missing_label:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append("-1：任意一页页脚居中位置没有出现页码")
-            print(f"[-1] {missing_label}居中位置未出现页码")
-        else:
-            print("[PASS] 页脚有页码")
-
-    def _footer_has_center_page_number(self, footer):
-        """页脚中是否存在处于'居中位置'的页码"""
-        if footer is None:
-            return False
-        # 直接段落
-        for p in footer.paragraphs:
-            if self._paragraph_page_number_at_center(p):
-                return True
-        # 表格：递归检查所有表格
-        for table in footer.tables:
-            if self._table_has_center_page_number(table):
-                return True
-        return False
-
-    def _table_has_center_page_number(self, table):
-        """表格中间列的单元格是否包含页码（递归含嵌套表格）"""
-        col_count = len(table.columns)
-        if col_count == 0:
-            return False
-        middle_idx = col_count // 2  # 3列→1；2列→1（右列，不视为居中，故要求>=2列时中列存在）
-        # 只有奇数列时"中间列"才有真正的居中含义
-        if col_count % 2 == 0:
-            candidate_idxs = []
-        else:
-            candidate_idxs = [middle_idx]
-        # 无论多少列，仍需递归嵌套表格，但对本层"中列"要求列数为奇数
-        for row in table.rows:
-            for c_idx, cell in enumerate(row.cells):
-                if c_idx in candidate_idxs:
-                    for p in cell.paragraphs:
-                        if self._paragraph_has_page_number(p):
-                            return True
-                # 嵌套表格递归
-                for nested in cell.tables:
-                    if self._table_has_center_page_number(nested):
-                        return True
-        return False
-
-    def _paragraph_page_number_at_center(self, paragraph):
-        """段落中的页码是否处于'居中位置'"""
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        if not self._paragraph_has_page_number(paragraph):
-            return False
-        # 情形A：段落整体居中对齐
-        align = self._resolve_paragraph_alignment(paragraph)
-        if align == WD_ALIGN_PARAGRAPH.CENTER:
-            return True
-        # 情形B：页码位于段落的居中制表位处
-        if self._page_number_at_center_tab(paragraph):
-            return True
-        # 情形C：页码位于水平居中的浮动文本框内（wps:txbx / v:textbox）
-        if self._page_number_in_centered_textbox(paragraph):
-            return True
-        return False
-
-    def _page_number_in_centered_textbox(self, paragraph):
-        """页码位于水平居中的浮动文本框内
-
-        Word/WPS 允许把页码放进浮动文本框，通过 <wp:anchor> 的
-        <wp:positionH> 把文本框锁定到页面/页边距的水平居中。这种情形
-        视觉上就是"页脚居中位置出现了页码"，需按居中通过。
-        """
-        element = paragraph._element
-        # 遍历段落内所有 <w:drawing> 或 <w:pict>（VML 回退）
-        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
-        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-        # 1) DrawingML: w:drawing/wp:anchor 或 wp:inline
-        for drawing in element.iter(qn('w:drawing')):
-            # 找到 wp:anchor / wp:inline
-            for anchor in drawing.iter():
-                tag = anchor.tag
-                if not (tag == f'{{{WP_NS}}}anchor' or tag == f'{{{WP_NS}}}inline'):
-                    continue
-                # 内容里必须含 PAGE 域
-                contains_page = False
-                for instr in anchor.iter(f'{{{W_NS}}}instrText'):
-                    if instr.text and self._instr_is_page(instr.text):
-                        contains_page = True
-                        break
-                if not contains_page:
-                    for fld in anchor.iter(f'{{{W_NS}}}fldSimple'):
-                        if self._instr_is_page(
-                            fld.get(f'{{{W_NS}}}instr', '')
-                        ):
-                            contains_page = True
-                            break
-                if not contains_page:
-                    continue
-                # 检查水平位置是否居中
-                if self._anchor_horizontally_centered(anchor):
-                    return True
-        # 2) VML: w:pict/v:shape，style 里 mso-position-horizontal:center
-        for pict in element.iter(qn('w:pict')):
-            contains_page = False
-            for instr in pict.iter(f'{{{W_NS}}}instrText'):
-                if instr.text and self._instr_is_page(instr.text):
-                    contains_page = True
-                    break
-            if not contains_page:
-                continue
-            for shape in pict.iter():
-                style = shape.get('style') if hasattr(shape, 'get') else None
-                if style and 'mso-position-horizontal:center' in style.replace(' ', ''):
-                    return True
-        return False
-
-    def _anchor_horizontally_centered(self, anchor):
-        """判断 DrawingML 锚点是否水平居中放置"""
-        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
-        positionH = anchor.find(f'{{{WP_NS}}}positionH')
-        if positionH is None:
-            return False
-        align_el = positionH.find(f'{{{WP_NS}}}align')
-        if align_el is not None and (align_el.text or '').strip().lower() == 'center':
-            return True
-        return False
-
-    def _paragraph_has_page_number(self, paragraph):
-        """段落是否包含页码（覆盖办公软件产生页码的各种途径）"""
-        element = paragraph._element
-        # <w:fldSimple w:instr="... PAGE ...">
-        for fld in element.iter(qn('w:fldSimple')):
-            if self._instr_is_page(fld.get(qn('w:instr'), '')):
-                return True
-        # 三段式域 <w:instrText>...PAGE...</w:instrText>
-        for instr in element.iter(qn('w:instrText')):
-            if instr.text and self._instr_is_page(instr.text):
-                return True
-        # 纯数字文本或常见页码文本模板
-        text = paragraph.text.strip()
-        if not text:
-            return False
-        if re.fullmatch(r'\d+', text):
-            return True
-        # "第 X 页"、"第X页"
-        if re.search(r'第\s*\d+\s*页', text):
-            return True
-        # "Page X"、"Page X of Y"
-        if re.search(r'page\s*\d+', text, re.IGNORECASE):
-            return True
-        # "- X -"、"— X —"
-        if re.fullmatch(r'[\-—–\s]*\d+[\-—–\s]*', text):
-            return True
-        return False
-
-    def _instr_is_page(self, instr):
-        """域代码是否为 PAGE 类页码域"""
-        if not instr:
-            return False
-        tokens = re.findall(r'[A-Za-z]+', instr)
-        # PAGE / NUMPAGES / SECTIONPAGES 均视为页码域
-        return any(t.upper() in ('PAGE', 'NUMPAGES', 'SECTIONPAGES') for t in tokens)
-
-    def _page_number_at_center_tab(self, paragraph):
-        """页码是否位于段落的居中制表位处"""
-        element = paragraph._element
-        tabs_before = 0
-        page_seen = False
-
-        # 按文档顺序遍历，统计页码前的 tab 字符个数
-        for descendant in element.iter():
-            tag = descendant.tag
-            if tag == qn('w:tab'):
-                parent = descendant.getparent()
-                # 排除 pPr/tabs 下 tab 定义节点，仅计入 run 中的 tab 字符
-                if parent is not None and parent.tag == qn('w:r'):
-                    if not page_seen:
-                        tabs_before += 1
-            elif tag == qn('w:fldSimple'):
-                if self._instr_is_page(descendant.get(qn('w:instr'), '')):
-                    page_seen = True
-            elif tag == qn('w:instrText'):
-                if descendant.text and self._instr_is_page(descendant.text):
-                    page_seen = True
-
-        if not page_seen or tabs_before == 0:
-            return False
-        return self._paragraph_has_center_tab_stop(paragraph)
-
-    def _paragraph_has_center_tab_stop(self, paragraph):
-        """段落是否具有居中制表位（含样式继承，或使用内置页脚样式的默认居中制表位）"""
-        from docx.enum.text import WD_TAB_ALIGNMENT
-        # 直接段落设置
-        try:
-            for tab in paragraph.paragraph_format.tab_stops:
-                if tab.alignment == WD_TAB_ALIGNMENT.CENTER:
-                    return True
-        except Exception:
-            pass
-        # 样式继承链
-        try:
-            style = paragraph.style
-        except Exception:
-            style = None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                pf = style.paragraph_format
-                for tab in pf.tab_stops:
-                    if tab.alignment == WD_TAB_ALIGNMENT.CENTER:
-                        return True
-            except Exception:
-                pass
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        # 内置"页脚/Footer"样式默认在页面中心提供居中制表位
-        try:
-            s = paragraph.style
-            style_id = getattr(s, 'style_id', '') or ''
-            style_name = getattr(s, 'name', '') or ''
-        except Exception:
-            style_id, style_name = '', ''
-        if style_id.lower() == 'footer' or 'footer' in style_name.lower() or '页脚' in style_name:
-            return True
-        return False
-
-    def _check_page_number_format(self):
-        """检查页码格式（罗马数字/阿拉伯数字） (-1分)
-
-        细则：目录页及目录页之前的页面页码不是罗马数字，目录页之后的页面
-              页码不是阿拉伯数字
-
-        覆盖范围：
-          - 通过 _get_paragraph_section_index 定位"目录"标题所在节 outline_sec
-          - 分为两段并分别校验办公软件中实际显示的页码格式：
-              A) 索引 <= outline_sec 的所有节 —— 必须为罗马数字
-              B) 索引 >  outline_sec 的所有节 —— 必须为阿拉伯数字
-          - 每个节的页码格式来源于 sectPr/w:pgNumType/@w:fmt
-              * 缺失 pgNumType 或 fmt 属性时，办公软件默认按十进制（阿拉伯数字）
-                显示，视为 "decimal"
-        格式识别（按办公软件"看到"的显示归类）：
-          - 罗马数字：fmt ∈ {upperRoman, lowerRoman}
-          - 阿拉伯数字：fmt ∈ {decimal, decimalEnclosedCircle, decimalZero,
-                              decimalFullWidth, decimalHalfWidth,
-                              decimalFullWidth2, decimalEnclosedFullstop,
-                              decimalEnclosedParen, decimalEnclosedCircleChinese}
-            —— 上述 fmt 在办公软件里最终呈现的都是"0-9"阿拉伯数字字形
-        """
-        if self.doc is None or len(self._flat_sections) == 0:
-            print("[PASS] 页码格式符合要求")
-            return
-
-        outline_sec = self._get_paragraph_section_index(self.outline_para_idx)
-        if outline_sec < 0:
-            # 未找到目录，无法判定，按通过处理
-            print("[PASS] 页码格式符合要求")
-            return
-
-        roman_fmts = {'upperRoman', 'lowerRoman'}
-        arabic_fmts = {
-            'decimal', 'decimalEnclosedCircle', 'decimalZero',
-            'decimalFullWidth', 'decimalHalfWidth', 'decimalFullWidth2',
-            'decimalEnclosedFullstop', 'decimalEnclosedParen',
-            'decimalEnclosedCircleChinese',
-        }
-
-        has_issue = False
-        fail_reason = ""
-
-        for i, section in enumerate(self._flat_sections):
-            fmt = self._get_section_page_number_format(section)
-            if i <= outline_sec:
-                # 目录页及目录页之前 → 必须罗马数字
-                if fmt not in roman_fmts:
-                    has_issue = True
-                    fail_reason = (
-                        f"节{i}（目录页及之前）页码格式为\"{fmt}\"，不是罗马数字"
-                    )
-                    break
-            else:
-                # 目录页之后 → 必须阿拉伯数字
-                if fmt not in arabic_fmts:
-                    has_issue = True
-                    fail_reason = (
-                        f"节{i}（目录页之后）页码格式为\"{fmt}\"，不是阿拉伯数字"
-                    )
-                    break
-
-        if has_issue:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：目录页及目录页之前的页面页码不是罗马数字，"
-                "目录页之后的页面页码不是阿拉伯数字"
-            )
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 页码格式符合要求")
-
-    def _get_section_page_number_format(self, section):
-        """读取节的页码格式（w:sectPr/w:pgNumType/@w:fmt）
-
-        - 未设置 pgNumType 或未设置 fmt 时，办公软件按"decimal"显示
-        """
-        sectPr = section._sectPr
-        if sectPr is None:
-            return 'decimal'
-        pgNumType = sectPr.find(qn('w:pgNumType'))
-        if pgNumType is None:
-            return 'decimal'
-        fmt = pgNumType.get(qn('w:fmt'))
-        return fmt if fmt else 'decimal'
-
-    def _check_heading1_format(self):
-        """检查目录页后所有一级标题是否为黑体、三号、加粗 (-1分)
-
-        细则：目录页后所有一级标题不是黑体、三号、加粗
-
-        - 起始位置：目录标题段之后（未找到目录则从文档首段开始）
-        - 一级标题识别（三选一）：段落样式为 Heading 1/标题 1；
-          大纲级别 outlineLvl=0（含样式继承）；或文本形态属于中文论文
-          常见一级标题："第X章…"、"参考文献"、"致谢"、"结论"、
-          "结束语"、"附录…"。排除含制表符 / "……" / "…" 或末尾
-          "空白+数字"的目录条目。
-        - 每个一级标题的所有非空 run，按办公软件实际显示解析：
-          (1) 中文字体 w:rFonts/@w:eastAsia：字体名包含"黑体"或"SimHei"
-          (2) 字号 w:sz：等于 16 磅（三号），容差 0.5 磅
-          (3) 加粗 w:b：解析为 True
-          解析顺序：run 直接设置 → 段落样式链（含 base_style）
-        """
-        if self.doc is None:
-            print("[PASS] 一级标题格式符合要求")
-            return
-        start = self.outline_para_idx + 1 if self.outline_para_idx >= 0 else 0
-        fail_reason = None
-        for p in self._flat_paragraphs[start:]:
-            if not self._is_first_level_heading(p):
-                continue
-            for run in p.runs:
-                if not run.text or not run.text.strip():
-                    continue
-                font = self._resolve_run_east_asia_font(run, p)
-                size_pt = self._resolve_run_font_size_pt(run, p)
-                is_bold = self._resolve_run_bold(run, p)
-                if not font or ('黑体' not in font and 'SimHei' not in font):
-                    fail_reason = (
-                        f"一级标题「{p.text.strip()[:20]}」"
-                        f"中文字体「{font}」不是黑体"
-                    )
-                    break
-                if size_pt is None or abs(size_pt - 16) > 0.5:
-                    fail_reason = (
-                        f"一级标题「{p.text.strip()[:20]}」"
-                        f"字号{size_pt}磅不是三号(16磅)"
-                    )
-                    break
-                if is_bold is not True:
-                    fail_reason = f"一级标题「{p.text.strip()[:20]}」未加粗"
-                    break
-            if fail_reason:
-                break
-        if fail_reason:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：目录页后所有一级标题不是黑体、三号、加粗"
-            )
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 一级标题格式符合要求")
-
-    def _is_first_level_heading(self, paragraph):
-        """判断段落是否为一级标题（仅看标题文本本身）
-
-        按办公软件中"眼见"的一级标题文本形态判定，与样式/大纲级别无关：
-          (1) 中文数字序号章节："一、xxx"、"二、xxx" ...
-          (2) "第X章 xxx"（X 为中文数字或阿拉伯数字）
-          (3) 论文常见独立一级标题：结论 / 结束语 / 结  语 / 参考文献 /
-              致谢 / 致  谢 / 附录 / 附  录（允许中间含空白）
-
-        排除目录条目：含制表符、"…"/"……"、末尾"空白+数字"
-        """
-        text = paragraph.text.strip()
-        if not text:
-            return False
-        if '\t' in paragraph.text or '……' in text or '…' in text:
-            return False
-        if re.search(r'\s+\d+\s*$', text):
-            return False
-
-        normalized = re.sub(r'\s+', '', text)
-
-        # (1) 中文数字序号章节
-        if re.match(r'^[一二三四五六七八九十百千]+[、\.．]', normalized):
-            return True
-        # (2) 第X章
-        if re.match(r'^第[一二三四五六七八九十百千0-9]+章', normalized):
-            return True
-        # (3) 独立标题（裸的整段标题名，不含额外序号或子标题内容）
-        if normalized in ('结论', '结束语', '结语',
-                          '参考文献', '致谢', '附录'):
-            return True
-        return False
-
-    def _resolve_paragraph_outline_level(self, paragraph):
-        """解析段落大纲级别：直接设置 → 段落样式链"""
-        pPr = paragraph._element.pPr
-        if pPr is not None:
-            ol = pPr.find(qn('w:outlineLvl'))
-            if ol is not None:
-                val = ol.get(qn('w:val'))
-                try:
-                    return int(val) if val is not None else None
-                except (ValueError, TypeError):
-                    return None
-        try:
-            style = paragraph.style
-        except Exception:
-            style = None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                sp = style.element.find(qn('w:pPr'))
-            except Exception:
-                sp = None
-            if sp is not None:
-                ol = sp.find(qn('w:outlineLvl'))
-                if ol is not None:
-                    val = ol.get(qn('w:val'))
-                    try:
-                        return int(val) if val is not None else None
-                    except (ValueError, TypeError):
-                        return None
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        return None
-
-    def _resolve_run_east_asia_font(self, run, paragraph):
-        """解析 run 最终生效的中文字体名（run → 段落样式链）"""
-        rPr = run._element.rPr
-        if rPr is not None:
-            rFonts = rPr.find(qn('w:rFonts'))
-            if rFonts is not None:
-                ea = rFonts.get(qn('w:eastAsia'))
-                if ea:
-                    return ea
-                ascii_font = rFonts.get(qn('w:ascii'))
-                if ascii_font:
-                    return ascii_font
-        try:
-            style = paragraph.style
-        except Exception:
-            style = None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                sr = style.element.find(qn('w:rPr'))
-            except Exception:
-                sr = None
-            if sr is not None:
-                rFonts = sr.find(qn('w:rFonts'))
-                if rFonts is not None:
-                    ea = rFonts.get(qn('w:eastAsia'))
-                    if ea:
-                        return ea
-                    ascii_font = rFonts.get(qn('w:ascii'))
-                    if ascii_font:
-                        return ascii_font
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        return None
-
-    def _resolve_run_font_size_pt(self, run, paragraph):
-        """解析 run 最终生效的字号（磅）：run → 段落样式链"""
-        try:
-            if run.font.size is not None:
-                return run.font.size.pt
-        except Exception:
-            pass
-        try:
-            style = paragraph.style
-        except Exception:
-            style = None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                sz = style.font.size
-            except Exception:
-                sz = None
-            if sz is not None:
-                return sz.pt
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        return None
-
-    def _resolve_run_bold(self, run, paragraph):
-        """解析 run 最终生效的加粗属性：run → 段落样式链"""
-        try:
-            if run.font.bold is not None:
-                return run.font.bold
-        except Exception:
-            pass
-        try:
-            style = paragraph.style
-        except Exception:
-            style = None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                b = style.font.bold
-            except Exception:
-                b = None
-            if b is not None:
-                return b
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        return None
-
-    def _check_heading2_format(self):
-        """检查目录页后所有二级标题是否为黑体、四号、加粗 (-1分)
-
-        细则：目录页后所有二级标题不是黑体、四号、加粗
-
-        - 起始位置：目录标题段之后（未找到目录则从文档首段开始）
-        - 二级标题识别（办公软件"导航窗格"视角）：
-          (1) 段落直接引用样式为 Heading 2 / 标题 2 / heading2；或
-          (2) 段落大纲级别 outlineLvl = 1（含样式继承）
-          排除目录条目：含制表符、"…"/"……"、末尾"空白+数字"
-        - 每个二级标题的所有非空 run 按办公软件实际显示解析：
-          (1) 中文字体 w:rFonts/@w:eastAsia：字体名包含"黑体"或"SimHei"
-          (2) 字号 w:sz：等于 14 磅（四号），容差 0.5 磅
-          (3) 加粗 w:b：解析为 True
-          解析顺序：run 直接设置 → 段落样式链（含 base_style）
-        """
-        if self.doc is None:
-            print("[PASS] 二级标题格式符合要求")
-            return
-        start = self.outline_para_idx + 1 if self.outline_para_idx >= 0 else 0
-        fail_reason = None
-        for p in self._flat_paragraphs[start:]:
-            if not self._is_second_level_heading(p):
-                continue
-            for run in p.runs:
-                if not run.text or not run.text.strip():
-                    continue
-                font = self._resolve_run_east_asia_font(run, p)
-                size_pt = self._resolve_run_font_size_pt(run, p)
-                is_bold = self._resolve_run_bold(run, p)
-                if not font or ('黑体' not in font and 'SimHei' not in font):
-                    fail_reason = (
-                        f"二级标题「{p.text.strip()[:20]}」"
-                        f"中文字体「{font}」不是黑体"
-                    )
-                    break
-                if size_pt is None or abs(size_pt - 14) > 0.5:
-                    fail_reason = (
-                        f"二级标题「{p.text.strip()[:20]}」"
-                        f"字号{size_pt}磅不是四号(14磅)"
-                    )
-                    break
-                if is_bold is not True:
-                    fail_reason = f"二级标题「{p.text.strip()[:20]}」未加粗"
-                    break
-            if fail_reason:
-                break
-        if fail_reason:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：目录页后所有二级标题不是黑体、四号、加粗"
-            )
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 二级标题格式符合要求")
-
-    def _is_second_level_heading(self, paragraph):
-        """判断段落是否为二级标题（仅看标题文本本身）
-
-        按办公软件中"眼见"的二级标题文本形态判定，与样式/大纲级别无关：
-          - "X.Y xxx"（X、Y 为阿拉伯数字，之间恰好一个点，且不再有第三段数字）
-
-        排除目录条目：含制表符、"…"/"……"、末尾"空白+数字"
-        """
-        text = paragraph.text.strip()
-        if not text:
-            return False
-        if '\t' in paragraph.text or '……' in text or '…' in text:
-            return False
-        if re.search(r'\s+\d+\s*$', text):
-            return False
-
-        # X.Y 开头，且不是 X.Y.Z（避免把三级标题误判为二级）
-        if re.match(r'^\d+\.\d+(?!\.\d)', text):
-            return True
-        return False
-
-    def _check_heading3_format(self):
-        """检查目录页后所有三级标题是否为黑体、小四号、加粗 (-1分)
-
-        细则：目录页后所有三级标题不是黑体、小四号、加粗
-
-        - 起始位置：目录标题段之后（未找到目录则从文档首段开始）
-        - 三级标题识别（办公软件"导航窗格"视角）：
-          (1) 段落直接引用样式为 Heading 3 / 标题 3 / heading3；或
-          (2) 段落大纲级别 outlineLvl = 2（含样式继承）
-          排除目录条目：含制表符、"…"/"……"、末尾"空白+数字"
-        - 每个三级标题的所有非空 run 按办公软件实际显示解析：
-          (1) 中文字体 w:rFonts/@w:eastAsia：字体名包含"黑体"或"SimHei"
-          (2) 字号 w:sz：等于 12 磅（小四号），容差 0.5 磅
-          (3) 加粗 w:b：解析为 True
-          解析顺序：run 直接设置 → 段落样式链（含 base_style）
-        """
-        if self.doc is None:
-            print("[PASS] 三级标题格式符合要求")
-            return
-        start = self.outline_para_idx + 1 if self.outline_para_idx >= 0 else 0
-        fail_reason = None
-        for p in self._flat_paragraphs[start:]:
-            if not self._is_third_level_heading(p):
-                continue
-            for run in p.runs:
-                if not run.text or not run.text.strip():
-                    continue
-                font = self._resolve_run_east_asia_font(run, p)
-                size_pt = self._resolve_run_font_size_pt(run, p)
-                is_bold = self._resolve_run_bold(run, p)
-                if not font or ('黑体' not in font and 'SimHei' not in font):
-                    fail_reason = (
-                        f"三级标题「{p.text.strip()[:20]}」"
-                        f"中文字体「{font}」不是黑体"
-                    )
-                    break
-                if size_pt is None or abs(size_pt - 12) > 0.5:
-                    fail_reason = (
-                        f"三级标题「{p.text.strip()[:20]}」"
-                        f"字号{size_pt}磅不是小四号(12磅)"
-                    )
-                    break
-                if is_bold is not True:
-                    fail_reason = f"三级标题「{p.text.strip()[:20]}」未加粗"
-                    break
-            if fail_reason:
-                break
-        if fail_reason:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：目录页后所有三级标题不是黑体、小四号、加粗"
-            )
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 三级标题格式符合要求")
-
-    def _is_third_level_heading(self, paragraph):
-        """判断段落是否为三级标题（仅看标题文本本身）
-
-        按办公软件中"眼见"的三级标题文本形态判定，与样式/大纲级别无关：
-          - "X.Y.Z xxx"（X、Y、Z 均为阿拉伯数字，且不再有第四段数字）
-
-        排除目录条目：含制表符、"…"/"……"、末尾"空白+数字"
-        """
-        text = paragraph.text.strip()
-        if not text:
-            return False
-        if '\t' in paragraph.text or '……' in text or '…' in text:
-            return False
-        if re.search(r'\s+\d+\s*$', text):
-            return False
-
-        if re.match(r'^\d+\.\d+\.\d+(?!\.\d)', text):
-            return True
-        return False
-
-    def _check_paragraph_format(self):
-        """检查"1.1.1 研究背景"与"1.1.2 研究意义"之间的文本 (-1分)
-
-        细则："1.1.1 研究背景"与"1.1.2 研究意义"中间的文本不满足以下
-              任意一项：宋体、小四、1.5倍行距、两端对齐
-
-        - 定位区间：找到含"1.1.1"且含"研究背景"的段落作为起始，
-          含"1.1.2"且含"研究意义"的段落作为结束，取二者之间（不含边界）
-          的所有非空段落进行判定
-        - 若未能定位到两个边界标题，或区间内没有可检查的段落，说明
-          无法验证该 rubric 项（可能是标题缺失、措辞变化导致定位失败，
-          或中间确实没有正文），此时不能默认按"通过"处理——按扣分
-          处理，避免标题缺失/定位失败被误判为格式合规
-        - 每个段落的所有非空 run 按办公软件实际显示解析：
-          (1) 中文字体 w:rFonts/@w:eastAsia：字体名包含"宋体"或"SimSun"
-          (2) 字号 w:sz：等于 12 磅（小四号），容差 0.5 磅
-          解析顺序均为：run 直接设置 → 段落样式链（含 base_style）
-        - 每个段落自身按办公软件实际显示解析：
-          (3) 1.5 倍行距：pPr/w:spacing/w:line = 360 且 w:lineRule
-              ∈ {缺省, 'auto'}（办公软件中此配置显示为"1.5 倍行距"）；
-              解析顺序：段落直接设置 → 段落样式链
-          (4) 两端对齐：解析后的对齐方式为 WD_ALIGN_PARAGRAPH.JUSTIFY
-              解析顺序：段落直接设置 → 段落样式链
-        - 区间内任一段落任一项不满足即判定该项扣分
-        """
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-        if self.doc is None:
-            print("[PASS] 段落格式符合要求")
-            return
-
-        start_idx = -1
-        end_idx = -1
-        for i, p in enumerate(self._flat_paragraphs):
-            text = p.text.strip()
-            if start_idx == -1 and '1.1.1' in text and '研究背景' in text:
-                start_idx = i
-            elif start_idx != -1 and '1.1.2' in text and '研究意义' in text:
-                end_idx = i
-                break
-
-        if start_idx == -1 or end_idx == -1:
-            # 未能定位到两个边界标题之一，无法验证该 rubric 项——
-            # 不能默认按"通过"处理，按扣分处理（标题缺失/措辞变化导致
-            # 定位失败本身即是不合规的信号）
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：\"1.1.1 研究背景\"与\"1.1.2 研究意义\"中间的文本"
-                "不满足以下任意一项：宋体、小四、1.5倍行距、两端对齐"
-            )
-            print("[-1] 未定位到\"1.1.1 研究背景\"或\"1.1.2 研究意义\"边界标题，无法验证")
-            return
-
-        checkable = [
-            i for i in range(start_idx + 1, end_idx)
-            if self._flat_paragraphs[i].text.strip()
-        ]
-        if not checkable:
-            # 区间为空（无可检查段落）同样无法验证该 rubric 项，
-            # 不能默认按"通过"处理
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：\"1.1.1 研究背景\"与\"1.1.2 研究意义\"中间的文本"
-                "不满足以下任意一项：宋体、小四、1.5倍行距、两端对齐"
-            )
-            print("[-1] \"1.1.1 研究背景\"与\"1.1.2 研究意义\"之间没有可检查的正文段落，无法验证")
-            return
-
-        fail_reason = None
-        for i in checkable:
-            p = self._flat_paragraphs[i]
-
-            # (1)(2) 每个非空 run 的字体和字号
-            for run in p.runs:
-                if not run.text or not run.text.strip():
-                    continue
-                font = self._resolve_run_east_asia_font(run, p)
-                size_pt = self._resolve_run_font_size_pt(run, p)
-                if not font or ('宋体' not in font and 'SimSun' not in font):
-                    fail_reason = (
-                        f"段落「{p.text.strip()[:20]}」"
-                        f"中文字体「{font}」不是宋体"
-                    )
-                    break
-                if size_pt is None or abs(size_pt - 12) > 0.5:
-                    fail_reason = (
-                        f"段落「{p.text.strip()[:20]}」"
-                        f"字号{size_pt}磅不是小四(12磅)"
-                    )
-                    break
-            if fail_reason:
-                break
-
-            # (3) 1.5 倍行距
-            line_twips, line_rule = self._resolve_paragraph_line_spacing(p)
-            if not (line_twips == 360 and line_rule in (None, 'auto')):
-                fail_reason = (
-                    f"段落「{p.text.strip()[:20]}」"
-                    f"行距(line={line_twips}, rule={line_rule})不是1.5倍行距"
-                )
-                break
-
-            # (4) 两端对齐
-            align = self._resolve_paragraph_alignment(p)
-            if align != WD_ALIGN_PARAGRAPH.JUSTIFY:
-                fail_reason = (
-                    f"段落「{p.text.strip()[:20]}」对齐方式{align}不是两端对齐"
-                )
-                break
-
-        if fail_reason:
-            self.results['dimension2_deductions'].append(1)
-            self.results['hit_points'].append(
-                "-1：\"1.1.1 研究背景\"与\"1.1.2 研究意义\"中间的文本"
-                "不满足以下任意一项：宋体、小四、1.5倍行距、两端对齐"
-            )
-            print(f"[-1] {fail_reason}")
-        else:
-            print("[PASS] 段落格式符合要求")
-
-    def _resolve_paragraph_line_spacing(self, paragraph):
-        """解析段落最终生效的行距：段落直接设置 → 样式链（含 base_style）
-
-        返回 (line_twips, line_rule)：
-          - line_twips: int 或 None —— w:spacing/@w:line 的原始值（twips）
-          - line_rule: 'auto' / 'atLeast' / 'exact' 或 None
-        """
-        pPr = paragraph._element.pPr
-        if pPr is not None:
-            spacing = pPr.find(qn('w:spacing'))
-            if spacing is not None:
-                line = spacing.get(qn('w:line'))
-                rule = spacing.get(qn('w:lineRule'))
-                if line is not None:
-                    try:
-                        return int(line), rule
-                    except (ValueError, TypeError):
-                        return None, rule
-
-        try:
-            style = paragraph.style
-        except Exception:
-            style = None
-        visited = set()
-        while style is not None and id(style) not in visited:
-            visited.add(id(style))
-            try:
-                sp = style.element.find(qn('w:pPr'))
-            except Exception:
-                sp = None
-            if sp is not None:
-                spacing = sp.find(qn('w:spacing'))
-                if spacing is not None:
-                    line = spacing.get(qn('w:line'))
-                    rule = spacing.get(qn('w:lineRule'))
-                    if line is not None:
-                        try:
-                            return int(line), rule
-                        except (ValueError, TypeError):
-                            return None, rule
-            try:
-                style = style.base_style
-            except Exception:
-                break
-        return None, None
-
-    def _is_visible_border(self, border):
-        """判断边框XML节点是否为可见边框"""
-        if border is None:
-            return False
-        val = border.get(qn('w:val'))
-        sz = border.get(qn('w:sz'))
-        return val not in [None, 'none', 'nil'] and sz != '0'
-
-    def _is_three_line_table(self, table):
-        """按单元格实际边框判断是否为三线表"""
-        row_count = len(table.rows)
-        col_count = len(table.columns)
-        if row_count < 2 or col_count == 0:
-            return True  # 封面布局类表格不作为正文三线表扣分依据
-
-        tblBorders = None
-        tblPr = table._element.tblPr
-        if tblPr is not None:
-            tblBorders = tblPr.find(qn('w:tblBorders'))
-        table_borders = {b.tag.split('}')[-1]: b for b in tblBorders} if tblBorders is not None else {}
-
-        has_any_border = False
-        has_top = self._is_visible_border(table_borders.get('top'))
-        has_header_bottom = False
-        has_bottom = self._is_visible_border(table_borders.get('bottom'))
-        has_extra_line = False
-        has_cell_borders = False
-
-        for r_idx, row in enumerate(table.rows):
-            for cell in row.cells:
-                tcPr = cell._tc.tcPr
-                tcBorders = tcPr.find(qn('w:tcBorders')) if tcPr is not None else None
-                if tcBorders is None:
-                    continue
-
-                borders = {b.tag.split('}')[-1]: b for b in tcBorders}
-                for name, border in borders.items():
-                    if not self._is_visible_border(border):
-                        continue
-                    has_any_border = True
-                    if name in ['left', 'right', 'insideV', 'start', 'end']:
-                        has_extra_line = True
-                    elif name == 'top':
-                        if r_idx == 0:
-                            has_top = True
-                        elif r_idx == 1:
-                            # Word中表头下线可能表现为第1个正文行的上边框
-                            has_header_bottom = True
-                        else:
-                            has_extra_line = True
-                    elif name == 'bottom':
-                        if r_idx == 0:
-                            has_header_bottom = True
-                        elif r_idx == row_count - 1:
-                            has_bottom = True
-                        else:
-                            has_extra_line = True
-                    elif name in ['insideH']:
-                        has_header_bottom = True
-                    elif name not in ['tl2br', 'tr2bl']:
-                        has_extra_line = True
-
-        if not has_any_border:
-            return True  # 无边框布局表不按三线表扣分
-        return has_top and has_header_bottom and has_bottom and not has_extra_line
-
-    def _check_table_borders(self):
-        """检查目录页后是否存在边框线数量不等于3的表格 (-3分)
-
-        细则：目录页后任意一个表格的边框线数量不是3
-
-        - 定位区间：按文档流顺序取"目录"标题段之后出现的所有顶层表格
-          （未找到目录时，按整个文档处理）
-        - 每个表格按办公软件"看到"的边框线数量单独计数（不跨表求和）：
-          * 表格有 (行数+1) 个水平边框位置，(列数+1) 个垂直边框位置
-          * 某位置有可见线 = 该位置对应的表级 tblBorders/@top|bottom|
-            insideH|left|right|insideV|start|end 可见，或该位置任一单元格
-            对应 tcBorders 中相邻的 top/bottom/left/right/start/end 可见
-          * 可见 = w:val 不为 none/nil，且 w:sz > 0
-          * 每个位置至多计 1 条线（与办公软件里视觉上一条线的观感一致）
-        - 边框线数量 = 水平可见位置数 + 垂直可见位置数
-        - 目录后只要有一个表格的边框线数量 ≠ 3，即触发 -3 扣分
-        """
-        if self.doc is None:
-            print("[PASS] 表格边框线符合要求")
-            return
-
-        tables_to_check = self._top_level_tables_after_outline()
-        if not tables_to_check:
-            print("[PASS] 表格边框线符合要求")
-            return
-
-        fail_info = None
-        for idx, table in enumerate(tables_to_check):
-            count = self._count_table_visible_border_lines(table)
-            if count != 3:
-                fail_info = f"目录后第{idx + 1}个表格的边框线数量为{count}，不是3"
-                break
-
-        if fail_info:
-            self.results['dimension2_deductions'].append(3)
-            self.results['hit_points'].append(
-                "-3：目录页后任意一个表格的边框线数量不是3"
-            )
-            print(f"[-3] {fail_info}")
-        else:
-            print("[PASS] 表格边框线符合要求")
-
-    def _top_level_tables_after_outline(self):
-        """按文档流顺序返回"目录"段之后的顶层表格对象
-
-        使用 _build_flat_document_index 构建的扁平索引，穿透 w:sdt/
-        w:sdtContent，与段落索引保持同一口径。
-        """
-        target_idx = self.outline_para_idx
-        # 若未找到目录，纳入全部顶层表格
-        if target_idx < 0:
-            return list(self._flat_tables)
-        # 找出目录段之后（按文档流）出现的顶层表格
-        # 需要按 body 元素顺序判断表格与目录段的先后关系
-        outline_p_elem = (
-            self._flat_para_elements[target_idx]
-            if target_idx < len(self._flat_para_elements)
-            else None
-        )
-        if outline_p_elem is None:
-            return list(self._flat_tables)
-
-        # 深度遍历 body（穿透 sdt）按文档流顺序枚举 <w:p> / <w:tbl>
-        passed = False
-        result_elements = []
-
-        def walk(container):
-            nonlocal passed
-            for child in container.iterchildren():
-                tag = child.tag.split('}')[-1]
-                if tag == 'p':
-                    if not passed and child is outline_p_elem:
-                        passed = True
-                elif tag == 'tbl':
-                    if passed:
-                        result_elements.append(child)
-                elif tag == 'sdt':
-                    sdt_content = child.find(qn('w:sdtContent'))
-                    if sdt_content is not None:
-                        walk(sdt_content)
-
-        walk(self.doc.element.body)
-
-        result = []
-        for tbl_elem in result_elements:
-            for t in self._flat_tables:
-                if t._element is tbl_elem:
-                    result.append(t)
-                    break
-        return result
-
-    def _count_table_visible_border_lines(self, table):
-        """按办公软件视角统计表格可见边框线数量（水平+垂直）
-
-        判定优先级与 OOXML/Word 一致：
-          - 单元格 tcBorders 中若定义了对应边（存在即优先，无论 val），
-            以该定义为准
-          - 单元格未定义时才回退到表级 tblBorders 的默认边框
-          - 可见 = w:val 不为 none/nil，且 w:sz > 0（缺 sz 视为不可见）
-          - 一个"位置"由两侧相邻单元格共同决定：任一相邻侧判为可见即可见
-          - 每个位置至多计 1 条线（与办公软件视觉观感一致）
-        """
-        rows = list(table.rows)
-        row_count = len(rows)
-        col_count = len(table.columns)
-        if row_count == 0 or col_count == 0:
-            return 0
-
-        # 表级默认边框
-        tbl_borders = {}
-        tblPr = table._element.tblPr
-        if tblPr is not None:
-            tblBorders = tblPr.find(qn('w:tblBorders'))
-            if tblBorders is not None:
-                for b in tblBorders:
-                    name = b.tag.split('}')[-1]
-                    tbl_borders[name] = b
-
-        def cell_at(r_idx, c_idx):
-            if not (0 <= r_idx < row_count) or not (0 <= c_idx < col_count):
-                return None
-            try:
-                return rows[r_idx].cells[c_idx]
-            except (IndexError, ValueError):
-                return None
-
-        def cell_border_element(cell, name):
-            if cell is None:
-                return None
-            tcPr = cell._tc.tcPr
-            if tcPr is None:
-                return None
-            tcBorders = tcPr.find(qn('w:tcBorders'))
-            if tcBorders is None:
-                return None
-            return tcBorders.find(qn(f'w:{name}'))
-
-        def cell_side_visible(cell, side_names, table_default_names):
-            """判定单元格某一侧的边框是否可见，考虑单元格覆盖表级默认"""
-            if cell is None:
-                return False
-            # 单元格自身定义（含 nil）优先
-            for name in side_names:
-                b = cell_border_element(cell, name)
-                if b is not None:
-                    return self._is_visible_border(b)
-            # 未定义则回退表级默认
-            for name in table_default_names:
-                if self._is_visible_border(tbl_borders.get(name)):
-                    return True
-            return False
-
-        # 水平线：row_count + 1 个位置
-        h_visible = 0
-        for pos in range(row_count + 1):
-            visible = False
-            if pos == 0:
-                # 顶边：由第 0 行所有单元格的 top 决定，回退 tblBorders.top
-                for c in range(col_count):
-                    if cell_side_visible(cell_at(0, c), ['top'], ['top']):
-                        visible = True
-                        break
-            elif pos == row_count:
-                # 底边：由末行所有单元格的 bottom 决定，回退 tblBorders.bottom
-                for c in range(col_count):
-                    if cell_side_visible(
-                        cell_at(row_count - 1, c), ['bottom'], ['bottom']
-                    ):
-                        visible = True
-                        break
-            else:
-                # 中间水平线：由上侧单元格的 bottom 或下侧单元格的 top 决定，
-                # 回退 tblBorders.insideH
-                for c in range(col_count):
-                    if cell_side_visible(
-                        cell_at(pos - 1, c), ['bottom'], ['insideH']
-                    ) or cell_side_visible(
-                        cell_at(pos, c), ['top'], ['insideH']
-                    ):
-                        visible = True
-                        break
-            if visible:
-                h_visible += 1
-
-        # 垂直线：col_count + 1 个位置
-        v_visible = 0
-        for pos in range(col_count + 1):
-            visible = False
-            if pos == 0:
-                for r in range(row_count):
-                    if cell_side_visible(
-                        cell_at(r, 0), ['left', 'start'], ['left', 'start']
-                    ):
-                        visible = True
-                        break
-            elif pos == col_count:
-                for r in range(row_count):
-                    if cell_side_visible(
-                        cell_at(r, col_count - 1),
-                        ['right', 'end'],
-                        ['right', 'end'],
-                    ):
-                        visible = True
-                        break
-            else:
-                for r in range(row_count):
-                    if cell_side_visible(
-                        cell_at(r, pos - 1), ['right', 'end'], ['insideV']
-                    ) or cell_side_visible(
-                        cell_at(r, pos), ['left', 'start'], ['insideV']
-                    ):
-                        visible = True
-                        break
-            if visible:
-                v_visible += 1
-
-        return h_visible + v_visible
-
-    def _calculate_total_score(self):
-        """计算总分"""
-        positive = sum(self.results['dimension2_scores'])
-        negative = sum(self.results['dimension2_deductions'])
-        self.results['total_score'] = positive - negative
-
-    def _print_results(self):
-        """打印评估结果"""
-        print()
-        print("=" * 60)
-        print("评估结果汇总")
-        print("=" * 60)
-
-        if not self.results['dimension1_passed']:
-            print("维度一：未通过，最终得分：0分")
-            print("失败原因：")
-            for failure in self.results['dimension1_failures']:
-                print(f"  - {failure}")
-            return
-
-        print("维度一：通过")
-        print("维度二：评分结果")
-        for point in self.results['hit_points']:
-            print(f"  {point}")
-
-        print()
-        print(f"最终得分：{self.results['total_score']}分")
-        print("=" * 60)
-
-
-# ---- 统一对外接口（见 "脚本接口差异与统一建议.md" §2.2 / §3） -------------
-# 说明：本文件的内部评估逻辑、类结构、参数、每条评分点的判定语义均保持不变；
-# 仅在此处新增模块级 evaluate(file_path) 作为唯一对外入口，把结果规范成
-# §2.2 约定的 dict；类内原有 print 视为调试信息，运行时全部改走 stderr。
+            targets.append(f)
+    inp = os.path.join(dirpath, inputs[0]) if inputs else None
+    targets = [os.path.join(dirpath, t) for t in targets]
+    return targets, inp, docs
+
+
+# ---- 统一对外接口(见 "脚本接口差异与统一建议.md" §2.1 / §2.2) -----------------
+# 说明: 内部评分逻辑(Docx / score / report / 各校验项判定语义)保持不变;
+# 此处新增模块级 evaluate(file_path) 作为唯一对外入口, 把 score() 结果规范成
+# §2.2 约定的 dict; 主结果只走 return, 不 print、不改 sys.stdout、不 sys.exit。
 
 SCRIPT_ID = "002"
 
 
-def _locate_office_file(dir_path: str) -> str:
-    """在任务目录中定位唯一的非临时 DOCX 文档。"""
-    if not os.path.isdir(dir_path):
-        raise FileNotFoundError(f"目录不存在: {dir_path}")
+def _locate_office_file(dir_path):
+    """在任务目录中定位待评测的 DOCX(排除'输入/原始'与临时文件)。"""
+    import os, glob
     candidates = sorted(
-        path for path in glob.glob(os.path.join(dir_path, "*.docx"))
-        if not os.path.basename(path).startswith("~$")
+        p for p in glob.glob(os.path.join(dir_path, "*.docx"))
+        if not os.path.basename(p).startswith("~$")
     )
     if not candidates:
-        raise FileNotFoundError(f"目录内未找到 .docx 文件: {dir_path}")
-    return candidates[0]
+        raise FileNotFoundError(f"目录中未找到 .docx 文件：{dir_path}")
+    targets = [
+        p for p in candidates
+        if not ('输入' in os.path.basename(p)
+                or os.path.basename(p).lower().startswith('input')
+                or '原始' in os.path.basename(p))
+    ]
+    return (targets or candidates)[0]
 
 
-def _resolve_office_file(path: str) -> str:
+def _find_input_beside(target_path):
+    """在待评测文件同目录内寻找原始输入文档(用于减分核查); 找不到返回 None。"""
+    import os, glob
+    dir_path = os.path.dirname(os.path.abspath(target_path))
+    for p in sorted(glob.glob(os.path.join(dir_path, "*.docx"))):
+        base = os.path.basename(p)
+        if base.startswith("~$"):
+            continue
+        if ('输入' in base or base.lower().startswith('input') or '原始' in base):
+            return p
+    return None
+
+
+def _resolve_office_file(path):
     """兼容批量运行器目录入口和本地调试的文件入口。"""
+    import os
     if os.path.isdir(path):
         return _locate_office_file(path)
     if os.path.isfile(path):
         ext = os.path.splitext(path)[1].lower()
-        if ext == ".docx" and not os.path.basename(path).startswith("~$"):
+        if ext == '.docx' and not os.path.basename(path).startswith("~$"):
             return path
-    raise FileNotFoundError(f"未找到 .docx 文件: {path}")
+        raise FileNotFoundError(f"不是可评测的 .docx 文件：{path}")
+    raise FileNotFoundError(f"路径不存在：{path}")
 
 
-# 维度2各评分点静态元数据。hit_marker 与类内 hit_points 里追加的字符串
-# 完全一致，用来判断该项是否命中；命令名与判定语义在类里，请不要在此改动。
-# 元素结构：(kind, rule 简述, max_delta 正整数, 类内 hit_marker 原文)
-_Dim2Rule = tuple[str, str, int, str]
-_DIM2_RULES: list[_Dim2Rule] = [
-    ("bonus", "摘要前所有页面页眉处没有横线", 3,
-     "+3：摘要前所有页面页眉处没有横线"),
-    ("bonus",
-     ("摘要页及摘要页后所有页面页眉处存在两条相互平行的黑色横线，"
-      + "上横线粗细不低于下横线的3倍，下横线粗细不超过1.5磅"), 5,
-     ("+5：摘要页及摘要页后所有页面页眉处存在两条相互平行的黑色横线，"
-      + "上横线粗细不低于下横线的3倍,下横线粗细不超过1.5磅")),
-    ("bonus",
-     "所有页页眉位置上的横线位于页眉文本下方，与页眉文本间距在1-4字符之间", 5,
-     "+5：所有页页眉位置上的横线位于页眉文本下方，与页眉文本间距在1-4字符之间"),
+def evaluate(file_path):
+    """脚本对外唯一入口, 接收任务目录或单个 .docx, 返回规范化结果 dict。
 
-    ("penalty",
-     "任意一页页眉文本内容不是\"澄湖理工大学硕士学位论文\"或不在居中位置", 1,
-     "-1：任意一页页眉文本内容不是\"澄湖理工大学硕士学位论文\"或不在居中位置"),
-    ("penalty",
-     ("目录页后所有页面不满足以下任意一项：页脚文本没有出现"
-      + "\"城市社区微气候韧性评价与公共空间更新研究\"；"
-      + "奇数页页脚文本不是左对齐；偶数页页脚文本不是右对齐"), 1,
-     ("-1：目录页后所有页面不满足以下任意一项：页脚文本没有出现"
-      + "\"城市社区微气候韧性评价与公共空间更新研究\"；"
-      + "奇数页页脚文本不是左对齐；偶数页页脚文本不是右对齐")),
-    ("penalty", "任意一页页脚居中位置没有出现页码", 1,
-     "-1：任意一页页脚居中位置没有出现页码"),
-    ("penalty",
-     "目录页及目录页之前的页面页码不是罗马数字，目录页之后的页面页码不是阿拉伯数字", 1,
-     ("-1：目录页及目录页之前的页面页码不是罗马数字，"
-      + "目录页之后的页面页码不是阿拉伯数字")),
-    ("penalty", "中文摘要页、英文摘要页、目录页不是此先后顺序", 1,
-     "-1：中文摘要页、英文摘要页、目录页不是此先后顺序"),
-    ("penalty", "目录页后所有一级标题不是黑体、三号、加粗", 1,
-     "-1：目录页后所有一级标题不是黑体、三号、加粗"),
-    ("penalty", "目录页后所有二级标题不是黑体、四号、加粗", 1,
-     "-1：目录页后所有二级标题不是黑体、四号、加粗"),
-    ("penalty", "目录页后所有三级标题不是黑体、小四号、加粗", 1,
-     "-1：目录页后所有三级标题不是黑体、小四号、加粗"),
-    ("penalty",
-     ("\"1.1.1 研究背景\"与\"1.1.2 研究意义\"中间的文本不满足以下任意一项："
-      + "宋体、小四、1.5倍行距、两端对齐"), 1,
-     ("-1：\"1.1.1 研究背景\"与\"1.1.2 研究意义\"中间的文本不满足以下"
-      + "任意一项：宋体、小四、1.5倍行距、两端对齐")),
-    ("penalty", "目录页后任意一个表格的边框线数量不是3", 3,
-     "-3：目录页后任意一个表格的边框线数量不是3"),
-]
-
-
-def evaluate(dir_path: str) -> dict[str, object]:
-    """脚本对外唯一入口，接收任务目录并定位其中的 DOC/DOCX。
-
-    - 不改动内部评估逻辑与参数，仍复用 WordDocumentEvaluator。
-    - 类内的 print 全部丢弃（stdout/stderr 均重定向到 devnull），主结果只走 return。
-    - 任何未捕获异常一律折成 status="error"，避免混淆"评估 0 分"与"脚本崩溃"。
+    - 不改动内部评估逻辑与参数, 仍复用 Docx / score()。
+    - 主结果仅通过 return 传出; 任何未捕获异常一律折成 status="error",
+      以区分"评估 0 分"与"脚本自身崩溃"。
+    - 定位不到 .docx 等前置失败时, dim1_pass 与 dim1_reason 一律留空(空字符串,
+      表示维度一根本没进入判定)、dim2_items=[]、total_score=max_score=0,
+      error 仅给出可读原因(不带异常类名前缀)。
+    - 维度一未通过时 dim1_pass=False, 且 dim1_reason 带出错误摘要。
+    - dim2_items 命中项与未命中项都列出, 便于对齐评分项矩阵。
     """
-    dim2_items: list[dict[str, object]] = []
-    # 满分 = 所有加分项 max_delta 之和（扣分项只影响最终得分，不计入满分）
-    max_score: int = sum(m for kind, _rule, m, _mark in _DIM2_RULES
-                         if kind == "bonus")
-    result: dict[str, object] = {
+    import os
+    dim2_items = []
+    result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": True,
+        "dim1_pass": False,
         "dim1_reason": "",
         "dim2_items": dim2_items,
         "total_score": 0,
-        "max_score": max_score,
+        "max_score": 0,
     }
 
     try:
-        file_path = _resolve_office_file(dir_path)
-        result["file_name"] = os.path.basename(file_path)
-
-        evaluator = WordDocumentEvaluator(file_path, skip_page_check=True)
-        # 类内所有 print 视为调试输出，全部丢弃；主结果仅通过 return 传出
-        with open(os.devnull, "w", encoding="utf-8") as _null, \
-                contextlib.redirect_stdout(_null), \
-                contextlib.redirect_stderr(_null):
-            evaluator.evaluate()
+        target = _resolve_office_file(file_path)
+        result["file_name"] = os.path.basename(target)
+        inp = _find_input_beside(target)
+        res = score(target, inp)
+    except FileNotFoundError as e:
+        # 找不到被评估文件：error 只回传纯文本原因(不带异常类名)；维度一根本没进入
+        # 判定，dim1_pass 与 dim1_reason 一律留空(空字符串,而非 False)，dim2 不出项，
+        # 总分与满分一并归零。
+        result["status"] = "error"
+        result["error"] = str(e)
+        result["file_name"] = ""
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
     except Exception as e:
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = f"脚本运行异常：{type(e).__name__}: {e}"
         return result
 
-    res = evaluator.results  # type: ignore[assignment]
-
-    dim1_passed_raw = res.get("dimension1_passed", True)
-    if not bool(dim1_passed_raw):
-        failures_raw = res.get("dimension1_failures", []) or []
-        if isinstance(failures_raw, list):
-            failures: list[str] = [str(x) for x in failures_raw]
-        else:
-            failures = []
-        result["dim1_pass"] = False
-        result["dim1_reason"] = "；".join(failures)
+    # 维度一: 文件可否正常打开(不可打开则维度一未通过, 总分 0)
+    if not res.get("openable", False):
+        # 维度一未通过: dim1_pass 保持 False, 且 dim1_reason 必须带上错误摘要,
+        # 便于直接定位原因(note 里已含底层解析报错, 缺失时给出兜底说明)
+        note = (res.get("note") or "").strip()
+        result["dim1_reason"] = note or "文件无法打开或无法解析(未取得具体报错), 维度一不通过, 总分 0"
         result["total_score"] = 0
+        result["max_score"] = int(res.get("max_add", 13))
         return result
+    result["dim1_pass"] = True
 
-    hit_points_raw = res.get("hit_points", []) or []
-    if isinstance(hit_points_raw, list):
-        hit_set: set[str] = {str(x) for x in hit_points_raw}
-    else:
-        hit_set = set()
-    for kind, rule_desc, max_delta, hit_marker in _DIM2_RULES:
-        hit = hit_marker in hit_set
-        # bonus 的 max_delta 天然为正，penalty 天然为负；命中时 delta = max_delta，
-        # 未命中时 delta = 0。这里保留每条规则的正负号，不强行改写。
-        signed_max = max_delta if kind == "bonus" else -max_delta
+    # 维度二: 逐项映射
+    #   加分项(points>0): hit=passed; 命中得 +points
+    #   减分项(points<0): 内部 passed=False 表示"检出与细则写明的绝对值不符的改动"→触发扣分;
+    #                     hit=(passed is False); 命中扣 points(本身为负)
+    max_score = 0
+    for it in res.get("items", []):
+        pts = it["points"]
+        passed = it["passed"]
+        if pts > 0:
+            hit = bool(passed)
+            max_delta = pts
+            delta = pts if hit else 0
+            max_score += pts
+        else:
+            hit = (passed is False)
+            max_delta = pts
+            delta = pts if hit else 0
         dim2_items.append({
-            "rule": rule_desc,
-            "max_delta": signed_max,
-            "delta": signed_max if hit else 0,
+            "rule": it["code"],
+            "max_delta": max_delta,
+            "delta": delta,
             "hit": hit,
-            "detail": "",
         })
 
-    total_raw = res.get("total_score", 0)
-    result["total_score"] = int(total_raw) if isinstance(total_raw, (int, bool)) else 0
+    result["max_score"] = int(res.get("max_add", max_score))
+    result["total_score"] = int(res.get("total", 0))
     return result
 
 
 def main():
-    """本地调试入口：evaluate(sys.argv[1]) 后打印 JSON 主结果到 stdout。
+    """本地调试入口: evaluate(sys.argv[1]) 后打印规范化 JSON 到 stdout。
 
-    仅用于脚本作者自测；批量运行器直接 import 本模块的 evaluate 即可。
+    无参数时兜底扫描脚本同目录下的 .docx 用于自测。
     """
-    # Windows 默认控制台可能是 cp1252/gbk，直接 print 中文 JSON 会崩溃；
-    # 统一把 stdout 切到 UTF-8。
     try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
+    import os
     if len(sys.argv) >= 2:
         target = sys.argv[1]
     else:
-        # 无参数：兜底扫描脚本同目录下的 .docx 用于自测，仅走第一个
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        office_files = sorted(
-            f for f in glob.glob(os.path.join(script_dir, "*.docx"))
-            if not os.path.basename(f).startswith("~$")
-        )
-        if not office_files:
-            print(json.dumps({
-                "id": SCRIPT_ID,
-                "file_name": "",
-                "status": "error",
-                "error": "未提供 file_path，且脚本目录下无 .docx 可供自测",
-            }, ensure_ascii=False, indent=2))
-            return
-        target = office_files[0]
+        target = os.path.dirname(os.path.abspath(__file__))
 
     print(json.dumps(evaluate(target), ensure_ascii=False, indent=2))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

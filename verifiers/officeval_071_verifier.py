@@ -1,1273 +1,1028 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自动评估“豆包制作PPT001_修改版(5).pptx”。
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-评分逻辑：
-1. 先检查维度1：交付文件为.pptx格式，文件可正常打开。
-   不满足时直接 0 分，不再检查维度2。
-2. 满足维度1后，逐条自动检测维度2的得分点和扣分点；命中则累计对应分值。
-3. 通过 evaluate(dir_path) 返回结构化字典，供批量运行器汇总。
-
-依赖：python-pptx、Pillow、lxml（通常安装 python-pptx 时会带上 lxml）。
-"""
-
-from __future__ import annotations
-
-import json
-import math
+import os
 import sys
-import zipfile
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, Optional
-
-from lxml import etree
-from PIL import Image
+import json
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.enum.dml import MSO_FILL
 
-EMU_PER_PT = 12700
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
 
-NS = {
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+SCRIPT_ID = "071"
+# 维度二所有加分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 44
+
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 results.append(...) 的顺序严格一致；共 24 项，
+# 其中正数为加分项（累加 = MAX_SCORE_TOTAL），负数为减分项。
+_MAX_DELTAS_ORDER = [
+    3,   # 01 首页主标题蓝色字芯
+    5,   # 02 首页主标题白色描边
+    3,   # 03 描边宽度 0.5-2.0 磅
+    1,   # 04 主标题居中/落位/自动换行
+    5,   # 05 第二页左右两栏并排
+    3,   # 06 两板块半宽且齐平
+    5,   # 07 两组元素各在本侧不越中缝
+    5,   # 08 两张照片各在本板块右上角
+    3,   # 09 左右对称（照片/标题/正文首行）
+    5,   # 10 第二页文案逐字一致
+    3,   # 11 正文块收窄至栏内且左对齐
+    3,   # 12 文字与板块底色对比充分
+    -3,  # 13 主标题字体 Kaiti SC 60 磅不加粗
+    -3,  # 14 首页重复叠放的同文标题框
+    -1,  # 15 首页副标题格式
+    -1,  # 16 首页背景图与空白占位形状
+    -3,  # 17 第二页页面标题格式与定位
+    -3,  # 18 第二页正文字体字号字色
+    -3,  # 19 两侧板块标题字色与字体
+    -3,  # 20 护鸟带板块底衬样式
+    -3,  # 21 第二页新增装饰元素
+    -3,  # 22 两张照片外形与描边
+    -1,  # 23 护鸟带要点被合并为一个文本框
+    -1,  # 24 第三、四页整页背景图
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+
+# ===================== 基础常量与几何/颜色工具 =====================
+
+A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+EMU_PER_CM = 360000.0
+TOL = 0.10          # 通用长度容差（cm）
+PAGE_W_CM = 33.87   # 页面宽（cm）
+PAGE_H_CM = 19.05   # 页面高（cm）
+
+# 第二页各元素的文本锚点：全部按文案定位，不依赖形状名称与 z 序
+KEY_PAGE_TITLE = '田间防护'
+KEY_A_TITLE = '护鸟带「'
+KEY_B_TITLE = '驱鸟器「'
+KEYS_A_BODY = ('材质：', '原理：', '设计：', '该装置适合', '布设灵活', '维护简单')
+KEYS_B_BODY = ('内置分时播放模块',)
+KEY_MAIN_TITLE = '田间共生观察'
+KEY_SUBTITLE = '生态友好型农事管理片段'
+
+# 第二页应当逐字保留的 10 条文案（判定"无删改、无改写、无新增"）
+EXPECTED_SLIDE2_TEXTS = [
+    '田间防护：护鸟带与驱鸟器应用说明',
+    '护鸟带「护鸟不伤鸟」',
+    '材质：柔性反光复合膜，边缘圆润，适合短期田间布设。',
+    '原理：借助风动飘摆与光线闪烁，形成温和视觉干扰，引导鸟群绕行。',
+    '设计：带状结构不设网孔，便于回收和重复安装。',
+    '该装置适合在果蔬、稻田等开阔区域配合田埂或支杆使用，重点用于降低啄食和踩踏造成的局部损耗。',
+    '•布设灵活：可按作物高度调整悬挂位置，风力变化时保持自然摆动。',
+    '•维护简单：定期检查固定点和清洁表面即可，避免长期遗留在田间。',
+    '驱鸟器「驱鸟还不吵」',
+    '内置分时播放模块，可在清晨与傍晚等重点时段发出短促提示音。音量可调，适合与反光带、巡田管理组合使用。',
+]
+
+# schemeClr 到主题色槽的映射（含 clrMap 的常规约定：tx1→dk1、bg1→lt1）
+_SCHEME_SLOT = {
+    'tx1': 'dk1', 'bg1': 'lt1', 'tx2': 'dk2', 'bg2': 'lt2',
+    'dk1': 'dk1', 'lt1': 'lt1', 'dk2': 'dk2', 'lt2': 'lt2',
 }
 
 
-@dataclass
-class CheckResult:
-    score: int
-    name: str
-    passed: bool
-    detail: str
+def _q(tag):
+    """DrawingML 限定名."""
+    return '{%s}%s' % (A_NS, tag)
 
 
-@dataclass
-class Rect:
-    left: int
-    top: int
-    width: int
-    height: int
-
-    @property
-    def right(self) -> int:
-        return self.left + self.width
-
-    @property
-    def bottom(self) -> int:
-        return self.top + self.height
-
-    @property
-    def cx(self) -> float:
-        return self.left + self.width / 2
-
-    @property
-    def cy(self) -> float:
-        return self.top + self.height / 2
-
-    @property
-    def area(self) -> int:
-        return max(0, self.width) * max(0, self.height)
+def _qp(tag):
+    """PresentationML 限定名."""
+    return '{%s}%s' % (P_NS, tag)
 
 
-def shape_text(shape) -> str:
-    if not hasattr(shape, "text"):
-        return ""
-    return (shape.text or "").strip()
+def _cm(emu):
+    """EMU → cm；None 安全."""
+    return None if emu is None else float(emu) / EMU_PER_CM
 
-
-def normalized_text(text: str) -> str:
-    return "".join((text or "").split())
-
-
-def all_slide_text(slide) -> str:
-    return "\n".join(shape_text(shape) for shape in slide.shapes if shape_text(shape))
-
-
-def iter_picture_shapes(slide):
-    for shape in slide.shapes:
-        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-            yield shape
-
-
-def rect_of(shape) -> Rect:
-    return Rect(int(shape.left), int(shape.top), int(shape.width), int(shape.height))
-
-
-def overlap_area(a: Rect, b: Rect) -> int:
-    x1 = max(a.left, b.left)
-    y1 = max(a.top, b.top)
-    x2 = min(a.right, b.right)
-    y2 = min(a.bottom, b.bottom)
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-
-def rgb_tuple_from_hex(value: str) -> tuple[int, int, int]:
-    value = value.strip().lstrip("#")
-    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
-
-
-def color_distance(c1: tuple[int, int, int], c2: tuple[int, int, int]) -> float:
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
-
-
-def classify_green(hex_color: str | None) -> Optional[str]:
-    """把颜色粗略归类为 deep_green / light_green / other。
-
-    细则只给出“深绿色/浅绿色”的语义，没有限定精确色值。这里采用自动化近似：
-    - 绿色通道必须明显占优；
-    - 亮度低于阈值视为深绿色，较高视为浅绿色。
-    """
-    if not hex_color:
+def _box(shape):
+    """形状外框 (left, top, right, bottom)，单位 cm；缺少定位信息返回 None."""
+    if shape.left is None or shape.top is None or shape.width is None or shape.height is None:
         return None
-    r, g, b = rgb_tuple_from_hex(hex_color)
-    if g < 70 or g < max(r, b) + 10:
-        return "other"
-    brightness = 0.299 * r + 0.587 * g + 0.114 * b
-    return "deep_green" if brightness < 150 else "light_green"
+    l = _cm(shape.left)
+    t = _cm(shape.top)
+    return (l, t, l + _cm(shape.width), t + _cm(shape.height))
 
 
-def is_blue(hex_color: str | None) -> bool:
-    """判断颜色是否为蓝色系。
-
-    细则只要求“蓝色填充”，未限定精确色值，故按颜色语义近似判断：
-    蓝色通道明显占优即视为蓝色。
-    """
-    if not hex_color:
-        return False
-    r, g, b = rgb_tuple_from_hex(hex_color)
-    return b >= 100 and b > r + 20 and b > g + 20
+def _inter_area(b1, b2):
+    """两外框相交面积（cm²）."""
+    if not b1 or not b2:
+        return 0.0
+    w = min(b1[2], b2[2]) - max(b1[0], b2[0])
+    h = min(b1[3], b2[3]) - max(b1[1], b2[1])
+    return w * h if (w > 0 and h > 0) else 0.0
 
 
-def is_white(hex_color: str | None, tolerance: float = 40.0) -> bool:
-    """判断颜色是否为白色（含近白色容差）。细则要求“白色外边”。"""
-    if not hex_color:
-        return False
-    return color_distance(rgb_tuple_from_hex(hex_color), (255, 255, 255)) <= tolerance
+def _area(b):
+    return 0.0 if not b else max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
 
 
-def shape_fill_hex(shape) -> Optional[str]:
-    if not hasattr(shape, "fill"):
+def _union_box(boxes):
+    boxes = [b for b in boxes if b]
+    if not boxes:
         return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def _v_overlap_ratio(b1, b2):
+    """两外框纵向区间的重合度（以较矮者高度为分母）."""
+    if not b1 or not b2:
+        return 0.0
+    ov = min(b1[3], b2[3]) - max(b1[1], b2[1])
+    base = min(b1[3] - b1[1], b2[3] - b2[1])
+    return 0.0 if base <= 0 else max(0.0, ov) / base
+
+
+def _center(b):
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+
+def _in_range(v, lo, hi):
+    return v is not None and lo <= v <= hi
+
+def _load_theme_colors(prs):
+    """读取 theme1.xml 的 clrScheme，得到 {'dk1': '000000', 'lt1': 'FFFFFF', ...}."""
+    slots = {}
     try:
-        fill = shape.fill
-        if fill.type != MSO_FILL.SOLID:
-            return None
-        rgb = fill.fore_color.rgb
-        return str(rgb).upper() if rgb else None
-    except Exception:
-        return None
-
-
-def get_slide_xml_root(pptx_path: Path, slide_number: int):
-    with zipfile.ZipFile(pptx_path) as zf:
-        xml = zf.read(f"ppt/slides/slide{slide_number}.xml")
-    return etree.fromstring(xml)
-
-
-def shape_id(shape) -> Optional[str]:
-    try:
-        return str(shape._element.xpath(".//p:cNvPr", namespaces=NS)[0].get("id"))
-    except Exception:
-        return None
-
-
-def find_xml_shape_by_id(root, sid: str):
-    matches = root.xpath(f".//p:sp[p:nvSpPr/p:cNvPr[@id='{sid}']]", namespaces=NS)
-    return matches[0] if matches else None
-
-
-def text_shape_xml_nodes_with_text(root, target: str):
-    nodes = []
-    for sp in root.xpath(".//p:sp", namespaces=NS):
-        text = "".join(sp.xpath(".//a:t/text()", namespaces=NS))
-        if target in text:
-            nodes.append(sp)
-    return nodes
-
-
-def _load_theme_colors(pptx_path: Path) -> dict[str, str]:
-    """加载 theme1.xml 的方案色映射：`accent1`/`dk1`/`lt1`/... → 六位 hex。
-
-    PPTX 中文字/线条颜色可能写成 ``<a:schemeClr val="accent1"/>`` 或
-    ``<a:sysClr lastClr="FFFFFF" val="window"/>``，只解析 ``srgbClr`` 会漏判。
-    """
-    try:
-        with zipfile.ZipFile(str(pptx_path)) as zf:
-            xml = zf.read("ppt/theme/theme1.xml")
-        root = etree.fromstring(xml)
-    except Exception:
-        return {}
-    colors: dict[str, str] = {}
-    for elem in root.xpath(".//a:clrScheme/*", namespaces=NS):
-        name = etree.QName(elem.tag).localname
-        for child in elem:
-            tag = etree.QName(child.tag).localname
-            if tag == "srgbClr":
-                val = child.get("val")
-                if val:
-                    colors[name] = val.upper()
+        from lxml import etree
+        for part in prs.part.package.iter_parts():
+            if str(part.partname).endswith('theme1.xml'):
+                root = etree.fromstring(part.blob)
+                scheme = root.find('.//' + _q('clrScheme'))
+                if scheme is None:
                     break
-            if tag == "sysClr":
-                val = child.get("lastClr")
-                if val:
-                    colors[name] = val.upper()
-                    break
-    return colors
+                for child in scheme:
+                    slot = etree.QName(child).localname
+                    srgb = child.find(_q('srgbClr'))
+                    sysc = child.find(_q('sysClr'))
+                    if srgb is not None and srgb.get('val'):
+                        slots[slot] = srgb.get('val').upper()
+                    elif sysc is not None:
+                        slots[slot] = (sysc.get('lastClr') or '000000').upper()
+                break
+    except Exception:
+        pass
+    # 兜底：主题缺失时给出常规明暗值，避免对比度判定误伤
+    slots.setdefault('dk1', '000000')
+    slots.setdefault('lt1', 'FFFFFF')
+    return slots
 
 
-# schemeClr 中 dk1/lt1/dk2/lt2 与 tx1/bg1/tx2/bg2 互为别名（Office Open XML §20.1.4.1.24）。
-_SCHEME_ALIASES = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2",
-                   "lt1": "bg1", "dk1": "tx1", "lt2": "bg2", "dk2": "tx2"}
-
-
-def _resolve_color_hex(clr_container, theme_colors: dict[str, str]) -> Optional[str]:
-    """从 ``<a:solidFill>``/``<a:ln>`` 之类的容器里解析出 hex 颜色。
-
-    识别 ``srgbClr``（直接色）、``schemeClr``（主题方案色）、``sysClr``（系统色 lastClr）。
-    未处理 lumMod/lumOff 等修饰——白/蓝的语义判定对轻微亮度调整仍能容忍。
-    """
-    if clr_container is None:
+def _color_hex(color_el, theme):
+    """把 <a:srgbClr>/<a:schemeClr> 元素解析为 6 位十六进制大写串."""
+    if color_el is None:
         return None
-    for child in clr_container:
-        tag = etree.QName(child.tag).localname
-        if tag == "srgbClr":
-            val = child.get("val")
-            return val.upper() if val else None
-        if tag == "schemeClr":
-            name = child.get("val") or ""
-            hex_val = theme_colors.get(name)
-            if hex_val is None and name in _SCHEME_ALIASES:
-                hex_val = theme_colors.get(_SCHEME_ALIASES[name])
-            return hex_val
-        if tag == "sysClr":
-            val = child.get("lastClr")
-            return val.upper() if val else None
+    tag = color_el.tag
+    if tag == _q('srgbClr'):
+        val = color_el.get('val')
+        return val.upper() if val else None
+    if tag == _q('schemeClr'):
+        val = (color_el.get('val') or '').lower()
+        return theme.get(_SCHEME_SLOT.get(val, val))
+    if tag == _q('sysClr'):
+        val = color_el.get('lastClr')
+        return val.upper() if val else None
     return None
 
 
-def _run_has_wordart_features(rpr, sp) -> tuple[bool, list[str]]:
-    """判断某个 run（``a:rPr``）及其所属形状是否具备 WordArt 特征。
+def _solid_fill_hex(holder, theme):
+    """holder（rPr / spPr / a:ln 等）直接子级 <a:solidFill> 的颜色."""
+    if holder is None:
+        return None
+    fill = holder.find(_q('solidFill'))
+    if fill is None:
+        return None
+    for child in fill:
+        hexv = _color_hex(child, theme)
+        if hexv:
+            return hexv
+    return None
 
-    仅"填充为蓝色 + 轮廓为白色"并不足以证明是艺术字——普通文本框也可以通过
-    "文本填充/文本轮廓"设置同样的颜色。因此这里额外核查真正的艺术字标志位：
-
-    - ``a:rPr/a:ln``：文本轮廓本身即艺术字属性（普通文字段落没有 ``a:ln`` 子节点）。
-    - ``a:rPr/a:effectLst``：文字效果（发光/阴影/映像/柔化边缘）。
-    - ``a:rPr/a:uFill``/``a:uLn``/``a:highlight``：进阶文字效果。
-    - ``a:rPr/a:scene3d``、``a:sp3d``：3D 文字效果。
-    - 形状 ``p:txBody/a:bodyPr/a:prstTxWarp``（非 ``textNoShape``）：文字变形（艺术字最强指征）。
-    - 形状 ``p:style/a:fontRef``：主题级 WordArt 样式引用。
-    """
-    reasons: list[str] = []
-    if rpr.xpath("./a:ln", namespaces=NS):
-        reasons.append("rPr/ln 文本轮廓")
-    if rpr.xpath("./a:effectLst/*", namespaces=NS):
-        reasons.append("rPr/effectLst 文字效果")
-    if rpr.xpath("./a:uFill | ./a:uLn | ./a:highlight", namespaces=NS):
-        reasons.append("rPr 高级文字装饰")
-    if rpr.xpath("./a:scene3d | ./a:sp3d", namespaces=NS):
-        reasons.append("rPr 3D 文字效果")
-
-    warps = sp.xpath(".//p:txBody/a:bodyPr/a:prstTxWarp/@prst", namespaces=NS)
-    if any(w and w != "textNoShape" for w in warps):
-        reasons.append("bodyPr/prstTxWarp 文字变形")
-    if sp.xpath(".//p:style/a:fontRef", namespaces=NS):
-        reasons.append("style/fontRef 主题艺术字样式")
-
-    return bool(reasons), reasons
+def _rgb_tuple(hexv):
+    if not hexv or len(hexv) != 6:
+        return None
+    try:
+        return (int(hexv[0:2], 16), int(hexv[2:4], 16), int(hexv[4:6], 16))
+    except ValueError:
+        return None
 
 
-def has_wordart_white_line_blue_fill(sp, theme_colors: dict[str, str]) -> tuple[bool, str]:
-    """检查文字 run 是否为"白色外边（轮廓线）+ 蓝色填充"的艺术字。
-
-    组合判定：同一 run 既要满足颜色语义（蓝色文本填充 + 白色文本轮廓），
-    又要具备至少一项 WordArt 结构特征（详见 ``_run_has_wordart_features``）；
-    避免"普通文本框设置同样颜色"误判为艺术字。颜色解析支持 srgbClr / schemeClr / sysClr。
-    """
-    for rpr in sp.xpath(".//a:rPr", namespaces=NS):
-        fill_hex = None
-        for fill in rpr.xpath("./a:solidFill", namespaces=NS):
-            fill_hex = _resolve_color_hex(fill, theme_colors)
-            if fill_hex:
-                break
-        line_hex = None
-        ln_nodes = rpr.xpath("./a:ln", namespaces=NS)
-        for ln in ln_nodes:
-            for sf in ln.xpath("./a:solidFill", namespaces=NS):
-                line_hex = _resolve_color_hex(sf, theme_colors)
-                if line_hex:
-                    break
-            if line_hex:
-                break
-
-        fill_ok = fill_hex is not None and is_blue(fill_hex)
-        line_ok = line_hex is not None and is_white(line_hex)
-        if not (fill_ok and line_ok):
-            continue
-
-        is_wordart, reasons = _run_has_wordart_features(rpr, sp)
-        if is_wordart:
-            return True, (
-                f"填充={fill_hex}(蓝色)，轮廓={line_hex}(白色)，"
-                f"艺术字特征：{'、'.join(reasons)}"
-            )
-    return False, ""
+def _rel_luminance(hexv):
+    """WCAG 相对亮度，取值 0-1."""
+    rgb = _rgb_tuple(hexv)
+    if rgb is None:
+        return None
+    out = []
+    for c in rgb:
+        c = c / 255.0
+        out.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2]
 
 
-def title_font_sizes_pt(root, target: str) -> list[float]:
-    sizes = []
-    for sp in text_shape_xml_nodes_with_text(root, target):
-        for sz in sp.xpath(".//a:rPr/@sz", namespaces=NS):
+def _contrast_ratio(hex1, hex2):
+    """两色对比度（1-21）；任一色未知返回 None."""
+    l1 = _rel_luminance(hex1)
+    l2 = _rel_luminance(hex2)
+    if l1 is None or l2 is None:
+        return None
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _hsv(hexv):
+    """RGB → (色相 0-360, 饱和度 0-1, 明度 0-1)."""
+    rgb = _rgb_tuple(hexv)
+    if rgb is None:
+        return None
+    r, g, b = [c / 255.0 for c in rgb]
+    mx, mn = max(r, g, b), min(r, g, b)
+    d = mx - mn
+    if d == 0:
+        h = 0.0
+    elif mx == r:
+        h = 60 * (((g - b) / d) % 6)
+    elif mx == g:
+        h = 60 * (((b - r) / d) + 2)
+    else:
+        h = 60 * (((r - g) / d) + 4)
+    return (h, 0.0 if mx == 0 else d / mx, mx)
+
+
+def _is_blue(hexv):
+    """蓝色系纯色：色相 195°-235°、饱和度≥0.30、明度≥0.20."""
+    hsv = _hsv(hexv)
+    if hsv is None:
+        return False
+    h, s, v = hsv
+    return 195.0 <= h <= 235.0 and s >= 0.30 and v >= 0.20
+
+
+def _is_white(hexv):
+    """白色（含近白）：三通道均≥245."""
+    rgb = _rgb_tuple(hexv)
+    return bool(rgb) and all(c >= 245 for c in rgb)
+
+# ===================== 形状 / 文字属性读取 =====================
+
+def _norm(text):
+    """文本归一化：去首尾空白、去全角空格、统一西文引号，便于逐字比对."""
+    if text is None:
+        return ''
+    s = text.replace('　', ' ').replace('\xa0', ' ').strip()
+    return ' '.join(s.split())
+
+
+def _shape_text(shape):
+    """形状内全部文字（段落间用 \\n 连接）；无文本框返回空串."""
+    try:
+        if not shape.has_text_frame:
+            return ''
+        return shape.text_frame.text or ''
+    except Exception:
+        return ''
+
+
+def _paragraph_texts(shape):
+    """形状内各段落的归一化文本（跳过空段）."""
+    out = []
+    try:
+        if not shape.has_text_frame:
+            return out
+        for p in shape.text_frame.paragraphs:
+            t = _norm(''.join(r.text for r in p.runs))
+            if t:
+                out.append(t)
+    except Exception:
+        pass
+    return out
+
+
+def _is_picture(shape):
+    try:
+        return shape.shape_type is not None and int(shape.shape_type) == 13
+    except Exception:
+        return shape.__class__.__name__ == 'Picture'
+
+
+def _sp_pr(shape):
+    """形状的 spPr 元素（图片为 p:pic/p:spPr）."""
+    el = shape._element
+    for tag in (_qp('spPr'), _q('spPr')):
+        found = el.find(tag)
+        if found is not None:
+            return found
+    return el.find('.//' + _qp('spPr'))
+
+
+def _geom_prst(shape):
+    """预设几何名（rect / roundRect / ...）与圆角 adj 值（千分比，None 表示未显式给出）."""
+    spPr = _sp_pr(shape)
+    if spPr is None:
+        return (None, None)
+    geom = spPr.find(_q('prstGeom'))
+    if geom is None:
+        return (None, None)
+    adj = None
+    gd = geom.find('.//' + _q('gd'))
+    if gd is not None and (gd.get('name') or '') == 'adj':
+        fmla = gd.get('fmla') or ''
+        if fmla.startswith('val '):
             try:
-                sizes.append(int(sz) / 100)
+                adj = int(fmla[4:])
             except ValueError:
-                pass
-    return sizes
+                adj = None
+    return (geom.get('prst'), adj)
+
+def _shape_fill_hex(shape, theme):
+    """形状实心填充色；非实心填充（noFill/渐变/图片）返回 None."""
+    return _solid_fill_hex(_sp_pr(shape), theme)
 
 
-def _first_sz(elem, xpath: str) -> Optional[float]:
-    """从 XML 子树按 xpath 找第一个 @sz（单位百分点），失败返回 None。"""
-    if elem is None:
-        return None
-    try:
-        vals = elem.xpath(xpath, namespaces=NS)
-    except Exception:
-        return None
-    for v in vals:
+def _shape_line(shape, theme):
+    """形状边框：(是否为无填充边框, 边框颜色, 线宽磅值)."""
+    spPr = _sp_pr(shape)
+    if spPr is None:
+        return (True, None, None)
+    ln = spPr.find(_q('ln'))
+    if ln is None:
+        return (True, None, None)
+    no_fill = ln.find(_q('noFill')) is not None
+    hexv = _solid_fill_hex(ln, theme)
+    w = ln.get('w')
+    pt = None
+    if w is not None:
         try:
-            return int(v) / 100
-        except (TypeError, ValueError):
-            continue
-    return None
+            pt = int(w) / 12700.0
+        except ValueError:
+            pt = None
+    return (no_fill or hexv is None, hexv, pt)
 
 
-def _run_explicit_size(run_elem) -> Optional[float]:
-    return _first_sz(run_elem, "./a:rPr/@sz")
+def _has_outer_shadow(shape):
+    spPr = _sp_pr(shape)
+    return spPr is not None and spPr.find('.//' + _q('outerShdw')) is not None
 
 
-def _paragraph_default_size(paragraph_elem, level_zero_based: int) -> Optional[float]:
-    """段落级默认字号：优先 a:pPr/a:defRPr/@sz，再向上到形状的 a:lstStyle/a:lvlXpPr。"""
-    return _first_sz(paragraph_elem, "./a:pPr/a:defRPr/@sz")
-
-
-def _lst_style_size(txBody_elem, level_zero_based: int) -> Optional[float]:
-    """形状内 a:lstStyle 的默认字号（按段落级 0..8 对应 lvl1pPr..lvl9pPr）。"""
-    if txBody_elem is None:
-        return None
-    lvl = max(0, min(8, level_zero_based)) + 1
-    lvl_tag = f"a:lvl{lvl}pPr"
-    if lvl == 1:
-        candidates = [f"./a:lstStyle/{lvl_tag}/a:defRPr/@sz",
-                      "./a:lstStyle/a:defPPr/a:defRPr/@sz"]
-    else:
-        candidates = [f"./a:lstStyle/{lvl_tag}/a:defRPr/@sz"]
-    for xp in candidates:
-        v = _first_sz(txBody_elem, xp)
-        if v is not None:
-            return v
-    return None
-
-
-def _placeholder_key(sp_elem) -> Optional[tuple[Optional[str], Optional[str]]]:
-    """占位符匹配键：(type, idx)。二者都可能缺省——按 OOXML 规则视作 body/0。"""
-    phs = sp_elem.xpath(".//p:nvSpPr/p:nvPr/p:ph", namespaces=NS)
-    if not phs:
-        return None
-    ph = phs[0]
-    return ph.get("type"), ph.get("idx")
-
-
-def _find_matching_placeholder(container_root, key: tuple[Optional[str], Optional[str]]):
-    """在 slideLayout/slideMaster 的根节点中匹配同 type/idx 的占位符 sp。"""
-    if container_root is None:
-        return None
-    ph_type, ph_idx = key
-    for sp in container_root.xpath(".//p:sp", namespaces=NS):
-        phs = sp.xpath(".//p:nvSpPr/p:nvPr/p:ph", namespaces=NS)
-        if not phs:
-            continue
-        t = phs[0].get("type")
-        i = phs[0].get("idx")
-        if t == ph_type and i == ph_idx:
-            return sp
-        # 常见互认：title / ctrTitle 都视为标题占位符；idx 缺省视为 "0"。
-        if ph_type in ("title", "ctrTitle") and t in ("title", "ctrTitle") and (i or "0") == (ph_idx or "0"):
-            return sp
-    return None
-
-
-def _master_style_size(master_root, ph_type: Optional[str], level_zero_based: int) -> Optional[float]:
-    """slideMaster 的 titleStyle / bodyStyle / otherStyle 里查对应层级的默认字号。"""
-    if master_root is None:
-        return None
-    if ph_type in ("title", "ctrTitle"):
-        style_tag = "p:titleStyle"
-    elif ph_type in ("body", "subTitle", None):
-        style_tag = "p:bodyStyle"
-    else:
-        style_tag = "p:otherStyle"
-    lvl = max(0, min(8, level_zero_based)) + 1
-    return _first_sz(master_root, f".//{style_tag}/a:lvl{lvl}pPr/a:defRPr/@sz")
-
-
-def _read_related_xml(pptx_path: Path, part_path: str):
+def _body_wrap(shape):
+    """文本框 bodyPr 的 wrap 值；未显式给出时按 OOXML 默认 'square' 处理."""
     try:
-        with zipfile.ZipFile(str(pptx_path)) as zf:
-            return etree.fromstring(zf.read(part_path))
+        if not shape.has_text_frame:
+            return None
+        body = shape.text_frame._txBody.find(_q('bodyPr'))
+        if body is None:
+            return 'square'
+        return body.get('wrap') or 'square'
     except Exception:
         return None
 
 
-def _resolve_slide_layout_and_master(pptx_path: Path, slide_number: int):
-    """通过 rels 追踪 slideN → slideLayout → slideMaster，返回二者的 XML 根节点。"""
-    rels_path = f"ppt/slides/_rels/slide{slide_number}.xml.rels"
+def _runs(shape):
+    """形状内全部非空 run."""
+    out = []
     try:
-        with zipfile.ZipFile(str(pptx_path)) as zf:
-            rels_root = etree.fromstring(zf.read(rels_path))
-            layout_target = None
-            for rel in rels_root.xpath(
-                "./*[local-name()='Relationship' and contains(@Type,'slideLayout')]",
-            ):
-                layout_target = rel.get("Target")
-                break
-            if not layout_target:
-                return None, None
-            layout_part = "ppt/" + layout_target.replace("../", "")
-            layout_root = etree.fromstring(zf.read(layout_part))
-            layout_rels = layout_part.rsplit("/", 1)
-            layout_rels_path = f"{layout_rels[0]}/_rels/{layout_rels[1]}.rels"
-            master_root = None
+        if not shape.has_text_frame:
+            return out
+        for p in shape.text_frame.paragraphs:
+            for r in p.runs:
+                if r.text:
+                    out.append(r)
+    except Exception:
+        pass
+    return out
+
+def _inherited_fill_hex(run, theme):
+    """run 未显式声明字色时的生效字色：沿 段落 a:pPr/a:defRPr → 文本体
+    a:lstStyle 各级 a:defRPr 逐级回落，仍未命中则落到主题 tx1（dk1）——
+    非占位符形状的默认文字色即母版 otherStyle 的 tx1。"""
+    r = run._r
+    para = r.getparent()
+    if para is not None:
+        pPr = para.find(_q('pPr'))
+        if pPr is not None:
+            hexv = _solid_fill_hex(pPr.find(_q('defRPr')), theme)
+            if hexv:
+                return hexv
+        body = para.getparent()
+        if body is not None:
+            lst = body.find(_q('lstStyle'))
+            if lst is not None:
+                for lvl in lst:
+                    hexv = _solid_fill_hex(lvl.find(_q('defRPr')), theme)
+                    if hexv:
+                        return hexv
+    return theme.get('dk1') or '000000'
+
+
+def _run_props(run, theme):
+    """单个 run 的关键属性：字号(磅)、加粗、中西文字体名、字色、文字描边色与线宽。
+    fill 为"生效字色"：run 级未显式声明 solidFill 时按继承链回落，不视为无色。"""
+    rPr = run._r.find(_q('rPr'))
+    info = {
+        'text': run.text, 'sz': None, 'bold': False,
+        'latin': None, 'ea': None, 'fill': _inherited_fill_hex(run, theme),
+        'ln_hex': None, 'ln_pt': None, 'has_ln': False,
+    }
+    if rPr is None:
+        return info
+    sz = rPr.get('sz')
+    if sz is not None:
+        try:
+            info['sz'] = int(sz) / 100.0
+        except ValueError:
+            info['sz'] = None
+    info['bold'] = (rPr.get('b') or '0') in ('1', 'true')
+    latin = rPr.find(_q('latin'))
+    ea = rPr.find(_q('ea'))
+    info['latin'] = latin.get('typeface') if latin is not None else None
+    info['ea'] = ea.get('typeface') if ea is not None else None
+    info['fill'] = _solid_fill_hex(rPr, theme) or _inherited_fill_hex(run, theme)
+    ln = rPr.find(_q('ln'))
+    if ln is not None:
+        info['has_ln'] = ln.find(_q('noFill')) is None
+        info['ln_hex'] = _solid_fill_hex(ln, theme)
+        w = ln.get('w')
+        if w is not None:
             try:
-                lrels = etree.fromstring(zf.read(layout_rels_path))
-                for rel in lrels.xpath(
-                    "./*[local-name()='Relationship' and contains(@Type,'slideMaster')]",
-                ):
-                    master_target = rel.get("Target")
-                    if master_target:
-                        master_part = "ppt/" + master_target.replace("../", "").lstrip("/")
-                        # slideLayout 位于 ppt/slideLayouts/，master target 通常是 "../slideMasters/slideMasterN.xml"
-                        if master_target.startswith("../"):
-                            master_part = "ppt/" + master_target[3:]
-                        elif master_target.startswith("/"):
-                            master_part = master_target.lstrip("/")
-                        master_root = etree.fromstring(zf.read(master_part))
-                        break
-            except KeyError:
-                pass
-            return layout_root, master_root
-    except Exception:
-        return None, None
+                info['ln_pt'] = int(w) / 12700.0
+            except ValueError:
+                info['ln_pt'] = None
+        else:
+            info['ln_pt'] = 0.75   # 未标注线宽时按 OOXML 细线默认值处理
+    return info
 
 
-def resolve_run_effective_size(
-    pptx_path: Path, slide_number: int, sp_elem, paragraph_elem, run_elem,
-) -> tuple[Optional[float], str]:
-    """按 OOXML 继承链解析 run 的最终字号（磅）。
-
-    继承顺序：run.rPr → paragraph.pPr.defRPr → shape.lstStyle.lvlXpPr →
-    slideLayout 同占位符 → slideMaster 同占位符 → slideMaster titleStyle/bodyStyle/otherStyle。
-    未在任一层找到即返回 (None, 说明)。返回值第二项用于诊断输出。
-    """
-    # 段落级号
-    level = 0
-    lvl_attr = paragraph_elem.xpath("./a:pPr/@lvl", namespaces=NS)
-    if lvl_attr:
-        try:
-            level = int(lvl_attr[0])
-        except (TypeError, ValueError):
-            level = 0
-
-    v = _run_explicit_size(run_elem)
-    if v is not None:
-        return v, "run.rPr@sz"
-
-    v = _paragraph_default_size(paragraph_elem, level)
-    if v is not None:
-        return v, "pPr/defRPr@sz"
-
-    txBody = sp_elem.xpath(".//p:txBody", namespaces=NS)
-    if txBody:
-        v = _lst_style_size(txBody[0], level)
-        if v is not None:
-            return v, f"shape.lstStyle.lvl{level + 1}pPr@sz"
-
-    ph_key = _placeholder_key(sp_elem)
-    layout_root, master_root = _resolve_slide_layout_and_master(pptx_path, slide_number)
-
-    if ph_key is not None:
-        # slideLayout 同占位符（rPr / pPr.defRPr / lstStyle）
-        layout_sp = _find_matching_placeholder(layout_root, ph_key)
-        if layout_sp is not None:
-            v = _first_sz(layout_sp, f".//a:p[{level + 1}]/a:pPr/a:defRPr/@sz")
-            if v is None:
-                v = _first_sz(layout_sp, ".//a:p/a:pPr/a:defRPr/@sz")
-            if v is None:
-                lb = layout_sp.xpath(".//p:txBody", namespaces=NS)
-                if lb:
-                    v = _lst_style_size(lb[0], level)
-            if v is not None:
-                return v, "slideLayout(占位符)"
-        # slideMaster 同占位符
-        master_sp = _find_matching_placeholder(master_root, ph_key)
-        if master_sp is not None:
-            v = _first_sz(master_sp, f".//a:p[{level + 1}]/a:pPr/a:defRPr/@sz")
-            if v is None:
-                v = _first_sz(master_sp, ".//a:p/a:pPr/a:defRPr/@sz")
-            if v is None:
-                mb = master_sp.xpath(".//p:txBody", namespaces=NS)
-                if mb:
-                    v = _lst_style_size(mb[0], level)
-            if v is not None:
-                return v, "slideMaster(占位符)"
-        # slideMaster titleStyle / bodyStyle / otherStyle
-        v = _master_style_size(master_root, ph_key[0], level)
-        if v is not None:
-            return v, "slideMaster.titleStyle/bodyStyle"
-
-    return None, "未在 slide/layout/master 中找到有效 @sz"
+def _font_of(props):
+    """中文实际生效字体：优先 ea，回落 latin."""
+    return props.get('ea') or props.get('latin')
 
 
-def collect_title_effective_sizes(
-    pptx_path: Path, slide_number: int, target: str,
-) -> list[tuple[float, str]]:
-    """收集所有包含 target 文本的 run 的最终字号（含出处诊断）。
-
-    若某个 run 未查到字号，用 (None, 原因) 也会记录，供上层判定"字号不明"。
-    """
-    root = get_slide_xml_root(pptx_path, slide_number)
-    result: list[tuple[float, str]] = []
-    unresolved: list[str] = []
-    for sp in text_shape_xml_nodes_with_text(root, target):
-        for paragraph in sp.xpath(".//a:p", namespaces=NS):
-            para_text = "".join(paragraph.xpath(".//a:t/text()", namespaces=NS))
-            # 只在段落级也含目标文本时才认为该段落隶属于标题；防止把同 shape 内其他段落
-            # （如副标题、注释）的字号也拿来判定。
-            if target not in para_text:
-                continue
-            for run in paragraph.xpath("./a:r", namespaces=NS):
-                run_text = "".join(run.xpath(".//a:t/text()", namespaces=NS))
-                if not run_text.strip():
-                    continue
-                size, origin = resolve_run_effective_size(pptx_path, slide_number, sp, paragraph, run)
-                if size is not None:
-                    result.append((size, f"[{run_text[:6]}…] {origin}={size}pt"))
-                else:
-                    unresolved.append(f"[{run_text[:6]}…] {origin}")
-    # 把 unresolved 塞进返回结构：约定 size=-1 表示"未解析出字号"。
-    for reason in unresolved:
-        result.append((-1.0, reason))
-    return result
-
-
-def picture_aspect_ratio(shape) -> float:
-    # 优先检查PPT中实际摆放尺寸；这比原图像素更符合“PPT图片横纵比”的评估意图。
-    if shape.height:
-        return float(shape.width) / float(shape.height)
-    return 0.0
-
-
-def is_square_picture(shape, tolerance: float = 0.03) -> bool:
-    return abs(picture_aspect_ratio(shape) - 1.0) <= tolerance
-
-
-def two_sides_balanced(left_rect: Rect, right_rect: Rect, tolerance: float = 0.08) -> bool:
-    if min(left_rect.width, right_rect.width) <= 0:
-        return False
-    ratio = left_rect.width / right_rect.width
-    return abs(ratio - 1.0) <= tolerance
-
-
-def find_slide2_main_title_rect(slide) -> Optional[Rect]:
-    """找到第二页顶部总标题“田间防护：护鸟带与驱鸟器应用说明”的矩形。"""
-    target = normalized_text("田间防护：护鸟带与驱鸟器应用说明")
-    for shape in slide.shapes:
-        if target in normalized_text(shape_text(shape)):
-            return rect_of(shape)
-    return None
-
-
-def find_panel_title_shapes(slide):
-    bird_band = []
-    repeller = []
-    for shape in slide.shapes:
-        text = normalized_text(shape_text(shape))
-        # 顶部总标题同时包含“护鸟带”和“驱鸟器”，不能作为单个板块标题。
-        if "护鸟带" in text and "驱鸟器" not in text:
-            bird_band.append(shape)
-        if "驱鸟器" in text and "护鸟带" not in text:
-            repeller.append(shape)
-    return bird_band, repeller
-
-
-def infer_content_panels(slide, slide_w: int, slide_h: int) -> Optional[tuple[Rect, Rect, str]]:
-    """推断第二页护鸟带/驱鸟器两个实际板块区域。
-
-    只有大背景块"真正包含"对应标题时才会归属该板块——去除按中心距离的兜底，
-    避免把同一个大背景块同时最近于两个标题、或把无关背景块误归属为板块。
-    如果大背景块方案不成立，则退回按板块标题/正文文字包围盒推断。
-    """
-    bird_shapes, repeller_shapes = find_panel_title_shapes(slide)
-    if not bird_shapes or not repeller_shapes:
+def _slide_bg_hex(slide, theme):
+    """幻灯片背景实心填充色；缺页或无显式背景返回 None."""
+    if slide is None:
         return None
+    bg = slide._element.find('.//' + _qp('bgPr'))
+    return _solid_fill_hex(bg, theme) if bg is not None else None
 
-    title_bird = rect_of(bird_shapes[0])
-    title_repeller = rect_of(repeller_shapes[0])
+# ===================== 对外接口 =====================
 
-    candidates = []
-    for shape in slide.shapes:
-        color = shape_fill_hex(shape)
-        sr = rect_of(shape)
-        if not color or sr.area == 0:
-            continue
-        if sr.width >= slide_w * 0.25 and sr.height >= slide_h * 0.18:
-            candidates.append(sr)
+class _TargetMissing(Exception):
+    """目录不存在或目录中没有 .pptx：连待评测对象都没有，不进入维度判定。"""
 
-    def containing_panel(title_rect: Rect) -> Optional[Rect]:
-        containing = [r for r in candidates if overlap_area(r, title_rect) / max(1, title_rect.area) >= 0.50]
-        if containing:
-            return max(containing, key=lambda r: r.area)
-        return None
 
-    bird_panel = containing_panel(title_bird)
-    repeller_panel = containing_panel(title_repeller)
-    # 大背景块可能同时把两个标题都罩住（同一整块背景），此时视为无有效背景。
-    if bird_panel and repeller_panel and bird_panel == repeller_panel:
-        bird_panel = repeller_panel = None
-
-    if not bird_panel or not repeller_panel:
-        # 兜底：使用各自标题/正文文字包围盒（严格按各自的文字位置，不做最近邻猜测）。
-        bird_panel = bounding_rect([rect_of(s) for s in bird_shapes])
-        repeller_panel = bounding_rect([rect_of(s) for s in repeller_shapes])
-        return bird_panel, repeller_panel, "未找到独立大背景块，按板块文字包围盒推断"
-
-    return bird_panel, repeller_panel, "按大背景块与板块标题位置推断"
-
-
-def bounding_rect(rects: Iterable[Rect]) -> Rect:
-    rects = list(rects)
-    left = min(r.left for r in rects)
-    top = min(r.top for r in rects)
-    right = max(r.right for r in rects)
-    bottom = max(r.bottom for r in rects)
-    return Rect(left, top, right - left, bottom - top)
-
-
-def pictures_in_region(slide, region: Rect):
-    pics = []
-    for pic in iter_picture_shapes(slide):
-        pr = rect_of(pic)
-        if pr.area and overlap_area(pr, region) / pr.area >= 0.45:
-            pics.append(pic)
-    return pics
-
-
-def picture_in_top_right(panel: Rect, pic) -> tuple[bool, str]:
-    """判断单张图片是否位于板块右上"角"。
-
-    仅"中心在右半上半区"不足以判定为"右上角"（可能贴中线或偏中央）。
-    这里同时校验：
-    - 图片中心在板块右半区且上半区（原有近似判定）；
-    - 图片右边界靠近板块右侧（距离 ≤ 板块宽的 20%）；
-    - 图片上边界靠近板块顶部（距离 ≤ 板块高的 25%）；
-    - 图片尺寸不至于占满整个板块（面积占板块 ≤ 55%），确保是"角落"而非"覆盖"。
-    """
-    pr = rect_of(pic)
-    center_ok = pr.cx >= panel.left + panel.width * 0.58 and pr.cy <= panel.top + panel.height * 0.48
-
-    right_gap = panel.right - pr.right
-    top_gap = pr.top - panel.top
-    right_close = 0 <= right_gap <= panel.width * 0.20
-    top_close = 0 <= top_gap <= panel.height * 0.25
-
-    area_ratio = pr.area / max(1, panel.area)
-    not_covering = area_ratio <= 0.55
-
-    ok = center_ok and right_close and top_close and not_covering
-    detail = (
-        f"中心右上={center_ok}，右缘距={right_gap}(≤{int(panel.width * 0.20)})={right_close}，"
-        f"上缘距={top_gap}(≤{int(panel.height * 0.25)})={top_close}，"
-        f"占板块面积={area_ratio:.2f}(≤0.55)={not_covering}"
-    )
-    return ok, detail
-
-
-def _iter_potential_content_shapes(slide):
-    """遍历幻灯片上"可能算作已有内容"的形状（文本框、自选图形、图表、表格等）。
-
-    图片自身单独处理；纯装饰底板（尺寸接近整页/半页的大块填充色矩形）不视为内容。
-    """
-    for shape in slide.shapes:
-        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-            continue
-        yield shape
-
-
-def picture_top_right_is_blank(
-    slide, panel: Rect, pic, other_pics_in_panel: list[object]
-) -> tuple[bool, str]:
-    """判断图片所在的板块右上角是否为"空白处"（不遮挡文字/其他内容）。
-
-    "空白"按几何近似：图片矩形与板块内其它非图片形状（文本/自选图形/表格等）
-    的重叠面积不超过图片面积的阈值。同时排除：
-    - 图片自身；
-    - 板块背景色块（面积 ≥ 板块面积 90% 的填充色形状）；
-    - 完全包住图片的容器形状（如整块板块背景，图片本就该"放置"在其上）。
-    """
-    pr = rect_of(pic)
-    slide_pic_iid = id(pic)
-    overlaps: list[tuple[str, int]] = []
-    total_overlap_ratio = 0.0
-    for shape in _iter_potential_content_shapes(slide):
-        sr = rect_of(shape)
-        if sr.area == 0:
-            continue
-        # 只关心与图片有实际重叠、并且这个形状确实"落在"当前板块内的内容。
-        if overlap_area(sr, panel) / max(1, sr.area) < 0.30:
-            continue
-        # 板块背景色块（尺寸接近整个板块的大填充块）不算内容遮挡。
-        if sr.area >= panel.area * 0.90 and overlap_area(sr, panel) / max(1, sr.area) >= 0.85:
-            continue
-        ov = overlap_area(sr, pr)
-        if ov <= 0:
-            continue
-        # 完全包住图片的容器（比如整块板块底板），不算遮挡。
-        if ov >= pr.area * 0.98 and sr.area >= pr.area * 2:
-            continue
-        text = shape_text(shape).strip()
-        label = text[:20] if text else f"<{shape.shape_type}>"
-        overlaps.append((label, ov))
-        total_overlap_ratio += ov / max(1, pr.area)
-
-    # 也把板块内的"其它图片"视为遮挡（严格意义上此细则要求本板块仅有一张图片）。
-    for other in other_pics_in_panel:
-        if id(other) == slide_pic_iid:
-            continue
-        ov = overlap_area(rect_of(other), pr)
-        if ov > 0:
-            other_name = getattr(other, "name", "?")
-            overlaps.append((f"<其他图片:{other_name}>", ov))
-            total_overlap_ratio += ov / max(1, pr.area)
-
-    is_blank = total_overlap_ratio <= 0.05  # 允许 ≤5% 的边缘擦碰
-    if overlaps:
-        summary = "、".join(f"{lbl}({ov})" for lbl, ov in overlaps[:3])
-        detail = f"重叠内容={summary}，累计遮挡={total_overlap_ratio:.2%}"
-    else:
-        detail = "板块内右上区域无内容遮挡"
-    return is_blank, detail
-
-
-def evaluate_dimension1(path: Path) -> tuple[bool, str, Optional[Presentation]]:
-    """维度1：交付文件为 .pptx 格式，且可正常打开。
-
-    仅"能被 python-pptx 解析"不足以证明可正常打开，此处补充以下检查：
-    - 扩展名与文件头一致（.pptx 必须是 ZIP，不能是加密 .pptx 的 OLE 复合文档头）；
-    - ZIP 内部结构完整、必需部件齐全（否则 PowerPoint 打开会报错）；
-    - 未设置打开密码（否则无法打开）。
-    """
-    # 1) 扩展名
-    if path.suffix.lower() != ".pptx":
-        return False, f"交付文件扩展名为 {path.suffix!r}，不是 .pptx", None
-    if not path.exists():
-        return False, f"文件不存在：{path}", None
-
-    # 2) 文件头识别：加密 .pptx 实际为 OLE 复合文档，无法直接编辑/播放
-    try:
-        with open(path, "rb") as fh:
-            header = fh.read(8)
-    except OSError as exc:
-        return False, f"文件读取失败，无法打开：{exc}", None
-    if header.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
-        return False, "文件为加密 OLE 复合文档（疑似设置了打开密码），无法正常编辑/播放", None
-    if not header.startswith(b"PK"):
-        return False, "文件不是有效的 .pptx（缺少 ZIP 文件头）", None
-
-    # 3) ZIP 结构完整性 + 必需部件 + 保护属性检查
-    pres_xml: bytes = b""
-    try:
-        with zipfile.ZipFile(str(path)) as zf:
-            broken = zf.testzip()
-            if broken is not None:
-                return False, f"文件内部条目 {broken} 损坏，PowerPoint 打开会报错", None
-            names = set(zf.namelist())
-            required_parts = ["[Content_Types].xml", "ppt/presentation.xml"]
-            missing = [p for p in required_parts if p not in names]
-            if missing:
-                return False, f"缺少必需部件 {missing}，无法正常打开/编辑", None
-            pres_xml = zf.read("ppt/presentation.xml")
-    except zipfile.BadZipFile:
-        return False, "文件不是有效的 .pptx（ZIP 结构损坏）", None
-    except Exception as exc:  # noqa: BLE001
-        return False, f"文件结构检查失败：{exc}", None
-
-    try:
-        etree.fromstring(pres_xml)  # type: ignore[arg-type]
-    except Exception as exc:  # noqa: BLE001
-        return False, f"presentation.xml 解析失败：{exc}", None
-
-    # 4) python-pptx 解析（可正常打开的基本前提：XML 语义合法）
-    try:
-        prs = Presentation(str(path))
-    except Exception as exc:  # noqa: BLE001
-        return False, f"文件无法正常打开解析：{exc}", None
-
-    slide_count = len(prs.slides)
-    if slide_count == 0:
-        return False, "文件可打开但没有幻灯片", None
-
-    detail = (
-        f"文件为 .pptx；ZIP 结构完整、无加密；共 {slide_count} 页；"
-        f"判定为可正常打开"
-    )
-    return True, detail, prs
-
-
-def check_title_wordart(prs: Presentation, path: Path) -> CheckResult:
-    name = "首页标题“田间共生观察”改为白色外边蓝色填充的艺术字"
-    if len(prs.slides) < 1:
-        return CheckResult(5, name, False, "缺少首页")
-    root = get_slide_xml_root(path, 1)
-    theme_colors = _load_theme_colors(path)
-    nodes = text_shape_xml_nodes_with_text(root, "田间共生观察")
-    for sp in nodes:
-        ok, why = has_wordart_white_line_blue_fill(sp, theme_colors)
-        if ok:
-            return CheckResult(5, name, True, why)
-    return CheckResult(
-        5, name, False,
-        "未同时检测到蓝色文字填充、白色文字轮廓与艺术字特征（普通文本框着色不视为艺术字）",
-    )
-
-
-def check_slide2_panels_1_to_1(prs: Presentation) -> CheckResult:
-    name = "第二页“田间防护：护鸟带与驱鸟器应用说明”下方护鸟带和驱鸟器板块分成左右两部分比例为1:1"
-    if len(prs.slides) < 2:
-        return CheckResult(5, name, False, "缺少第二页")
-    slide = prs.slides[1]
-    slide_w = int(prs.slide_width)
-    slide_h = int(prs.slide_height)
-    panels = infer_content_panels(slide, slide_w, slide_h)
-    if panels is None:
-        return CheckResult(5, name, False, "未找到护鸟带/驱鸟器板块")
-    bird_panel, repeller_panel, reason = panels
-
-    # 细则点1：位于“田间防护：护鸟带与驱鸟器应用说明”标题下方。
-    title_rect = find_slide2_main_title_rect(slide)
-    if title_rect is None:
-        below_title = False
-        title_detail = "未找到指定标题"
-    else:
-        below_title = bird_panel.top >= title_rect.bottom and repeller_panel.top >= title_rect.bottom
-        title_detail = f"标题底部={title_rect.bottom}，护鸟带顶={bird_panel.top}，驱鸟器顶={repeller_panel.top}"
-
-    # 细则点2：护鸟带在左、驱鸟器在右（左右顺序固定，且中心 x 有明显分离）。
-    order_ok = bird_panel.cx < repeller_panel.cx
-    horizontal_sep = abs(bird_panel.cx - repeller_panel.cx) > slide_w * 0.20
-    left_right = order_ok and horizontal_sep
-
-    # 细则点3：两板块位于同一行（顶部/底部/中心 y 接近，且垂直上重叠明显）。
-    max_h = max(bird_panel.height, repeller_panel.height, 1)
-    same_row_center = abs(bird_panel.cy - repeller_panel.cy) <= max_h * 0.20
-    v_overlap = max(
-        0,
-        min(bird_panel.bottom, repeller_panel.bottom) - max(bird_panel.top, repeller_panel.top),
-    )
-    same_row_overlap = v_overlap >= min(bird_panel.height, repeller_panel.height) * 0.60
-    same_row = same_row_center and same_row_overlap
-
-    # 细则点4：两板块"共同构成"标题下方的主要内容区。
-    # 用两板块联合覆盖的宽度和高度分别占标题下方剩余画布的比例来衡量。
-    if title_rect is not None:
-        content_top = title_rect.bottom
-    else:
-        content_top = min(bird_panel.top, repeller_panel.top)
-    content_h = max(1, slide_h - content_top)
-    union_left = min(bird_panel.left, repeller_panel.left)
-    union_right = max(bird_panel.right, repeller_panel.right)
-    union_top = min(bird_panel.top, repeller_panel.top)
-    union_bottom = max(bird_panel.bottom, repeller_panel.bottom)
-    width_cover = (union_right - union_left) / max(1, slide_w)
-    height_cover = (union_bottom - union_top) / content_h
-    covers_content_area = width_cover >= 0.70 and height_cover >= 0.50
-
-    # 细则点5：宽度与面积均满足 1:1（取更严格者，容差 ±8%）。
-    balanced_width = two_sides_balanced(bird_panel, repeller_panel)
-    if min(bird_panel.area, repeller_panel.area) > 0:
-        area_ratio = bird_panel.area / repeller_panel.area
-        balanced_area = abs(area_ratio - 1.0) <= 0.10
-    else:
-        area_ratio = 0.0
-        balanced_area = False
-    balanced = balanced_width and balanced_area
-
-    ok = below_title and left_right and same_row and covers_content_area and balanced
-    detail = (
-        f"{reason}；{title_detail}；"
-        f"护鸟带在左={order_ok}，水平分离={horizontal_sep}；"
-        f"同一行(中心y≈)={same_row_center}，垂直重叠={same_row_overlap}；"
-        f"覆盖标题下方内容区(宽{width_cover:.2f}/高{height_cover:.2f})={covers_content_area}；"
-        f"护鸟带宽={bird_panel.width}、驱鸟器宽={repeller_panel.width}，宽度1:1={balanced_width}；"
-        f"面积比={area_ratio:.3f}，面积1:1={balanced_area}"
-    )
-    return CheckResult(5, name, ok, detail)
-
-
-def check_slide2_panel_images_top_right(prs: Presentation) -> CheckResult:
-    name = "第二页护鸟带和驱鸟器板块分别有一张图片需放置在各自板块的右上角空白处"
-    if len(prs.slides) < 2:
-        return CheckResult(5, name, False, "缺少第二页")
-    slide = prs.slides[1]
-    slide_w = int(prs.slide_width)
-    slide_h = int(prs.slide_height)
-    panels = infer_content_panels(slide, slide_w, slide_h)
-    if panels is None:
-        return CheckResult(5, name, False, "未找到护鸟带/驱鸟器板块")
-    bird_panel, repeller_panel, _ = panels
-    bird_pics = pictures_in_region(slide, bird_panel)
-    repeller_pics = pictures_in_region(slide, repeller_panel)
-
-    def _judge(panel: Rect, pics: list, label: str) -> tuple[bool, str]:  # type: ignore[type-arg]
-        if len(pics) != 1:
-            return False, f"{label}板块图片{len(pics)}张(需恰好1张)"
-        pic = pics[0]
-        corner_ok, corner_detail = picture_in_top_right(panel, pic)
-        blank_ok, blank_detail = picture_top_right_is_blank(slide, panel, pic, pics)
-        return corner_ok and blank_ok, f"{label}：{corner_detail}；{blank_detail}"
-
-    ok_bird, detail_bird = _judge(bird_panel, bird_pics, "护鸟带")
-    ok_repeller, detail_repeller = _judge(repeller_panel, repeller_pics, "驱鸟器")
-
-    ok = ok_bird and ok_repeller
-    detail = f"{detail_bird}；{detail_repeller}"
-    return CheckResult(5, name, ok, detail)
-
-
-def check_slide2_picture_not_square(prs: Presentation) -> CheckResult:
-    name = "第二页护鸟带和驱鸟器图片横纵比不满足1:1"
-    if len(prs.slides) < 2:
-        return CheckResult(-5, name, False, "缺少第二页")
-    slide = prs.slides[1]
-    slide_w = int(prs.slide_width)
-    slide_h = int(prs.slide_height)
-    panels = infer_content_panels(slide, slide_w, slide_h)
-    if panels is None:
-        return CheckResult(-5, name, False, "未找到护鸟带/驱鸟器板块")
-    bird_panel, repeller_panel, _ = panels
-
-    # 细则只针对护鸟带和驱鸟器两个板块内的图片。
-    panel_pics = pictures_in_region(slide, bird_panel) + pictures_in_region(slide, repeller_panel)
-    if not panel_pics:
-        return CheckResult(-5, name, False, "护鸟带/驱鸟器板块内未检测到图片")
-
-    # 细则点：图片横纵比不满足1:1（即存在任一图片不是1:1）时扣分。
-    not_square = [p for p in panel_pics if not is_square_picture(p)]
-    detail = "；".join(f"{p.name}: {picture_aspect_ratio(p):.3f}" for p in panel_pics)
-    return CheckResult(-5, name, bool(not_square), detail)
-
-
-def _slide_background_fill_hex(pptx_path: Path, slide_number: int) -> Optional[str]:
-    """从 slideN.xml 读取幻灯片级背景填充色。
-
-    仅识别 ``<p:cSld>/<p:bg>`` 下的 ``a:solidFill``（srgbClr / sysClr）；渐变/图片背景返回 None。
-    幻灯片自身未定义背景时不回溯 layout/master —— 那些颜色对"左右半部分不同色"的判定并不适用。
-    """
-    try:
-        root = get_slide_xml_root(pptx_path, slide_number)
-    except Exception:
-        return None
-    for solid in root.xpath(".//p:cSld/p:bg//a:solidFill", namespaces=NS):
-        for child in solid:
-            tag = etree.QName(child.tag).localname
-            if tag == "srgbClr":
-                val = child.get("val")
-                if val:
-                    return val.upper()
-            if tag == "sysClr":
-                val = child.get("lastClr")
-                if val:
-                    return val.upper()
-    return None
-
-
-def check_slide2_background_bad(prs: Presentation, path: Path) -> CheckResult:
-    name = "第二页PPT背景填充不满足：左半部分护鸟带背景填充色为深绿色，右半部分填充色为浅绿色"
-    if len(prs.slides) < 2:
-        return CheckResult(-5, name, False, "缺少第二页")
-    slide = prs.slides[1]
-    slide_w = int(prs.slide_width)
-    slide_h = int(prs.slide_height)
-    slide_area = slide_w * slide_h
-    left_half = Rect(0, 0, slide_w // 2, slide_h)
-    right_half = Rect(slide_w // 2, 0, slide_w - slide_w // 2, slide_h)
-
-    # 1) 识别"真正的背景层"：幻灯片自身背景 + 大面积填充色块（跨越整张画布或整个半区）。
-    #    小于该阈值的填充块视为装饰/内容块，不参与背景色判定。
-    slide_bg_hex = _slide_background_fill_hex(path, 2)
-
-    background_shapes: list[tuple[Rect, str]] = []
-    for shape in slide.shapes:
-        color = shape_fill_hex(shape)
-        if not color:
-            continue
-        sr = rect_of(shape)
-        if sr.area == 0:
-            continue
-        # 背景形状必须"足够大"：占整页 ≥ 40%，或几乎覆盖某个半区（≥ 85%）。
-        covers_slide = sr.area / max(1, slide_area) >= 0.40
-        covers_left_half = overlap_area(sr, left_half) / max(1, left_half.area) >= 0.85
-        covers_right_half = overlap_area(sr, right_half) / max(1, right_half.area) >= 0.85
-        if covers_slide or covers_left_half or covers_right_half:
-            background_shapes.append((sr, color))
-
-    def dominant_bg_color(half: Rect) -> tuple[Optional[str], float, list[tuple[str, float]]]:
-        """返回该半区覆盖度最高的背景色、覆盖比例、以及全部候选(用于诊断)。"""
-        # 幻灯片背景视为一个"铺满整张画布"的候选，覆盖比例 = 100%。
-        coverage: dict[str, int] = {}
-        if slide_bg_hex:
-            coverage[slide_bg_hex] = coverage.get(slide_bg_hex, 0) + half.area
-        for rect, color in background_shapes:
-            ov = overlap_area(rect, half)
-            if ov <= 0:
-                continue
-            coverage[color] = coverage.get(color, 0) + ov
-        if not coverage:
-            return None, 0.0, []
-        ranked = sorted(coverage.items(), key=lambda kv: kv[1], reverse=True)
-        top_color, top_ov = ranked[0]
-        top_ratio = top_ov / max(1, half.area)
-        diagnostic = [(c, ov / max(1, half.area)) for c, ov in ranked[:3]]
-        return top_color, top_ratio, diagnostic
-
-    left_color, left_ratio, left_diag = dominant_bg_color(left_half)
-    right_color, right_ratio, right_diag = dominant_bg_color(right_half)
-
-    # 2) 要求主导背景色确实占半区的主要面积（≥ 60%），才判定其为"半区背景填充色"。
-    left_dominant_enough = left_ratio >= 0.60
-    right_dominant_enough = right_ratio >= 0.60
-
-    left_is_deep = left_color is not None and classify_green(left_color) == "deep_green"
-    right_is_light = right_color is not None and classify_green(right_color) == "light_green"
-
-    ok_positive = left_dominant_enough and right_dominant_enough and left_is_deep and right_is_light
-
-    def _fmt(diag: list[tuple[str, float]]) -> str:
-        return "、".join(f"{c}({r:.0%})" for c, r in diag) if diag else "无"
-
-    detail = (
-        f"幻灯片背景={slide_bg_hex or '无'}；"
-        f"左半区主导={left_color}({left_ratio:.0%})[{_fmt(left_diag)}]，深绿色={left_is_deep}(主导≥60%={left_dominant_enough})；"
-        f"右半区主导={right_color}({right_ratio:.0%})[{_fmt(right_diag)}]，浅绿色={right_is_light}(主导≥60%={right_dominant_enough})"
-    )
-    # 扣分项：不满足即命中扣分。
-    return CheckResult(-5, name, not ok_positive, detail)
-
-
-def check_title_font_not_60(prs: Presentation, path: Path) -> CheckResult:
-    name = "首页标题“田间共生观察”出现字号不是60磅"
-    if len(prs.slides) < 1:
-        return CheckResult(-1, name, False, "缺少首页")
-
-    # 按 OOXML 继承链解析：run.rPr → 段落 pPr → 形状 lstStyle → slideLayout → slideMaster。
-    entries = collect_title_effective_sizes(path, 1, "田间共生观察")
-    if not entries:
-        # 找不到含标题文本的 run。细则语义偏向"标题异常"，从严扣分。
-        return CheckResult(-1, name, True, "未在首页 slide/layout/master 中定位到标题 run")
-
-    resolved = [(s, note) for s, note in entries if s > 0]
-    unresolved = [note for s, note in entries if s <= 0]
-
-    bad_sizes = [s for s, _ in resolved if abs(s - 60) > 0.5]
-    detail_parts = [note for _, note in entries]
-
-    # 细则："出现字号不是 60 磅"即扣分。
-    # - 存在非 60 磅的 run  →  命中扣分。
-    # - 至少一个 run 未解析出字号  →  从严扣分（不再默认放过），并说明原因。
-    if bad_sizes:
-        hit = True
-        reason = f"检测到非60磅字号={bad_sizes}"
-    elif unresolved:
-        hit = True
-        reason = f"存在无法解析的字号，从严判定为异常：{unresolved}"
-    else:
-        hit = False
-        reason = "所有 run 的最终字号均为 60 磅"
-
-    return CheckResult(-1, name, hit, f"{reason}；明细：{'；'.join(detail_parts)}")
-
-
-def check_slide2_title_missing(prs: Presentation) -> CheckResult:
-    name = "第二页PPT顶部未出现“田间防护：护鸟带与驱鸟器应用说明”文字内容"
-    expected = "田间防护：护鸟带与驱鸟器应用说明"
-    if len(prs.slides) < 2:
-        return CheckResult(-3, name, True, "缺少第二页")
-    slide = prs.slides[1]
-    slide_h = int(prs.slide_height)
-
-    # 细则点：第二页“顶部”出现指定文字内容。找到含该文字的形状并判断其是否位于顶部。
-    target = normalized_text(expected)
-    title_shape = None
-    for shape in slide.shapes:
-        if target in normalized_text(shape_text(shape)):
-            title_shape = shape
-            break
-
-    if title_shape is None:
-        return CheckResult(-3, name, True, "未检测到指定文字内容")
-
-    at_top = rect_of(title_shape).cy <= slide_h * 0.30
-    detail = f"检测到文字内容，位于顶部={at_top}（中心y={int(rect_of(title_shape).cy)}）"
-    # 未出现在顶部即命中扣分。
-    return CheckResult(-3, name, not at_top, detail)
-
-
-def check_bird_band_content_missing(prs: Presentation) -> CheckResult:
-    name = "第二页护鸟带板块“材质”“原理”“设计”三条内容缺少任意一条"
-    required = ["材质", "原理", "设计"]
-    if len(prs.slides) < 2:
-        return CheckResult(-3, name, True, "缺少第二页")
-    slide = prs.slides[1]
-    slide_w = int(prs.slide_width)
-    slide_h = int(prs.slide_height)
-
-    # 细则点：范围限定在“护鸟带板块”内。先定位护鸟带板块区域，再取该区域内文字。
-    panels = infer_content_panels(slide, slide_w, slide_h)
-    if panels is None:
-        return CheckResult(-3, name, True, "未找到护鸟带板块")
-    bird_panel, _, _ = panels
-
-    texts = []
-    for shape in slide.shapes:
-        t = shape_text(shape)
-        if not t:
-            continue
-        sr = rect_of(shape)
-        if sr.area and overlap_area(sr, bird_panel) / sr.area >= 0.5:
-            texts.append(t)
-    bird_text = "\n".join(texts)
-
-    # 细则点：“材质”“原理”“设计”三条缺少任意一条即扣分。
-    missing = [word for word in required if word not in bird_text]
-    return CheckResult(-3, name, bool(missing), f"缺少：{missing}" if missing else "三条内容均检测到")
-
-
-SCRIPT_ID = "071"
-SUPPORTED_SUFFIXES = {".pptx"}
-
-
-def _locate_target_file(dir_path: Path) -> Path | None:
-    """在给定目录中寻找待评估的 .pptx 文件。
-
-    - 忽略脚本自身、缓存目录以及以 ``~$`` 开头的 Office 临时文件；
-    - 只识别 ``.pptx``；若存在多个候选，取修改时间最新的一个。
-    """
-    if not dir_path.is_dir():
-        return None
-    candidates: list[Path] = []
-    for entry in dir_path.iterdir():
-        if not entry.is_file():
-            continue
-        if entry.name.startswith("~$"):
-            continue
-        if entry.suffix.lower() not in SUPPORTED_SUFFIXES:
-            continue
-        candidates.append(entry)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda p: -p.stat().st_mtime)
-    return candidates[0]
-
-
-def evaluate(dir_path: str) -> dict[str, object]:
-    """评估脚本所在目录里的 PPT 文件，返回结构化结果字典。
-
-    参数 ``dir_path`` 为“脚本所在目录的路径”，脚本自行在该目录中查找并打开
-    被评估的文档。返回结构遵循《脚本接口差异与统一建议.md》§2.2。
-    """
-    result: dict[str, object] = {
+def evaluate(dir_path):
+    """按接口约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估的
+    .pptx（忽略以 ~$ 开头的临时锁文件）。目录不存在 / 未发现文档时返回
+    status='error' 且维度一未参与判定（dim1_pass 留空）；文件存在但打不开或
+    脚本崩溃时返回 status='error' 且 dim1_pass=False 并给出错误摘要。"""
+    result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
-    # 维度二各评分项的满分之和（正分累加，扣分项以其绝对值不计入满分基准，
-    # 这里保留“正向满分”语义：10 项细则中 3 项为得分项、7 项为扣分项，
-    # 满分为得分项之和 15 分）。
-    max_positive_score = 5 + 5 + 5
-    result["max_score"] = max_positive_score
-
     try:
-        directory = Path(dir_path)
-        target = _locate_target_file(directory)
-        if target is None:
-            result["status"] = "error"
-            result["error"] = f"目录中未找到 .pptx 文件：{directory}"
-            return result
-
-        result["file_name"] = target.name
-
-        dim1_ok, dim1_detail, prs = evaluate_dimension1(target)
-        result["dim1_pass"] = dim1_ok
-        if not dim1_ok or prs is None:
-            result["dim1_reason"] = dim1_detail
-            result["total_score"] = 0
-            return result
-
-        checks: list[CheckResult] = [
-            check_title_wordart(prs, target),
-            check_slide2_panels_1_to_1(prs),
-            check_slide2_panel_images_top_right(prs),
-            check_slide2_picture_not_square(prs),
-            check_slide2_background_bad(prs, target),
-            check_title_font_not_60(prs, target),
-            check_slide2_title_missing(prs),
-            check_bird_band_content_missing(prs),
-        ]
-
-        total = 0
-        items: list[dict[str, object]] = []
-        for item in checks:
-            delta = item.score if item.passed else 0
-            total += delta
-            items.append(
-                {
-                    "rule": item.name,
-                    "max_delta": item.score,
-                    "delta": delta,
-                    "hit": item.passed,
-                    "detail": "",
-                }
-            )
-        result["dim2_items"] = items
-        result["total_score"] = total
-        return result
-    except Exception as exc:  # noqa: BLE001
+        if not dir_path or not os.path.isdir(dir_path):
+            raise _TargetMissing(f"目录不存在：{dir_path}")
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith('.pptx') and not f.startswith('~$')
+        )
+        if not cands:
+            raise _TargetMissing(f"目录中未找到 .pptx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except _TargetMissing as exc:
+        # 找不到待评测文件：维度1 未参与判定，dim1_pass / dim1_reason 一律留空，满分也置 0
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        # 文件存在但打不开 / 解析失败：属于交付文件问题，记为维度一不通过、正常 0 分
+        result["status"] = "ok"
+        result["error"] = None
+        result["dim1_pass"] = False
+        result["dim1_reason"] = f"文件无法解析或无法打开：{type(exc).__name__}: {exc}"
+        result["dim2_items"] = []
+        result["total_score"] = 0
         return result
 
 
-def main(argv: list[str]) -> int:
-    """本地调试入口：把评估结果以 JSON 形式打印到标准输出。"""
-    target_dir = argv[0] if argv else str(Path(__file__).resolve().parent)
-    report = evaluate(target_dir)
-    text = json.dumps(report, ensure_ascii=False, indent=2)
+def _fail_dim1(result, reason):
+    """维度一未通过：完成度总分直接记 0（属于正常评测结果，不是脚本错误）。"""
+    result["status"] = "ok"
+    result["error"] = None
+    result["dim1_pass"] = False
+    result["dim1_reason"] = reason
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+def _evaluate_impl(file_path, result):
+    """维度一门禁 + 维度二评分主体；内部按追加顺序构造 results 列表，
+    末尾按 _MAX_DELTAS_ORDER 反解成结构化 dim2_items 填入 result。"""
+    # ========== 维度1：可用与可修改性 ==========
+    # 仅门禁"文件能否作为 .pptx 正常打开"，打不开则完成度总分直接记 0；
+    # 页数、页面尺寸、版面重叠越界等一律不设门禁，交由维度二各评分项据实计分。
     try:
-        print(text)
-    except UnicodeEncodeError:
-        # 兼容 Windows 默认 cp1252 控制台
-        sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
-        sys.stdout.buffer.write(b"\n")
-    return 0
+        prs = Presentation(file_path)
+        slides = list(prs.slides)
+    except Exception as exc:
+        return _fail_dim1(result, f"文件损坏或非有效 .pptx，无法打开（{type(exc).__name__}: {exc}）")
+
+    theme = _load_theme_colors(prs)
+    results = []
+
+    page_w = _cm(prs.slide_width)
+    page_h = _cm(prs.slide_height)
+
+    def _slide_at(idx):
+        return slides[idx] if idx < len(slides) else None
+
+    def _shapes_at(idx):
+        s = _slide_at(idx)
+        return list(s.shapes) if s is not None else []
+
+    s2 = _slide_at(1)
+    s1_shapes = _shapes_at(0)
+    s2_shapes = _shapes_at(1)
+
+    def _text_shapes(shapes):
+        return [sh for sh in shapes if not _is_picture(sh) and _norm(_shape_text(sh))]
+
+    s1_texts = _text_shapes(s1_shapes)
+    s2_texts = _text_shapes(s2_shapes)
+
+    # ========== 维度2：完成度评分 ==========
+
+    # --- 首页元素定位（按文案，不依赖形状名）---
+    s1_pics = [sh for sh in s1_shapes if _is_picture(sh)]
+    title_shapes = [sh for sh in s1_texts if KEY_MAIN_TITLE in _norm(_shape_text(sh))]
+    sub_shapes = [sh for sh in s1_texts if KEY_SUBTITLE in _norm(_shape_text(sh))]
+    main_title = title_shapes[-1] if title_shapes else None   # z 序最上层者为可见标题
+    subtitle = sub_shapes[-1] if sub_shapes else None
+    title_props = [_run_props(r, theme) for r in _runs(main_title)] if main_title else []
+    sub_props = [_run_props(r, theme) for r in _runs(subtitle)] if subtitle else []
+
+    # --- 第二页元素定位 ---
+    page_area = page_w * page_h
+    s2_pics = [sh for sh in s2_shapes if _is_picture(sh)]
+    content_pics = [sh for sh in s2_pics if _area(_box(sh)) < 0.9 * page_area]
+
+    def _hit_keys(shape, keys):
+        t = _norm(_shape_text(shape))
+        return any(k in t for k in keys)
+
+    page_title_sh = next((sh for sh in s2_texts if KEY_PAGE_TITLE in _norm(_shape_text(sh))), None)
+    a_title_sh = next((sh for sh in s2_texts if KEY_A_TITLE in _norm(_shape_text(sh))), None)
+    b_title_sh = next((sh for sh in s2_texts if KEY_B_TITLE in _norm(_shape_text(sh))), None)
+    a_body_shs = [sh for sh in s2_texts if _hit_keys(sh, KEYS_A_BODY)]
+    b_body_shs = [sh for sh in s2_texts if _hit_keys(sh, KEYS_B_BODY)]
+    group_a = [sh for sh in ([a_title_sh] if a_title_sh else []) + a_body_shs]
+    group_b = [sh for sh in ([b_title_sh] if b_title_sh else []) + b_body_shs]
+    box_a = _union_box([_box(sh) for sh in group_a])
+    box_b = _union_box([_box(sh) for sh in group_b])
+
+    # 板块底衬：无文字、非图片、实心填充且面积≥40cm² 的形状
+    panels = [
+        sh for sh in s2_shapes
+        if not _is_picture(sh) and not _norm(_shape_text(sh))
+        and _shape_fill_hex(sh, theme) and _area(_box(sh)) >= 40.0
+    ]
+    panels.sort(key=lambda sh: _box(sh)[0])
+
+    def _panel_of(box):
+        """外框中心所落入的板块；无包含关系时取中心距离最近者."""
+        if box is None or not panels:
+            return None
+        cx, cy = _center(box)
+        for sh in panels:
+            b = _box(sh)
+            if b[0] - TOL <= cx <= b[2] + TOL and b[1] - TOL <= cy <= b[3] + TOL:
+                return sh
+        return min(panels, key=lambda sh: abs(_center(_box(sh))[0] - cx) + abs(_center(_box(sh))[1] - cy))
+
+    def _panel_containing(box):
+        """外框中心确实压在某块底衬上时返回该底衬，否则返回 None。
+        用于取"文字实际叠在什么颜色上"，不做就近兜底——文字落在底衬之外时，
+        它的背景是幻灯片底色而非任何板块。"""
+        if box is None:
+            return None
+        cx, cy = _center(box)
+        for sh in panels:
+            b = _box(sh)
+            if b[0] - TOL <= cx <= b[2] + TOL and b[1] - TOL <= cy <= b[3] + TOL:
+                return sh
+        return None
+
+    panel_a = _panel_of(box_a)
+    panel_b = _panel_of(box_b)
+    two_panels = (panel_a is not None and panel_b is not None and panel_a is not panel_b)
+    pa, pb = (_box(panel_a) if panel_a else None), (_box(panel_b) if panel_b else None)
+    panels_side_by_side = bool(
+        two_panels and (pa[2] <= pb[0] + TOL or pb[2] <= pa[0] + TOL)
+        and _v_overlap_ratio(pa, pb) >= 0.9)
+    left_panel, right_panel = (pa, pb) if (pa and pb and pa[0] <= pb[0]) else (pb, pa)
+    mid_x = ((left_panel[2] + right_panel[0]) / 2.0
+             if panels_side_by_side else page_w / 2.0)
+
+    def _align_name(paragraph):
+        """段落对齐方式名（LEFT/CENTER/...）；None 表示继承默认（按左对齐处理）."""
+        al = paragraph.alignment
+        return None if al is None else str(al).split()[0]
+
+    # 01 +3：首页主标题蓝色字芯
+    ok = bool(title_props) and all(_is_blue(p['fill']) for p in title_props)
+    results.append(
+        ('+3' if ok else '+0')
+        + '：首页主标题"田间共生观察"的文字填充为蓝色系纯色（色相200°-230°区间），6个字全部为蓝色')
+
+    # 02 +5：首页主标题白色描边
+    ok = bool(title_props) and all(p['has_ln'] and _is_white(p['ln_hex']) for p in title_props)
+    results.append(
+        ('+5' if ok else '+0')
+        + '：首页主标题"田间共生观察"设有白色文字描边（run 级 a:ln 白色实线），6个字全部带描边，与蓝色字芯构成艺术字')
+
+    # 03 +3：描边宽度 0.5-2.0 磅
+    ok = bool(title_props) and all(_in_range(p['ln_pt'], 0.5, 2.0) for p in title_props)
+    results.append(
+        ('+3' if ok else '+0')
+        + '：主标题描边宽度0.5-2.0磅，白边不侵蚀笔画，未出现≥3磅粗边把文字压成一团白边')
+
+    # 04 +1：主标题居中、落位与自动换行
+    # 前提：主标题确已做过艺术字改动（run 级描边或蓝色字芯）。未动过标题的文件
+    # 天然满足"落位没偏"，不应凭"什么都没做"拿分。
+    title_reworked = bool(title_props) and any(
+        p['has_ln'] or _is_blue(p['fill']) for p in title_props)
+    ok = False
+    if title_reworked and main_title is not None:
+        b = _box(main_title)
+        paras = [p for p in main_title.text_frame.paragraphs if _norm(''.join(r.text for r in p.runs))]
+        ok = bool(
+            b and len(paras) == 1
+            and _norm(_shape_text(main_title)) == KEY_MAIN_TITLE
+            and all(_align_name(p) == 'CENTER' for p in paras)
+            and _in_range(b[0], 2.6, 3.0) and _in_range(b[1], 6.2, 6.5)
+            and _in_range(b[2] - b[0], 28.0, 28.5) and _in_range(b[3] - b[1], 2.6, 3.0)
+            and _body_wrap(main_title) == 'square')
+    results.append(
+        ('+1' if ok else '+0')
+        + '：在主标题已完成艺术字改动的前提下，主标题水平居中并落位在标题带内（左边界2.6-3.0cm、上边界6.2-6.5cm、尺寸28.0-28.5cm×2.6-3.0cm），文本框保持自动换行且未多出换行')
+
+    # 05 +5：第二页左右两栏并排
+    groups_side = bool(
+        box_a and box_b
+        and (box_a[2] <= box_b[0] + TOL or box_b[2] <= box_a[0] + TOL)
+        and _v_overlap_ratio(box_a, box_b) >= 0.9)
+    ok = bool(groups_side and panels_side_by_side)
+    results.append(
+        ('+5' if ok else '+0')
+        + '：第二页内容区为左右两栏并排的两个独立板块（左板块右边界≤右板块左边界、纵向重合度≥90%），护鸟带与驱鸟器各占一块，不是上下堆叠的通栏色块')
+
+    # 第二页是否确已做过分栏改版：出现两块相互独立的板块底衬，或两组元素已左右并排。
+    # 未改版的文件天然"文案逐字一致"，不应凭"什么都没做"拿第 10 条的分。
+    s2_reworked = bool(two_panels or groups_side)
+
+    # 06 +3：两板块各占半宽且相互齐平
+    ok = False
+    if panels_side_by_side:
+        lw, rw = left_panel[2] - left_panel[0], right_panel[2] - right_panel[0]
+        lh, rh = left_panel[3] - left_panel[1], right_panel[3] - right_panel[1]
+        gap = right_panel[0] - left_panel[2]
+        ok = bool(
+            _in_range(lw, 15.0, 16.5) and _in_range(rw, 15.0, 16.5) and abs(lw - rw) <= 1.0
+            and _in_range(left_panel[0], 0.7, 1.2) and _in_range(right_panel[2], 32.5, 33.2)
+            and abs(left_panel[1] - right_panel[1]) <= 0.2 and abs(lh - rh) <= 0.2
+            and _in_range(lh, 13.0, 13.6) and _in_range(rh, 13.0, 13.6)
+            and _in_range(gap, 0.3, 1.5))
+    results.append(
+        ('+3' if ok else '+0')
+        + '：两板块各占页宽约一半且相互齐平（单块宽15.0-16.5cm、宽度差≤1.0cm，左板块左边界0.7-1.2cm、右板块右边界32.5-33.2cm，上边界差≤0.2cm、高度差≤0.2cm、高13.0-13.6cm，中缝0.3-1.5cm不重叠）')
+
+    # 07 +5：两组元素各在本侧、不越中缝
+    def _inside_panel(shapes, panel_box):
+        if not shapes or panel_box is None:
+            return False
+        for sh in shapes:
+            b = _box(sh)
+            if b is None or b[0] < panel_box[0] - TOL or b[2] > panel_box[2] + TOL:
+                return False
+        return True
+
+    a_left = bool(group_a) and all(_box(sh)[2] <= mid_x + TOL for sh in group_a)
+    a_right = bool(group_a) and all(_box(sh)[0] >= mid_x - TOL for sh in group_a)
+    b_left = bool(group_b) and all(_box(sh)[2] <= mid_x + TOL for sh in group_b)
+    b_right = bool(group_b) and all(_box(sh)[0] >= mid_x - TOL for sh in group_b)
+    ok = bool(
+        panels_side_by_side and group_a and group_b
+        and _inside_panel(group_a, pa) and _inside_panel(group_b, pb)
+        and ((a_left and b_right) or (a_right and b_left)))
+    results.append(
+        ('+5' if ok else '+0')
+        + '：护鸟带的板块标题与其全部正文完全落在左板块内，驱鸟器的板块标题与其正文完全落在右板块内，无任何元素跨越中缝或伸入对侧')
+
+    # 08 +5：两张照片各在本板块右上角空白区
+    ok = False
+    if len(content_pics) == 2 and two_panels:
+        pic_panel = {}
+        for pic in content_pics:
+            pic_panel[id(pic)] = _panel_of(_box(pic))
+        mapped = {id(panel_a): None, id(panel_b): None}
+        for pic in content_pics:
+            pn = pic_panel[id(pic)]
+            if pn is not None and id(pn) in mapped and mapped[id(pn)] is None:
+                mapped[id(pn)] = pic
+        if all(v is not None for v in mapped.values()):
+            ok = True
+            for panel, grp in ((panel_a, group_a), (panel_b, group_b)):
+                pic = mapped[id(panel)]
+                pb_box, pic_box = _box(panel), _box(pic)
+                cx = (pb_box[0] + pb_box[2]) / 2.0
+                if not (pic_box[0] >= cx - TOL and pic_box[2] <= pb_box[2] + TOL
+                        and (pic_box[1] - pb_box[1]) <= 1.5 + TOL):
+                    ok = False
+                if any(_inter_area(pic_box, _box(sh)) > 0.05 for sh in grp):
+                    ok = False
+    results.append(
+        ('+5' if ok else '+0')
+        + '：两张照片分别置于各自板块的右上角空白区（左边界≥所属板块横向中点、右边界不超出该板块、上边界距板块顶端≤1.5cm），与本块标题、正文均无重叠压字')
+
+    # 09 +3：左右对称（照片规格 / 板块标题 / 正文首行）
+    ok = False
+    if len(content_pics) == 2 and a_title_sh is not None and b_title_sh is not None:
+        p1, p2 = _box(content_pics[0]), _box(content_pics[1])
+        w1, h1 = p1[2] - p1[0], p1[3] - p1[1]
+        w2, h2 = p2[2] - p2[0], p2[3] - p2[1]
+        at, bt = _box(a_title_sh), _box(b_title_sh)
+        a_top = min([_box(sh)[1] for sh in a_body_shs] or [None]) if a_body_shs else None
+        b_top = min([_box(sh)[1] for sh in b_body_shs] or [None]) if b_body_shs else None
+        ta = [_run_props(r, theme) for r in _runs(a_title_sh)]
+        tb = [_run_props(r, theme) for r in _runs(b_title_sh)]
+        ok = bool(
+            _in_range(w1, 4.5, 6.0) and _in_range(h1, 4.5, 6.0)
+            and _in_range(w2, 4.5, 6.0) and _in_range(h2, 4.5, 6.0)
+            and abs(w1 - w2) <= 0.2 and abs(h1 - h2) <= 0.2 and abs(p1[1] - p2[1]) <= 0.3
+            and ta and tb
+            and all(p['sz'] == 24.0 and p['bold'] for p in ta)
+            and all(p['sz'] == 24.0 and p['bold'] for p in tb)
+            and abs(at[1] - bt[1]) <= 0.5
+            and a_top is not None and b_top is not None and abs(a_top - b_top) <= 0.5)
+    results.append(
+        ('+3' if ok else '+0')
+        + '：左右两栏呈对称版式（两张照片边长4.5-6.0cm、宽高差≤0.2cm、上边界差≤0.3cm；两侧板块标题同为24磅加粗且上边界差≤0.5cm；两侧正文首行上边界差≤0.5cm）')
+
+    # 10 +5：第二页文案逐字一致（前提：第二页确已做过分栏改版）
+    collected = []
+    for sh in s2_texts:
+        collected.extend(_paragraph_texts(sh))
+    ok = bool(s2_reworked) and sorted(collected) == sorted(_norm(t) for t in EXPECTED_SLIDE2_TEXTS)
+    results.append(
+        ('+5' if ok else '+0')
+        + f'：在第二页已完成分栏改版的前提下，第二页文字与指定的10条文案逐字一致，无删减、改写、缩写或新增（实际条目{len(collected)}条）')
+
+    # 11 +3：正文块收窄至栏内且左对齐
+    body_shs = a_body_shs + b_body_shs
+    ok = bool(body_shs)
+    for sh in body_shs:
+        b = _box(sh)
+        if b is None or (b[2] - b[0]) > 14.5 + TOL:
+            ok = False
+            break
+        if any(_align_name(p) not in (None, 'LEFT')
+               for p in sh.text_frame.paragraphs if _norm(''.join(r.text for r in p.runs))):
+            ok = False
+            break
+        own = pa if sh in a_body_shs else pb
+        if own is not None and (b[0] < own[0] - TOL or b[2] > own[2] + TOL):
+            ok = False
+            break
+        if panels_side_by_side:
+            if sh in a_body_shs and not (b[2] <= mid_x + TOL or b[0] >= mid_x - TOL):
+                ok = False
+                break
+    results.append(
+        ('+3' if ok else '+0')
+        + '：两侧正文块宽度随栏宽收窄至≤14.5cm并保持左对齐，文字在本栏内自然换行，未横向溢出所属板块、未压到中缝')
+
+    # 12 +3：文字与板块底色对比充分（前提：确实存在左右两块底衬）
+    s2_bg = _slide_bg_hex(s2, theme)
+    ok = bool(two_panels and group_a and group_b)
+    for sh in group_a + group_b:
+        own_panel = _panel_containing(_box(sh))
+        bg_hex = _shape_fill_hex(own_panel, theme) if own_panel is not None else s2_bg
+        if not bg_hex:
+            continue
+        for p in [_run_props(r, theme) for r in _runs(sh)]:
+            ratio = _contrast_ratio(p['fill'], bg_hex)
+            if ratio is not None and ratio < 3.0:
+                ok = False
+                break
+        if not ok:
+            break
+    results.append(
+        ('+3' if ok else '+0')
+        + '：左右两板块内文字与板块底色对比充分（深底配浅色字、浅底配深色字，对比度≥3:1），标题与正文均清晰可读')
+
+    # 13 -3：主标题字体 Kaiti SC、60磅、不加粗
+    bad = (not title_props) or any(
+        _font_of(p) != 'Kaiti SC' or p['sz'] != 60.0 or p['bold'] for p in title_props)
+    results.append(('-3' if bad else '-0')
+                   + '：首页主标题"田间共生观察"不满足字体Kaiti SC、字号60磅、不加粗')
+
+    # 14 -3：首页存在重复叠放的同文标题框
+    bad = False
+    for i in range(len(s1_texts)):
+        for j in range(i + 1, len(s1_texts)):
+            ti, tj = _norm(_shape_text(s1_texts[i])), _norm(_shape_text(s1_texts[j]))
+            if not ti or ti != tj:
+                continue
+            bi, bj = _box(s1_texts[i]), _box(s1_texts[j])
+            base = min(_area(bi), _area(bj))
+            if base > 0 and _inter_area(bi, bj) / base >= 0.8:
+                bad = True
+    results.append(('-3' if bad else '-0')
+                   + '：首页存在两个文案同为"田间共生观察"、位置与尺寸完全重叠的文本框（以叠放两层文字的方式凑出白边效果，产生重复元素）')
+
+    # 15 -1：首页副标题格式
+    bad = (subtitle is None) or (not sub_props) or any(
+        _font_of(p) != 'Noto Sans SC' or p['sz'] != 30.0 or p['fill'] != '000000'
+        for p in sub_props)
+    results.append(('-1' if bad else '-0')
+                   + '：首页副标题"生态友好型农事管理片段"不满足字体Noto Sans SC、字号30磅、字色黑色（000000）')
+
+    # 16 -1：首页背景图与页面下部空白占位形状
+    has_bg = any(
+        (lambda b: b is not None and abs(b[0]) <= 0.05 and abs(b[1]) <= 0.05
+         and abs(b[2] - PAGE_W_CM) <= 0.05 and abs(b[3] - PAGE_H_CM) <= 0.05)(_box(sh))
+        for sh in s1_pics)
+    has_placeholder = False
+    for sh in s1_shapes:
+        b = _box(sh)
+        if _is_picture(sh) or b is None or _norm(_shape_text(sh)):
+            continue
+        if (abs(b[0] - 8.71) <= 0.2 and abs(b[1] - 19.76) <= 0.2
+                and abs((b[2] - b[0]) - 3.99) <= 0.2 and abs((b[3] - b[1]) - 0.85) <= 0.2):
+            has_placeholder = True
+    bad = not (has_bg and has_placeholder)
+    results.append(('-1' if bad else '-0')
+                   + '：首页背景图片不满足左上角(0cm,0cm)定位、尺寸33.87cm×19.05cm铺满整页，或页面下部不满足保留1个左边界约8.71cm、上边界约19.76cm、尺寸约3.99cm×0.85cm的空白占位形状')
+
+    # 17 -3：第二页页面标题格式与定位
+    bad = True
+    if page_title_sh is not None:
+        b = _box(page_title_sh)
+        props = [_run_props(r, theme) for r in _runs(page_title_sh)]
+        bad = not (
+            props and b is not None
+            and all(_font_of(p) == 'Noto Sans SC' and p['sz'] == 20.0 and p['bold']
+                    and p['fill'] == '135E35' for p in props)
+            and abs(b[0] - 1.06) <= TOL and abs(b[1] - 0.35) <= TOL
+            and abs((b[2] - b[0]) - 31.75) <= TOL)
+    results.append(('-3' if bad else '-0')
+                   + '：第二页页面标题"田间防护：护鸟带与驱鸟器应用说明"不满足字体Noto Sans SC、字号20磅、加粗、字色135E35，或不满足左边界1.06cm、上边界0.35cm、宽度31.75cm的顶部通栏单行')
+
+    # 18 -3：第二页正文字体、字号与字色
+    bad = not body_shs
+    for sh in body_shs:
+        own_panel = _panel_containing(_box(sh))
+        bg_hex = _shape_fill_hex(own_panel, theme) if own_panel is not None else s2_bg
+        bg_lum = _rel_luminance(bg_hex)
+        for p in [_run_props(r, theme) for r in _runs(sh)]:
+            if _font_of(p) != 'Noto Sans SC' or not _in_range(p['sz'], 13.0, 14.0):
+                bad = True
+                break
+            lum = _rel_luminance(p['fill'])
+            if lum is not None and bg_lum is not None:
+                if bg_lum < 0.5 and lum < 0.5:      # 深底必须配浅色字
+                    bad = True
+                    break
+                if bg_lum >= 0.5 and lum >= 0.5:    # 浅底必须配深色字
+                    bad = True
+                    break
+        if bad:
+            break
+    results.append(('-3' if bad else '-0')
+                   + '：第二页各段正文不满足字体Noto Sans SC、字号13-14磅，或字色不满足深底板块内为浅色、浅底板块内为深色文字')
+
+    # 19 -3：两侧板块标题字色与字体
+    a_t = [_run_props(r, theme) for r in _runs(a_title_sh)] if a_title_sh else []
+    b_t = [_run_props(r, theme) for r in _runs(b_title_sh)] if b_title_sh else []
+    bad = not (
+        a_t and b_t
+        and all(p['fill'] == 'FFFFFF' and _font_of(p) == 'Noto Sans SC' and p['bold'] for p in a_t)
+        and all(p['fill'] == '135E35' and _font_of(p) == 'Noto Sans SC' and p['bold'] for p in b_t))
+    results.append(('-3' if bad else '-0')
+                   + '：第二页两侧板块标题字色不满足"护鸟带「护鸟不伤鸟」"为白色（FFFFFF）、"驱鸟器「驱鸟还不吵」"为深绿（135E35），或字体不满足Noto Sans SC加粗')
+
+    # 20 -3：护鸟带板块底衬样式（深绿实心 + 圆角矩形 + 无边框 + 柔和外阴影）
+    bad = True
+    if panel_a is not None:
+        prst, adj = _geom_prst(panel_a)
+        no_line, _line_hex, _line_pt = _shape_line(panel_a, theme)
+        fill = _shape_fill_hex(panel_a, theme)
+        bad = not (
+            fill == '166534' and prst == 'roundRect'
+            and (adj is None or _in_range(adj / 1000.0, 1.6, 3.6))
+            and no_line and _has_outer_shadow(panel_a))
+    results.append(('-3' if bad else '-0')
+                   + '：护鸟带所在板块底衬不满足深绿色（166534）实心填充、圆角矩形（圆角率约2.6%）、无边框线并带柔和外阴影')
+
+    # 21 -3：第二页新增装饰元素（除两块底衬外的无文字非图片形状）
+    extras = [
+        sh for sh in s2_shapes
+        if not _is_picture(sh) and not _norm(_shape_text(sh))
+        and sh is not panel_a and sh is not panel_b
+    ]
+    bad = bool(extras)
+    results.append(('-3' if bad else '-0')
+                   + f'：第二页出现指令未要求的新增装饰元素（板块内侧竖向色条、板块标题下方细横分隔线、照片外圈方框、页面标题下方短色块等，实测多余形状{len(extras)}个）')
+
+    # 22 -3：两张照片外形与描边
+    bad = len(content_pics) != 2
+    for pic in content_pics:
+        prst, _adj = _geom_prst(pic)
+        no_line, line_hex, _pt = _shape_line(pic, theme)
+        if prst != 'roundRect' or not no_line or line_hex is not None:
+            bad = True
+    results.append(('-3' if bad else '-0')
+                   + '：第二页两张照片不满足圆角矩形外形且无边框描边（被改为直角矩形并加白色/彩色外边框）')
+
+    # 23 -1：护鸟带三条要点与三段说明分置于两个独立文本块
+    key_pt = ('材质：', '原理：', '设计：')
+    key_note = ('该装置适合', '布设灵活', '维护简单')
+    pt_shs = {id(sh) for sh in a_body_shs if _hit_keys(sh, key_pt)}
+    note_shs = {id(sh) for sh in a_body_shs if _hit_keys(sh, key_note)}
+    bad = not (pt_shs and note_shs and not (pt_shs & note_shs))
+    results.append(('-1' if bad else '-0')
+                   + '：护鸟带的三条要点（材质/原理/设计）与"该装置适合…"等三段说明不满足分置于两个可各自独立选中、独立移动的文本块（被合并进同一个文本框）')
+
+    # 24 -1：第三、四页各仅含 1 张铺满整页的图片（缺页同样计为不满足）
+    bad = False
+    for idx in (2, 3):
+        shs = _shapes_at(idx)
+        pics = [sh for sh in shs if _is_picture(sh)]
+        if _slide_at(idx) is None or len(shs) != 1 or len(pics) != 1:
+            bad = True
+            continue
+        b = _box(pics[0])
+        if b is None or not (
+                abs(b[0]) <= TOL and abs(b[1]) <= TOL
+                and abs((b[2] - b[0]) - PAGE_W_CM) <= TOL
+                and abs((b[3] - b[1]) - PAGE_H_CM) <= TOL):
+            bad = True
+    results.append(('-1' if bad else '-0')
+                   + '：第三页或第四页不满足各仅含1张左上角(0cm,0cm)定位、33.87cm×19.05cm铺满整页的图片且无其他元素')
+
+    # ========== results 反解为结构化 dim2_items ==========
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"评分项数量不匹配：results={len(results)}，_MAX_DELTAS_ORDER={len(_MAX_DELTAS_ORDER)}")
+
+    items = []
+    total = 0
+    for text, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, rule = text.split('：', 1)
+        delta = int(head)
+        total += delta
+        items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": delta != 0,
+        })
+
+    result["dim1_pass"] = True
+    result["dim1_reason"] = f"交付文件可作为 .pptx 正常打开（共 {len(slides)} 页）"
+    result["dim2_items"] = items
+    # 减分项据实累加，不做归零截断：总分可为负数
+    result["total_score"] = total
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+if __name__ == '__main__':
+    # 本地调试入口：python officeval_071_verifier.py [被评估文档所在目录]
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+
+

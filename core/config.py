@@ -49,7 +49,7 @@ TASK_TIMEOUT_OVERRIDES: dict[str, int] = {}
 # 压缩包安全限制
 # ---------------------------------------------------------------------------
 MAX_ZIP_SIZE_BYTES:        int = 2 * 1024 ** 3   # 2 GB
-MAX_SINGLE_FILE_BYTES:     int = 500 * 1024 ** 2  # 500 MB
+MAX_SINGLE_FILE_BYTES:     int = 500 * 1024 ** 2  # 500 MiB
 MAX_ZIP_MEMBER_COUNT:      int = 20_000
 MAX_UNCOMPRESSED_BYTES:    int = 5 * 1024 ** 3    # 5 GB
 MAX_COMPRESSION_RATIO:     float = 100.0            # 解压/压缩 > 此值视为炸弹
@@ -128,15 +128,23 @@ def resolve_com_enabled(com_mode: str | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 # 强依赖 COM：禁用 COM 时整项跳过；启用时进入 COM 串行通道。
+# 取值依据「脚本实际引用 win32com 且判定口径必须来自办公软件排版/运行时行为」：
+#   001 用 Word 打开后的真实页数与渲染墨迹分布
+#   021 渲染后的整页空白与按页定位
+#   023 重新分页后的实际页码、页脚显示值、表格跨页
+#   024 图片上下方按真实分页测得的连续空白行数
+#   025 表格在真实回流下横跨的页数（精确等值判定）
+#   039 Repaginate 后 ComputeStatistics 与 Information 双口径页数、分页断点位置
 COM_REQUIRED_VERIFIER_IDS: frozenset[str] = frozenset({
-    "001", "008", "019", "022", "023", "030", "039", "074", "081",
+    "001", "021", "023", "024", "025", "039",
 })
 
 
 # 存在普通解析路径的 COM 相关 verifier：在所有平台强制使用普通模式。
 # 即使批次启用了 COM，worker 也会向这些脚本传入 OFFICEVAL_COM_ENABLED=0。
 COM_FORCED_NORMAL_VERIFIER_IDS: frozenset[str] = frozenset({
-    "011",
+    "007", "010", "011", "014", "019", "022",
+    "029", "032", "034", "037", "051", "059",
 })
 
 

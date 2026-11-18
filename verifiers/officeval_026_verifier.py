@@ -1,1095 +1,1183 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 """
-自动评估脚本：对 "项目式协作学习统计表_三线表优化版.docx" 按照"打分细则"评分。
+三线表（表5-4 至 表5-12 统计表）排版格式自动评估工具（officeval_026）
 
-评估逻辑：
-  维度1（可用与可修改性）：若不满足任意一条 -> 直接 0 分，不再检查维度2。
-  维度2（完成度）：满足维度1后逐条检查；得分点累加正分，扣分点累加负分。
-      - 加分细则：必须满足细则中的"每一个点"才加分（按满足的表格个数累加，有上限）。
-      - 扣分细则：只要满足"任意一点"即扣分。
+统一入口：
+    evaluate(dir_path: str) -> dict
+    - dir_path: 输出文件所在目录（内含待评估的 .docx，忽略以 ~$ 开头的 Word 临时锁文件）
+    - 返回字段：id / file_name / status / error / dim1_pass / dim1_reason /
+                dim2_items（命中与未命中项都返回）/ total_score / max_score
+    - dim2_items 每项只含 rule / max_delta / delta / hit 四个键
 
-仅依赖 Python 标准库（zipfile + xml.etree），无需 python-docx。
-对不易精确判定的点，采用合理的近似方式实现自动判定，并在输出中说明。
-
-对外只暴露 evaluate(dir_path: str) -> dict：
-  传入"脚本所在目录的路径"，脚本自己在该目录内定位被评估的 .docx 文档并返回结构化结果。
+规范约束：
+    * 只暴露 evaluate 一个函数供批量运行器调用
+    * 不修改 sys.stdout、不打印主结果、不使用 sys.exit
+    * 不硬编码文档路径，全部由 dir_path 参数驱动
+    * status='error' 表示这份提交没被真正评过（目录不存在、目录内无可评估文档、
+      脚本自身异常），此时 dim1_pass 为空串（维度一未判定）、
+      total_score 与 max_score 一律为 0；
+      文档能定位到但不达标一律 status='ok'，由 dim1_pass / dim2_items 承载
+    * dim1_pass 为 False 时 dim1_reason 必须给出未通过的错误摘要；通过时为空串
+    * 本文件仅在 __main__ 下作为本地调试入口，才把 dict 序列化为 JSON 输出
 """
 
 import os
 import re
 import sys
 import json
-import zipfile
-import xml.etree.ElementTree as ET
+from docx import Document
+from docx.oxml.ns import qn
+
+SCRIPT_ID = "026"
+# 维度二所有加分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 116
 
 # ---------------------------------------------------------------------------
-# 常量与命名空间
+# 常量
 # ---------------------------------------------------------------------------
-W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-NS = {"w": W}
-
-
-def w(tag):
-    return f"{{{W}}}{tag}"
-
-
-# Word 中边框线宽 sz 单位为 1/8 磅。1.5磅 = sz 12；0.75磅 = sz 6。
+# Word 边框线宽 w:sz 单位为 1/8 磅：1.5磅 = 12；0.75磅 = 6。
 SZ_1_5PT = 12
 SZ_0_75PT = 6
+# 字号 w:sz 单位为 half-point：小五(9磅) = 18；五号(10.5磅) = 21。
+SZ_XIAOWU = 18
+SZ_WUHAO = 21
+# 1cm = 567 twips
+TWIPS_PER_CM = 567.0
 
-# 字号：half-points。小五 = 9磅 = sz18；五号 = 10.5磅 = sz21。
-SZ_XIAOWU = 18   # 小五号
-SZ_WUHAO = 21    # 五号
+# 9 张统计表的键（文档顺序）与展示用标签
+ORDER = ['5-4', '5-5', '5-6', '5-7', '5-8', '5-9', '5-10', '5-11', '5-12']
+def LAB(k):
+    return '表' + k
 
-# 目标表格题注前缀（顺序对应文档中表格顺序）
-TARGET_LABELS = ["表5-4", "表5-5", "表5-6", "表5-7", "表5-8",
-                 "表5-9", "表5-10", "表5-11", "表5-12"]
+# 含 “Levene检验”“t 检验” 两个分组标题的 7 列表
+SEVEN = ['5-4', '5-5', '5-8', '5-9', '5-12']
+# 仅含 “t 检验” 一个分组标题的 5 列表
+FIVE = ['5-6', '5-7', '5-10', '5-11']
+# 维度列需要纵向合并的表（表5-12 第1列为“组别”，无维度列）
+DIM_COL = ['5-4', '5-5', '5-6', '5-7', '5-8', '5-9', '5-10', '5-11']
 
-# 需要"两个分组标题(Levene/t检验)下方各一条内框线"的表
-TWO_GROUP_TABLES = {"表5-4", "表5-5", "表5-8", "表5-9", "表5-12"}
-# 仅"t检验"一个分组标题下方有内框线的表
-ONE_GROUP_TABLES = {"表5-6", "表5-7", "表5-10", "表5-11"}
+# 细则规定的行数、列数
+SHAPE = {'5-4': (6, 7), '5-5': (6, 7), '5-6': (6, 5), '5-7': (6, 5), '5-8': (12, 7),
+         '5-9': (12, 7), '5-10': (12, 5), '5-11': (12, 5), '5-12': (4, 7)}
+
+# 9 条表题全文（细则逐字列出，检测时按“去空格”归一化后比较）
+CAPS = {
+    '5-4': '表5-4 干预组与参照组任务动机前测结果',
+    '5-5': '表5-5 干预组与参照组任务动机后测结果',
+    '5-6': '表5-6 干预组任务动机前后测比较',
+    '5-7': '表5-7 参照组任务动机前后测比较',
+    '5-8': '表5-8 干预组与参照组科学探究兴趣前测结果',
+    '5-9': '表5-9 干预组与参照组科学探究兴趣后测结果',
+    '5-10': '表5-10 干预组科学探究兴趣前后测结果',
+    '5-11': '表5-11 参照组科学探究兴趣前后测结果',
+    '5-12': '表5-12 干预组与参照组科学探究技能考核结果',
+}
+CAP_SET = set(CAPS.values())
+# 文档中允许存在的唯一提示段
+SAMPLE_HINT = '例子：'
+
+# 各表维度名称
+DIMS = {
+    '5-4': ['任务价值', '学习投入'],
+    '5-5': ['任务价值', '学习投入'],
+    '5-6': ['任务价值', '学习投入'],
+    '5-7': ['任务价值', '学习投入'],
+    '5-8': ['探究兴趣', '学习顾虑', '课堂参与度', '课外实践参与', '学习资源关注'],
+}
+for _k in ('5-9', '5-10', '5-11'):
+    DIMS[_k] = DIMS['5-8']
+DIMS['5-12'] = []
+
+# 各表组别 / 测试时间名称
+GRP = {_k: ['干预组', '参照组'] for _k in ('5-4', '5-5', '5-8', '5-9', '5-12')}
+for _k in ('5-6', '5-7', '5-10', '5-11'):
+    GRP[_k] = ['干预前', '干预后']
+
+# 表头必需文字；元组表示“三者之一即可”
+HDR_REQ = {}
+for _k in ('5-4', '5-5', '5-8', '5-9'):
+    HDR_REQ[_k] = ['Levene检验', 't检验', '维度', '组别', 'X±S', 'F值', 'Sig.', 't值', 'Sig(双侧)']
+HDR_REQ['5-12'] = ['Levene检验', 't检验', '组别', 'N', 'X±S', 'F值', 'Sig.', 't值', 'Sig(双侧)']
+for _k in ('5-6', '5-7', '5-10', '5-11'):
+    HDR_REQ[_k] = ['t检验', '维度', ('测试时间', '时间', '组别'), 'X±S', 't值', 'Sig(双侧)']
+
+# 各表必须保留的数值（细则逐字列出，检测时按“去空格 + 归一化负号”后比较）
+VALS = {
+    '5-4': ['23.72±4.86', '23.45±4.93', '0.091', '0.764', '0.274', '0.785',
+            '15.26±3.41', '15.44±3.36', '0.128', '0.722', '-0.265', '0.792'],
+    '5-5': ['27.36±4.28', '24.68±4.51', '0.037', '0.848', '3.054', '0.003',
+            '18.02±3.57', '15.98±3.49', '0.072', '0.789', '2.889', '0.005'],
+    '5-6': ['23.72±4.86', '27.36±4.28', '-4.126', '0.001',
+            '15.26±3.41', '18.02±3.57', '-3.184', '0.003'],
+    '5-7': ['23.45±4.93', '24.68±4.51', '-1.248', '0.219',
+            '15.44±3.36', '15.98±3.49', '-0.876', '0.386'],
+    '5-8': ['20.18±4.32', '19.94±4.40', '0.316', '0.576', '0.273', '0.786',
+            '26.74±5.08', '26.96±4.97', '0.104', '0.748', '-0.219', '0.827',
+            '19.22±4.06', '19.08±4.13', '0.193', '0.662', '0.171', '0.865',
+            '12.34±3.04', '12.18±3.11', '0.076', '0.784', '0.260', '0.796',
+            '10.62±2.73', '10.48±2.69', '0.142', '0.708', '0.258', '0.797'],
+    '5-9': ['25.08±5.21', '20.42±5.16', '0.232', '0.632', '4.492', '0.001',
+            '22.46±6.38', '26.18±6.71', '0.063', '0.803', '-2.842', '0.006',
+            '23.14±4.12', '19.66±4.24', '0.115', '0.736', '4.158', '0.001',
+            '14.02±3.18', '12.76±3.09', '0.087', '0.769', '2.009', '0.048',
+            '11.36±2.82', '10.74±2.76', '0.176', '0.676', '1.112', '0.270'],
+    '5-10': ['20.18±4.32', '25.08±5.21', '-5.308', '0.001',
+             '26.74±5.08', '22.46±6.38', '3.014', '0.004',
+             '19.22±4.06', '23.14±4.12', '-4.806', '0.001',
+             '12.34±3.04', '14.02±3.18', '-2.316', '0.025',
+             '10.62±2.73', '11.36±2.82', '-1.248', '0.218'],
+    '5-11': ['19.94±4.40', '20.42±5.16', '-0.524', '0.603',
+             '26.96±4.97', '26.18±6.71', '0.462', '0.646',
+             '19.08±4.13', '19.66±4.24', '-0.712', '0.480',
+             '12.18±3.11', '12.76±3.09', '-0.638', '0.527',
+             '10.48±2.69', '10.74±2.76', '-0.421', '0.676'],
+    '5-12': ['40', '85.16±6.42', '78.34±6.96', '0.718', '0.399', '4.558', '0.001'],
+}
+
+# ---------------------------------------------------------------------------
+# 维度二条目定义
+#   加分项按“一个三线表满足此条 +N 分”逐表拆分为独立条目，使每个条目都满足
+#   delta == max_delta（命中）/ 0（未命中）的接口约定；上限分 = 每表分值 × 表数。
+#   减分项 max_delta 为负值，命中即扣。
+# ---------------------------------------------------------------------------
+_PLUS_SPECS = [
+    (3, 'A1', ORDER,
+     '表5-4至表5-12表格外框线：外框线只保留上下外框线，表格上框线和下框线为1.5磅黑色实线，'
+     '左右两侧无外框线；且该设置在表格整体边框上完成，表格整体边框中的左框线、右框线、'
+     '内部横框线、内部竖框线均为无线条'),
+    (3, 'A2', SEVEN,
+     '表5-4、表5-5、表5-8、表5-9和表5-12分组内框线：仅有“Levene检验”、“t检验”两个分组标题'
+     '下方有下框线，其余位置无内框线，框线类型为0.75磅黑色实线'),
+    (3, 'A3', FIVE,
+     '表5-6、表5-7、表5-10和表5-11分组表头内框线：仅有“t检验”标题下方有下框线，'
+     '其余位置无内框线，框线类型为0.75磅黑色实线'),
+    (1, 'A4', ORDER,
+     '表5-4至表5-12表格行列数：表5-4、表5-5为6行7列，表5-6、表5-7为6行5列，'
+     '表5-8、表5-9为12行7列，表5-10、表5-11为12行5列，表5-12为4行7列'),
+    (1, 'A5', SEVEN,
+     '表5-4、表5-5、表5-8、表5-9和表5-12分组表头横向合并：第1行前3个单元格无文字且不合并，'
+     '第4列单元格横向合并2列，第6列单元格横向合并2列，第2行7个单元格均不横向合并'),
+    (1, 'A6', FIVE,
+     '表5-6、表5-7、表5-10和表5-11分组表头横向合并：第1行前3个单元格无文字且不合并，'
+     '第4列单元格横向合并2列，第2行5个单元格均不横向合并'),
+    (1, 'A7', DIM_COL,
+     '表5-4至表5-11维度列纵向合并：第1列每个维度名称占2个数据行并纵向合并为1个单元格，'
+     '维度名称在合并区内只出现1次，第2个数据行对应位置无重复文字'),
+    (1, 'A8', ORDER,
+     '表5-4至表5-12统计量列纵向合并：“F值”“Sig.”“t值”“Sig(双侧)”各列在同属一个维度的'
+     '2个数据行内纵向合并为1个单元格，同一数值只出现1次'),
+    (1, 'A9', ORDER,
+     '表5-4至表5-12表格宽度：表格宽度设置为按百分比自适应正文宽度、取值约为正文宽度的100%，'
+     '表格实际总宽度不大于14.7cm，右边缘不越出右侧页边距'),
+    (1, 'A10', ORDER,
+     '表5-4至表5-12数据行行高：表5-4至表5-7的4个数据行中第1、3个数据行，'
+     '表5-8至表5-11的10个数据行中第1、3、5、7、9个数据行，表5-12的2个数据行中第1个数据行，'
+     '均设置0.69cm及以上的最小行高'),
+    (1, 'A11', ORDER,
+     '表5-4至表5-12表内字体与对齐：表内中文字体为宋体、西文与数字字体为Times New Roman，'
+     '且表内所有有文字的单元格均为水平居中、垂直居中、首行缩进为0'),
+]
+
+_MINUS_SPECS = [
+    (-1, 'D1', '纸张尺寸不为A4（21.0cm×29.7cm），或页边距不为上下2.54cm、左右约3.17cm'),
+    (-3, 'D2', '“表5-4 干预组与参照组任务动机前测结果”“表5-5 干预组与参照组任务动机后测结果”'
+     '“表5-6 干预组任务动机前后测比较”“表5-7 参照组任务动机前后测比较”'
+     '“表5-8 干预组与参照组科学探究兴趣前测结果”“表5-9 干预组与参照组科学探究兴趣后测结果”'
+     '“表5-10 干预组科学探究兴趣前后测结果”“表5-11 参照组科学探究兴趣前后测结果”'
+     '“表5-12 干预组与参照组科学探究技能考核结果”9条表题中任一条被删除或文字被改写'),
+    (-1, 'D3', '任一表题段落不为居中对齐，或带有首行缩进'),
+    (-1, 'D4', '任一表题段落文字不为宋体（西文Times New Roman）、10.5磅（五号）、加粗'),
+    (-3, 'D5', '表5-4至表5-12中任一表题段之后未紧跟1张独立的Word表格，'
+     '表题与表格之间被插入空段落，或相邻两张统计表被合并为同一张表'),
+    (-1, 'D6', '表5-4至表5-12中任一表内文字的字号不为9磅（小五）'),
+    (-1, 'D7', '表5-4、表5-5、表5-8、表5-9、表5-12中“Levene检验”“t 检验”“X±S”“F值”“Sig.”'
+     '“t值”“Sig(双侧)”任一表头文字被删除或改写，或表5-6、表5-7、表5-10、表5-11中'
+     '“t 检验”“X±S”“t值”“Sig(双侧)”任一表头文字被删除或改写（表5-4至表5-11第1列列名为“维度”，'
+     '表5-4、表5-5、表5-8、表5-9第2列列名为“组别”，表5-6、表5-7、表5-10、表5-11第2列列名为'
+     '“测试时间”“时间”或“组别”，表5-12第1、2列列名为“组别”“N”）'),
+    (-1, 'D8', '表5-4至表5-7中“任务价值”“学习投入”任一维度名称被删除或改写，'
+     '或表5-8至表5-11中“探究兴趣”“学习顾虑”“课堂参与度”“课外实践参与”“学习资源关注”'
+     '任一维度名称被删除或改写'),
+    (-1, 'D9', '表5-4、表5-5、表5-8、表5-9、表5-12中“干预组”“参照组”两个组别名称任一被删除或改写，'
+     '或表5-6、表5-7、表5-10、表5-11中“干预前”“干预后”两个测试时间名称任一被删除或改写'),
+    (-3, 'V5-4', '表5-4中以下数值任一被删除或改写（任务价值维度：干预组“X±S”23.72±4.86、'
+     '参照组“X±S”23.45±4.93、“F值”0.091、“Sig.”0.764、“t值”0.274、“Sig(双侧)”0.785；'
+     '学习投入维度：干预组“X±S”15.26±3.41、参照组“X±S”15.44±3.36、“F值”0.128、“Sig.”0.722、'
+     '“t值”-0.265、“Sig(双侧)”0.792）'),
+    (-3, 'V5-5', '表5-5中以下数值任一被删除或改写（任务价值维度：干预组“X±S”27.36±4.28、'
+     '参照组“X±S”24.68±4.51、“F值”0.037、“Sig.”0.848、“t值”3.054、“Sig(双侧)”0.003；'
+     '学习投入维度：干预组“X±S”18.02±3.57、参照组“X±S”15.98±3.49、“F值”0.072、“Sig.”0.789、'
+     '“t值”2.889、“Sig(双侧)”0.005）'),
+    (-1, 'V5-6', '表5-6中以下数值任一被删除或改写（任务价值维度：干预前“X±S”23.72±4.86、'
+     '干预后“X±S”27.36±4.28、“t值”-4.126、“Sig(双侧)”0.001；学习投入维度：干预前“X±S”15.26±3.41、'
+     '干预后“X±S”18.02±3.57、“t值”-3.184、“Sig(双侧)”0.003）'),
+    (-1, 'V5-7', '表5-7中以下数值任一被删除或改写（任务价值维度：干预前“X±S”23.45±4.93、'
+     '干预后“X±S”24.68±4.51、“t值”-1.248、“Sig(双侧)”0.219；学习投入维度：干预前“X±S”15.44±3.36、'
+     '干预后“X±S”15.98±3.49、“t值”-0.876、“Sig(双侧)”0.386）'),
+    (-3, 'V5-8', '表5-8中以下数值任一被删除或改写（探究兴趣维度：干预组“X±S”20.18±4.32、'
+     '参照组“X±S”19.94±4.40、“F值”0.316、“Sig.”0.576、“t值”0.273、“Sig(双侧)”0.786；'
+     '学习顾虑维度：干预组“X±S”26.74±5.08、参照组“X±S”26.96±4.97、“F值”0.104、“Sig.”0.748、'
+     '“t值”-0.219、“Sig(双侧)”0.827；课堂参与度维度：干预组“X±S”19.22±4.06、参照组“X±S”19.08±4.13、'
+     '“F值”0.193、“Sig.”0.662、“t值”0.171、“Sig(双侧)”0.865；课外实践参与维度：'
+     '干预组“X±S”12.34±3.04、参照组“X±S”12.18±3.11、“F值”0.076、“Sig.”0.784、“t值”0.260、'
+     '“Sig(双侧)”0.796；学习资源关注维度：干预组“X±S”10.62±2.73、参照组“X±S”10.48±2.69、'
+     '“F值”0.142、“Sig.”0.708、“t值”0.258、“Sig(双侧)”0.797）'),
+    (-3, 'V5-9', '表5-9中以下数值任一被删除或改写（探究兴趣维度：干预组“X±S”25.08±5.21、'
+     '参照组“X±S”20.42±5.16、“F值”0.232、“Sig.”0.632、“t值”4.492、“Sig(双侧)”0.001；'
+     '学习顾虑维度：干预组“X±S”22.46±6.38、参照组“X±S”26.18±6.71、“F值”0.063、“Sig.”0.803、'
+     '“t值”-2.842、“Sig(双侧)”0.006；课堂参与度维度：干预组“X±S”23.14±4.12、参照组“X±S”19.66±4.24、'
+     '“F值”0.115、“Sig.”0.736、“t值”4.158、“Sig(双侧)”0.001；课外实践参与维度：'
+     '干预组“X±S”14.02±3.18、参照组“X±S”12.76±3.09、“F值”0.087、“Sig.”0.769、“t值”2.009、'
+     '“Sig(双侧)”0.048；学习资源关注维度：干预组“X±S”11.36±2.82、参照组“X±S”10.74±2.76、'
+     '“F值”0.176、“Sig.”0.676、“t值”1.112、“Sig(双侧)”0.270）'),
+    (-3, 'V5-10', '表5-10中以下数值任一被删除或改写（探究兴趣维度：干预前“X±S”20.18±4.32、'
+     '干预后“X±S”25.08±5.21、“t值”-5.308、“Sig(双侧)”0.001；学习顾虑维度：干预前“X±S”26.74±5.08、'
+     '干预后“X±S”22.46±6.38、“t值”3.014、“Sig(双侧)”0.004；课堂参与度维度：干预前“X±S”19.22±4.06、'
+     '干预后“X±S”23.14±4.12、“t值”-4.806、“Sig(双侧)”0.001；课外实践参与维度：干预前“X±S”12.34±3.04、'
+     '干预后“X±S”14.02±3.18、“t值”-2.316、“Sig(双侧)”0.025；学习资源关注维度：干预前“X±S”10.62±2.73、'
+     '干预后“X±S”11.36±2.82、“t值”-1.248、“Sig(双侧)”0.218）'),
+    (-3, 'V5-11', '表5-11中以下数值任一被删除或改写（探究兴趣维度：干预前“X±S”19.94±4.40、'
+     '干预后“X±S”20.42±5.16、“t值”-0.524、“Sig(双侧)”0.603；学习顾虑维度：干预前“X±S”26.96±4.97、'
+     '干预后“X±S”26.18±6.71、“t值”0.462、“Sig(双侧)”0.646；课堂参与度维度：干预前“X±S”19.08±4.13、'
+     '干预后“X±S”19.66±4.24、“t值”-0.712、“Sig(双侧)”0.480；课外实践参与维度：干预前“X±S”12.18±3.11、'
+     '干预后“X±S”12.76±3.09、“t值”-0.638、“Sig(双侧)”0.527；学习资源关注维度：干预前“X±S”10.48±2.69、'
+     '干预后“X±S”10.74±2.76、“t值”-0.421、“Sig(双侧)”0.676）'),
+    (-1, 'V5-12', '表5-12中以下数值任一被删除或改写（干预组行“N”40、“X±S”85.16±6.42；'
+     '参照组行“N”40、“X±S”78.34±6.96；“F值”0.718、“Sig.”0.399、“t值”4.558、“Sig(双侧)”0.001）'),
+    (-1, 'D19', '任一统计表单元格内文字被设置为加粗、倾斜或下划线'),
+    (-1, 'D20', '任一统计表单元格被设置底纹或填充颜色'),
+    (-1, 'D21', '任一统计表单元格文字颜色不为自动色或黑色'),
+    (-3, 'D22', '任一统计表中出现整行单元格均无文字的空数据行'),
+    (-3, 'D23', '任一统计表的数据区出现“维度+组别+X±S”完全相同的重复数据行'),
+    (-1, 'D24', '文档被添加页眉或页脚内容'),
+    (-1, 'D25', '文档中出现除9条表题与“例子：”提示段以外的新增文字段落'
+     '（如修改说明、生成备注、版本标注等）'),
+    (-1, 'D26', '文档中被插入分页符，或分节符多于1处，统计表被强制分页'),
+]
+
+# 维度二条目的固定顺序：先 11 条加分项（逐表拆分），再 26 条减分项
+_ITEMS = []
+for _per, _key, _labels, _rule in _PLUS_SPECS:
+    for _lab in _labels:
+        _ITEMS.append((_key, _lab, _per, '%s（%s）' % (_rule, LAB(_lab))))
+for _delta, _key, _rule in _MINUS_SPECS:
+    _ITEMS.append((_key, None, _delta, _rule))
+
+_MAX_DELTAS_ORDER = [_it[2] for _it in _ITEMS]
+assert sum(x for x in _MAX_DELTAS_ORDER if x > 0) == MAX_SCORE_TOTAL
+assert len(_MAX_DELTAS_ORDER) == 80 + 26
 
 
 # ---------------------------------------------------------------------------
-# 文档加载
+# 底层工具
 # ---------------------------------------------------------------------------
-class DocxModel:
-    def __init__(self, path):
-        self.path = path
-        self.ok_open = False
-        self.is_docx = path.lower().endswith(".docx")
-        self.document_xml = None
-        self.app_xml = None
-        self.has_image_parts = False
-        self.tables = []          # 文档顺序的所有表格 (ET element)
-        self.body_order = []      # 正文中 段落/表格 的顺序列表 [("p",text)/("tbl",elem)]
-        self.page_count = None
-        self.sect = None
-        self._load()
+def _nz(s):
+    """归一化：去掉半角/全角空格，全角括号转半角，各类连字符统一为 ASCII 减号。"""
+    if not s:
+        return ''
+    s = s.replace(' ', '').replace('　', '').replace('\t', '')
+    s = s.replace('（', '(').replace('）', ')')
+    for ch in ('−', '–', '—', '－'):
+        s = s.replace(ch, '-')
+    return s
 
-    def _load(self):
-        try:
-            with zipfile.ZipFile(self.path) as z:
-                names = z.namelist()
-                self.document_xml = z.read("word/document.xml")
-                if "docProps/app.xml" in names:
-                    self.app_xml = z.read("docProps/app.xml")
-                # 是否包含图片资源（用于判断是否被转图）
-                self.has_image_parts = any(
-                    n.lower().startswith("word/media/") for n in names
-                )
-            self.ok_open = True
-        except Exception as e:
-            self.ok_open = False
-            self.load_error = str(e)
-            return
 
-        self.root = ET.fromstring(self.document_xml)
-        self.body = self.root.find(w("body"))
-        for child in list(self.body):
-            if child.tag == w("p"):
-                txt = self._para_text(child)
-                self.body_order.append(("p", txt, child))
-            elif child.tag == w("tbl"):
-                self.tables.append(child)
-                self.body_order.append(("tbl", None, child))
+def _txt_of(el):
+    """取元素下所有 w:t 的拼接文本。"""
+    return ''.join(n.text or '' for n in el.iter(qn('w:t')))
 
-        self.sect = self.root.find(f".//{w('sectPr')}")
 
-        if self.app_xml is not None:
+def _border(el, name):
+    """读取 w:tblBorders / w:tcBorders 下某一方向的 (val, sz, color)。"""
+    if el is None:
+        return None
+    e = el.find(qn('w:' + name))
+    if e is None:
+        return None
+    try:
+        sz = int(e.get(qn('w:sz')) or 0)
+    except ValueError:
+        sz = 0
+    return (e.get(qn('w:val')), sz, (e.get(qn('w:color')) or 'auto').lower())
+
+
+def _line(b):
+    """是否为“有线条”。val 为 none/nil 或宽度为 0 均视为无线条。"""
+    return b is not None and b[0] not in (None, 'none', 'nil') and b[1] > 0
+
+
+def _solid_black(b, sz):
+    """是否为指定磅值的黑色实线。"""
+    return (_line(b) and b[0] == 'single' and b[1] == sz
+            and b[2] in ('auto', '000000', '000'))
+
+
+def _cells_of(tr):
+    """解析一行的所有 w:tc；col 为该单元格起始网格列号（累加 gridSpan）。"""
+    out = []
+    col = 0
+    for tc in tr.findall(qn('w:tc')):
+        tcPr = tc.find(qn('w:tcPr'))
+        gs = 1
+        vm = None
+        va = None
+        tb = {}
+        if tcPr is not None:
+            g = tcPr.find(qn('w:gridSpan'))
+            if g is not None:
+                gs = int(g.get(qn('w:val')))
+            e = tcPr.find(qn('w:vMerge'))
+            if e is not None:
+                vm = e.get(qn('w:val')) or 'continue'
+            a = tcPr.find(qn('w:vAlign'))
+            if a is not None:
+                va = a.get(qn('w:val'))
+            bd = tcPr.find(qn('w:tcBorders'))
+            if bd is not None:
+                for name in ('top', 'bottom', 'left', 'right', 'insideH', 'insideV'):
+                    b = _border(bd, name)
+                    if b is not None:
+                        tb[name] = b
+        out.append({'tc': tc, 'col': col, 'gs': gs, 'txt': _txt_of(tc).strip(),
+                    'vm': vm, 'va': va, 'tb': tb})
+        col += gs
+    return out
+
+
+def _hlines(rows):
+    """收集所有内部横线，按“边界序号 + 网格列号”去重。
+
+    同一条视觉横线既可写成第 i 行单元格的下框线，也可写成第 i+1 行单元格的上框线，
+    因此两种写法都要归并到同一个 (边界序号, 列号) 上。返回 (线集合, 是否全为0.75磅黑色实线)。
+    """
+    got = set()
+    ok_sz = True
+    for i in range(len(rows) - 1):
+        for c in rows[i]:
+            b = c['tb'].get('bottom')
+            if _line(b):
+                for x in range(c['col'], c['col'] + c['gs']):
+                    got.add((i, x))
+                if not _solid_black(b, SZ_0_75PT):
+                    ok_sz = False
+        for c in rows[i + 1]:
+            b = c['tb'].get('top')
+            if _line(b):
+                for x in range(c['col'], c['col'] + c['gs']):
+                    got.add((i, x))
+                if not _solid_black(b, SZ_0_75PT):
+                    ok_sz = False
+    return got, ok_sz
+
+
+def _vlines(rows):
+    """统计内部竖线条数（行首左框线、行尾右框线属于外框，不计入）。"""
+    n = 0
+    for r in rows:
+        for i, c in enumerate(r):
+            if i > 0 and _line(c['tb'].get('left')):
+                n += 1
+            if i < len(r) - 1 and _line(c['tb'].get('right')):
+                n += 1
+    return n
+
+
+def _table_info(tbl):
+    """把一张 w:tbl 解析成检测所需的字典。"""
+    rows = [_cells_of(tr) for tr in tbl.findall(qn('w:tr'))]
+    pr = tbl.find(qn('w:tblPr'))
+    bd = pr.find(qn('w:tblBorders')) if pr is not None else None
+    tb = {}
+    for name in ('top', 'bottom', 'left', 'right', 'insideH', 'insideV'):
+        b = _border(bd, name)
+        if b is not None:
+            tb[name] = b
+    wel = pr.find(qn('w:tblW')) if pr is not None else None
+    grid = tbl.find(qn('w:tblGrid'))
+    cols = [int(g.get(qn('w:w')) or 0) for g in grid.findall(qn('w:gridCol'))] if grid is not None else []
+    hs = []
+    for tr in tbl.findall(qn('w:tr')):
+        trPr = tr.find(qn('w:trPr'))
+        h = None
+        if trPr is not None:
+            he = trPr.find(qn('w:trHeight'))
+            if he is not None:
+                h = (int(he.get(qn('w:val')) or 0) / TWIPS_PER_CM, he.get(qn('w:hRule')))
+        hs.append(h)
+    try:
+        wval = int(wel.get(qn('w:w')) or 0) if wel is not None else 0
+    except ValueError:
+        wval = 0
+    return {'el': tbl, 'rows': rows, 'tb': tb, 'hs': hs, 'grid': cols, 'ncol': len(cols),
+            'wtype': wel.get(qn('w:type')) if wel is not None else None, 'wval': wval}
+
+
+def _map_labeled_tables(body):
+    """按“表题段落 + 紧随其后的表格”把 9 张统计表映射到表号。
+
+    表题与表格之间允许夹入空段落（该情形由减分项 D5 单独判定），此处只负责定位。
+    """
+    T = {}
+    pending = None
+    for ch in body.iterchildren():
+        if ch.tag == qn('w:p'):
+            t = _nz(_txt_of(ch).strip())
+            for k, cap in CAPS.items():
+                if t == _nz(cap):
+                    pending = k
+                    break
+            else:
+                if t:
+                    pending = None
+        elif ch.tag == qn('w:tbl'):
+            if pending is not None and pending not in T:
+                T[pending] = _table_info(ch)
+            pending = None
+    return T
+
+
+# ---------------------------------------------------------------------------
+# 有效格式解析：run 直接格式 -> 段落样式链（basedOn） -> docDefaults
+# ---------------------------------------------------------------------------
+def _style_maps(doc):
+    st_el = doc.styles.element
+    by_id = {}
+    for st in st_el.findall(qn('w:style')):
+        by_id[st.get(qn('w:styleId'))] = st
+    dd_r = dd_p = None
+    dd = st_el.find(qn('w:docDefaults'))
+    if dd is not None:
+        rd = dd.find(qn('w:rPrDefault'))
+        if rd is not None:
+            dd_r = rd.find(qn('w:rPr'))
+        pd = dd.find(qn('w:pPrDefault'))
+        if pd is not None:
+            dd_p = pd.find(qn('w:pPr'))
+    return (by_id, dd_r, dd_p)
+
+
+def _para_style_id(p):
+    pPr = p.find(qn('w:pPr')) if p is not None else None
+    if pPr is None:
+        return None
+    ps = pPr.find(qn('w:pStyle'))
+    return ps.get(qn('w:val')) if ps is not None else None
+
+
+def _walk_styles(getter, sid, by_id, dflt):
+    seen = set()
+    while sid and sid not in seen:
+        seen.add(sid)
+        st = by_id.get(sid)
+        if st is None:
+            break
+        v = getter(st)
+        if v is not None:
+            return v
+        b = st.find(qn('w:basedOn'))
+        sid = b.get(qn('w:val')) if b is not None else None
+    return dflt
+
+
+def _resolve_run(getter, r, p, sm):
+    by_id, dd_r, _ = sm
+    v = getter(r.find(qn('w:rPr'))) if r is not None else None
+    if v is not None:
+        return v
+    v = _walk_styles(lambda st: getter(st.find(qn('w:rPr'))), _para_style_id(p), by_id, None)
+    if v is not None:
+        return v
+    return getter(dd_r)
+
+
+def _resolve_para(getter, p, sm):
+    by_id, _, dd_p = sm
+    v = getter(p.find(qn('w:pPr'))) if p is not None else None
+    if v is not None:
+        return v
+    v = _walk_styles(lambda st: getter(st.find(qn('w:pPr'))), _para_style_id(p), by_id, None)
+    if v is not None:
+        return v
+    return getter(dd_p)
+
+
+def _g_eastasia(rPr):
+    if rPr is None:
+        return None
+    rf = rPr.find(qn('w:rFonts'))
+    return rf.get(qn('w:eastAsia')) if rf is not None else None
+
+
+def _g_ascii(rPr):
+    if rPr is None:
+        return None
+    rf = rPr.find(qn('w:rFonts'))
+    if rf is None:
+        return None
+    return rf.get(qn('w:ascii')) or rf.get(qn('w:hAnsi'))
+
+
+def _g_sz(rPr):
+    if rPr is None:
+        return None
+    e = rPr.find(qn('w:sz'))
+    if e is None:
+        return None
+    try:
+        return int(e.get(qn('w:val')))
+    except (TypeError, ValueError):
+        return None
+
+
+def _g_bold(rPr):
+    if rPr is None:
+        return None
+    e = rPr.find(qn('w:b'))
+    if e is None:
+        return None
+    return e.get(qn('w:val')) not in ('0', 'false', 'off')
+
+
+def _g_jc(pPr):
+    if pPr is None:
+        return None
+    e = pPr.find(qn('w:jc'))
+    return e.get(qn('w:val')) if e is not None else None
+
+
+def _g_firstline(pPr):
+    """返回首行缩进（twips 或字符数），未设置返回 None。"""
+    if pPr is None:
+        return None
+    e = pPr.find(qn('w:ind'))
+    if e is None:
+        return None
+    for attr in ('w:firstLine', 'w:firstLineChars'):
+        v = e.get(qn(attr))
+        if v is not None:
             try:
-                aroot = ET.fromstring(self.app_xml)
-                for el in aroot.iter():
-                    if el.tag.endswith("}Pages") or el.tag.endswith("Pages"):
-                        self.page_count = int(el.text)
-                        break
-            except Exception:
-                pass
-
-    @staticmethod
-    def _para_text(p):
-        return "".join(t.text or "" for t in p.iter(w("t")))
-
-
-# ---------------------------------------------------------------------------
-# 辅助：把目标表格与其题注配对
-# ---------------------------------------------------------------------------
-def map_labeled_tables(model):
-    """
-    返回 dict: label -> table_element
-    依据正文顺序，紧邻在题注段落(含 '表5-x')之后的表格即为该表。
-    """
-    result = {}
-    pending_label = None
-    for kind, txt, elem in model.body_order:
-        if kind == "p":
-            t = (txt or "").replace(" ", "")
-            for lab in TARGET_LABELS:
-                # 题注以 表5-x 开头，避免 表5-1 误匹配 表5-12：用边界
-                norm = lab.replace("-", "-")
-                if re.search(re.escape(norm) + r"(?![0-9])", t):
-                    pending_label = lab
-                    break
-        elif kind == "tbl":
-            if pending_label is not None:
-                result[pending_label] = elem
-                pending_label = None
-    return result
-
-
-# ---------------------------------------------------------------------------
-# 边框解析辅助
-# ---------------------------------------------------------------------------
-def get_table_borders(tbl):
-    tblPr = tbl.find(w("tblPr"))
-    if tblPr is None:
-        return None
-    return tblPr.find(w("tblBorders"))
-
-
-def border_attr(borders_el, side):
-    """返回 (val, sz, color) 或 None"""
-    if borders_el is None:
-        return None
-    b = borders_el.find(w(side))
-    if b is None:
-        return None
-    return (
-        b.get(w("val")),
-        b.get(w("sz")),
-        (b.get(w("color")) or "auto"),
-    )
-
-
-def cell_borders(tc):
-    tcPr = tc.find(w("tcPr"))
-    if tcPr is None:
-        return None
-    return tcPr.find(w("tcBorders"))
-
-
-def is_black(color):
-    return color in ("000000", "auto", "black", None)
-
-
-def is_visible(val):
-    return val is not None and val not in ("nil", "none")
-
-
-def rows_of(tbl):
-    return tbl.findall(w("tr"))
-
-
-def cells_of(row):
-    return row.findall(w("tc"))
-
-
-def cell_text(tc):
-    return "".join(t.text or "" for t in tc.iter(w("t")))
-
-
-# ---------------------------------------------------------------------------
-# 维度1 检查
-# ---------------------------------------------------------------------------
-def check_dimension1(model):
-    """维度一四个子项（.docx 格式/表格齐全/页数与无乱码/表格未图片化）已全部删除，
-    维度一不再拦截评分流程，恒返回 True。保留函数签名以兼容 evaluate() 现有调用。"""
-    details: list[tuple[bool, str]] = []
-    return True, details
-
-
-# ---------------------------------------------------------------------------
-# 维度2 - 得分点
-# ---------------------------------------------------------------------------
-def check_outer_border(labeled):
-    """
-    +1/表：表格外框线 —— 外框线只保留上下外框线，表格上框线和下框线为1.5磅黑色实线。
-    （一个三线表满足+1，两个+2，以此类推，最多9分）
-
-    细则逐点拆解（每一个点都必须踩到）：
-      点1：外框线"只保留上下外框线" —— 左外框线、右外框线均不保留（nil/none）。
-      点2：表格上框线为 1.5磅(sz=12) 黑色(000000/auto) 实线(single)。
-      点3：表格下框线为 1.5磅(sz=12) 黑色(000000/auto) 实线(single)。
-    细则未提及内框线(insideH/insideV)，故此条不对内框线加以约束。
-    """
-    count = 0
-    hits = []
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-        tb = get_table_borders(tbl)
-        top = border_attr(tb, "top")
-        bottom = border_attr(tb, "bottom")
-        left = border_attr(tb, "left")
-        right = border_attr(tb, "right")
-
-        def line_1_5pt_black_solid(side_attr):
-            # 实线 single + 1.5磅(sz=12) + 黑色
-            if side_attr is None:
-                return False
-            val, sz, color = side_attr
-            return (val == "single"
-                    and sz is not None and int(sz) == SZ_1_5PT
-                    and is_black(color))
-
-        def outer_not_kept(side_attr):
-            # "只保留上下外框线" -> 左右外框线不保留：缺失或 nil/none 均视为不保留
-            if side_attr is None:
-                return True
-            val = side_attr[0]
-            return not is_visible(val)
-
-        # 点1：只保留上下外框线（左右外框线不保留）
-        p1 = outer_not_kept(left) and outer_not_kept(right)
-        # 点2：上框线 1.5磅黑色实线
-        p2 = line_1_5pt_black_solid(top)
-        # 点3：下框线 1.5磅黑色实线
-        p3 = line_1_5pt_black_solid(bottom)
-
-        if p1 and p2 and p3:
-            count += 1
-            hits.append(lab)
-    score = min(count, 9)
-    return score, hits
-
-
-def _inner_horizontal_border(tc):
-    """
-    返回该单元格"内框横线"(下框线/上框线)信息。
-    内框线指单元格 tcBorders 中的 bottom / top / insideH。
-    返回 list[(side, val, sz, color)]，仅含可见者。
-    """
-    cb = cell_borders(tc)
-    result = []
-    for side in ("bottom", "top", "insideH"):
-        a = border_attr(cb, side)
-        if a is not None and is_visible(a[0]):
-            result.append((side, a[0], a[1], a[2]))
-    return result
-
-
-def check_group_inner_border(labeled, target_tables, title_keywords, max_score):
-    """
-    通用：分组标题下方内框线评分。
-    细则逐点拆解（每一个点都必须踩到）：
-      点1：每一个指定分组标题(title_keywords)所在单元格下方都有下框线。
-      点2：除这些分组标题单元格外，其余位置均无内框横线（"其余位置无内框线"）。
-      点3：这些下框线的类型为 0.75磅(sz=6) 黑色(000000/auto) 短横线(single)。
-    细则未提及竖向内框线，故此条不对竖线加以约束（竖线由专门的扣分项处理）。
-    """
-    norm_titles = [k.replace(" ", "") for k in title_keywords]
-    count = 0
-    hits = []
-    for lab in sorted(target_tables):
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-
-        found_titles = set()       # 已满足"标题下方有0.75磅黑色短横线"的标题
-        other_has_inner = False    # 非分组标题位置是否出现内框横线
-
-        for row in rows_of(tbl):
-            for tc in cells_of(row):
-                txt = cell_text(tc).replace(" ", "")
-                is_title = any(k in txt for k in norm_titles)
-                inner = _inner_horizontal_border(tc)
-
-                if is_title:
-                    # 点1 + 点3：分组标题单元格需有 0.75磅黑色短横线的下框线
-                    for side, val, sz, color in inner:
-                        if (side == "bottom"
-                                and val == "single"
-                                and sz is not None and int(sz) == SZ_0_75PT
-                                and is_black(color)):
-                            for k in norm_titles:
-                                if k in txt:
-                                    found_titles.add(k)
-                else:
-                    # 点2："其余位置无内框线" —— 非标题单元格不应有任何可见内框横线
-                    if inner:
-                        other_has_inner = True
-
-        p1_p3 = (found_titles == set(norm_titles))  # 每个指定标题都满足下框线且类型正确
-        p2 = (not other_has_inner)                  # 其余位置无内框线
-
-        if p1_p3 and p2:
-            count += 1
-            hits.append(lab)
-
-    score = min(count, max_score)
-    return score, hits
-
-
-def check_two_group_inner(labeled):
-    """
-    +1/表：表5-4、表5-5、表5-8、表5-9和表5-12 分组内框线 ——
-    仅有"Levene检验"、"t检验"两个分组标题下方有下框线，其余位置无内框线，
-    框线类型为0.75磅黑色短横线。（一个+1，两个+2，以此类推，最多5分）
-    """
-    return check_group_inner_border(
-        labeled, TWO_GROUP_TABLES, ["Levene检验", "t检验"], 5)
-
-
-def check_one_group_inner(labeled):
-    """
-    +1/表：表5-6、表5-7、表5-10和表5-11 分组表头内框线 ——
-    仅有"t检验"标题下方有下框线，其余位置无内框线，
-    框线类型为0.75磅黑色短横线。（一个+1，两个+2，以此类推，最多4分）
-
-    细则逐点拆解（每一个点都必须踩到，由 check_group_inner_border 实现）：
-      点1："t检验"标题所在单元格下方有下框线。
-      点2：除该标题单元格外，其余位置均无内框横线（"其余位置无内框线"，字面严格）。
-      点3：该下框线类型为 0.75磅(sz=6) 黑色(000000/auto) 短横线(single)。
-    细则未提及竖向内框线，故此条不对竖线加以约束。
-    """
-    return check_group_inner_border(
-        labeled, ONE_GROUP_TABLES, ["t检验"], 4)
-
-
-# ---------------------------------------------------------------------------
-# 维度2 - 扣分点
-# ---------------------------------------------------------------------------
-def deduct_extra_vertical(labeled):
-    """
-    -3：表格出现额外竖框线。
-
-    细则逐点拆解（"出现"即扣分，只要任意一点命中即触发）：
-      竖框线 = 表格中任何竖直方向的边框线（left / right / insideV）。
-      判定"有效竖线"：与 WPS/Word 实际渲染一致 —— 单元格级 tcBorders 优先于
-      表级 tblBorders。一条竖线是否真正显示，由它两侧单元格的对应竖边决定：
-        · 表格最左边线：由第 1 列单元格的 tcBorders/left 决定（缺省时继承表级 left）。
-        · 表格最右边线：由最后一列单元格的 tcBorders/right 决定（缺省继承表级 right）。
-        · 内部竖线(insideV)：夹在相邻两单元格之间，只要"左邻的 right"或
-          "右邻的 left"任一被单元格显式设为 nil/none，该竖线即不画；两侧都缺省
-          时才继承表级 insideV。
-      因此单元格若把自身 left/right 全设为 nil/none，即使表级 left/right/insideV
-      写着 single，最终也不显示任何竖线（本文档三线表即属此情形）。
-      三线表本身不含竖框线，故任何真正显示的竖线均属"额外"。
-    细则只针对竖框线，不约束横框线、对角线(tl2br/tr2bl)等其余内容。
-    """
-
-    def cell_side(tc, side):
-        """返回单元格 tcBorders 中指定边的 val；无定义返回 None（继承表级）。"""
-        cb = cell_borders(tc)
-        a = border_attr(cb, side)
-        return a[0] if a is not None else None
-
-    def table_side_visible(tb, side):
-        a = border_attr(tb, side)
-        return a is not None and is_visible(a[0])
-
-    def edge_visible(cell_val, table_val_visible):
-        """一条竖边的最终可见性：单元格显式值优先，缺省则继承表级。"""
-        if cell_val is not None:
-            return is_visible(cell_val)
-        return table_val_visible
-
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-
-        tb = get_table_borders(tbl)
-        t_left = table_side_visible(tb, "left")
-        t_right = table_side_visible(tb, "right")
-        t_insideV = table_side_visible(tb, "insideV")
-
-        for row in rows_of(tbl):
-            cells = cells_of(row)
-            n = len(cells)
-            for ci, tc in enumerate(cells):
-                c_left = cell_side(tc, "left")
-                c_right = cell_side(tc, "right")
-
-                # 表格最左外框竖线（第 1 列的 left）
-                if ci == 0 and edge_visible(c_left, t_left):
-                    return True, f"{lab} 出现额外竖框线（最左竖线）"
-                # 表格最右外框竖线（最后 1 列的 right）
-                if ci == n - 1 and edge_visible(c_right, t_right):
-                    return True, f"{lab} 出现额外竖框线（最右竖线）"
-
-                # 内部竖线：本单元格 right 与右邻单元格 left 共同决定；
-                # 任一被显式设为 nil/none 即不画，两侧都缺省才继承表级 insideV。
-                if ci < n - 1:
-                    nb_left = cell_side(cells[ci + 1], "left")
-                    right_hidden = (c_right is not None and not is_visible(c_right))
-                    nbleft_hidden = (nb_left is not None and not is_visible(nb_left))
-                    if not (right_hidden or nbleft_hidden):
-                        # 两侧都没把它设为不可见 -> 由显式可见值或表级 insideV 决定
-                        shown = (
-                            (c_right is not None and is_visible(c_right))
-                            or (nb_left is not None and is_visible(nb_left))
-                            or t_insideV
-                        )
-                        if shown:
-                            return True, f"{lab} 出现额外竖框线（内部竖线 insideV）"
-
-    return False, ""
-
-
-def deduct_simulated_columns(labeled):
-    """
-    -5：表5-4至表5-12任意表格仍使用连续空格、制表符或同一大单元格模拟多列数据，
-        未形成与字段对应的独立可编辑单元格。
-
-    细则逐点拆解（"任意表格"命中"任意一种模拟方式"即扣分）：
-      方式1：用"连续空格"在单个单元格内模拟多列 —— 单元格文本内部出现 2 个及
-             以上连续空格分隔多段数据。
-      方式2：用"制表符"在单个单元格内模拟多列 —— 单元格文本含 \\t。
-      方式3：用"同一大单元格"模拟多列 —— 一个单元格通过 gridSpan 横跨多列，
-             却在其中塞入本应分列的多段数据（即跨列单元格内仍含空格/制表符分隔
-             的多段内容）。
-    共同后果判据：未形成"与字段对应的独立可编辑单元格"。即上述任一模拟方式出现，
-    意味着数据没有落入各自独立的单元格。
-    细则只针对"模拟多列"这一行为，不对列数本身、字段顺序等其他内容加以约束。
-    """
-    # 仅当一段数据明显是被空格/制表符拆成"多列"时才算模拟；
-    # 中文短语内部的单个空格(如 "t 检验")不计为模拟。
-    multi_space = re.compile(r"\S+\s{2,}\S+")   # 2+连续空格分隔的多段
-    tab_char = "\t"
-
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-        for row in rows_of(tbl):
-            for tc in cells_of(row):
-                txt = cell_text(tc)
-
-                # 该单元格是否为"同一大单元格"(横跨多列)
-                tcPr = tc.find(w("tcPr"))
-                gs = tcPr.find(w("gridSpan")) if tcPr is not None else None
-                span = int(gs.get(w("val"))) if gs is not None else 1
-                is_big_cell = span >= 2
-
-                # 方式2：制表符模拟分列
-                if tab_char in txt:
-                    return True, (f"{lab} 单元格用制表符模拟多列、"
-                                  f"未形成独立单元格: '{txt}'")
-
-                # 方式1：连续空格模拟分列
-                if multi_space.search(txt):
-                    return True, (f"{lab} 单元格用连续空格模拟多列、"
-                                  f"未形成独立单元格: '{txt}'")
-
-                # 方式3：同一大单元格(跨列)内塞入用空格/制表符分隔的多段数据
-                if is_big_cell and (multi_space.search(txt) or tab_char in txt):
-                    return True, (f"{lab} 用同一大单元格(跨{span}列)模拟多列、"
-                                  f"未形成独立单元格: '{txt}'")
-    return False, ""
-
-
-def deduct_image_table(labeled, model):
-    """
-    -5：表5-4至表5-12任意表格被转换为图片、截图或不可编辑对象。
-
-    细则逐点拆解（任意一个目标表命中任意一种"被转换"形态即扣分）：
-      形态1：被转换为"图片"/"截图" —— 原本应是 w:tbl 的位置出现图片对象：
-             w:drawing（DrawingML，含 a:blip 引用 word/media 中的图片）、
-             w:pict（VML 图片）、w:object 内嵌图片。截图与普通图片在 OOXML
-             中同为图片对象，无法也无需区分。
-      形态2：被转换为"不可编辑对象" —— OLE/嵌入对象 w:object / w:OLEObject，
-             或内容控件锁定为不可编辑(w:sdt 且 w:lock 含 contentLocked)。
-      "被转换"判据：该目标表对应位置已不再是可编辑的 w:tbl，而是上述对象之一；
-                    或在本应是表格的题注之后，紧邻出现的是图片/对象而非 w:tbl。
-    细则只针对"被转换为图片/截图/不可编辑对象"，不对其他内容加以约束。
-    """
-    IMG_OBJ_TAGS = ("drawing", "pict", "object", "OLEObject")
-
-    # 情形A：目标表仍是 w:tbl，但表格内部嵌入了图片/对象（即用图片替换了内容）
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-        for tag in IMG_OBJ_TAGS:
-            if tbl.find(f".//{w(tag)}") is not None:
-                return True, f"{lab} 表格被转换为图片/截图/不可编辑对象（含 {tag}）"
-
-    # 情形B：题注之后本应紧邻 w:tbl，却变成了图片/对象段落（整表被转图）
-    pending_label = None
-    for kind, txt, elem in model.body_order:
-        if kind == "p":
-            t = (txt or "").replace(" ", "")
-            matched = None
-            for lab in TARGET_LABELS:
-                if re.search(re.escape(lab) + r"(?![0-9])", t):
-                    matched = lab
-                    break
-            if matched is not None:
-                pending_label = matched
-            elif pending_label is not None:
-                # 题注后、表格出现前的段落：若含图片/对象，视为整表被转图
-                for tag in IMG_OBJ_TAGS:
-                    if elem.find(f".//{w(tag)}") is not None:
-                        return True, (f"{pending_label} 表格被转换为图片/截图/"
-                                      f"不可编辑对象（题注后出现 {tag}）")
-        elif kind == "tbl":
-            # 正常出现表格，清除待配对标签
-            pending_label = None
-
-    return False, ""
-
-
-def _render_pdf_via_wps(docx_path: str):
-    """
-    历史入口：曾用 WPS/Word COM 渲染 PDF 以拿到真实分页坐标。
-    因用户要求"非必要不用 COM"，且跨页检测已可用 OOXML 分页信号回退（见
-    deduct_page_break 的回退分支），本函数固定返回 None，不再触发 COM 调用。
-    保留函数与调用点是为了让后续如需真渲染时可插回 pdf 后端（如 Aspose / docx2pdf
-    的非 COM 后端），无需改上层调用链。
-    """
-    del docx_path  # 保留形参签名，不再使用
+                return float(v)
+            except ValueError:
+                return None
     return None
 
 
-def _detect_crosspage_from_pdf(pdf_path):
-    """
-    用 pdfplumber（经 pdf_backend 适配层）在渲染后的 PDF 上检测：表5-4~表5-12 中是否存在表格跨页
-    或数据行被分页拆开。返回 (命中:bool, 触发说明:str)。
+def _parent_para(el):
+    """向上找到 run 所属的 w:p。"""
+    node = el.getparent()
+    while node is not None and node.tag != qn('w:p'):
+        node = node.getparent()
+    return node
 
-    判定方法（基于真实排版坐标，与 WPS 所见一致）：
-      · 以各表题注("表5-x")在 PDF 中的首次出现作为该表起点(页, y)；
-        下一个题注(或末尾"例子")作为"内容区间"的上界。
-      · 关键：只有当表格"自身内容"真的落到了下一页，才算跨页。
-        下一张表的题注在下一页，只说明当前表之后发生了翻页，并不代表当前
-        表被切断（当前表可能是本页最后一张、完整落在本页）。
-      · 因此对每张表：收集从其题注 y 往下、到下一锚点之前、且位于其起始页
-        的所有文字块，取最大底部 y 作为该表实际底部。
-        - 若在下一锚点之前，本表内容还出现在了起始页的下一页，则表身跨越了
-          页边界 -> 跨页 / 数据行被分页拆开。
-        - 否则（内容全部落在起始页）-> 不跨页，即使下一题注在下一页。
-    """
-    try:
-        try:
-            import pdf_backend
-        except ImportError:
-            from verifiers import pdf_backend
-    except Exception:
-        return None  # 库不可用 -> 交由调用方降级处理
 
-    try:
-        doc = pdf_backend.open_pdf(pdf_path)
-    except Exception:
-        return None
+# ---------------------------------------------------------------------------
+# 加分项 A1~A11 的单表判定
+# ---------------------------------------------------------------------------
+def _chk_a1_outer(t):
+    """A1 外框线：整体边框仅上下 1.5 磅黑色实线，左右与内部横竖框线均无线条。"""
+    tb = t['tb']
+    bad = []
+    if not _solid_black(tb.get('top'), SZ_1_5PT):
+        bad.append('表格整体上框线不是1.5磅黑色实线')
+    if not _solid_black(tb.get('bottom'), SZ_1_5PT):
+        bad.append('表格整体下框线不是1.5磅黑色实线')
+    for name, zh in (('left', '左框线'), ('right', '右框线'),
+                     ('insideH', '内部横框线'), ('insideV', '内部竖框线')):
+        if _line(tb.get(name)):
+            bad.append('表格整体边框的%s有线条' % zh)
+    return (not bad), '；'.join(bad)
 
-    order = list(TARGET_LABELS) + ["例子"]
 
-    def first_anchor(label):
-        hits = []
-        for pno in range(doc.page_count):
-            for r in doc.search_text(pno, label):
-                hits.append((pno, r.y0))
-        hits.sort()
-        return hits[0] if hits else None
+def _chk_group_line(k, t):
+    """A2/A3 分组标题下方内框线：仅第1行分组标题下方有 0.75 磅黑色实线，其余无内框线。"""
+    ncol = SHAPE[k][1]
+    if (len(t['rows']), t['ncol']) != SHAPE[k]:
+        return False, '行列数不符（实际%d行%d列），无法判定分组内框线' % (len(t['rows']), t['ncol'])
+    got, ok_sz = _hlines(t['rows'])
+    expect = {(0, c) for c in range(3, ncol)}
+    bad = []
+    miss = sorted(expect - got)
+    extra = sorted(got - expect)
+    if miss:
+        bad.append('分组标题下方缺下框线（边界/列号 %s）' % miss)
+    if extra:
+        bad.append('存在多余内部横框线（边界/列号 %s）' % extra)
+    if not ok_sz:
+        bad.append('内框线不是0.75磅黑色实线')
+    nv = _vlines(t['rows'])
+    if nv:
+        bad.append('存在%d处内部竖框线' % nv)
+    return (not bad), '；'.join(bad)
 
-    anchors = {lab: first_anchor(lab) for lab in order}
 
-    # 预取各页文字块（page, y0, y1）用于判断表身实际延伸范围
-    def page_blocks(pno):
-        try:
-            # 保持与历史文本块相同的元组结构
-            # (x0,y0,x1,y1,text,bno,btype)
-            return [
-                (b.bbox.x0, b.bbox.y0, b.bbox.x1, b.bbox.y1, b.text, i, 0)
-                for i, b in enumerate(doc.extract_text_blocks(pno))
-            ]
-        except Exception:
-            return []
+def _chk_a4_shape(k, t):
+    """A4 行列数。"""
+    want = SHAPE[k]
+    got = (len(t['rows']), t['ncol'])
+    if got == want:
+        return True, ''
+    return False, '要求%d行%d列，实际%d行%d列' % (want[0], want[1], got[0], got[1])
 
-    for i, lab in enumerate(TARGET_LABELS):
-        a = anchors.get(lab)
-        if a is None:
+
+def _chk_header_merge(k, t):
+    """A5/A6 分组表头横向合并：第1行前3个单元格不合并且无文字，第4列（7列表另加第6列）横向合并2列，第2行均不合并。"""
+    ncol = SHAPE[k][1]
+    rows = t['rows']
+    if (len(rows), t['ncol']) != SHAPE[k]:
+        return False, '行列数不符（实际%d行%d列），无法判定表头合并' % (len(rows), t['ncol'])
+    r0, r1 = rows[0], rows[1]
+    need_cells = 5 if ncol == 7 else 4
+    bad = []
+    if len(r0) != need_cells:
+        bad.append('第1行应为%d个单元格，实际%d个' % (need_cells, len(r0)))
+    else:
+        for i in range(3):
+            if r0[i]['gs'] != 1:
+                bad.append('第1行第%d个单元格被横向合并' % (i + 1))
+            if r0[i]['txt']:
+                bad.append('第1行第%d个单元格有文字“%s”' % (i + 1, r0[i]['txt']))
+        if not (r0[3]['col'] == 3 and r0[3]['gs'] == 2):
+            bad.append('第4列单元格未横向合并2列')
+        if ncol == 7 and not (r0[4]['col'] == 5 and r0[4]['gs'] == 2):
+            bad.append('第6列单元格未横向合并2列')
+    if len(r1) != ncol or any(c['gs'] != 1 for c in r1):
+        bad.append('第2行未保持%d个不合并的单元格' % ncol)
+    return (not bad), '；'.join(bad)
+
+
+def _chk_a7_dim_merge(k, t):
+    """A7 维度列纵向合并：第1列每个维度占2个数据行合并为1格，第2个数据行无重复文字。"""
+    rows = t['rows']
+    if (len(rows), t['ncol']) != SHAPE[k]:
+        return False, '行列数不符（实际%d行%d列），无法判定维度列合并' % (len(rows), t['ncol'])
+    n = len(rows)
+    seq, txts = [], []
+    for i in range(2, n):
+        c0 = rows[i][0] if rows[i] and rows[i][0]['col'] == 0 else None
+        seq.append(c0['vm'] if c0 else 'MISSING')
+        txts.append(c0['txt'] if c0 else '')
+    want = ['restart', 'continue'] * ((n - 2) // 2)
+    bad = []
+    if seq != want:
+        bad.append('第1列纵向合并序列不符（实际 %s）' % '/'.join(str(x) for x in seq))
+    dup = [txts[i] for i in range(1, len(txts), 2) if txts[i]]
+    if dup:
+        bad.append('维度名称在第2个数据行重复出现：%s' % '、'.join(dup))
+    return (not bad), '；'.join(bad)
+
+
+def _chk_a8_stat_merge(k, t):
+    """A8 统计量列纵向合并：第4列起各统计量列在同一维度的2个数据行内合并为1格。"""
+    rows = t['rows']
+    if (len(rows), t['ncol']) != SHAPE[k]:
+        return False, '行列数不符（实际%d行%d列），无法判定统计量列合并' % (len(rows), t['ncol'])
+    n = len(rows)
+    want = ['restart', 'continue'] * ((n - 2) // 2)
+    bad = []
+    for ci in range(3, SHAPE[k][1]):
+        seq = []
+        for i in range(2, n):
+            found = None
+            for c in rows[i]:
+                if c['col'] <= ci < c['col'] + c['gs']:
+                    found = c
+            seq.append(found['vm'] if found else 'MISSING')
+        if seq != want:
+            bad.append('第%d列纵向合并序列不符（实际 %s）'
+                       % (ci + 1, '/'.join(str(x) for x in seq)))
+    return (not bad), '；'.join(bad)
+
+
+def _chk_a9_width(t, text_width_cm):
+    """A9 表格宽度：按百分比自适应正文宽度、约 100%；此时实际宽度等于正文宽度，需不大于 14.7cm。"""
+    if t['wtype'] != 'pct':
+        return False, '表格宽度未设置为按百分比自适应（实际类型 %s，值 %d）' % (t['wtype'], t['wval'])
+    if not (4900 <= t['wval'] <= 5100):
+        return False, '百分比宽度不在100%%附近（实际 %.1f%%）' % (t['wval'] / 50.0)
+    if text_width_cm > 14.7 + 1e-6:
+        return False, '正文宽度%.2fcm已超过14.7cm' % text_width_cm
+    return True, ''
+
+
+def _chk_a10_height(k, t):
+    """A10 数据行行高：每个维度的第1个数据行须设置 0.69cm 及以上的最小行高。"""
+    rows = t['rows']
+    ndata = len(rows) - 2
+    if ndata != SHAPE[k][0] - 2:
+        return False, '数据行数不符（要求%d行，实际%d行）' % (SHAPE[k][0] - 2, ndata)
+    bad = []
+    for j in range(0, ndata, 2):
+        h = t['hs'][2 + j]
+        if h is None:
+            bad.append('第%d个数据行未设置行高' % (j + 1))
+        elif h[1] != 'atLeast':
+            bad.append('第%d个数据行行高规则不是“最小值”' % (j + 1))
+        elif h[0] < 0.69 - 0.005:
+            bad.append('第%d个数据行最小行高仅%.2fcm' % (j + 1, h[0]))
+    return (not bad), '；'.join(bad)
+
+
+def _join(items, limit=6):
+    """去重并截断明细，避免 detail 过长。"""
+    out = []
+    for x in items:
+        if x not in out:
+            out.append(x)
+    if len(out) > limit:
+        return '；'.join(out[:limit]) + '；等%d项' % len(out)
+    return '；'.join(out)
+
+
+def _chk_a11_font_align(t, sm):
+    """A11 表内字体与对齐：中文宋体、西文与数字 Times New Roman，有文字单元格水平垂直居中且首行缩进 0。"""
+    bad = []
+    for r in t['el'].iter(qn('w:r')):
+        if not _txt_of(r).strip():
             continue
-        pg, y = a
-
-        # 下一个存在的锚点作为内容区间上界
-        nxt = None
-        for j in range(i + 1, len(order)):
-            if anchors.get(order[j]) is not None:
-                nxt = anchors[order[j]]
-                break
-
-        # 本表内容是否出现在起始页的"下一页及之后"，且仍在下一锚点之前。
-        # 若下一锚点就在起始页 -> 本表必然不跨页，直接跳过。
-        if nxt is not None:
-            npg, ny = nxt
-            if npg == pg:
-                continue  # 下一张表与本表同页 -> 本表完整落在本页，不跨页
-
-        # 起始页之后、下一锚点之前，是否还有本表的文字内容
-        crossed = False
-        cross_pg = None
-        for pno in range(pg + 1, doc.page_count):
-            # 到达下一锚点所在页时，只统计该页中位于下一锚点 y 之上的内容
-            if nxt is not None:
-                npg, ny = nxt
-                if pno > npg:
-                    break
-                limit_y = ny if pno == npg else None
-            else:
-                limit_y = None
-            for b in page_blocks(pno):
-                by0 = b[1]
-                text = (b[4] or "").strip()
-                if not text:
+        p = _parent_para(r)
+        ea = _resolve_run(_g_eastasia, r, p, sm)
+        asc = _resolve_run(_g_ascii, r, p, sm)
+        if ea != '宋体':
+            bad.append('中文字体为“%s”' % (ea or '未设置'))
+        if asc != 'Times New Roman':
+            bad.append('西文字体为“%s”' % (asc or '未设置'))
+    for row in t['rows']:
+        for c in row:
+            if not c['txt']:
+                continue
+            tag = c['txt'][:8]
+            if c['va'] != 'center':
+                bad.append('单元格“%s”未垂直居中' % tag)
+            for p in c['tc'].iter(qn('w:p')):
+                if not _txt_of(p).strip():
                     continue
-                if limit_y is not None and by0 >= limit_y:
-                    continue  # 已进入下一张表的题注区域，不属于本表
-                crossed = True
-                cross_pg = pno
+                if _resolve_para(_g_jc, p, sm) != 'center':
+                    bad.append('单元格“%s”未水平居中' % tag)
+                fl = _resolve_para(_g_firstline, p, sm)
+                if fl is not None and fl > 0:
+                    bad.append('单元格“%s”首行缩进不为0' % tag)
+    return (not bad), _join(bad)
+
+
+# ---------------------------------------------------------------------------
+# 减分项 D1~D26 判定
+# ---------------------------------------------------------------------------
+def _chk_d1_page(doc):
+    sec = doc.sections[0]
+    want = [('纸张宽度', sec.page_width, 21.0), ('纸张高度', sec.page_height, 29.7),
+            ('上边距', sec.top_margin, 2.54), ('下边距', sec.bottom_margin, 2.54),
+            ('左边距', sec.left_margin, 3.17), ('右边距', sec.right_margin, 3.17)]
+    bad = []
+    for name, val, exp in want:
+        cm = (val.cm if val is not None else 0.0)
+        if abs(cm - exp) > 0.05:
+            bad.append('%s为%.2fcm（应为%.2fcm）' % (name, cm, exp))
+    return bool(bad), _join(bad)
+
+
+def _chk_d2_caps(body_paras_norm):
+    miss = [CAPS[k] for k in ORDER if _nz(CAPS[k]) not in body_paras_norm]
+    return bool(miss), ('缺失或被改写的表题：' + '、'.join(miss)) if miss else ''
+
+
+def _chk_d3_cap_align(cap_paras, sm):
+    bad = []
+    for k, p in cap_paras:
+        if _resolve_para(_g_jc, p, sm) != 'center':
+            bad.append('%s表题未居中' % LAB(k))
+        fl = _resolve_para(_g_firstline, p, sm)
+        if fl is not None and fl > 0:
+            bad.append('%s表题有首行缩进' % LAB(k))
+    return bool(bad), _join(bad)
+
+
+def _chk_d4_cap_font(cap_paras, sm):
+    bad = []
+    for k, p in cap_paras:
+        for r in p.iter(qn('w:r')):
+            if not _txt_of(r).strip():
+                continue
+            ea = _resolve_run(_g_eastasia, r, p, sm)
+            asc = _resolve_run(_g_ascii, r, p, sm)
+            sz = _resolve_run(_g_sz, r, p, sm)
+            bold = _resolve_run(_g_bold, r, p, sm)
+            if ea != '宋体':
+                bad.append('%s表题中文字体为“%s”' % (LAB(k), ea or '未设置'))
+            if asc != 'Times New Roman':
+                bad.append('%s表题西文字体为“%s”' % (LAB(k), asc or '未设置'))
+            if sz != SZ_WUHAO:
+                bad.append('%s表题字号为%.1f磅' % (LAB(k), (sz or 0) / 2.0))
+            if not bold:
+                bad.append('%s表题未加粗' % LAB(k))
+    return bool(bad), _join(bad)
+
+
+def _chk_d5_follow(seq, T):
+    """表题段之后必须紧跟 1 张独立表格；不得夹入空段落，不得两表合并。"""
+    bad = []
+    for i, (kind, txt) in enumerate(seq):
+        if kind != 'P':
+            continue
+        for k in ORDER:
+            if _nz(CAPS[k]) == _nz(txt):
+                if i + 1 >= len(seq) or seq[i + 1][0] != 'T':
+                    bad.append('%s表题后未紧跟表格' % LAB(k))
                 break
-            if crossed:
-                break
-
-        if crossed:
-            doc.close()
-            return True, (f"{lab} 表格出现跨页（题注在第{pg + 1}页，"
-                          f"表身延续到第{cross_pg + 1}页，数据行被分页拆开）")
-
-    doc.close()
-    return False, ""
+    missing = [LAB(k) for k in ORDER if k not in T]
+    if missing:
+        bad.append('未定位到独立表格：' + '、'.join(missing))
+    ids = [id(T[k]['el']) for k in ORDER if k in T]
+    if len(ids) != len(set(ids)):
+        bad.append('存在多条表题共用同一张表格（统计表被合并）')
+    return bool(bad), _join(bad)
 
 
-def deduct_page_break(labeled, model=None, docx_path=None):
-    """
-    -3：表5-4至表5-12任意一个表格出现跨页情况，或任意数据行被分页拆开。
+def _chk_d6_size(T, sm):
+    bad = []
+    for k in ORDER:
+        t = T.get(k)
+        if t is None:
+            continue
+        for r in t['el'].iter(qn('w:r')):
+            if not _txt_of(r).strip():
+                continue
+            sz = _resolve_run(_g_sz, r, _parent_para(r), sm)
+            if sz != SZ_XIAOWU:
+                bad.append('%s表内字号为%.1f磅' % (LAB(k), (sz or 0) / 2.0))
+    return bool(bad), _join(bad)
 
-    细则逐点拆解（两点为"或"关系，任意一点在任意目标表命中即扣分）：
-      点1：表格出现"跨页"——整张表横跨两个页面。
-      点2："任意数据行被分页拆开"——某一行被分页边界从中切断。
 
-    实现：分页位置只有排版引擎渲染时才确定，docx 源 XML 通常不含可靠的分页
-    信息。故本条用本机 WPS 将文档真实渲染为 PDF，再按真实坐标判定
-    每张表是否跨页 / 数据行是否被页边界切开（与在 WPS 中肉眼所见一致）。
+def _chk_presence(T, need_map, prefix):
+    """按“文字是否仍存在于该表中”判定删除/改写；文本先归一化。"""
+    bad = []
+    for k in ORDER:
+        needs = need_map.get(k, [])
+        if not needs:
+            continue
+        t = T.get(k)
+        if t is None:
+            bad.append('%s未定位到表格' % LAB(k))
+            continue
+        full = _nz(_txt_of(t['el']))
+        for need in needs:
+            if isinstance(need, tuple):
+                if not any(_nz(x) in full for x in need):
+                    bad.append('%s缺“%s”' % (LAB(k), '/'.join(need)))
+            elif _nz(need) not in full:
+                bad.append('%s缺“%s”' % (LAB(k), need))
+    return bool(bad), (prefix + _join(bad, 8) if bad else '')
 
-    渲染不可用时（无 WPS/Word 或无 PDF 解析库）回退到 XML 源码信号
-    （显式分页符 w:br[type=page]、渲染分页标记 w:lastRenderedPageBreak），
-    此回退为近似，可能漏判未写入分页标记的文档。
-    细则只针对"跨页 / 数据行被拆开"，不对其他内容加以约束。
-    """
-    # ---- 首选：真实渲染 PDF 后按坐标判定 ----
-    if docx_path:
-        pdf_path = _render_pdf_via_wps(docx_path)
-        if pdf_path:
-            result = _detect_crosspage_from_pdf(pdf_path)
+
+def _chk_values(k, T):
+    """某张表内规定数值是否仍完整存在。"""
+    t = T.get(k)
+    if t is None:
+        return True, '%s未定位到表格，规定数值全部缺失' % LAB(k)
+    full = _nz(_txt_of(t['el']))
+    miss = [v for v in VALS[k] if _nz(v) not in full]
+    if not miss:
+        return False, ''
+    return True, '缺失或被改写的数值：' + _join(miss, 8)
+
+
+
+def _chk_d19_d20_d21(T):
+    """D19 加粗/倾斜/下划线、D20 底纹、D21 文字颜色。"""
+    b19, b20, b21 = [], [], []
+    for k in ORDER:
+        t = T.get(k)
+        if t is None:
+            continue
+        for r in t['el'].iter(qn('w:r')):
+            rPr = r.find(qn('w:rPr'))
+            if rPr is None:
+                continue
+            for tag, zh in (('b', '加粗'), ('i', '倾斜')):
+                e = rPr.find(qn('w:' + tag))
+                if e is not None and e.get(qn('w:val')) not in ('0', 'false', 'off'):
+                    b19.append('%s存在%s文字' % (LAB(k), zh))
+            u = rPr.find(qn('w:u'))
+            if u is not None and u.get(qn('w:val')) not in (None, 'none'):
+                b19.append('%s存在下划线文字' % LAB(k))
+            c = rPr.find(qn('w:color'))
+            if c is not None and (c.get(qn('w:val')) or 'auto').lower() not in ('auto', '000000', '000'):
+                b21.append('%s文字颜色为%s' % (LAB(k), c.get(qn('w:val'))))
+        for s in t['el'].iter(qn('w:shd')):
+            fill = (s.get(qn('w:fill')) or 'auto').lower()
+            if fill not in ('auto', 'ffffff') or (s.get(qn('w:val')) or 'clear') not in ('clear', 'nil'):
+                b20.append('%s存在底纹/填充（fill=%s）' % (LAB(k), s.get(qn('w:fill'))))
+    return ((bool(b19), _join(b19)), (bool(b20), _join(b20)), (bool(b21), _join(b21)))
+
+
+def _chk_d22_d23(T):
+    """D22 空数据行、D23 重复数据行。"""
+    b22, b23 = [], []
+    for k in ORDER:
+        t = T.get(k)
+        if t is None:
+            continue
+        rows = t['rows']
+        for i in range(2, len(rows)):
+            if rows[i] and all(c['txt'] == '' and c['vm'] is None for c in rows[i]):
+                b22.append('%s第%d个数据行整行无文字' % (LAB(k), i - 1))
+        keys = [tuple(c['txt'] for c in rows[i]) for i in range(2, len(rows))]
+        if len(keys) != len(set(keys)):
+            b23.append('%s数据区存在完全相同的重复数据行' % LAB(k))
+    return (bool(b22), _join(b22)), (bool(b23), _join(b23))
+
+
+def _chk_d24_hf(doc):
+    """D24 页眉页脚内容。"""
+    found = []
+    for si, sec in enumerate(doc.sections):
+        for attr, zh in (('header', '页眉'), ('footer', '页脚'),
+                         ('first_page_header', '首页页眉'), ('first_page_footer', '首页页脚'),
+                         ('even_page_header', '偶数页页眉'), ('even_page_footer', '偶数页页脚')):
+            part = getattr(sec, attr, None)
+            if part is None:
+                continue
             try:
-                os.remove(pdf_path)
+                txt = ''.join(p.text for p in part.paragraphs).strip()
             except Exception:
-                pass
-            if result is not None:
-                return result  # 渲染检测成功（命中或未命中均以此为准）
+                txt = ''
+            if txt:
+                found.append('第%d节%s含文字“%s”' % (si + 1, zh, txt[:20]))
+    return bool(found), _join(found)
 
-    # ---- 回退：XML 源码分页信号（近似）----
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
+
+def _chk_d25_extra(seq):
+    """D25 除 9 条表题与“例子：”提示段以外的新增文字段落。"""
+    allow = {_nz(c) for c in CAP_SET}
+    allow.add(_nz(SAMPLE_HINT))
+    extra = []
+    for kind, txt in seq:
+        if kind != 'P':
             continue
-
-        # 点1：表格跨页
-        table_crosses_page = False
-        for br in tbl.iter(w("br")):
-            if br.get(w("type")) == "page":
-                table_crosses_page = True
-                break
-        if not table_crosses_page and tbl.find(f".//{w('lastRenderedPageBreak')}") is not None:
-            table_crosses_page = True
-        if table_crosses_page:
-            return True, f"{lab} 表格出现跨页（XML分页信号，回退判定）"
-
-        # 点2：数据行被分页拆开
-        rows = rows_of(tbl)
-        for ri, row in enumerate(rows):
-            if ri < 2:
-                continue
-            if row.find(f".//{w('lastRenderedPageBreak')}") is not None:
-                return True, f"{lab} 第{ri + 1}行(数据行)被分页拆开（XML分页信号）"
-            trPr = row.find(w("trPr"))
-            cant_split = (trPr is not None
-                          and trPr.find(w("cantSplit")) is not None)
-            if table_crosses_page and not cant_split:
-                return True, f"{lab} 第{ri + 1}行(数据行)未禁止跨页拆分且表格已跨页"
-    return False, ""
+        t = txt.strip()
+        if t and _nz(t) not in allow:
+            extra.append(t[:24])
+    return bool(extra), ('新增文字段落：' + _join(extra, 6)) if extra else ''
 
 
-def deduct_data_corruption(labeled):
-    """
-    -3：表5-4至表5-12中的 维度名称、组别名称、测试时间、样本量 或 统计数值
-        出现大面积缺失、替换或顺序错乱。
-
-    细则逐点拆解（5 类内容 × 3 种异常，任意目标表命中任意一项即扣分）：
-      涉及的 5 类内容：
-        a) 维度名称   —— 表头含"维度"列，数据区每个维度分组应有名称。
-        b) 组别名称   —— 表头含"组别"列时，应出现 干预组/参照组 等组别名。
-        c) 测试时间   —— 表头含"测试时间"列时，应出现 干预前/干预后(前测/后测) 等。
-           （注：双组表用"组别"，单组前后测表用"测试时间"，二者按表头存在性判断。）
-        d) 样本量     —— 若表头声明样本量列(如 N/样本量/人数)，数据区应有对应数值。
-        e) 统计数值   —— X±S、F值、Sig.、t值、Sig(双侧) 等统计列的数值。
-      3 种异常：
-        缺失：应有内容的位置大面积为空（非空率过低）。
-        替换：内容被无意义占位符替换（如 ###、xxx、占位、N/A、待填、??? 等）。
-        顺序错乱：表头列顺序与三线表规范顺序明显不一致（如 维度/组别 不在最前，
-                  或统计列顺序颠倒）。
-    "大面积"判据：缺失按非空率阈值衡量；替换/顺序错乱按是否出现即判定。
-    细则只针对这 5 类内容的 缺失/替换/顺序错乱，不对其他内容加以约束。
-    """
-    placeholder_pat = re.compile(
-        r"(#{2,}|x{3,}|X{3,}|\?{2,}|待填|占位|placeholder|N/?A|TODO|空缺|未填)",
-        re.IGNORECASE)
-    # 表头各类内容的关键字
-    HEADER_DIM = ["维度"]
-    HEADER_GROUP = ["组别"]
-    HEADER_TIME = ["测试时间", "时间"]
-    HEADER_SAMPLE = ["样本量", "N", "人数", "样本"]
-    GROUP_VALUES = ["干预组", "参照组", "实验组", "对照组"]
-    TIME_VALUES = ["干预前", "干预后", "前测", "后测", "测前", "测后"]
-    STAT_HEADERS = ["X±S", "F值", "Sig", "t值"]
-
-    def norm(s):
-        return (s or "").replace(" ", "")
-
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-        rows = rows_of(tbl)
-        if len(rows) < 3:
-            return True, f"{lab} 表格行数异常({len(rows)})，疑似数据缺失"
-
-        # 表头文本（前两行）与各列首行字段
-        header_cells = [norm(cell_text(tc)) for r in rows[:2] for tc in cells_of(r)]
-        header_text = "".join(header_cells)
-        # 字段名行（第2行）按列顺序
-        field_row = [norm(cell_text(tc)) for tc in cells_of(rows[1])]
-
-        has_dim = any(k in header_text for k in HEADER_DIM)
-        has_group = any(norm(k) in header_text for k in HEADER_GROUP)
-        has_time = any(norm(k) in header_text for k in HEADER_TIME)
-        has_sample = any(norm(k) in header_text for k in HEADER_SAMPLE
-                         if k not in ("N",)) or ("N" in [c for c in field_row])
-
-        # 数据区（第3行起）全部文本
-        data_cells = [cell_text(tc) for r in rows[2:] for tc in cells_of(r)]
-        data_text = "".join(norm(c) for c in data_cells)
-
-        # ---- 异常1：替换（占位符/乱码替换真实内容）----
-        for c in data_cells + header_cells:
-            if placeholder_pat.search(c):
-                return True, f"{lab} 出现占位符/替换内容: '{c.strip()}'"
-
-        # ---- 异常2：大面积缺失 ----
-        # a) 维度名称：表头有"维度"但数据区维度分组名称大面积为空
-        if has_dim:
-            # 维度名称位于每个分组首行第一列；统计非空的维度名个数
-            dim_names = [norm(cell_text(cells_of(r)[0])) for r in rows[2:]
-                         if len(cells_of(r)) > 0]
-            nonempty_dim = [d for d in dim_names if d != ""]
-            if len(nonempty_dim) == 0:
-                return True, f"{lab} 维度名称大面积缺失"
-        # b) 组别名称
-        if has_group and not any(g in data_text for g in [norm(x) for x in GROUP_VALUES]):
-            return True, f"{lab} 组别名称大面积缺失（未见 干预组/参照组 等）"
-        # c) 测试时间
-        if has_time and not any(t in data_text for t in [norm(x) for x in TIME_VALUES]):
-            return True, f"{lab} 测试时间大面积缺失（未见 干预前/干预后 等）"
-        # d) 样本量（仅当表头声明样本量列时检查）
-        if has_sample:
-            # 数据区应含数字（样本量为整数）
-            if not re.search(r"\d", data_text):
-                return True, f"{lab} 样本量大面积缺失"
-        # e) 统计数值：统计列对应的数值整体非空率
-        # 数值型单元格（含 数字 / ± / 小数点 / 负号）
-        numeric_cells = [c for c in data_cells
-                         if re.search(r"[0-9]", c)]
-        # 统计数值应占数据区相当比例；若数据区几乎无数值 -> 大面积缺失
-        if data_cells:
-            # 仅统计"本应有数值"的单元格：排除维度名/组别名/时间名等文字列
-            text_value_set = set(norm(x) for x in
-                                 (GROUP_VALUES + TIME_VALUES))
-            candidate = []
-            for c in data_cells:
-                nc = norm(c)
-                if nc == "":
-                    continue
-                if nc in text_value_set:
-                    continue
-                candidate.append(c)
-            # 在非空、非"文字值"的数据单元格里，应当主要是统计数值
-            if candidate:
-                num_ratio = sum(1 for c in candidate if re.search(r"[0-9]", c)) / len(candidate)
-                if num_ratio < 0.5:
-                    return True, (f"{lab} 统计数值大面积缺失/异常"
-                                  f"（数值占比 {num_ratio:.2f}）")
-
-        # ---- 异常3：顺序错乱 ----
-        # 三线表规范：表头字段行应以 维度 开头，随后是 组别/测试时间，
-        # 统计列(X±S / F值 / Sig. / t值 / Sig(双侧))在后。
-        non_empty_fields = [f for f in field_row if f != ""]
-        if non_empty_fields:
-            # 维度应是首个非空字段
-            if has_dim and non_empty_fields[0] != norm("维度"):
-                return True, (f"{lab} 表头字段顺序错乱（首列应为'维度'，"
-                              f"实为'{non_empty_fields[0]}'）")
-            # 维度/组别/测试时间 应排在统计列之前
-            first_stat_idx = None
-            first_label_after_stat = None
-            for i, f in enumerate(non_empty_fields):
-                is_stat = any(norm(s) in f for s in STAT_HEADERS)
-                is_label = (f == norm("维度") or f == norm("组别")
-                            or "测试时间" in f or f == norm("时间"))
-                if is_stat and first_stat_idx is None:
-                    first_stat_idx = i
-                if is_label and first_stat_idx is not None:
-                    first_label_after_stat = f
-            if first_label_after_stat is not None:
-                return True, (f"{lab} 表头字段顺序错乱（描述列'{first_label_after_stat}'"
-                              f"出现在统计列之后）")
-    return False, ""
-
-
-def deduct_font_issue(labeled, model):
-    """
-    -3：表5-4至表5-12 表内文字 中文不是宋体小五号，英文、数字及统计符号不是
-        Times New Roman 小五号，字体颜色不是黑色；或 任意标题字体不是宋体五号加粗。
-
-    细则逐点拆解（前半段"表内文字"与后半段"标题"为"或"关系，任意一处违规即扣分）：
-      表内文字（表5-4~表5-12 单元格内）每个 run：
-        点1：中文字符 -> 中文字体(eastAsia)必须是"宋体"，字号必须是小五号(sz=18)。
-        点2：英文、数字及统计符号(如 ± . () F t Sig 等 ASCII/拉丁字符) ->
-             西文字体(ascii)必须是"Times New Roman"，字号必须是小五号(sz=18)。
-        点3：字体颜色必须是黑色(000000/auto)。
-      标题（各表题注，如"表5-4 …"）：
-        点4：标题字体必须是宋体五号(sz=21)加粗(b)。任意一个标题不满足即违规。
-    小五号 = 9磅 = sz18；五号 = 10.5磅 = sz21。
-    细则只针对上述字体/字号/颜色/加粗，不对其他内容加以约束。
-    """
-
-    def run_props(r):
-        rpr = r.find(w("rPr"))
-        if rpr is None:
-            return {"ascii": None, "eastAsia": None, "sz": None,
-                    "color": None, "bold": False}
-        fonts = rpr.find(w("rFonts"))
-        sz = rpr.find(w("sz"))
-        color = rpr.find(w("color"))
-        bold = rpr.find(w("b"))
-        return {
-            "ascii": fonts.get(w("ascii")) if fonts is not None else None,
-            "eastAsia": fonts.get(w("eastAsia")) if fonts is not None else None,
-            "sz": sz.get(w("val")) if sz is not None else None,
-            "color": color.get(w("val")) if color is not None else None,
-            "bold": (bold is not None and bold.get(w("val")) not in ("0", "false")),
-        }
-
-    def is_cjk(ch):
-        return '一' <= ch <= '鿿'
-
-    def is_latin_or_symbol(ch):
-        # 英文、数字及统计符号（ASCII 字母数字 + 常见统计符号）
-        if ch.isascii() and (ch.isalnum()):
-            return True
-        return ch in "±.()-+/*=<>%:,"
-
-    # ---- 表内文字（前半段）----
-    for lab in TARGET_LABELS:
-        tbl = labeled.get(lab)
-        if tbl is None:
-            continue
-        for r in tbl.iter(w("r")):
-            txt = "".join(t.text or "" for t in r.findall(w("t")))
-            if txt.strip() == "":
-                continue
-            p = run_props(r)
-            has_cjk = any(is_cjk(ch) for ch in txt)
-            has_latin = any(is_latin_or_symbol(ch) for ch in txt)
-
-            # 点1：中文 -> 宋体 + 小五
-            if has_cjk:
-                if p["eastAsia"] != "宋体":
-                    return True, (f"{lab} 表内中文字体不是宋体: "
-                                  f"'{txt.strip()}'(eastAsia={p['eastAsia']})")
-                if p["sz"] is None or int(p["sz"]) != SZ_XIAOWU:
-                    return True, (f"{lab} 表内中文字号不是小五号: "
-                                  f"'{txt.strip()}'(sz={p['sz']})")
-            # 点2：英文/数字/统计符号 -> Times New Roman + 小五
-            if has_latin:
-                if p["ascii"] != "Times New Roman":
-                    return True, (f"{lab} 表内英文/数字/符号字体不是Times New Roman: "
-                                  f"'{txt.strip()}'(ascii={p['ascii']})")
-                if p["sz"] is None or int(p["sz"]) != SZ_XIAOWU:
-                    return True, (f"{lab} 表内英文/数字/符号字号不是小五号: "
-                                  f"'{txt.strip()}'(sz={p['sz']})")
-            # 点3：颜色 -> 黑色
-            if not is_black(p["color"]):
-                return True, (f"{lab} 表内文字颜色不是黑色: "
-                              f"'{txt.strip()}'(color={p['color']})")
-
-    # ---- 标题（后半段）：任意标题字体不是宋体五号加粗 ----
-    for kind, txt, elem in model.body_order:
-        if kind != "p":
-            continue
-        t = (txt or "").replace(" ", "")
-        if not any(re.search(re.escape(lab) + r"(?![0-9])", t) for lab in TARGET_LABELS):
-            continue
-        # 该题注内每个有文字的 run 都需满足 宋体 + 五号 + 加粗
-        for r in elem.iter(w("r")):
-            rt = "".join(x.text or "" for x in r.findall(w("t")))
-            if rt.strip() == "":
-                continue
-            p = run_props(r)
-            if p["eastAsia"] != "宋体":
-                return True, (f"标题字体不是宋体: '{t}'(eastAsia={p['eastAsia']})")
-            if p["sz"] is None or int(p["sz"]) != SZ_WUHAO:
-                return True, (f"标题字号不是五号: '{t}'(sz={p['sz']})")
-            if not p["bold"]:
-                return True, (f"标题未加粗: '{t}'")
-
-    return False, ""
+def _chk_d26_break(body):
+    """D26 分页符，或分节符多于 1 处。"""
+    pgbr = [b for b in body.iter(qn('w:br')) if b.get(qn('w:type')) == 'page']
+    pgbr += [e for e in body.iter(qn('w:pageBreakBefore'))
+             if e.get(qn('w:val')) not in ('0', 'false', 'off')]
+    sects = body.findall('.//' + qn('w:sectPr'))
+    msg = []
+    if pgbr:
+        msg.append('存在%d处分页符' % len(pgbr))
+    if len(sects) > 1:
+        msg.append('存在%d处分节符' % len(sects))
+    return bool(msg), '；'.join(msg)
 
 
 # ---------------------------------------------------------------------------
-# 主流程
+# 对外接口
 # ---------------------------------------------------------------------------
-SCRIPT_ID = "026"
+def _open_word_document(file_path):
+    """打开 .docx；损坏或非法包会抛出异常，由调用方转为维度一未通过。"""
+    return Document(file_path)
 
 
-def _find_docx_in_dir(dir_path):
-    """在 dir_path 目录下定位被评估的 .docx 文档（忽略临时文件）。"""
-    candidates = [
-        f for f in os.listdir(dir_path)
-        if f.lower().endswith(".docx") and not f.startswith("~$")
-    ]
-    if not candidates:
-        raise FileNotFoundError(f"目录中未找到 .docx 文档: {dir_path}")
-    return os.path.join(dir_path, candidates[0])
+def _build_dim2_items(hits):
+    """按 _ITEMS 固定顺序生成严格二值的评分明细，返回 (items, total_score)。
+
+    hits 为 {条目键: (是否命中, 判定明细)}；条目键在加分项为 (key, 表号)、
+    减分项为 key。缺项直接抛错，以免条目表与判定点悄悄漂移后仍算出一个
+    看似正常的分数。各 _chk_* 函数给出的明细只用于内部校验，不再输出：
+    每项只含 rule / max_delta / delta / hit 四个键，判定说明由 rule 原文承载。
+    """
+    if len(_ITEMS) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError('dim2 项数不一致：items=%d vs order=%d'
+                           % (len(_ITEMS), len(_MAX_DELTAS_ORDER)))
+    items = []
+    total_score = 0
+    for (key, lab, max_delta, rule), order_delta in zip(_ITEMS, _MAX_DELTAS_ORDER):
+        if max_delta != order_delta:
+            raise RuntimeError('dim2 分值与顺序表不一致：%s 记为 %d，顺序表为 %d'
+                               % (key, max_delta, order_delta))
+        slot = (key, lab) if lab is not None else key
+        if slot not in hits:
+            raise RuntimeError('dim2 条目缺少判定结果：%s' % (slot,))
+        hit, _detail = hits[slot]
+        hit = bool(hit)
+        delta = max_delta if hit else 0
+        items.append({'rule': rule, 'max_delta': max_delta, 'delta': delta,
+                      'hit': hit})
+        total_score += delta
+    return items, total_score
 
 
 def evaluate(dir_path: str) -> dict:
-    """
-    对 dir_path 目录下的 .docx 文档评分。
+    """统一入口：接收输出文件所在目录，定位并评估目录内的三线表文档。
 
-    Args:
-        dir_path: 脚本所在目录的路径，脚本自己在该目录内定位并打开被评估的文档。
+    评分口径：维度一为门槛项，未通过则 dim2_items 置空、total_score 记 0，
+    max_score 仍为加分项满分之和（MAX_SCORE_TOTAL）；维度二逐条二值判定，
+    total_score 为加分项得分减去减分项扣分。
 
-    Returns:
-        结构化结果 dict，字段见 §2.2：
-        id / file_name / status / error / dim1_pass / dim1_reason /
-        dim2_items / total_score / max_score。
+    status='error' 只在“这份提交没被真正评过”时出现——目录不存在、目录内没有
+    可评估的 Word 文档、或脚本自身抛异常；此时 dim1_pass 为空串（未判定）、
+    dim1_reason 为空串、dim2_items 为空表、total_score 与 max_score 一律为 0。
+    文档能定位到但打不开（损坏包），仍按 status='ok' + 维度一未通过处理，
+    此时 dim1_pass=False 且 dim1_reason 带有未通过的错误摘要。
+
+    参数:
+        dir_path: 输出文件所在目录路径。
+    返回:
+        dict，字段对齐统一接口约定 §2.2。
     """
-    result = {
-        "id": SCRIPT_ID,
-        "file_name": None,
-        "status": "ok",
-        "error": None,
-        "dim1_pass": False,
-        "dim1_reason": "",
-        "dim2_items": [],
-        "total_score": 0,
-        "max_score": 0,
+    result: dict[str, object] = {
+        'id': SCRIPT_ID,
+        'file_name': '',
+        'status': 'ok',
+        'error': None,
+        # 空串表示“维度一尚未判定”；status='error' 的三条出口都保持空串，
+        # 只有真正跑过维度一门槛判定才会写入 True / False。
+        'dim1_pass': '',
+        'dim1_reason': '',
+        'dim2_items': [],
+        'total_score': 0,
+        'max_score': 0,
     }
 
     try:
-        docx_path = _find_docx_in_dir(dir_path)
-        result["file_name"] = os.path.basename(docx_path)
-        model = DocxModel(docx_path)
-
-        # ---------------- 维度1 ----------------
-        passed1, d1 = check_dimension1(model)
-        result["dim1_pass"] = passed1
-        if not passed1:
-            for ok, msg in d1:
-                if not ok:
-                    result["dim1_reason"] = msg
-                    break
-            result["total_score"] = 0
+        if not os.path.isdir(dir_path):
+            result['status'] = 'error'
+            result['error'] = f'目录不存在：{dir_path}'
             return result
 
-        labeled = map_labeled_tables(model)
+        docxs = [f for f in sorted(os.listdir(dir_path))
+                 if f.lower().endswith('.docx') and not f.startswith('~$')
+                 and os.path.isfile(os.path.join(dir_path, f))]
+        if not docxs:
+            result['status'] = 'error'
+            result['error'] = f'目录中未找到 .docx 文件：{dir_path}'
+            return result
 
-        # ---------------- 维度2：逐条评分 ----------------
-        # 每条评分细则的完整文字（用于 dim2_items 展示）
-        RULE_OUTER = ("表5-4至表5-12表格外框线：外框线只保留上下外框线，"
-                      "表格上框线和下框线为1.5磅黑色实线。")
-        RULE_TWO = ("表5-4、表5-5、表5-8、表5-9和表5-12分组内框线：仅有"
-                    "“Levene检验”、“t检验”两个分组标题下方有下框线，其余位置无内框线，"
-                    "框线类型为0.75磅黑色短横线。")
-        RULE_ONE = ("表5-6、表5-7、表5-10和表5-11分组表头内框线：仅有“t检验”标题下方"
-                    "有下框线，其余位置无内框线，框线类型为0.75磅黑色短横线。")
-        RULE_VERT = "表格出现额外竖框线"
-        RULE_SIM = ("表5-4至表5-12任意表格仍使用连续空格、制表符或同一大单元格模拟"
-                    "多列数据，未形成与字段对应的独立可编辑单元格。")
-        RULE_IMG = "表5-4至表5-12任意表格被转换为图片、截图或不可编辑对象。"
-        RULE_PAGE = "表5-4至表5-12任意一个表格出现跨页情况或任意数据行被分页拆开"
-        RULE_DATA = ("表5-4至表5-12中的维度名称、组别名称、测试时间、样本量或统计数值"
-                     "出现大面积缺失、替换或顺序错乱。")
-        RULE_FONT = ("表5-4至表5-12表内文字中文不是宋体小五号，英文、数字及统计符号不是"
-                     "Times New Roman小五号，字体颜色不是黑色；或任意标题字体不是宋体五号加粗")
+        file_path = os.path.join(dir_path, docxs[0])
+        result['file_name'] = os.path.basename(file_path)
 
-        dim2_items = []
-        total = 0
+        # 维度一：交付文件能否被当作 .docx 正常打开。打不开是“评了但不达标”，
+        # 按门槛短路约定返回 status='ok' + dim1_pass=False + dim2_items=[]，
+        # 且 dim1_reason 必须带上未通过的错误摘要。
+        try:
+            doc = _open_word_document(file_path)
+        except Exception as exc:
+            result['dim1_pass'] = False
+            result['dim1_reason'] = '.docx 文件损坏无法打开（%s: %s）' % (type(exc).__name__, exc)
+            result['dim2_items'] = []
+            result['total_score'] = 0
+            result['max_score'] = MAX_SCORE_TOTAL
+            return result
 
-        # 得分点（每张三线表 +1，rubric 语义为"逐表独立计分"）。
-        # 脚本契约要求每个 item 满足 delta == max_delta(命中) 或 delta == 0(未命中)，
-        # 因此把"最多 N 分"的聚合项拆成 N 个逐表 item（每表 max_delta=1）：
-        #   - hit=该表是否满足本条细则；
-        #   - delta = 1 if hit else 0，天然满足 delta == max_delta if hit else 0；
-        #   - 逐表 rule 文案追加表标签，便于区分与定位。
-        def _append_per_table(rule, target_labels, hit_labels, per_table_delta=1):
-            nonlocal total
-            hit_set = set(hit_labels)
-            for lab in target_labels:
-                hit = lab in hit_set
-                delta = per_table_delta if hit else 0
-                total += delta
-                dim2_items.append({
-                    "rule": f"{rule}（{lab}）",
-                    "max_delta": per_table_delta,
-                    "delta": delta,
-                    "hit": hit,
-                    "detail": "",
-                })
+        # 维度一通过：按统一约定 dim1_reason 保持空串（只有未通过才写原因）。
+        result['dim1_pass'] = True
+        result['dim1_reason'] = ''
+        return _evaluate_impl(doc, result)
 
-        _, outer_hits = check_outer_border(labeled)
-        _append_per_table(RULE_OUTER, TARGET_LABELS, outer_hits)
-
-        _, two_hits = check_two_group_inner(labeled)
-        _append_per_table(RULE_TWO, sorted(TWO_GROUP_TABLES), two_hits)
-
-        _, one_hits = check_one_group_inner(labeled)
-        _append_per_table(RULE_ONE, sorted(ONE_GROUP_TABLES), one_hits)
-
-        # 扣分点（命中即计入对应负分；未命中 delta=0）
-        deductions = [
-            (-3, deduct_extra_vertical(labeled), RULE_VERT),
-            (-5, deduct_simulated_columns(labeled), RULE_SIM),
-            (-5, deduct_image_table(labeled, model), RULE_IMG),
-            (-3, deduct_page_break(labeled, model, docx_path), RULE_PAGE),
-            (-3, deduct_data_corruption(labeled), RULE_DATA),
-            (-3, deduct_font_issue(labeled, model), RULE_FONT),
-        ]
-        for pts, (hit, reason), rule in deductions:
-            delta = pts if hit else 0
-            total += delta
-            dim2_items.append({
-                "rule": rule, "max_delta": pts, "delta": delta,
-                "hit": hit, "detail": reason,
-            })
-
-        result["dim2_items"] = dim2_items
-        result["total_score"] = total
-        result["max_score"] = sum(abs(item["max_delta"]) for item in dim2_items
-                                  if item["max_delta"] > 0)
-        return result
-
-    except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
+    except Exception as exc:
+        # _evaluate_impl 是就地写 result 的，异常可能发生在它写了一半之后，
+        # 因此这里把所有承载评分结论的字段显式复位，保证 error 的返回值是干净的全 0；
+        # dim1_pass 复位为空串而不是 False——异常意味着维度一的结论作废，不是判定为不通过。
+        result['status'] = 'error'
+        result['error'] = f'{type(exc).__name__}: {exc}'
+        result['dim1_pass'] = ''
+        result['dim1_reason'] = ''
+        result['dim2_items'] = []
+        result['total_score'] = 0
+        result['max_score'] = 0
         return result
 
 
-if __name__ == "__main__":
-    # 仅用于本地调试：传入目录路径，打印结构化结果
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    output = json.dumps(evaluate(target_dir), ensure_ascii=False, indent=2)
-    _ = sys.stdout.buffer.write((output + "\n").encode("utf-8"))
+def _evaluate_impl(doc, result):
+    body = doc.element.body
+    sm = _style_maps(doc)
+    T = _map_labeled_tables(body)
+
+    # 正文（body）直接子级的段落 / 表格顺序
+    seq = []
+    cap_paras = []
+    for ch in body.iterchildren():
+        if ch.tag == qn('w:p'):
+            txt = _txt_of(ch).strip()
+            seq.append(('P', txt))
+            for k in ORDER:
+                if _nz(CAPS[k]) == _nz(txt):
+                    cap_paras.append((k, ch))
+                    break
+        elif ch.tag == qn('w:tbl'):
+            seq.append(('T', ''))
+    paras_norm = {_nz(t) for kind, t in seq if kind == 'P'}
+
+    sec = doc.sections[0]
+    try:
+        text_width_cm = sec.page_width.cm - sec.left_margin.cm - sec.right_margin.cm
+    except Exception:
+        text_width_cm = 0.0
+
+    # --- 加分项：逐表判定 -------------------------------------------------
+    hits = {}
+    for key, lab, _md, _rule in _ITEMS:
+        if lab is None:
+            continue
+        t = T.get(lab)
+        if t is None:
+            hits[(key, lab)] = (False, '未在文档中定位到%s（表题缺失或表题后无独立表格）' % LAB(lab))
+            continue
+        if key == 'A1':
+            hits[(key, lab)] = _chk_a1_outer(t)
+        elif key in ('A2', 'A3'):
+            hits[(key, lab)] = _chk_group_line(lab, t)
+        elif key == 'A4':
+            hits[(key, lab)] = _chk_a4_shape(lab, t)
+        elif key in ('A5', 'A6'):
+            hits[(key, lab)] = _chk_header_merge(lab, t)
+        elif key == 'A7':
+            hits[(key, lab)] = _chk_a7_dim_merge(lab, t)
+        elif key == 'A8':
+            hits[(key, lab)] = _chk_a8_stat_merge(lab, t)
+        elif key == 'A9':
+            hits[(key, lab)] = _chk_a9_width(t, text_width_cm)
+        elif key == 'A10':
+            hits[(key, lab)] = _chk_a10_height(lab, t)
+        elif key == 'A11':
+            hits[(key, lab)] = _chk_a11_font_align(t, sm)
+
+    # --- 减分项 -----------------------------------------------------------
+    hits['D1'] = _chk_d1_page(doc)
+    hits['D2'] = _chk_d2_caps(paras_norm)
+    hits['D3'] = _chk_d3_cap_align(cap_paras, sm)
+    hits['D4'] = _chk_d4_cap_font(cap_paras, sm)
+    hits['D5'] = _chk_d5_follow(seq, T)
+    hits['D6'] = _chk_d6_size(T, sm)
+    hits['D7'] = _chk_presence(T, HDR_REQ, '表头文字缺失或被改写：')
+    hits['D8'] = _chk_presence(T, DIMS, '维度名称缺失或被改写：')
+    hits['D9'] = _chk_presence(T, GRP, '组别/测试时间名称缺失或被改写：')
+    for k in ORDER:
+        hits['V' + k] = _chk_values(k, T)
+    hits['D19'], hits['D20'], hits['D21'] = _chk_d19_d20_d21(T)
+    hits['D22'], hits['D23'] = _chk_d22_d23(T)
+    hits['D24'] = _chk_d24_hf(doc)
+    hits['D25'] = _chk_d25_extra(seq)
+    hits['D26'] = _chk_d26_break(body)
+
+    # ========== 生成结构化 dim2_items ==========
+    # 按 _ITEMS 固定顺序（80 条逐表拆分的加分项 + 26 条减分项）逐项取判定结果。
+    dim2_items, total_score = _build_dim2_items(hits)
+
+    result['dim2_items'] = dim2_items
+    result['total_score'] = total_score
+    result['max_score'] = MAX_SCORE_TOTAL
+    return result
+
+
+if __name__ == '__main__':
+    # 本地调试入口：命令行第 1 个参数可覆盖目录路径；未指定时使用脚本所在目录。
+    # 直接写 stdout 的二进制缓冲区并显式指定 utf-8，避免受控制台默认编码影响。
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    _output = json.dumps(evaluate(_dir), ensure_ascii=False, indent=2) + '\n'
+    sys.stdout.buffer.write(_output.encode('utf-8', errors='replace'))

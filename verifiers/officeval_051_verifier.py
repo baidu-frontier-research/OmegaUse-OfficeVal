@@ -1,4260 +1,2035 @@
-"""
-可编辑流程图复刻.pptx 自动评估脚本
-依赖: pip install python-pptx Pillow
-"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingImports=false, reportMissingModuleSource=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportIndexIssue=false, reportGeneralTypeIssues=false
+
+# 按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。主结果统一由
+# evaluate(dir_path) -> dict 返回；入参为“脚本所在目录的路径”，即存放待评测 .pptx
+# 的目录。本文件仅在 __main__ 下作为本地调试入口，把返回值以 JSON 形式打印出来。
+#
+# 返回字段：id / file_name / status / error / dim1_pass / dim1_reason /
+#           dim2_items（每项只含 rule / max_delta / delta / hit）/
+#           total_score / max_score
+# status='error' 表示这份提交没被真正评过（目录不存在、目录内无 .pptx、脚本自身
+# 异常），此时 dim1_pass 为空串（维度一未判定）、dim2_items 为空表、total_score
+# 与 max_score 一律为 0；dim1_pass 为 False 时 dim1_reason 必须给出错误摘要，
+# 通过时为空串。
+#
+# 本脚本对应任务：把一张流程图复刻成“一模一样并且可编辑”的单页 PPT。
+# 维度1 为可用与可修改性硬门槛，不满足则完成度总分记 0；
+# 维度2 为 38 条完成度加分项，满分 82 分，逐条严格对齐《评测细则.txt》。
+#
+# 判定所依赖的三类事实来源：
+#   ① OOXML 几何与样式：p:spTree 递归展开（含 a:chOff/a:chExt 组内坐标变换），
+#      取 a:off/a:ext（保留有符号 cx/cy 以还原箭头指向）、a:prstGeom@prst、
+#      a:ln（w/solidFill/prstDash/headEnd/tailEnd）、a:solidFill、a:xfrm@flipH/@flipV；
+#   ② 主题色解析：p:clrMap → theme1.xml/a:clrScheme，把 schemeClr（tx1/bg2/accent1…）
+#      还原成 srgb，否则 scheme 引用色会被误判为“无颜色”；
+#   ③ 折行行数：按 AFM 字宽表估算——可用排版宽度 = 文本框宽度 - 左右内边距，
+#      逐段累加字宽折行，留 3% 宽度容差。
+#
+# 与办公软件对齐：EMU→cm 用 360000 EMU/cm；线宽 EMU→磅用 /12700；字号
+# 磅→cm 用 ×2.54/72。位置一律换算成“占页面宽/高的百分比”后再与细则区间比对，
+# 使不同页面尺寸的交付文件可以用同一套锚点判定。
+
+import os
+import re
 import sys
 import json
+import math
+import zipfile
+from xml.etree import ElementTree as ET
 
 SCRIPT_ID = "051"
+MAX_SCORE_TOTAL = 82
 
-import math
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
+_MAX_DELTAS_ORDER = [
+    1,  # 01 左侧极浅青色圆角矩形
+    1,  # 02 Multivariate / Time Series 两行标签
+    3,  # 03 折线图竖直网格线
+    5,  # 04 蓝橙紫绿四条连贯数据曲线
+    1,  # 05 青绿色圆角矩形（Sequence Encoder 容器）
+    1,  # 06 “1. Sequence Encoder”标题
+    3,  # 07 上下并列两个 GRU 圆角矩形
+    1,  # 08 紫色圆角矩形（Pattern Encoder 容器）
+    1,  # 09 “2. Pattern Encoder”标题
+    3,  # 10 紫色系小方块矩阵
+    1,  # 11 Temporal / Embedding 两行标签
+    1,  # 12 橙色圆角矩形（Fusion 容器）
+    1,  # 13 “3. Fusion & Representation Learning”标题
+    3,  # 14 橙色容器内横向并排四个子矩形及其标签
+    3,  # 15 Concatenate 网格状表格图形
+    3,  # 16 注意力示意图形
+    3,  # 17 神经网络示意图形
+    3,  # 18 曲线示意图形
+    1,  # 19 绿色圆角矩形（Anomaly Scoring 容器）
+    1,  # 20 “4. Anomaly Scoring”标题
+    3,  # 21 Reconstruction Module 框及框内四个小矩形
+    1,  # 22 Anomaly Score 框及单行文本
+    3,  # 23 概率分布钟形曲线示意图形
+    1,  # 24 粉红色圆角矩形（Decision 容器）
+    1,  # 25 “5. Decision”标题
+    3,  # 26 Thresholding / Normal-Anomaly 两框及箭头
+    1,  # 27 极浅蓝色圆角矩形（Training Objective 容器）
+    1,  # 28 “6. Training Objective”标题
+    3,  # 29 左右并排两个损失项圆角矩形
+    3,  # 30 Lrec / Lreg 下标数学符号及“+”
+    1,  # 31 损失区水平分隔单实线
+    3,  # 32 “Total Loss: L = Lrec + λLreg”汇总公式
+    3,  # 33 底部图例框及其七个内部元素
+    5,  # 34 七处黑色带箭头连接线且走向正确
+    3,  # 35 紫色与蓝色两条虚线折线箭头
+    1,  # 36 橙色框至蓝色框的黑色折线箭头
+    1,  # 37 六处区块标题单行完整显示且不压边线
+    5,  # 38 虚线边框由线型实现、顶层形状数量与成组情况
+]
+assert sum(_MAX_DELTAS_ORDER) == MAX_SCORE_TOTAL
 
-from pptx import Presentation
-from pptx.util import Cm, Pt, Emu
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.oxml.ns import qn
-from pptx.oxml import parse_xml
-from pptx.enum.dml import MSO_THEME_COLOR
-import zipfile
+A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+EMU_PER_CM = 360000.0
+EMU_PER_PT = 12700.0
+PT_TO_CM = 2.54 / 72.0
 
-def emu2cm(e): return e / 360000
-def rgb(r,g,b): return RGBColor(r,g,b)
-
-
-def normalize_integral_coordinates(prs):
-    """规范化整数值小数，并返回不符合整数坐标类型的原始值。"""
-    invalid_values = []
-    node_attributes = (
-        ('.//a:off | .//a:chOff | .//a:pt', ('x', 'y')),
-        ('.//a:ext | .//a:chExt | .//p:sldSz', ('cx', 'cy')),
-        ('.//a:path', ('w', 'h')),
-    )
-    for part in prs.part.package.iter_parts():
-        root = getattr(part, '_element', None)
-        if root is None:
-            continue
-        for xpath, attr_names in node_attributes:
-            for node in root.xpath(xpath):
-                for attr_name in attr_names:
-                    raw_value = node.get(attr_name)
-                    if raw_value is None:
-                        continue
-                    try:
-                        value = Decimal(raw_value)
-                    except InvalidOperation:
-                        invalid_values.append(raw_value)
-                        continue
-                    if not value.is_finite() or value != value.to_integral_value():
-                        invalid_values.append(raw_value)
-                        continue
-                    normalized = str(int(value))
-                    if normalized != raw_value:
-                        node.set(attr_name, normalized)
-    return invalid_values
+_LINE_PRST = frozenset([
+    "line", "straightConnector1",
+    "bentConnector2", "bentConnector3", "bentConnector4", "bentConnector5",
+    "curvedConnector2", "curvedConnector3", "curvedConnector4", "curvedConnector5",
+])
+_SHAPE_KINDS = ("sp", "pic", "cxnSp", "grpSp", "graphicFrame")
+_DASH_PRST = frozenset([
+    "dash", "sysDash", "dot", "sysDot", "lgDash", "dashDot",
+    "sysDashDot", "lgDashDot", "lgDashDotDot", "sysDashDotDot",
+])
 
 
-def shape_bounds(s):
-    """返回标准化后的 (left_cm, top_cm, w_cm, h_cm)，兼容负宽/负高线段。"""
-    l1, t1 = emu2cm(s.left), emu2cm(s.top)
-    l2, t2 = emu2cm(s.left + s.width), emu2cm(s.top + s.height)
-    return min(l1, l2), min(t1, t2), abs(l2 - l1), abs(t2 - t1)
+def _q(ns, tag):
+    return "{%s}%s" % (ns, tag)
 
-def shape_right(s):
-    l,t,w,h = shape_bounds(s)
-    return l + w
 
-def shape_bottom(s):
-    l,t,w,h = shape_bounds(s)
-    return t + h
-
-def in_range(v, lo, hi): return lo <= v <= hi
-
-def get_fill_color(shape):
-    """尝试获取形状填充色 RGBColor，失败返回 None"""
+def _fnum(v, default=None):
     try:
-        fill = shape.fill
-        if fill.type is None: return None
-        fg = fill.fore_color
-        if fg.type is not None:
-            return fg.rgb
-    except Exception:
-        pass
-    return None
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
-def get_line_color(shape):
-    # ① 优先按 srgbClr 直接取
+
+def _truthy(v):
+    return v in ("1", "true", "on", "True", True, 1)
+
+
+def _rng(v, lo, hi):
+    return v is not None and lo <= v <= hi
+
+
+def _hex2rgb(c):
+    """把解析后的颜色字符串还原成 (r, g, b)；非具体色值（none/grad/blip）返回 None。"""
+    if not c or not isinstance(c, str):
+        return None
+    s = c.strip().lstrip("#")
+    if len(s) != 6:
+        return None
     try:
-        c = shape.line.color.rgb
-        if c is not None:
-            return c
-    except Exception:
-        pass
-    # ② XML 兜底：解析 <a:ln>/<a:solidFill> 下的 schemeClr / sysClr / srgbClr
-    #    并按需应用 lumMod/lumOff/shade/tint（仅对灰阶基色应用，避免把
-    #    accent 彩色调暗到分类阈值以下）。
-    try:
-        sp = shape._element.spPr
-        ln = sp.find(qn('a:ln')) if sp is not None else None
-        if ln is None:
-            return None
-        sf = ln.find(qn('a:solidFill'))
-        if sf is None or len(sf) == 0:
-            return None
-        clr_node = sf[0]
-        master = _master_of_shape(shape)
-        base = _resolve_color_node(clr_node, master)
-        if base is None:
-            return None
-        return _apply_color_mods(base, clr_node)
-    except Exception:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except ValueError:
         return None
 
-def _master_of_shape(shape):
-    """尝试拿到 shape 所在 slide 的 master，用于解析 schemeClr。"""
-    try:
-        part = shape.part
-        slide = getattr(part, 'slide', None)
-        if slide is not None:
-            return slide.slide_layout.slide_master
-    except Exception:
-        pass
-    return None
 
-def _apply_color_mods(rgb, clr_node):
-    """把 clr_node 上的 lumMod/lumOff/shade/tint 应用到 rgb。
-    仅对灰阶基色（r≈g≈b，如 bg1=白、tx1=黑）应用亮度调整——
-    办公软件里对彩色 accent 加 lumMod 只是微调色深，色相不变，
-    强行乘算会把绿/蓝/橙压过颜色分类阈值，反而漏判。"""
-    if rgb is None or clr_node is None:
-        return rgb
-    r, g, b = rgb[0], rgb[1], rgb[2]
-    is_gray = max(r, g, b) - min(r, g, b) <= 8
-    if not is_gray:
-        return rgb
-    def _val(tag):
-        n = clr_node.find(qn('a:' + tag))
-        if n is None: return None
-        v = n.get('val')
-        try:
-            return int(v) / 100000.0 if v is not None else None
-        except Exception:
-            return None
-    lm = _val('lumMod'); lo = _val('lumOff')
-    sh = _val('shade');  ti = _val('tint')
-    fr, fg, fb = float(r), float(g), float(b)
-    if lm is not None:
-        fr *= lm; fg *= lm; fb *= lm
-    if lo is not None:
-        fr += 255 * lo; fg += 255 * lo; fb += 255 * lo
-    if sh is not None:
-        fr *= (1 - sh); fg *= (1 - sh); fb *= (1 - sh)
-    if ti is not None:
-        fr = fr + (255 - fr) * ti
-        fg = fg + (255 - fg) * ti
-        fb = fb + (255 - fb) * ti
-    def clamp(x): return max(0, min(255, int(round(x))))
-    return RGBColor(clamp(fr), clamp(fg), clamp(fb))
+def _hsv(rgb):
+    """返回 (hue 0-360, sat 0-1, val 0-1)；rgb 为 0-255 整数三元组。"""
+    r, g, b = (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+    mx, mn = max(r, g, b), min(r, g, b)
+    d = mx - mn
+    if d <= 1e-9:
+        h = 0.0
+    elif mx == r:
+        h = 60.0 * (((g - b) / d) % 6.0)
+    elif mx == g:
+        h = 60.0 * (((b - r) / d) + 2.0)
+    else:
+        h = 60.0 * (((r - g) / d) + 4.0)
+    return (h, 0.0 if mx <= 1e-9 else d / mx, mx)
 
-def line_color_is_black_or_dark(shape):
-    """判定形状线条颜色为"黑/深色"，兼容三种情况：
-      ① 显式 RGB 值为深色（走 color_is_black_or_dark）；
-      ② 采用主题色 schemeClr 且槽位为 tx1/dk1/dk2（办公软件默认渲染为黑/深色文本槽）；
-      ③ <a:ln> 中 solidFill/gradFill/pattFill 都不存在，或存在空 <a:solidFill/>（无子色元素，
-         继承主题默认线条色，PowerPoint 默认为黑）。
-    """
-    c = get_line_color(shape)
-    if c is not None and color_is_black_or_dark(c):
-        return True
-    try:
-        sp = shape._element.spPr
-        ln = sp.find(qn('a:ln')) if sp is not None else None
-        if ln is None:
-            # 无显式 a:ln：继承主题（默认黑）
-            return True
-        # 空的 <a:solidFill/>（无 srgbClr/schemeClr 子元素）等价于未指定色 → 继承黑
-        sf = ln.find(qn('a:solidFill'))
-        if sf is not None and len(sf) == 0:
-            return True
-        # 检查 schemeClr：tx1/dk1/dk2 皆为深色文本槽
-        for fill_tag in ('a:solidFill', 'a:gradFill', 'a:pattFill', 'a:noFill'):
-            f = ln.find(qn(fill_tag))
-            if f is not None:
-                if fill_tag == 'a:noFill':
-                    return False
-                if fill_tag == 'a:solidFill':
-                    sc = f.find(qn('a:schemeClr'))
-                    if sc is not None and sc.get('val') in ('tx1', 'dk1', 'dk2'):
-                        return True
-                    # 其余情况（srgbClr 等）交由 RGB 分支处理
-                return False
-        # <a:ln> 存在但未指定 fill：继承主题默认（黑）
-        return True
-    except Exception:
+
+def _lum(c):
+    rgb = _hex2rgb(c)
+    if rgb is None:
+        return None
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+
+def _hue_in(c, lo, hi, smin=0.05):
+    rgb = _hex2rgb(c)
+    if rgb is None:
         return False
+    h, s, _v = _hsv(rgb)
+    if s < smin:
+        return False
+    if lo <= hi:
+        return lo <= h <= hi
+    return h >= lo or h <= hi
 
-def get_line_width_pt(shape):
-    try:
-        w = shape.line.width
-        if w is None: return None
-        return w / 12700  # EMU -> pt
-    except Exception:
-        return None
 
-def line_width_in_range(shape, lo, hi):
-    """判定形状线宽是否落在 [lo, hi] 磅区间。
-    若形状未显式指定线宽（继承主题/默认，python-pptx 会返回 0 EMU 或 None），
-    按 PowerPoint 默认线宽 0.75 磅代入判定。
-    """
-    wpt = get_line_width_pt(shape)
-    # 显式未设 w 时，python-pptx line.width 通常返回 0 EMU，需回落到默认
-    if wpt is None or wpt <= 0:
-        wpt = 0.75   # PowerPoint 默认线宽
-    return in_range(wpt, lo, hi)
+# 色系判定：全部走 HSV 色相区间，而不是逐个枚举十六进制值，
+# 这样同一族里深浅不同的实现（如 #0F9F9A 与 #37ADA0）都能被同一条规则接受。
+def _is_teal(c):
+    return _hue_in(c, 150.0, 200.0, 0.03)
 
-def line_is_single_solid(shape):
-    """边线为"单实线"：线型为实线（prstDash 为 solid 或缺省默认实线），
-    且复合线型为单线（cmpd 为 sng 或缺省），排除虚线/双线/粗细线等。
-    以办公软件实际渲染的 a:ln 定义为准。"""
-    try:
-        sp = shape._element.spPr
-        ln = sp.find(qn('a:ln')) if sp is not None else None
-        if ln is None:
-            # 无显式线定义：无法确认存在实线边框
+
+def _is_purple(c):
+    return _hue_in(c, 250.0, 300.0, 0.03)
+
+
+def _is_orange(c):
+    return _hue_in(c, 12.0, 48.0, 0.05)
+
+
+def _is_paleorange(c):
+    return _hue_in(c, 8.0, 60.0, 0.008)
+
+
+def _is_green(c):
+    return _hue_in(c, 70.0, 150.0, 0.03)
+
+
+def _is_pink(c):
+    return _hue_in(c, 315.0, 8.0, 0.03)
+
+
+def _is_blue(c):
+    return _hue_in(c, 200.0, 250.0, 0.05)
+
+
+def _is_brownorange(c):
+    rgb = _hex2rgb(c)
+    if rgb is None:
+        return False
+    h, s, v = _hsv(rgb)
+    return 8.0 <= h <= 45.0 and s >= 0.30 and v <= 0.72
+
+
+def _is_lightgray(c):
+    rgb = _hex2rgb(c)
+    if rgb is None:
+        return False
+    _h, s, v = _hsv(rgb)
+    return s <= 0.25 and 0.45 <= v <= 0.97
+
+
+def _is_black(c):
+    rgb = _hex2rgb(c)
+    if rgb is None:
+        return False
+    return _hsv(rgb)[2] <= 0.25
+
+
+def _is_darkgrayblue(c):
+    rgb = _hex2rgb(c)
+    if rgb is None:
+        return False
+    h, s, v = _hsv(rgb)
+    return v <= 0.72 and (s <= 0.25 or 190.0 <= h <= 260.0)
+
+
+def _min_ch(c):
+    rgb = _hex2rgb(c)
+    return None if rgb is None else min(rgb)
+
+
+def _is_verylight(c):
+    m = _min_ch(c)
+    return m is not None and m >= 228
+
+
+def _is_light(c):
+    m = _min_ch(c)
+    return m is not None and m >= 185
+
+
+def _is_white(c):
+    m = _min_ch(c)
+    return m is not None and m >= 246
+
+
+def _near_rgb(c, lo_hex, hi_hex, tol=26):
+    """逐通道落在给定两个端点色所围成的区间内（含 tol 容差）。"""
+    rgb, lo, hi = _hex2rgb(c), _hex2rgb(lo_hex), _hex2rgb(hi_hex)
+    if rgb is None or lo is None or hi is None:
+        return False
+    for k in range(3):
+        a, b = min(lo[k], hi[k]) - tol, max(lo[k], hi[k]) + tol
+        if not (a <= rgb[k] <= b):
             return False
-        cmpd = ln.get('cmpd')
-        if cmpd is not None and cmpd != 'sng':
-            return False  # dbl/thickThin/thinThick/tri 等复合线，非单线
-        prst = ln.find(qn('a:prstDash'))
-        if prst is not None and prst.get('val') not in (None, 'solid'):
-            return False  # 明确的虚线/点线
-        if ln.find(qn('a:custDash')) is not None:
-            return False  # 自定义虚线
-        if ln.find(qn('a:noFill')) is not None:
-            return False  # 无线
-        return True
-    except Exception:
-        return False
-
-def is_dash_line(shape):
-    """检测线型是否为虚线（支持真正dash_style，也支持短线段拼虚线外框）。
-    办公软件中"虚线"涵盖 dash / dot / dashDot 等所有非实线模式，
-    python-pptx 的 MSO_LINE_DASH_STYLE 枚举名可能是 DASH/ROUND_DOT/SQUARE_DOT/DASH_DOT/…，
-    也可能是 SYSTEM_DASH/SYSTEM_DOT 等，均视为虚线。"""
-    try:
-        dash = shape.line.dash_style
-        if dash is not None:
-            name = str(dash).upper()
-            if any(k in name for k in ('DASH', 'DOT')):
-                return True
-    except Exception:
-        pass
-    # 直接看 XML：<a:prstDash val="..."/> 非 solid 皆为虚线
-    try:
-        sp = shape._element.spPr
-        ln = sp.find(qn('a:ln')) if sp is not None else None
-        if ln is not None:
-            pd = ln.find(qn('a:prstDash'))
-            if pd is not None and (pd.get('val') or 'solid') != 'solid':
-                return True
-    except Exception:
-        pass
-    return False
-
-def is_drawn_as_dashes(shape, shapes, max_gap=0.42, min_segments=10):
-    """
-    检测一个形状是否被大量相邻短线段"拼"出了虚线外框。
-    必须在该形状自身四条边附近都有同色短线段，避免把附近外层虚线框
-    误判成内部实线矩形的虚线边框。
-    """
-    l,t,w,h = shape_bounds(shape)
-    c = get_line_color(shape)
-    if c is None: return False
-    tol = 0.12
-    same = [s for s in shapes if s is not shape and get_line_color(s) == c]
-    short_segs = []
-    for s in same:
-        sl,st,sw,sh = shape_bounds(s)
-        if max(sw, sh) <= max_gap and min(sw, sh) <= 0.03:
-            short_segs.append((sl, st, sw, sh))
-
-    top = [x for x in short_segs if x[2] > x[3] and abs(x[1]-t) <= tol and l-tol <= x[0] <= l+w+tol]
-    bottom = [x for x in short_segs if x[2] > x[3] and abs(x[1]-(t+h)) <= tol and l-tol <= x[0] <= l+w+tol]
-    left = [x for x in short_segs if x[3] > x[2] and abs(x[0]-l) <= tol and t-tol <= x[1] <= t+h+tol]
-    right = [x for x in short_segs if x[3] > x[2] and abs(x[0]-(l+w)) <= tol and t-tol <= x[1] <= t+h+tol]
-    return (len(top) + len(bottom) + len(left) + len(right) >= min_segments
-            and all(len(side) >= 2 for side in (top, bottom, left, right)))
-
-def fill_is_none_or_transparent(shape):
-    """检查形状是否无填充/透明填充；浅色填充不算无填充。"""
-    try:
-        sp_pr = shape._element.spPr
-        if sp_pr.find(qn('a:noFill')) is not None:
-            return True
-        solid_fill = sp_pr.find(qn('a:solidFill'))
-        if solid_fill is not None:
-            alpha = solid_fill.find('.//' + qn('a:alpha'))
-            return alpha is not None and alpha.get('val') == '0'
-        fill = shape.fill
-        return fill.type is None
-    except Exception:
-        return False
-
-def fill_is_visually_empty(shape):
-    """办公软件中"内部无填充"的有效判定：真正无填充 / 完全透明，
-    或填充为近白色（在白底页面上渲染后与页面无法区分，视觉上等同无填充）。"""
-    if fill_is_none_or_transparent(shape):
-        return True
-    c = get_fill_color(shape)
-    if c is None:
-        return True
-    return color_is_white_or_near(c)
-
-def color_is_light_gray(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return abs(r-g) <= 35 and abs(g-b) <= 35 and 120 <= r <= 230 and 120 <= g <= 230 and 120 <= b <= 230
-
-def color_is_light(c):
-    if c is None: return True
-    r,g,b = c[0],c[1],c[2]
-    lum = 0.299*r + 0.587*g + 0.114*b
-    return lum > 200
-
-def color_is_white_or_grayish_white(c):
-    """白色或极浅灰白色：高亮度且接近中性（低彩度）。None 视为办公软件默认白底。"""
-    if c is None:
-        return True
-    r, g, b = c[0], c[1], c[2]
-    return min(r, g, b) >= 224 and (max(r, g, b) - min(r, g, b)) <= 12
-
-def color_is_white_or_near(c):
-    if c is None: return True
-    r,g,b = c[0],c[1],c[2]
-    return r>220 and g>220 and b>220
-
-def color_is_cyan_green(c):
-    """青绿色/深青绿色 ~ teal"""
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return (g >= 140 and b >= 120 and r < 170) or (r < 80 and g >= 80 and b >= 80 and abs(g-b) <= 60)
-
-def color_is_light_cyan(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r>180 and g>220 and b>220
-
-def color_is_purple(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r>100 and b>100 and g < min(r,b)-20
-
-def color_is_orange(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r>140 and g>50 and b<140 and r>g+25
-
-def color_is_blue(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return b>150 and b > r+30 and b > g+30
-
-def color_is_green(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return g>150 and g > r+30 and g > b+20
-
-def color_is_pink(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r>180 and b>120 and g<180 and r>b+20
-
-def color_is_black_or_dark(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r<80 and g<80 and b<80
-
-def color_is_light_orange(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r>220 and g>180 and b>150 and r>b+50
-
-def color_is_orangey_light_fill(c):
-    """办公软件中实际呈现为"浅橙色"的填充：从明显浅橙到暖调奶油近白都算。
-    判据：暖色相（r>=g>=b 且带暖偏移 r>b），亮度较高。以肉眼所见为准。"""
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    if color_is_light_orange(c):
-        return True
-    # 暖调浅色（含奶油/浅橙近白）：红≥绿≥蓝且明显偏暖、整体偏亮
-    return r >= g >= b and (r - b) >= 4 and r >= 235 and g >= 210 and b >= 190
-
-def color_is_light_blue(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return b>180 and r>180 and g>180 and b>=r
-
-def color_is_light_green(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return g>200 and r>180 and b>180
-
-def color_is_light_purple(c):
-    if c is None: return False
-    r,g,b = c[0],c[1],c[2]
-    return r>180 and b>180 and g>180 and (r+b) > g*2+40
-
-def font_is_arial_calibri(run_font):
-    if run_font is None: return False
-    name = (run_font or '').lower()
-    return 'arial' in name or 'calibri' in name
-
-def has_smaller_suffix_text(shape, prefix, suffix):
-    """检测类似 Lrec/Lreg：suffix（如 rec）在办公软件中显示得比 prefix（L）小。
-    覆盖所有可能的实现方式：
-      ① suffix 与 prefix 分属不同 run，且 suffix run 字号更小；
-      ② suffix 设为下标/上标（baseline 属性），办公软件会自动缩小显示；
-      ③ 同一 run 内但 suffix 字符字号更小（罕见，仍按 run 字号比较）。"""
-    from pptx.oxml.ns import qn as _qn
-    runs = [r for r in get_text_runs(shape) if r.text.strip()]
-    if not runs:
-        return False
-    text = ''.join(r.text for r in runs).replace('_', '').replace(' ', '')
-    target = prefix + suffix
-    if target.lower() not in text.lower():
-        return False
-
-    prefix_sizes = []
-    suffix_sizes = []
-    suffix_has_baseline = False
-    for r in runs:
-        sz = r.font.size.pt if r.font.size else None
-        # 读取 baseline（下标/上标）——有则视觉缩小
-        rpr = r._r.find(_qn('a:rPr'))
-        baseline = rpr.get('baseline') if rpr is not None else None
-        rtext = r.text.replace('_', '')
-        for ch in rtext:
-            if ch.lower() == prefix.lower():
-                if sz is not None:
-                    prefix_sizes.append(sz)
-            elif ch.lower() in suffix.lower():
-                if sz is not None:
-                    suffix_sizes.append(sz)
-                if baseline not in (None, '', '0'):   # ② 下标/上标
-                    suffix_has_baseline = True
-    # ② 后缀被设为下标/上标 → 办公软件显示更小
-    if suffix_has_baseline and (prefix.lower() in ''.join(r.text.lower() for r in runs)):
-        return True
-    # ①③ 按字号比较：后缀最大字号 < 前缀最小字号
-    return bool(prefix_sizes and suffix_sizes and max(suffix_sizes) < min(prefix_sizes))
-
-def color_is_genuine_light_blue(c):
-    """真正带浅蓝色调的填充（区别于纯白）：整体偏亮，且蓝分量明显高于红/绿。
-    覆盖办公软件里"浅蓝色"的各种呈现，但排除纯白/近白（无蓝调）。"""
-    if c is None:
-        return False
-    r, g, b = c[0], c[1], c[2]
-    if not (b >= 200 and b >= r and b >= g):
-        return False
-    # 需有可见蓝调：蓝比红或绿至少高一点，避免把纯白(相等)判成浅蓝
-    return (b - min(r, g)) >= 6
-
-
-def get_text_runs(shape):
-    runs = []
-    try:
-        for para in shape.text_frame.paragraphs:
-            for run in para.runs:
-                runs.append(run)
-    except Exception:
-        pass
-    return runs
-
-def shape_text(shape):
-    try:
-        return shape.text_frame.text
-    except Exception:
-        return ''
-
-def shapes_on_slide(slide):
-    result = []
-    def collect(sp_list):
-        for s in sp_list:
-            result.append(s)
-            try:
-                collect(s.shapes)
-            except Exception:
-                pass
-    collect(slide.shapes)
-    return result
-
-def is_rounded_rect(shape):
-    try:
-        sp_pr = shape._element.spPr
-        prstGeom = sp_pr.find(qn('a:prstGeom'))
-        if prstGeom is not None:
-            prst = prstGeom.get('prst', '') or ''
-            return 'roundRect' in prst or 'round' in prst.lower()
-    except Exception:
-        pass
-    return False
-
-def is_line_or_connector(shape):
-    try:
-        return shape.shape_type in (6, 9)  # LINE, CONNECTOR (freeform connector)
-    except Exception:
-        return False
-
-def get_connector_dash(shape):
-    try:
-        ln = shape.line
-        return ln.dash_style
-    except Exception:
-        return None
-
-
-def center(shape):
-    l,t,w,h = shape_bounds(shape)
-    return l+w/2, t+h/2
-
-def freeform_points(shape):
-    """读取 FREEFORM 形状 <a:custGeom>/<a:pathLst>/<a:path> 下的顶点坐标，
-    按形状实际位置/尺寸换算成 cm 坐标列表 [(x_cm, y_cm), ...]。
-    custGeom 内的坐标以 path 自身声明的宽高（w/h，单位EMU的“路径坐标系”）为参照，
-    需按 shape 实际宽高做比例缩放后再加上 shape 左上角偏移。失败返回 None。"""
-    try:
-        sp_pr = shape._element.spPr
-        cg = sp_pr.find(qn('a:custGeom'))
-        if cg is None:
-            return None
-        path_lst = cg.find(qn('a:pathLst'))
-        if path_lst is None:
-            return None
-        path = path_lst.find(qn('a:path'))
-        if path is None:
-            return None
-        pw = int(path.get('w', 0)) or 1
-        ph = int(path.get('h', 0)) or 1
-        l, t, w, h = shape_bounds(shape)
-        pts = []
-        for child in path:
-            tag = etree_local_tag(child)
-            if tag in ('moveTo', 'lnTo'):
-                pt = child.find(qn('a:pt'))
-                if pt is None:
-                    continue
-                px, py = int(pt.get('x')), int(pt.get('y'))
-                pts.append((l + (px / pw) * w, t + (py / ph) * h))
-            elif tag == 'cubicBezTo':
-                for pt in child.findall(qn('a:pt')):
-                    px, py = int(pt.get('x')), int(pt.get('y'))
-                    pts.append((l + (px / pw) * w, t + (py / ph) * h))
-        return pts if pts else None
-    except Exception:
-        return None
-
-def etree_local_tag(el):
-    tag = el.tag
-    return tag.split('}', 1)[1] if '}' in tag else tag
-
-def bbox_intersection(a, b):
-    ax,ay,aw,ah = shape_bounds(a); bx,by,bw,bh = shape_bounds(b)
-    x1,y1 = max(ax,bx), max(ay,by)
-    x2,y2 = min(ax+aw,bx+bw), min(ay+ah,by+bh)
-    if x2 <= x1 or y2 <= y1: return 0.0
-    return (x2-x1)*(y2-y1)
-
-def bbox_area(shape):
-    _,_,w,h = shape_bounds(shape)
-    return max(0,w)*max(0,h)
-
-def overlaps(a,b,ratio=0.35):
-    inter = bbox_intersection(a,b)
-    if inter <= 0: return False
-    return inter / max(0.01, min(bbox_area(a), bbox_area(b))) >= ratio
-
-def box_in(shape, left=None, top=None, width=None, height=None, right=None, bottom=None):
-    l,t,w,h = shape_bounds(shape)
-    checks = []
-    if left: checks.append(in_range(l, *left))
-    if top: checks.append(in_range(t, *top))
-    if width: checks.append(in_range(w, *width))
-    if height: checks.append(in_range(h, *height))
-    if right: checks.append(in_range(l+w, *right))
-    if bottom: checks.append(in_range(t+h, *bottom))
-    return all(checks)
-
-def canonical_text(s):
-    return ''.join(ch.lower() for ch in s.replace('_', '').replace('／', '/') if not ch.isspace())
-
-def text_contains(shape, needle):
-    raw = shape_text(shape)
-    compact_raw = canonical_text(raw)
-    compact_need = canonical_text(needle)
-    alnum_raw = ''.join(ch for ch in compact_raw if ch.isalnum())
-    alnum_need = ''.join(ch for ch in compact_need if ch.isalnum())
-    return needle.lower() in raw.lower() or compact_need in compact_raw or (alnum_need and alnum_need in alnum_raw)
-
-def text_norm(shape):
-    return ' '.join(shape_text(shape).replace('\r','\n').split())
-
-def line_count(shape):
-    txt = shape_text(shape).replace('\r', '\n')
-    return len([x for x in txt.split('\n') if x.strip()])
-
-
-# ── 文本行数：按办公软件实际渲染估算 ──────────────────────────────────
-# 细则里的"分几行"是以办公软件打开时实际看到的行数为准，而不是源 XML 里
-# 段落数。python-pptx 的 line_count 只数 \n/段落，会把"文本超出文本框宽度
-# 被自动换行"的情形误判为 1 行。这里改用字体度量+文本框可用宽度模拟换行。
-
-_FONT_PATHS = {
-    ('arial', True): 'C:/Windows/Fonts/arialbd.ttf',
-    ('arial', False): 'C:/Windows/Fonts/arial.ttf',
-    ('calibri', True): 'C:/Windows/Fonts/calibrib.ttf',
-    ('calibri', False): 'C:/Windows/Fonts/calibri.ttf',
-    ('times new roman', True): 'C:/Windows/Fonts/timesbd.ttf',
-    ('times new roman', False): 'C:/Windows/Fonts/times.ttf',
-}
-_FONT_CACHE = {}
-
-def _load_font(name, bold, sz_pt):
-    key = ((name or 'arial').lower().strip(), bool(bold), round(float(sz_pt), 2))
-    if key in _FONT_CACHE:
-        return _FONT_CACHE[key]
-    try:
-        from PIL import ImageFont
-    except Exception:
-        _FONT_CACHE[key] = None
-        return None
-    path = _FONT_PATHS.get(key[:2])
-    if path is None:
-        # 未知字体退回 Arial（保持度量可用；实际字宽差异不大）
-        path = _FONT_PATHS[('arial', bool(bold))]
-    sz_px = max(1, int(round(sz_pt * 96 / 72)))
-    try:
-        f = ImageFont.truetype(path, sz_px)
-    except Exception:
-        try:
-            f = ImageFont.load_default()
-        except Exception:
-            f = None
-    _FONT_CACHE[key] = f
-    return f
-
-def _measure_text_cm(text, font_name, bold, sz_pt):
-    f = _load_font(font_name, bold, sz_pt)
-    if f is None or not text:
-        return 0.0
-    try:
-        bbox = f.getbbox(text)
-    except Exception:
-        return 0.0
-    return (bbox[2] - bbox[0]) / 96.0 * 2.54
-
-def _runs_of_paragraph(p):
-    runs = []
-    for r in p.runs:
-        name = r.font.name or 'Arial'
-        try:
-            sz = r.font.size.pt if r.font.size else None
-        except Exception:
-            sz = None
-        if sz is None:
-            sz = 18.0  # 未显式声明字号时按 PPT 默认体量估算
-        bold = bool(r.font.bold)
-        runs.append((r.text, name, bold, sz))
-    return runs
-
-def _paragraph_wrap_lines(runs, avail_cm, tolerance=1.05):
-    """段落内按空格贪心换行估算行数。tolerance 给 PPT 更紧的字距一点余地。
-    额外处理：单个词宽度超过可用宽度时，PowerPoint 会字符级断行，此时用
-    ceil(段总宽 / 可用宽度) 作为该段最少行数。"""
-    import math
-    if not runs:
-        return 1
-    # 段总宽 & 是否存在超长词
-    total_w = 0.0
-    max_token_w = 0.0
-    for text, name, bold, sz in runs:
-        if not text:
-            continue
-        total_w += _measure_text_cm(text, name, bold, sz)
-        for part in text.split(' '):
-            if part:
-                w = _measure_text_cm(part, name, bold, sz)
-                if w > max_token_w:
-                    max_token_w = w
-    avail_effective = avail_cm * tolerance
-    # 拼接文本、按空格分词；每个词度量宽度用其所属 run 的字体
-    tokens = []  # (text, name, bold, sz)
-    for text, name, bold, sz in runs:
-        if not text:
-            continue
-        parts = text.split(' ')
-        for i, part in enumerate(parts):
-            if part:
-                tokens.append((part, name, bold, sz))
-            if i < len(parts) - 1:
-                tokens.append((' ', name, bold, sz))
-    if not tokens:
-        return 1
-    lines = 1
-    cur_w = 0.0
-    for text, name, bold, sz in tokens:
-        w = _measure_text_cm(text, name, bold, sz)
-        if cur_w == 0.0:
-            if text == ' ':
-                continue
-            cur_w = w
-            continue
-        if cur_w + w <= avail_effective:
-            cur_w += w
-        else:
-            lines += 1
-            cur_w = 0.0 if text == ' ' else w
-    # 单词强制字符级断行下限（避免"某个词本身超宽却只算 1 行"的漏判）
-    if max_token_w > avail_effective:
-        lines = max(lines, int(math.ceil(total_w / avail_effective)))
-    return lines
-
-def rendered_line_count(shape):
-    """按办公软件实际渲染估算文本行数。"""
-    try:
-        body = shape._element.find('.//' + qn('a:bodyPr'))
-        # wrap="none" 时不换行 —— 段落数即行数
-        wrap = 'square'
-        l_ins = r_ins = 91440  # PPT 默认 lIns/rIns 单位为 EMU；缺省 0.1 inch
-        font_scale = 1.0
-        if body is not None:
-            wrap = body.get('wrap', 'square') or 'square'
-            l_ins = int(body.get('lIns', str(l_ins)) or l_ins)
-            r_ins = int(body.get('rIns', str(r_ins)) or r_ins)
-            # "根据形状自动调整文字大小"：<a:normAutofit fontScale="90000"/> 表示办公软件
-            # 实际渲染时把字号整体缩放到 90%（单位千分之一），文字宽度须按此折算，
-            # 否则会把已被自动缩小、实际能容纳的一行误判为换行后的多行。
-            autofit = body.find(qn('a:normAutofit'))
-            if autofit is not None:
-                fs = autofit.get('fontScale')
-                if fs:
-                    try:
-                        font_scale = int(fs) / 100000.0
-                    except Exception:
-                        font_scale = 1.0
-        _, _, w_cm, _ = shape_bounds(shape)
-        inset_cm = (l_ins + r_ins) / 914400.0 * 2.54
-        avail_cm = max(0.05, w_cm - inset_cm)
-        paragraphs = list(shape.text_frame.paragraphs)
-        if not paragraphs:
-            return 0
-        total = 0
-        any_visible = False
-        for p in paragraphs:
-            runs = _runs_of_paragraph(p)
-            if font_scale != 1.0:
-                runs = [(t, n, b, sz * font_scale) for (t, n, b, sz) in runs]
-            text = ''.join(r[0] for r in runs)
-            if not text.strip():
-                # 空段落 —— PPT 里也会显示一行空行，但细则中"分几行"通常忽略
-                continue
-            any_visible = True
-            if wrap == 'none':
-                total += 1
-                continue
-            # 段落内全文宽度
-            full_w = sum(_measure_text_cm(t, n, b, s) for (t, n, b, s) in runs)
-            if full_w <= avail_cm * 1.05:
-                total += 1
-            else:
-                total += _paragraph_wrap_lines(runs, avail_cm)
-        return total if any_visible else 0
-    except Exception:
-        # 度量失败退回原始段落数
-        return line_count(shape)
-
-def text_font_ok(shape, fonts=('arial','calibri'), size=None, bold=None, color_pred=None, center_align=None):
-    """按 run 检查文本属性。默认严格模式：
-      - bold=True 时，run 必须显式声明 b="1"（bold is None 视作未加粗）；
-      - bold=False 时，任何 run 显式 b="1" 都视作失败；
-      - 字体/字号/颜色仍允许缺失继承 —— 因为主题里通常会强制指定，
-        且这些属性在办公软件里可用系统默认渲染而不影响细则判定。
-    fonts=None 时不校验字体（用于细则未限定字体的场景）。"""
-    runs = [r for r in get_text_runs(shape) if r.text.strip()]
-    if not runs:
-        return False
-    font_hits = 0; size_hits = 0; color_hits = 0
-    checked_font = checked_size = checked_color = 0
-    bold_explicit_true = 0
-    bold_explicit_false = 0
-    for r in runs:
-        name = (r.font.name or '').lower()
-        if fonts is not None and name:
-            checked_font += 1
-            if any(f in name for f in fonts): font_hits += 1
-        if r.font.size:
-            checked_size += 1
-            pt = r.font.size.pt
-            if size is None or in_range(pt, *size): size_hits += 1
-        # 加粗：严格计数——仅 XML 显式声明才算数
-        if r.font.bold is True:
-            bold_explicit_true += 1
-        elif r.font.bold is False:
-            bold_explicit_false += 1
-        try:
-            c = r.font.color.rgb
-            if c is not None:
-                checked_color += 1
-                if color_pred is None or color_pred(c): color_hits += 1
-        except Exception:
-            pass
-    if checked_font and font_hits == 0: return False
-    if size is not None and checked_size and size_hits == 0: return False
-    if bold is True:
-        # 严格加粗：所有可见 run 必须显式 b="1"
-        if bold_explicit_true == 0 or bold_explicit_true < len(runs):
-            return False
-    elif bold is False:
-        if bold_explicit_true > 0:
-            return False
-    if color_pred is not None and checked_color and color_hits == 0: return False
-    if center_align is not None:
-        try:
-            aligns = [p.alignment for p in shape.text_frame.paragraphs if p.text.strip()]
-            # 2 is CENTER in python-pptx enum; some inherited alignment may be None.
-            if any(a is not None for a in aligns) and not any(str(a).upper().endswith('CENTER') or a == 2 for a in aligns):
-                return False
-        except Exception:
-            pass
     return True
 
-def has_arrow_head(shape):
-    try:
-        ln = shape._element.spPr.find(qn('a:ln'))
-        if ln is None: return False
-        for tag in ('a:tailEnd', 'a:headEnd'):
-            el = ln.find(qn(tag))
-            if el is not None and el.get('type', 'triangle') != 'none':
-                return True
-    except Exception:
-        return False
 
-def vertical_arrow_points_down(shape):
-    """竖向箭头是否朝下（按办公软件实际几何：结合两端箭头 + flipV 翻转）。
-    line 的起点=上端(headEnd)、终点=下端(tailEnd)；flipV 会上下互换。"""
-    try:
-        ln = shape._element.spPr.find(qn('a:ln'))
-        if ln is None:
-            return False
-        head = ln.find(qn('a:headEnd'))
-        tail = ln.find(qn('a:tailEnd'))
-        head_arrow = head is not None and head.get('type', 'triangle') != 'none'
-        tail_arrow = tail is not None and tail.get('type', 'triangle') != 'none'
-        if not (head_arrow or tail_arrow):
-            return False
-        xfrm = shape._element.find('.//' + qn('a:xfrm'))
-        flip = xfrm is not None and xfrm.get('flipV') == '1'
-        # 未翻转：tail 在下端；翻转：head 变到下端
-        return (tail_arrow and not flip) or (head_arrow and flip)
-    except Exception:
-        return False
+def _nat_key(name):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
 
-def horizontal_arrow_points_right(shape):
-    """水平箭头是否朝右（按办公软件实际几何：结合线段两端箭头 + flipH 翻转）。
-    line 的起点=左端(headEnd)、终点=右端(tailEnd)；flipH 会左右互换。"""
-    try:
-        ln = shape._element.spPr.find(qn('a:ln'))
-        if ln is None:
-            return False
-        head = ln.find(qn('a:headEnd'))
-        tail = ln.find(qn('a:tailEnd'))
-        head_arrow = head is not None and head.get('type', 'triangle') != 'none'
-        tail_arrow = tail is not None and tail.get('type', 'triangle') != 'none'
-        if not (head_arrow or tail_arrow):
-            return False
-        xfrm = shape._element.find('.//' + qn('a:xfrm'))
-        flip = xfrm is not None and xfrm.get('flipH') == '1'
-        # 未翻转：tail 在右端；翻转：head 变到右端
-        right_end_arrow = (tail_arrow and not flip) or (head_arrow and flip)
-        return right_end_arrow
-    except Exception:
-        return False
 
-def is_connector(shape):
-    try:
-        return shape.shape_type in (MSO_SHAPE_TYPE.LINE, MSO_SHAPE_TYPE.FREEFORM)
-    except Exception:
-        return is_line_or_connector(shape)
-
-def is_horizontal(shape):
-    l,t,w,h = shape_bounds(shape)
-    return w >= h*2
-
-def is_vertical(shape):
-    l,t,w,h = shape_bounds(shape)
-    return h >= w*2
-
-def shape_name_or_prst(shape):
-    try:
-        prstGeom = shape._element.spPr.find(qn('a:prstGeom'))
-        prst = prstGeom.get('prst', '') if prstGeom is not None else ''
-    except Exception:
-        prst = ''
-    return (getattr(shape, 'name', '') + ' ' + prst).lower()
-
-def looks_like_rect(shape):
-    n = shape_name_or_prst(shape)
-    return 'rect' in n or 'rectangle' in n or is_rounded_rect(shape)
-
-def count_shapes_in(box_shape, shapes, pred=lambda s: True):
-    l,t,w,h = shape_bounds(box_shape)
-    r,b = l+w,t+h
-    cnt = 0
-    inside = []
-    for s in shapes:
-        if s is box_shape: continue
-        cx,cy = center(s)
-        if l <= cx <= r and t <= cy <= b and pred(s):
-            cnt += 1; inside.append(s)
-    return cnt, inside
-
-def _theme_of_master(master):
-    """取母版关联的主题 XML 根节点。"""
-    try:
-        for rel in master.part.rels.values():
-            if 'theme' in rel.reltype:
-                return parse_xml(rel.target_part.blob)
-    except Exception:
-        pass
-    return None
-
-def _scheme_color_rgb(name, master):
-    """按 clrMap 把占位色名映射到主题 clrScheme，返回 RGBColor 或 None。"""
-    if master is None or name is None:
-        return None
-    try:
-        cm = master._element.find(qn('p:clrMap'))
-        mapping = dict(cm.attrib) if cm is not None else {}
-        mapped = mapping.get(name, name)
-        theme = _theme_of_master(master)
-        if theme is None:
-            return None
-        cs = theme.find(qn('a:themeElements') + '/' + qn('a:clrScheme'))
-        if cs is None:
-            return None
-        node = cs.find(qn('a:' + mapped))
-        if node is None or len(node) == 0:
-            return None
-        ch = node[0]
-        if ch.tag == qn('a:srgbClr'):
-            return RGBColor.from_string(ch.get('val'))
-        if ch.tag == qn('a:sysClr'):
-            last = ch.get('lastClr')
-            return RGBColor.from_string(last) if last else None
-    except Exception:
-        return None
-    return None
-
-def _resolve_color_node(clr_node, master):
-    """把 a:srgbClr / a:sysClr / a:schemeClr 解析为 RGBColor。"""
-    if clr_node is None:
-        return None
-    try:
-        tag = clr_node.tag
-        if tag == qn('a:srgbClr'):
-            return RGBColor.from_string(clr_node.get('val'))
-        if tag == qn('a:sysClr'):
-            last = clr_node.get('lastClr')
-            return RGBColor.from_string(last) if last else None
-        if tag == qn('a:schemeClr'):
-            return _scheme_color_rgb(clr_node.get('val'), master)
-    except Exception:
-        return None
-    return None
-
-def _bg_element(part):
-    """取某个部件（幻灯片/版式/母版）cSld 下的 p:bg 节点。"""
-    try:
-        csld = part._element.find(qn('p:cSld'))
-        if csld is None:
-            return None
-        return csld.find(qn('p:bg'))
-    except Exception:
-        return None
-
-def _resolve_bgref(bgRef, master):
-    """解析 p:bgRef（主题 fillStyle 引用）为 (kind, rgb)。"""
-    try:
-        idx = int(bgRef.get('idx', '0'))
-    except Exception:
-        idx = 0
-    phclr = _resolve_color_node(bgRef[0], master) if len(bgRef) else None
-    theme = _theme_of_master(master)
-    if theme is None:
-        return ('ref', phclr)
-    fmt = theme.find(qn('a:themeElements') + '/' + qn('a:fmtScheme'))
-    if fmt is None:
-        return ('ref', phclr)
-    if idx >= 1001:
-        lst = fmt.find(qn('a:bgFillStyleLst')); i = idx - 1000
-    else:
-        lst = fmt.find(qn('a:fillStyleLst')); i = idx
-    if lst is None or i < 1 or i > len(lst):
-        return ('ref', phclr)
-    fill = lst[i - 1]
-    if fill.tag == qn('a:solidFill'):
-        node = fill[0] if len(fill) else None
-        if node is not None and node.tag == qn('a:schemeClr') and node.get('val') == 'phClr':
-            return ('solid', phclr)
-        return ('solid', _resolve_color_node(node, master))
-    if fill.tag == qn('a:gradFill'):
-        return ('gradient', None)
-    if fill.tag == qn('a:blipFill'):
-        return ('image', None)
-    return ('ref', phclr)
-
-def shape_fill_is_semitransparent(shape):
-    """填充/图片存在 5%~95% 之间的透明度（明显半透明覆盖），完全透明或不透明都不算。"""
-    try:
-        sp = shape._element.spPr
-        if sp is None:
-            return False
-        for al in sp.findall('.//' + qn('a:alpha')):
-            v = al.get('val')
-            if v is None:
-                continue
-            if 5000 <= int(v) <= 95000:
-                return True
-    except Exception:
-        pass
-    return False
-
-def first_run_rgb(shape):
-    """取形状内首个有显式颜色的文本 run 的 RGB。"""
-    for r in get_text_runs(shape):
+def _theme_lookup(zf):
+    """构造 schemeClr 名 → srgb 的映射：p:clrMap 先把 tx1/bg2 等映射到
+    dk1/lt2 等主题槽位，再到 theme1.xml 的 a:clrScheme 里取具体色值。"""
+    names = zf.namelist()
+    cmap = {}
+    masters = sorted(
+        [n for n in names if re.match(r"ppt/slideMasters/slideMaster\d+\.xml$", n)],
+        key=_nat_key)
+    if masters:
         try:
-            if r.font.color is not None and r.font.color.type is not None:
-                return r.font.color.rgb
-        except Exception:
-            pass
+            root = ET.fromstring(zf.read(masters[0]))
+            node = root.find(_q(P_NS, "clrMap"))
+            if node is not None:
+                cmap = dict(node.attrib)
+        except ET.ParseError:
+            cmap = {}
+    scheme = {}
+    themes = sorted(
+        [n for n in names if re.match(r"ppt/theme/theme\d+\.xml$", n)], key=_nat_key)
+    if themes:
+        try:
+            root = ET.fromstring(zf.read(themes[0]))
+            cs = root.find(".//" + _q(A_NS, "clrScheme"))
+            for child in (cs if cs is not None else []):
+                slot = child.tag.split("}")[-1]
+                srgb = child.find(_q(A_NS, "srgbClr"))
+                sysc = child.find(_q(A_NS, "sysClr"))
+                if srgb is not None:
+                    scheme[slot] = srgb.get("val")
+                elif sysc is not None:
+                    scheme[slot] = sysc.get("lastClr") or sysc.get("val")
+        except ET.ParseError:
+            scheme = {}
+    out = {}
+    for k in ("bg1", "tx1", "bg2", "tx2", "accent1", "accent2", "accent3",
+              "accent4", "accent5", "accent6", "hlink", "folHlink"):
+        out[k] = scheme.get(cmap.get(k, k))
+    for k, v in scheme.items():
+        out.setdefault(k, v)
+    out.setdefault("phClr", None)
+    return out
+
+
+def _first_slide_xml(zf):
+    names = sorted([n for n in zf.namelist()
+                    if re.match(r"ppt/slides/slide\d+\.xml$", n)], key=_nat_key)
+    if not names:
+        raise ValueError("包内未发现 ppt/slides/slideN.xml")
+    return zf.read(names[0]), len(names)
+
+
+def _slide_size(zf):
+    try:
+        root = ET.fromstring(zf.read("ppt/presentation.xml"))
+    except (KeyError, ET.ParseError):
+        return (33.87, 19.05, 1)
+    sz = root.find(_q(P_NS, "sldSz"))
+    cx = _fnum(sz.get("cx"), 12192000.0) if sz is not None else 12192000.0
+    cy = _fnum(sz.get("cy"), 6858000.0) if sz is not None else 6858000.0
+    lst = root.find(_q(P_NS, "sldIdLst"))
+    n = len(list(lst)) if lst is not None else 0
+    return (cx / EMU_PER_CM, cy / EMU_PER_CM, n)
+
+
+def _color_of(node, theme):
+    """从一个填充/线条容器节点里取颜色，schemeClr 用主题表还原成 srgb。"""
+    if node is None:
+        return None
+    srgb = node.find(_q(A_NS, "srgbClr"))
+    if srgb is not None:
+        return srgb.get("val")
+    sch = node.find(_q(A_NS, "schemeClr"))
+    if sch is not None:
+        return theme.get(sch.get("val"))
+    sysc = node.find(_q(A_NS, "sysClr"))
+    if sysc is not None:
+        return sysc.get("lastClr") or sysc.get("val")
     return None
 
 
-class Evaluator:
-    def __init__(self, ppt_path):
-        self.path = Path(ppt_path)
-        self.presentation = None
-        self.slide = None
-        self.shapes = []
-        self.slide_w = 0
-        self.slide_h = 0
-        self.total: int = 0
-        self.hits: list[tuple[int, str, str]] = []
-        self.misses: list[tuple[int, str, str]] = []
-        self.key = {}
-        self.invalid_coordinate_values: list[str] = []
-
-    def load(self):
-        self.presentation = Presentation(str(self.path))
-        self.invalid_coordinate_values = normalize_integral_coordinates(
-            self.presentation
-        )
-        self.slide_w = emu2cm(self.presentation.slide_width)
-        self.slide_h = emu2cm(self.presentation.slide_height)
-        if len(self.presentation.slides):
-            self.slide = self.presentation.slides[0]
-            self.shapes = shapes_on_slide(self.slide)
-
-    def add(self, points: int, desc: str, ok: object, detail: str = ''):
-        if bool(ok):
-            self.total += points
-            self.hits.append((points, desc, detail))
-        else:
-            self.misses.append((points, desc, detail))
-
-    def find_shapes(self, pred):
-        return [s for s in self.shapes if pred(s)]
-
-    def find_text(self, needle, area=None):
-        candidates = [s for s in self.shapes if text_contains(s, needle)]
-        if area:
-            candidates = [s for s in candidates if box_in(s, **area)]
-        return candidates
-
-    def dimension1(self):
-        reasons = []
-        if self.path.suffix.lower() != '.pptx':
-            reasons.append('交付文件不是 .pptx')
-            return False, reasons
-        try:
-            self.load()
-        except Exception as e:
-            reasons.append(f'文件无法正常打开: {e}')
-            return False, reasons
-        if self.invalid_coordinate_values:
-            samples = ', '.join(self.invalid_coordinate_values[:3])
-            reasons.append(
-                f'PPT XML 包含非整数坐标（共 {len(self.invalid_coordinate_values)} 处，'
-                f'示例：{samples}）'
-            )
-        if len(self.presentation.slides) != 1:
-            reasons.append(f'交付PPT不是1页，而是 {len(self.presentation.slides)} 页')
-        if not self.slide:
-            reasons.append('没有可检查的幻灯片')
-            return False, reasons
-
-        return len(reasons) == 0, reasons
-
-    def detect_key_objects(self):
-        sh = self.shapes
-        def rrects(lo=None, to=None, wo=None, ho=None):
-            return [s for s in sh if looks_like_rect(s) and is_rounded_rect(s)
-                    and (lo is None or in_range(emu2cm(s.left),*lo))
-                    and (to is None or in_range(emu2cm(s.top),*to))
-                    and (wo is None or in_range(abs(emu2cm(s.width)),*wo))
-                    and (ho is None or in_range(abs(emu2cm(s.height)),*ho))]
-        self.key['left_box']   = (rrects(lo=(0.5,5.4),  to=(4.3,11.8),  wo=(4.2,5.5),   ho=(5.5,7.2)) or [None])[0]
-        self.key['seq_box']    = (rrects(lo=(7.8,14.4),  to=(1.2,7.0),   wo=(5.5,6.7),   ho=(3.6,5.6)) or [None])[0]
-        self.key['purple_box'] = (rrects(lo=(7.2,13.8),  to=(7.5,12.8),  wo=(5.0,6.0),   ho=(4.7,5.6)) or [None])[0]
-        self.key['orange_box'] = (rrects(lo=(15.1,29.7), to=(1.2,9.3),   wo=(13.0,15.0), ho=(6.0,8.0)) or [None])[0]
-        self.key['green_box']  = (rrects(lo=(29.2,36.5), to=(1.6,11.0),  wo=(4.5,5.5),   ho=(6.8,8.3)) or [None])[0]
-        self.key['pink_box']   = (rrects(lo=(29.5,36.5), to=(10.5,16.5), wo=(4.5,5.3),   ho=(4.5,5.5)) or [None])[0]
-        self.key['blue_box']   = (rrects(lo=(15.0,25.3), to=(10.0,16.0), wo=(8.0,9.5),   ho=(4.4,5.0)) or [None])[0]
-        self.key['legend_box'] = (rrects(lo=(8.8,29.0),  to=(16.5,18.7), wo=(18.5,19.5), ho=(1.3,1.6)) or [None])[0]
-
-    def line_candidates(self, area=None, color_pred=None, width=None, dashed=None, horizontal=None, vertical=None, arrow=None):
-        result = []
-        for s in self.shapes:
-            if not (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s)):
-                continue
-            if area:
-                l,t,w,h = shape_bounds(s)
-                al = area.get('left', (-999,999)); at = area.get('top', (-999,999))
-                aw = area.get('width', (-999,999)); ah = area.get('height', (-999,999))
-                # 线段常有0宽/0高，因此区域主要按左上坐标/长度容差判断
-                if not (in_range(l, *al) and in_range(t, *at) and in_range(w, *aw) and in_range(h, *ah)):
-                    continue
-            c = get_line_color(s)
-            if color_pred and not color_pred(c): continue
-            wpt = get_line_width_pt(s)
-            if width and wpt is not None and not in_range(wpt, *width): continue
-            if dashed is not None and is_dash_line(s) != dashed: continue
-            if horizontal is not None and is_horizontal(s) != horizontal: continue
-            if vertical is not None and is_vertical(s) != vertical: continue
-            if arrow is not None and has_arrow_head(s) != arrow: continue
-            result.append(s)
-        return result
-
-    def rounded_rects(self, area=None, line_color=None, fill_color=None, width=None, dashed=None):
-        result = []
-        for s in self.shapes:
-            if not (looks_like_rect(s) and is_rounded_rect(s)): continue
-            if area and not box_in(s, **area): continue
-            if line_color and not line_color(get_line_color(s)): continue
-            if fill_color and not fill_color(get_fill_color(s)): continue
-            lw = get_line_width_pt(s)
-            if width and lw is not None and not in_range(lw, *width): continue
-            if dashed is not None and self.is_dashed_outline(s) != dashed: continue
-            result.append(s)
-        return result
-
-    def is_dashed_outline(self, shape):
-        """"虚线矩形"判定：仅承认矩形自身边线的 prstDash（真正的虚线属性）。
-        不接受"边线透明实线 + 周围用短线段拼出虚线视觉"这类拼装做法 ——
-        细则要求矩形本身是虚线矩形。"""
-        return is_dash_line(shape)
-
-    def _master(self):
-        try:
-            return self.slide.slide_layout.slide_master
-        except Exception:
-            return None
-
-    def background_kind_and_color(self):
-        """按 幻灯片→版式→母版 继承顺序解析当前生效的整页背景。
-        返回 (kind, rgb)，kind ∈ {'solid','gradient','image','none'}。"""
-        master = self._master()
-        try:
-            parts = [self.slide, self.slide.slide_layout, master]
-        except Exception:
-            parts = [self.slide]
-        for part in parts:
-            if part is None:
-                continue
-            bg = _bg_element(part)
-            if bg is None:
-                continue
-            bgpr = bg.find(qn('p:bgPr'))
-            if bgpr is not None:
-                if bgpr.find(qn('a:noFill')) is not None:
-                    return ('none', None)
-                solid = bgpr.find(qn('a:solidFill'))
-                if solid is not None:
-                    node = solid[0] if len(solid) else None
-                    return ('solid', _resolve_color_node(node, master))
-                if bgpr.find(qn('a:gradFill')) is not None:
-                    return ('gradient', None)
-                if bgpr.find(qn('a:blipFill')) is not None:
-                    return ('image', None)
-                continue
-            bgref = bg.find(qn('p:bgRef'))
-            if bgref is not None:
-                return _resolve_bgref(bgref, master)
-        # 无任何显式背景 → 办公软件默认白色
-        return ('solid', RGBColor(0xFF, 0xFF, 0xFF))
-
-    def has_watermark(self):
-        """检测页面是否存在水印。办公软件中水印通常表现为：
-        1) 背景/大幅图片以半透明形式铺在页面上；
-        2) 大面积、半透明或极浅的重复文字（如"样张""机密"）压在内容之上。
-        仅识别真正的水印特征，普通浅色装饰不计入。"""
-        page_area = self.slide_w * self.slide_h
-        for s in self.shapes:
-            area = bbox_area(s)
-            if area < page_area * 0.25:
-                continue
-            # 半透明的大幅图片/形状铺满页面 → 图片型水印
-            is_pic = getattr(s, 'shape_type', None) == MSO_SHAPE_TYPE.PICTURE
-            if (is_pic or area > page_area * 0.5) and shape_fill_is_semitransparent(s):
-                return True
-            # 大面积文字水印：字号大、半透明或极浅灰色
-            txt = shape_text(s).strip()
-            if txt:
-                sizes = [r.font.size.pt for r in get_text_runs(s) if r.font.size]
-                big_font = bool(sizes) and max(sizes) >= 40
-                col = first_run_rgb(s)
-                faint = shape_fill_is_semitransparent(s) or (col is not None and color_is_light_gray(col))
-                if area > page_area * 0.3 and big_font and faint:
-                    return True
-        return False
+def _own_xfrm(el):
+    for name in ("spPr", "grpSpPr", "xfrm"):
+        child = el.find(_q(P_NS, name))
+        if child is not None:
+            if child.tag == _q(A_NS, "xfrm"):
+                return child
+            return child.find(_q(A_NS, "xfrm"))
+    return None
 
 
-
-    def rect_covering_text(self, text_shape, rect_pred=lambda r: True, margin=0.25):
-        """返回包含文本中心点、且满足条件的最小圆角矩形，避免先匹配到外层大框。"""
-        cx, cy = center(text_shape)
-        matches = []
-        for r in self.shapes:
-            if r is text_shape or not (looks_like_rect(r) and is_rounded_rect(r)):
-                continue
-            l,t,w,h = shape_bounds(r)
-            if l-margin <= cx <= l+w+margin and t-margin <= cy <= t+h+margin and rect_pred(r):
-                matches.append(r)
-        if not matches:
-            return None
-        return min(matches, key=bbox_area)
-
-    def text_in_area(self, needle, area, font_kwargs=None, require_lines=None):
-        for s in self.find_text(needle):
-            if not box_in(s, **area):
-                continue
-            if require_lines is not None and rendered_line_count(s) != require_lines:
-                continue
-            if font_kwargs and not text_font_ok(s, **font_kwargs):
-                continue
-            return s
+def _off_ext(xf):
+    if xf is None:
         return None
-
-    def line_group(self, area, color_pred=None, width=None, arrow_count=0, min_count=1, horizontal=None, vertical=None, dashed=None):
-        lines = self.line_candidates(area=area, color_pred=color_pred, width=width, horizontal=horizontal, vertical=vertical)
-        if dashed is not None:
-            if dashed:
-                lines = [s for s in lines if is_dash_line(s) or min(shape_bounds(s)[2], shape_bounds(s)[3]) < 0.03]
-            else:
-                lines = [s for s in lines if not is_dash_line(s)]
-        arrows = [s for s in lines if has_arrow_head(s)]
-        return len(lines) >= min_count and len(arrows) >= arrow_count
-
-    def bent_arrow_exists(self, area, color_pred=None, width=None, min_w=0.5, min_h=0.5):
-        """检测单个折线/肘形箭头，而不是多段普通直线拼接。"""
-        for s in self.line_candidates(area=area, color_pred=color_pred, width=width, arrow=True):
-            l,t,w,h = shape_bounds(s)
-            if w >= min_w and h >= min_h:
-                return True
-        return False
-
-    def two_turn_path_in_region(self, region, dirs, color_pred=None, width=None, tol=0.4):
-        """检测由三段直线首尾相连、拥有两个拐点的折线箭头。
-        - region=(lx0,lx1,ty0,ty1)：整条折线各段都必须落在此范围（对应细则"距左/距上"）。
-        - dirs=('right','down','right')：三段依次的方向（末段带箭头，即"最后指向"）。
-        折线在办公软件中通常是多段独立直线段拼成（虚线更会拆成大量共线短段），
-        先把共线相邻的短段合并成"整段"，再按端点相连 + 逐段方向 + 末段箭头判定。
-        """
-        def is_seg(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        lx0, lx1, ty0, ty1 = region
-        raw = []
-        for s in self.shapes:
-            if not is_seg(s):
-                continue
-            if color_pred and not color_pred(get_line_color(s)):
-                continue
-            wpt = get_line_width_pt(s)
-            if width and wpt is not None and not in_range(wpt, *width):
-                continue
-            l, t, w, h = shape_bounds(s)
-            if not (lx0 - tol <= l and l + w <= lx1 + tol and ty0 - tol <= t and t + h <= ty1 + tol):
-                continue
-            raw.append(s)
-        if not raw:
-            return False
-
-        # 把共线相邻的水平/竖直短段合并成整段：run=(orient,minx,miny,maxx,maxy,has_arrow)
-        hsegs = [s for s in raw if is_horizontal(s) or (shape_bounds(s)[2] >= shape_bounds(s)[3])]
-        vsegs = [s for s in raw if is_vertical(s) or (shape_bounds(s)[3] > shape_bounds(s)[2])]
-
-        def merge(segments, orient):
-            runs = []
-            def bounds5(s):
-                l, t, w, h = shape_bounds(s)
-                return l, t, l + w, t + h, has_arrow_head(s)
-            for s in segments:
-                l, t, r, b, arr = bounds5(s)
-                placed = False
-                for run in runs:
-                    if orient == 'H':
-                        # 同一水平线(y接近) 且 x 方向相邻/重叠
-                        if abs(((t + b) / 2) - ((run[2] + run[4]) / 2)) <= tol and \
-                           l <= run[3] + tol and r >= run[1] - tol:
-                            run[1] = min(run[1], l); run[3] = max(run[3], r)
-                            run[2] = min(run[2], t); run[4] = max(run[4], b)
-                            run[5] = run[5] or arr
-                            placed = True; break
-                    else:
-                        if abs(((l + r) / 2) - ((run[1] + run[3]) / 2)) <= tol and \
-                           t <= run[4] + tol and b >= run[2] - tol:
-                            run[2] = min(run[2], t); run[4] = max(run[4], b)
-                            run[1] = min(run[1], l); run[3] = max(run[3], r)
-                            run[5] = run[5] or arr
-                            placed = True; break
-                if not placed:
-                    runs.append([orient, l, t, r, b, arr])
-            # 迭代合并直到稳定（相邻 run 可能因顺序未合并）
-            changed = True
-            while changed:
-                changed = False
-                for i in range(len(runs)):
-                    for j in range(i + 1, len(runs)):
-                        a, c = runs[i], runs[j]
-                        if orient == 'H':
-                            if abs(((a[2]+a[4])/2)-((c[2]+c[4])/2)) <= tol and \
-                               a[1] <= c[3]+tol and a[3] >= c[1]-tol:
-                                a[1]=min(a[1],c[1]);a[3]=max(a[3],c[3]);a[2]=min(a[2],c[2]);a[4]=max(a[4],c[4]);a[5]=a[5] or c[5]
-                                runs.pop(j); changed=True; break
-                        else:
-                            if abs(((a[1]+a[3])/2)-((c[1]+c[3])/2)) <= tol and \
-                               a[2] <= c[4]+tol and a[4] >= c[2]-tol:
-                                a[2]=min(a[2],c[2]);a[4]=max(a[4],c[4]);a[1]=min(a[1],c[1]);a[3]=max(a[3],c[3]);a[5]=a[5] or c[5]
-                                runs.pop(j); changed=True; break
-                    if changed: break
-            return runs
-
-        runs = merge(hsegs, 'H') + merge(vsegs, 'V')
-        if len(runs) < 3:
-            return False
-
-        def run_ends(run):
-            orient, l, t, r, b, arr = run
-            if orient == 'H':
-                return (l, (t + b) / 2), (r, (t + b) / 2), arr
-            return ((l + r) / 2, t), ((l + r) / 2, b), arr
-
-        def near(p, q):
-            return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
-
-        def matches(want, p_from, p_to):
-            if want in ('right', 'left'):
-                if abs(p_from[1] - p_to[1]) > tol:
-                    return False
-                return (p_to[0] > p_from[0]) if want == 'right' else (p_to[0] < p_from[0])
-            else:
-                if abs(p_from[0] - p_to[0]) > tol:
-                    return False
-                return (p_to[1] > p_from[1]) if want == 'down' else (p_to[1] < p_from[1])
-
-        # 枚举三段整段的有序组合，验证首尾相连 + 方向序列 + 末段带箭头
-        for r1 in runs:
-            a1, b1, _ = run_ends(r1)
-            for start, end1 in ((a1, b1), (b1, a1)):
-                if not matches(dirs[0], start, end1):
-                    continue
-                for r2 in runs:
-                    if r2 is r1:
-                        continue
-                    a2, b2, _ = run_ends(r2)
-                    for j2, e2 in ((a2, b2), (b2, a2)):
-                        if not near(j2, end1) or not matches(dirs[1], j2, e2):
-                            continue
-                        for r3 in runs:
-                            if r3 is r1 or r3 is r2:
-                                continue
-                            a3, b3, arr3 = run_ends(r3)
-                            if not arr3:
-                                continue
-                            for j3, e3 in ((a3, b3), (b3, a3)):
-                                if near(j3, e2) and matches(dirs[2], j3, e3):
-                                    return True
-        return False
-
-
-
-    def _region_has_rounded_bent_arrow(self, region, color_pred=None, width=None,
-                                       dashed_only=False, tol=0.4):
-        """检测给定 region 内是否存在一个"单一形状"承载整条圆角折线箭头。
-        "圆角"以办公软件实际渲染为准，命中以下之一：
-          - `bentConnector*` / `curvedConnector*` 连接符（拐角默认圆角）；
-          - `FREEFORM` 自由路径且含 `<a:arcTo>` 弧线段；
-          - 折线形状且 `<a:ln>` 显式带 `<a:round/>` 连接样式。
-        三段独立的 `prst="line"` 直线在同点相接（直角拐点）不算圆角。"""
-        lx0, lx1, ty0, ty1 = region
-        for s in self.shapes:
-            if color_pred and not color_pred(get_line_color(s)):
-                continue
-            wpt = get_line_width_pt(s)
-            if width and wpt is not None and not in_range(wpt, *width):
-                continue
-            l, t, w, h = shape_bounds(s)
-            if not (lx0 - tol <= l and l + w <= lx1 + tol
-                    and ty0 - tol <= t and t + h <= ty1 + tol):
-                continue
-            # 必须是"拥有拐角"的整段折线：跨度须同时具备水平和竖直方向
-            if w < 0.4 or h < 0.4:
-                continue
-            if dashed_only and not is_dash_line(s):
-                continue
-            prst = ''
-            try:
-                g = s._element.spPr.find(qn('a:prstGeom'))
-                if g is not None:
-                    prst = g.get('prst', '') or ''
-            except Exception:
-                pass
-            # ① bent/curved connector 连接符
-            if prst.startswith('bentConnector') or prst.startswith('curvedConnector'):
-                return True
-            # ② freeform 且路径含 arcTo 弧段
-            try:
-                if s.shape_type == MSO_SHAPE_TYPE.FREEFORM:
-                    if s._element.spPr.find('.//' + qn('a:arcTo')) is not None:
-                        return True
-            except Exception:
-                pass
-            # ③ 折线形状且 line 显式 round join（排除单段 line 直线）
-            try:
-                ln = s._element.spPr.find(qn('a:ln'))
-                if ln is not None and ln.find(qn('a:round')) is not None and prst != 'line':
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def two_turn_arrow_to_box(self, region, origin_box, target_box,
-                              color_pred=None, width=None, vertical_dir='up', tol=0.4):
-        """检测一条"先向右→再向上/向下→最后向右指向目标框"的两拐点折线箭头。
-        - region=(lx0,lx1,ty0,ty1)：整条折线必须落在此范围内（对应细则"距左/距上"）。
-        - origin_box：折线起点所依附的圆角矩形（文本所在框）。
-        - target_box：箭头最终指向的圆角矩形。
-        - vertical_dir：中间竖段方向，'up'（向上）或 'down'（向下）。
-        折线在办公软件中可为多段相连的直线段拼成，本检测按端点相连+方向+箭头判定。
-        """
-        def is_seg(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        lx0, lx1, ty0, ty1 = region
-        segs = []
-        for s in self.shapes:
-            if not is_seg(s):
-                continue
-            if color_pred and not color_pred(get_line_color(s)):
-                continue
-            wpt = get_line_width_pt(s)
-            if width and wpt is not None and not in_range(wpt, *width):
-                continue
-            l, t, w, h = shape_bounds(s)
-            if not (lx0 - tol <= l and l + w <= lx1 + tol and ty0 - tol <= t and t + h <= ty1 + tol):
-                continue
-            segs.append(s)
-        if len(segs) < 3:
-            return False
-
-        hor = [s for s in segs if is_horizontal(s)]
-        ver = [s for s in segs if is_vertical(s)]
-        if not hor or not ver:
-            return False
-
-        def ends(s):
-            l, t, w, h = shape_bounds(s)
-            if is_horizontal(s):
-                return (l, t + h / 2), (l + w, t + h / 2)  # 左端, 右端
-            return (l + w / 2, t), (l + w / 2, t + h)      # 上端, 下端
-
-        def near(p, q):
-            return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
-
-        obl, obt, obw, obh = shape_bounds(origin_box)
-        tbl, tbt, tbw, tbh = shape_bounds(target_box)
-
-        # 末段：水平、带箭头、右端指向目标框左缘
-        for a in hor:
-            if not has_arrow_head(a):
-                continue
-            a_left, a_right = ends(a)
-            if abs(a_right[0] - tbl) > tol or not (tbt - tol <= a_right[1] <= tbt + tbh + tol):
-                continue
-            # 中间竖段：一端与末段左端相连
-            for v in ver:
-                v_top, v_bot = ends(v)
-                if near(v_top, a_left):
-                    join_a, other = v_top, v_bot     # a 在竖段顶端
-                    a_at_top = True
-                elif near(v_bot, a_left):
-                    join_a, other = v_bot, v_top      # a 在竖段底端
-                    a_at_top = False
-                else:
-                    continue
-                # 方向校验：'up' 要求末段在竖段顶部，'down' 要求在底部
-                if vertical_dir == 'up' and not a_at_top:
-                    continue
-                if vertical_dir == 'down' and a_at_top:
-                    continue
-                # 首段：水平，一端连竖段另一端，另一端贴近起点框右缘
-                for h0 in hor:
-                    if h0 is a:
-                        continue
-                    h_left, h_right = ends(h0)
-                    if near(h_left, other) or near(h_right, other):
-                        far = h_right if near(h_left, other) else h_left
-                        if abs(far[0] - (obl + obw)) <= tol and (obt - tol <= far[1] <= obt + obh + tol):
-                            return True
-        return False
-
-
-    def dashed_vertical_line_count(self, area, color_pred=None, width=None):
-        """统计区域内真正的竖向虚线网格线。"""
-        count = 0
-        for s in self.line_candidates(area=area, color_pred=color_pred, width=width, vertical=True):
-            if is_dash_line(s):
-                count += 1
-        return count
-
-    def score(self):
-        self.detect_key_objects()
-        sh = self.shapes
-
-        # 1. 第1页白色页面背景：覆盖整张幻灯片，颜色为白色或极浅灰白色，
-        #    页面没有深色背景、水印。（逐点检查，且以办公软件真实生效的背景为准）
-        page_area = self.slide_w * self.slide_h
-        bg_kind, bg_rgb = self.background_kind_and_color()
-
-        # 点1+点2：整页背景为白色或极浅灰白色纯色（'none' 时办公软件回落为白底）
-        if bg_kind == 'none':
-            bg_white_page = True
-        elif bg_kind == 'solid':
-            bg_white_page = color_is_white_or_grayish_white(bg_rgb)
-        else:  # gradient / image / ref 等，非纯白整页背景
-            bg_white_page = False
-
-        # 点3：页面没有深色背景（背景本身不深，且没有铺满页面的深色形状充当背景）
-        bg_self_dark = (bg_kind == 'solid' and bg_rgb is not None and not color_is_light(bg_rgb))
-        dark_cover = [s for s in sh
-                      if bbox_area(s) > page_area * 0.5
-                      and not fill_is_none_or_transparent(s)
-                      and not color_is_light(get_fill_color(s))]
-        no_dark_bg = (not bg_self_dark) and (not dark_cover)
-
-        # 点4：页面没有水印
-        no_watermark = not self.has_watermark()
-
-        self.add(3, '整页白色或极浅灰白色背景，覆盖整张幻灯片，无深色背景、无水印',
-                 bg_white_page and no_dark_bg and no_watermark)
-
-        # 2. 第1页左侧圆角矩形。逐点检查（位置/尺寸已在 detect_key_objects 的
-        #    rrects 范围内约束：距左0.5–5.4cm、距上4.3–11.8cm、宽4.2–5.5cm、高5.5–7.2cm、
-        #    且形状为圆角矩形）。此处补齐：填充浅青白色、边线青绿色单实线、线宽1–1.5磅。
-        #    注：办公软件里常见两层圆角矩形叠合（底色壳 + 描边壳），detect_key_objects
-        #    的 left_box 只取第一个，这里独立扫描全部位置尺寸匹配的圆角矩形候选，
-        #    只要其中一个同时满足全部条件即视为达标。
-        lb = self.key.get('left_box')
-        left_ok = False
-        lb_candidates = [s for s in self.shapes if looks_like_rect(s) and is_rounded_rect(s)
-                         and in_range(emu2cm(s.left), 0.5, 5.4)
-                         and in_range(emu2cm(s.top), 4.3, 11.8)
-                         and in_range(abs(emu2cm(s.width)), 4.2, 5.5)
-                         and in_range(abs(emu2cm(s.height)), 5.5, 7.2)]
-        for cand in lb_candidates:
-            lw = get_line_width_pt(cand)
-            if (color_is_light_cyan(get_fill_color(cand))          # 填充为浅青白色
-                    and color_is_cyan_green(get_line_color(cand))   # 边线为青绿色
-                    and line_is_single_solid(cand)                  # 单实线
-                    and lw is not None and in_range(lw, 1, 1.5)):   # 线宽1–1.5磅
-                left_ok = True
-                break
-        self.add(3, '左侧圆角矩形：位置尺寸达标、浅青白填充、青绿色单实线边线、线宽1–1.5磅', left_ok)
-
-        # 3. 第1页左侧"Multivariate Time Series"文本。逐点检查：
-        #    ① 位于左侧圆角矩形的上半部分内；② 文本内容分两行排列；
-        #    ③ 字体 Arial/Calibri；④ 字号10–18磅；⑤ 加粗；⑥ 颜色青绿色；⑦ 水平居中。
-        mts_ok = False
-        for s in self.find_text('Multivariate Time Series'):
-            # ① 位于左侧圆角矩形上半部分内（文本中心落在 left_box 上半区）
-            if lb is None:
-                continue
-            bl, bt, bw, bh = shape_bounds(lb)
-            cx, cy = center(s)
-            if not (bl <= cx <= bl + bw and bt <= cy <= bt + bh / 2):
-                continue
-            # ② 文本内容分两行排列
-            if rendered_line_count(s) != 2:
-                continue
-            # ③④⑤⑥⑦ 字体/字号/加粗/颜色/水平居中（Arial 或 Calibri，10–18磅，加粗，青绿色，居中）
-            if text_font_ok(s, fonts=('arial', 'calibri'), size=(10, 18), bold=True,
-                            color_pred=color_is_cyan_green, center_align=True):
-                mts_ok = True
-                break
-        self.add(3, '左侧圆角矩形上半部："Multivariate Time Series"两行、Arial/Calibri 10–18磅加粗青绿色居中', mts_ok)
-
-
-        # 4. 第1页左侧折线图。逐点检查：
-        #    ① 位于左侧圆角矩形的下半部分；② 含浅灰色竖向虚线网格；
-        #    ③ 4条不同颜色的折线；④ 颜色包含蓝、橙、紫、绿；
-        #    ⑤ 折线线宽0.5–2磅；⑥ 整体宽度2.7–4.2cm；⑦ 高度2.8–4.8cm。
-        def _is_line_like(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        chart_ok = False
-        if lb is not None:
-            bl, bt, bw, bh = shape_bounds(lb)
-            # ① 下半部分区域：left_box 下半区
-            rx0, rx1 = bl, bl + bw
-            ry0, ry1 = bt + bh / 2, bt + bh
-            region = [s for s in self.shapes if _is_line_like(s)
-                      and rx0 <= center(s)[0] <= rx1 and ry0 <= center(s)[1] <= ry1]
-
-            # ② 浅灰色竖向虚线网格（青绿之外的浅灰竖线，且线型为虚线，构成网格需≥2条）
-            grid = [s for s in region
-                    if color_is_light_gray(get_line_color(s)) and is_vertical(s) and is_dash_line(s)]
-            has_grid = len(grid) >= 2
-
-            # ③④⑤ 4条折线：蓝/橙/紫/绿各至少1条，线宽0.5–2磅
-            #     线宽未显式设置时（w=0/None）按 PowerPoint 默认线宽处理，
-            #     避免把主题继承的线段误判为 0 磅
-            def _colored(pred):
-                return [s for s in region
-                        if pred(get_line_color(s))
-                        and line_width_in_range(s, 0.5, 2)]
-            blue_ln = _colored(color_is_blue)
-            orange_ln = _colored(color_is_orange)
-            purple_ln = _colored(color_is_purple)
-            green_ln = _colored(color_is_green)
-            has_four_colors = all([blue_ln, orange_ln, purple_ln, green_ln])
-
-            # ⑥⑦ 整体尺寸：折线图全部线元素的包围盒
-            chart_shapes = grid + blue_ln + orange_ln + purple_ln + green_ln
-            if chart_shapes:
-                l = min(shape_bounds(s)[0] for s in chart_shapes)
-                t = min(shape_bounds(s)[1] for s in chart_shapes)
-                r = max(shape_bounds(s)[0] + shape_bounds(s)[2] for s in chart_shapes)
-                b = max(shape_bounds(s)[1] + shape_bounds(s)[3] for s in chart_shapes)
-                size_ok = in_range(r - l, 2.7, 4.2) and in_range(b - t, 2.8, 4.8)
-            else:
-                size_ok = False
-
-            chart_ok = has_grid and has_four_colors and size_ok
-        self.add(3, '左侧圆角矩形下半部折线图：浅灰竖向虚线网格＋蓝/橙/紫/绿4色折线(0.5–2磅)，整体2.7–4.2×2.8–4.8cm', chart_ok)
-
-        # 5. 第1页左侧"Multivariate Time Series"文本所在圆角矩形，出现一条
-        #    "先向右→再向上→最后指向右侧青色圆角虚线矩形"的折线箭头。逐点检查：
-        #    ① 起点依附文本所在的 left_box；② 折线走向：右→上→右指向青色框；
-        #    ③ 位于距左4.5–8.5cm、距上2.5–7.0cm范围内；④ 黑色；
-        #    ⑤ 折线箭头（末端带箭头）；⑥ 拥有两个拐点；⑦ 线宽0.5–2磅。
-        # 5. 第1页左侧"Multivariate Time Series"文本所在的圆角矩形，
-        #    出现一条先向右→再向上→最后指向右侧青色圆角虚线矩形的折线箭头：
-        #    位于距左4.5–8.5cm、距上2.5–7cm范围内，为黑色圆角折线箭头，拥有两个拐点；线宽0.5–2磅。
-        #    逐点检查（细则每一个点都必须踩到，办公软件实际渲染为准；同一条箭头必须同时满足所有条件）：
-        #    ① 起点=左侧"Multivariate Time Series"文本所在的圆角矩形（left_box）；
-        #    ② 折线箭头（末端带箭头）；
-        #    ③ 方向：先向右→再向上→最后向右；
-        #    ④ 最后指向右侧"青色圆角虚线矩形"（seq_box）——该目标框须为圆角矩形、青绿色边线、虚线；
-        #    ⑤ 距左4.5–8.5cm、距上2.5–7.0cm 范围内；
-        #    ⑥ 黑色；
-        #    ⑦ 圆角折线箭头（办公软件里的"圆角"呈现：bentConnector*/curvedConnector* 连接符、
-        #       或 FREEFORM 路径含 a:arcTo 弧段、或线段显式 <a:round/> 连接样式）；
-        #    ⑧ 两个拐点；⑨ 线宽0.5–2磅。
-        cyan_arrow_ok = False
-        origin_box = self.key.get('left_box')
-        target_box = self.key.get('seq_box')
-        if origin_box is not None and target_box is not None:
-            # ①：origin_box 由 rrects 筛出，是圆角矩形（细则要求"文本所在的圆角矩形"，已满足）
-            # ④：目标框须为圆角+青绿色边线+虚线
-            target_qualifies = (is_rounded_rect(target_box)
-                                and color_is_cyan_green(get_line_color(target_box))
-                                and self.is_dashed_outline(target_box))
-            if target_qualifies:
-                obl, obt, obw, obh = shape_bounds(origin_box)
-                tbl, tbt, tbw, tbh = shape_bounds(target_box)
-                tol = 0.6
-                lx0, lx1, ty0, ty1 = 4.5, 8.5, 2.5, 7.0
-                for s in self.shapes:
-                    # 线状形状（连接符/自由线/线形状）
-                    if not (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                            or 'line' in shape_name_or_prst(s)
-                            or 'connector' in shape_name_or_prst(s)):
-                        continue
-                    # ⑥ 黑色（含主题色 tx1 / 继承默认线条色的深色）
-                    if not line_color_is_black_or_dark(s):
-                        continue
-                    # ⑨ 线宽0.5–2磅（含继承主题/默认线宽的形状）
-                    if not line_width_in_range(s, 0.5, 2):
-                        continue
-                    # ⑤ 范围
-                    l, t, w, h = shape_bounds(s)
-                    if not (lx0 - 0.4 <= l and l + w <= lx1 + 0.4
-                            and ty0 - 0.4 <= t and t + h <= ty1 + 0.4):
-                        continue
-                    # 取 prstGeom prst
-                    prst = ''
-                    try:
-                        g = s._element.spPr.find(qn('a:prstGeom'))
-                        if g is not None:
-                            prst = g.get('prst', '') or ''
-                    except Exception:
-                        pass
-                    # ⑦ "一体的折线箭头"：必须是单一形状本身承载整条两拐点折线，
-                    #      即 bentConnector3/curvedConnector3 连接符、或 FREEFORM+arcTo 弧段、
-                    #      或显式 <a:round/> 连接样式的折线形状。
-                    #    普通 line/straightConnector1 只能画一条直线，天然不具备"两个拐点"，
-                    #    也无法体现"先右→再上→最后右"的折线走向，即使多段拼接看起来像折线，
-                    #    也不算"一体的折线箭头"——因此不再纳入判定，排除拼接线段冒充折线箭头。
-                    is_rounded = False
-                    if prst in ('bentConnector3', 'curvedConnector3'):
-                        # 两个拐点：单一形状边界框需同时跨水平+竖直
-                        if w >= 0.4 and h >= 0.4:
-                            is_rounded = True
-                    elif (prst.startswith('bentConnector')
-                          or prst.startswith('curvedConnector')):
-                        pass
-                    else:
-                        try:
-                            if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                                    and s._element.spPr.find('.//' + qn('a:arcTo')) is not None \
-                                    and w >= 0.4 and h >= 0.4:
-                                is_rounded = True
-                        except Exception:
-                            pass
-                        if not is_rounded:
-                            try:
-                                ln = s._element.spPr.find(qn('a:ln'))
-                                if ln is not None and ln.find(qn('a:round')) is not None \
-                                        and w >= 0.4 and h >= 0.4:
-                                    is_rounded = True
-                            except Exception:
-                                pass
-                    if not is_rounded:
-                        continue
-                    # ② 折线箭头：末端带箭头
-                    if not has_arrow_head(s):
-                        continue
-                    # ①③④ 圆角折线箭头几何走向：起点靠近 origin_box 右缘、终点靠近 target_box 左缘；
-                    #      方向 right→up→right ⇒ 整体从 origin 中心 y 走到 target 中心 y（向上）；
-                    #      箭头形状边界框：左缘≈origin 右缘、右缘≈target 左缘、
-                    #      下缘覆盖 origin 中心 y、上缘覆盖 target 中心 y。
-                    if not (abs(l - (obl + obw)) <= tol):
-                        continue
-                    if not (abs((l + w) - tbl) <= tol):
-                        continue
-                    origin_cy = obt + obh / 2
-                    target_cy = tbt + tbh / 2
-                    if not (target_cy < origin_cy):        # 目标框在起点框上方（"向上"）
-                        continue
-                    if not (t <= target_cy + tol and t + h >= origin_cy - tol):
-                        continue
-                    cyan_arrow_ok = True
-                    break
-        self.add(3, '左侧文本框到右侧青色圆角虚线矩形：黑色圆角折线箭头(先右→上→右、两拐点、0.5–2磅，距左4.5–8.5/距上2.5–7.0cm)', cyan_arrow_ok)
-
-        # 6. 第1页左侧"Multivariate Time Series"文本所在的圆角矩形，
-        #    出现一条先向右→再向下→最后向右指向紫色圆角虚线矩形的折线箭头：
-        #    位于距左5.0–7.6cm、距上9.3–11.2cm范围内，为黑色圆角折线箭头，
-        #    拥有两个拐点；线宽0.5–2磅。
-        #    逐点检查（细则每一个点都必须踩到，办公软件实际渲染为准；同一条箭头必须同时满足所有条件）：
-        #    ① 起点=左侧"Multivariate Time Series"文本所在的圆角矩形（left_box）；
-        #    ② 折线箭头（末端带箭头）；
-        #    ③ 方向：先向右→再向下→最后向右；
-        #    ④ 最后指向右下"紫色圆角虚线矩形"（purple_box）——该目标框须为圆角矩形、紫色边线、虚线；
-        #    ⑤ 距左5.0–7.6cm、距上9.3–11.2cm 范围内；
-        #    ⑥ 黑色；
-        #    ⑦ 圆角折线箭头（办公软件里的"圆角"呈现：bentConnector*/curvedConnector* 连接符、
-        #       或 FREEFORM 路径含 a:arcTo 弧段、或线段显式 <a:round/> 连接样式）；
-        #    ⑧ 两个拐点；⑨ 线宽0.5–2磅。
-        purple_arrow_ok = False
-        origin_box = self.key.get('left_box')
-        purple_target = self.key.get('purple_box')
-        if origin_box is not None and purple_target is not None:
-            # ④ 目标框须为圆角+紫色边线+虚线
-            target_qualifies = (is_rounded_rect(purple_target)
-                                and color_is_purple(get_line_color(purple_target))
-                                and self.is_dashed_outline(purple_target))
-            if target_qualifies:
-                obl, obt, obw, obh = shape_bounds(origin_box)
-                tbl, tbt, tbw, tbh = shape_bounds(purple_target)
-                tol = 0.6
-                lx0, lx1, ty0, ty1 = 5.0, 7.6, 9.3, 11.2
-                for s in self.shapes:
-                    # 线状形状（连接符/自由线/线形状）
-                    if not (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                            or 'line' in shape_name_or_prst(s)
-                            or 'connector' in shape_name_or_prst(s)):
-                        continue
-                    # ⑥ 黑色（含主题色 tx1 / 继承默认线条色的深色）
-                    if not line_color_is_black_or_dark(s):
-                        continue
-                    # ⑨ 线宽0.5–2磅（含继承主题/默认线宽的形状）
-                    if not line_width_in_range(s, 0.5, 2):
-                        continue
-                    # ⑤ 范围
-                    l, t, w, h = shape_bounds(s)
-                    if not (lx0 - 0.4 <= l and l + w <= lx1 + 0.4
-                            and ty0 - 0.4 <= t and t + h <= ty1 + 0.4):
-                        continue
-                    # 取 prstGeom prst
-                    prst = ''
-                    try:
-                        g = s._element.spPr.find(qn('a:prstGeom'))
-                        if g is not None:
-                            prst = g.get('prst', '') or ''
-                    except Exception:
-                        pass
-                    # ⑦⑧ "一体的折线箭头"：单一形状本身承载整条两拐点折线，
-                    #     即 bentConnector3/curvedConnector3 连接符、或 FREEFORM+arcTo 弧段、
-                    #     或显式 <a:round/> 连接样式的折线形状。
-                    is_rounded = False
-                    if prst in ('bentConnector3', 'curvedConnector3'):
-                        # 两个拐点：单一形状边界框需同时跨水平+竖直
-                        if w >= 0.4 and h >= 0.4:
-                            is_rounded = True
-                    elif (prst.startswith('bentConnector')
-                          or prst.startswith('curvedConnector')):
-                        pass
-                    else:
-                        try:
-                            if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                                    and s._element.spPr.find('.//' + qn('a:arcTo')) is not None \
-                                    and w >= 0.4 and h >= 0.4:
-                                is_rounded = True
-                        except Exception:
-                            pass
-                        if not is_rounded:
-                            try:
-                                ln = s._element.spPr.find(qn('a:ln'))
-                                if ln is not None and ln.find(qn('a:round')) is not None \
-                                        and w >= 0.4 and h >= 0.4:
-                                    is_rounded = True
-                            except Exception:
-                                pass
-                    if not is_rounded:
-                        continue
-                    # ② 折线箭头：末端带箭头
-                    if not has_arrow_head(s):
-                        continue
-                    # ①③④ 圆角折线箭头几何走向：起点靠近 origin_box 右缘、终点靠近 purple_box 左缘；
-                    #      方向 right→down→right ⇒ 从 origin 中心 y 走到 target 中心 y（向下）；
-                    #      箭头形状边界框：左缘≈origin 右缘、右缘≈target 左缘、
-                    #      上缘覆盖 origin 中心 y、下缘覆盖 target 中心 y。
-                    if not (abs(l - (obl + obw)) <= tol):
-                        continue
-                    if not (abs((l + w) - tbl) <= tol):
-                        continue
-                    origin_cy = obt + obh / 2
-                    target_cy = tbt + tbh / 2
-                    if not (target_cy > origin_cy):        # 目标框在起点框下方（"向下"）
-                        continue
-                    if not (t <= origin_cy + tol and t + h >= target_cy - tol):
-                        continue
-                    purple_arrow_ok = True
-                    break
-        self.add(3, '左侧文本框到右下紫色圆角虚线矩形：黑色圆角折线箭头(先右→下→右、两拐点、0.5–2磅，距左5.0–7.6/距上9.3–11.2cm)', purple_arrow_ok)
-
-        # 7. 第1页左上方矩形形状。逐点检查：① 位于距左7.8–14.4cm、距上1.2–7.0cm
-        #    （已由 detect_key_objects 的 rrects 约束）；② 圆角矩形；③ 青绿色虚线边框；
-        #    ④ 宽5.5–6.7cm、高3.6–5.6cm（已由 rrects 约束）；⑤ 线宽0.5–2磅；⑥ 内部无填充。
-        seq = self.key.get('seq_box')
-        # 7. 第1页左上方出现矩形形状：位于距左7.8–14.4cm、距上1.2–7.0cm范围内，
-        #    形状为青绿色虚线圆角矩形，宽5.5–6.7cm，高3.6–5.6cm，线宽0.5–2磅；内部无填充。
-        #    逐点检查（细则每一个点都必须踩到，办公软件实际渲染为准）：
-        #    ① 距左7.8–14.4cm；② 距上1.2–7.0cm；③ 圆角矩形；④ 青绿色边线；⑤ 虚线；
-        #    ⑥ 宽5.5–6.7cm；⑦ 高3.6–5.6cm；⑧ 线宽0.5–2磅；⑨ 内部无填充。
-        seq = None
-        for s in self.shapes:
-            if not looks_like_rect(s):                                # ③ 前提：矩形
-                continue
-            if not is_rounded_rect(s):                                # ③ 圆角矩形
-                continue
-            if not box_in(s, left=(7.8, 14.4), top=(1.2, 7.0),         # ①② 位置
-                          width=(5.5, 6.7), height=(3.6, 5.6)):        # ⑥⑦ 尺寸
-                continue
-            if not color_is_cyan_green(get_line_color(s)):            # ④ 青绿色边线
-                continue
-            if not self.is_dashed_outline(s):                         # ⑤ 虚线
-                continue
-            lw = get_line_width_pt(s)
-            if not (lw is not None and in_range(lw, 0.5, 2)):         # ⑧ 线宽0.5–2磅
-                continue
-            if not fill_is_visually_empty(s):                         # ⑨ 内部无填充
-                continue
-            seq = s
-            break
-        # 更新 key，便于后续依赖此框的检查（如 Sequence Encoder 文本、GRU 矩形等）
-        self.key['seq_box'] = seq
-        seq_ok = seq is not None
-        self.add(5, '左上青绿色虚线圆角矩形：距左7.8–14.4/距上1.2–7.0cm、宽5.5–6.7/高3.6–5.6cm、线宽0.5–2磅、内部无填充', seq_ok)
-
-        # 8. 第1页上方"Sequence Encoder"文本。逐点检查：
-        #    ① 位于青色虚线圆角矩形上方；② 文本内容仅排列为1行；
-        #    ③ 字体 Arial 或 Calibri；④ 字号12–18磅；⑤ 加粗；⑥ 颜色为青绿色。
-        seq_text_ok = False
-        if seq is not None:
-            bl, bt, bw, bh = shape_bounds(seq)
-            for s in self.find_text('Sequence Encoder'):
-                # ② 仅1行
-                if rendered_line_count(s) != 1:
-                    continue
-                # ① 位于青色框上方：文本中心在框顶边以上，且横向与框重叠（属于该框）
-                cx, cy = center(s)
-                tl, _tt, tw, _th = shape_bounds(s)
-                horiz_overlap = min(tl + tw, bl + bw) - max(tl, bl) > 0
-                if not (cy <= bt + 0.1 and horiz_overlap):
-                    continue
-                # ③④⑤⑥ 字体 Arial/Calibri、字号12–18磅、加粗、青绿色
-                if text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 18), bold=True,
-                                color_pred=color_is_cyan_green):
-                    seq_text_ok = True
-                    break
-        self.add(3, '青色框上方"Sequence Encoder"：仅1行、Arial/Calibri 12–18磅加粗青绿色', seq_text_ok)
-
-        # 9. 第1页"Sequence Encoder"下方两个圆角矩形。逐点检查：
-        #    ① 位于青色虚线圆角矩形内；② 浅青色填充；③ 实线（非虚线）；④ 圆角矩形；
-        #    ⑤ 边线青绿色单实线；⑥ 线宽0.5–2.0磅；⑦ 两个矩形内部均含"Gated Recurrent Unit"文本；
-        #    ⑧ 文本分两行排列；⑨ 字号9–18磅；⑩ 加粗；⑪ 颜色黑色。
-        good_gru = []
-        if seq is not None:
-            bl, bt, bw, bh = shape_bounds(seq)
-            for txt in self.find_text('Gated Recurrent Unit'):
-                # ⑧⑨⑩⑪ 文本：两行、字号9–18磅、加粗、黑色
-                if rendered_line_count(txt) != 2:
-                    continue
-                if not text_font_ok(txt, size=(9, 18), bold=True, color_pred=color_is_black_or_dark):
-                    continue
-                # ②③④⑤⑥ 承载文本的圆角矩形：浅青填充、实线、青绿色单实线、线宽0.5–2磅
-                def _rect_pred(r):
-                    lw = get_line_width_pt(r)
-                    return (color_is_light_cyan(get_fill_color(r))       # 浅青色填充
-                            and not self.is_dashed_outline(r)             # 实线（非虚线）
-                            and color_is_cyan_green(get_line_color(r))    # 青绿色边线
-                            and line_is_single_solid(r)                   # 单实线
-                            and lw is not None and in_range(lw, 0.5, 2))  # 线宽0.5–2.0磅
-                rect = self.rect_covering_text(txt, _rect_pred)           # ④ 圆角矩形（函数只取圆角矩形）
-                if rect is None:
-                    continue
-                # ① 位于青色虚线圆角矩形内
-                cx, cy = center(rect)
-                if bl <= cx <= bl + bw and bt <= cy <= bt + bh and rect not in good_gru:
-                    good_gru.append(rect)
-        gru_ok = len(good_gru) >= 2
-        self.add(5, '青色框内两个浅青实线圆角矩形(青绿单实线0.5–2磅)，各含两行9–18磅加粗黑色"Gated Recurrent Unit"', gru_ok)
-
-        # 10. 第1页"Gated Recurrent Unit"文本右侧折线箭头。逐点检查（细则每一个点都必须踩到，
-        #    办公软件实际渲染为准；同一条箭头必须同时满足所有条件）：
-        #    ① 位于距左12.9–15.5cm、距上2.8–5.5cm范围内；
-        #    ② 黑色；
-        #    ③ 线宽0.5–2磅；
-        #    ④ 折线箭头（末端带箭头）；
-        #    ⑤ 圆角折线箭头（办公软件里"圆角"呈现：bentConnector3/curvedConnector3 连接符、
-        #       或 FREEFORM 路径含 a:arcTo 弧段、或折线形状显式带 <a:round/> 连接样式）；
-        #    ⑥ 两个拐点（bentConnector3/curvedConnector3 天然=2 拐点；三段独立 prst="line"
-        #       直角相接不算圆角折线，此处不予认可）；
-        #    ⑦ 方向：先向右→再向下→最后指向右侧（起点靠区域左上、终点在右侧且位于起点下方）。
-        gru_arrow_ok = False
-        lx0, lx1, ty0, ty1 = 12.9, 15.5, 2.8, 5.5
-        tol = 0.4
-        for s in self.shapes:
-            if not (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s)
-                    or 'connector' in shape_name_or_prst(s)):
-                continue
-            # ② 黑色（含主题色 tx1 / 继承默认线条色的深色）
-            if not line_color_is_black_or_dark(s):
-                continue
-            # ③ 线宽0.5–2磅（含继承主题/默认线宽）
-            if not line_width_in_range(s, 0.5, 2):
-                continue
-            # ① 位置
-            l, t, w, h = shape_bounds(s)
-            if not (lx0 - tol <= l and l + w <= lx1 + tol
-                    and ty0 - tol <= t and t + h <= ty1 + tol):
-                continue
-            # ⑤ "一体的折线箭头"：必须是单一形状本身承载整条两拐点折线，
-            #      即 bentConnector3/curvedConnector3 连接符、或 FREEFORM+arcTo 弧段、
-            #      或显式 <a:round/> 连接样式的折线形状。
-            #    普通 line/straightConnector1 只能画一条直线，天然不具备"两个拐点"，
-            #    也无法体现"先右→再下→最后右"的折线走向，多段拼接冒充折线箭头不予认可。
-            prst = ''
-            try:
-                g = s._element.spPr.find(qn('a:prstGeom'))
-                if g is not None:
-                    prst = g.get('prst', '') or ''
-            except Exception:
-                pass
-            is_rounded = False
-            if prst in ('bentConnector3', 'curvedConnector3'):
-                if w >= 0.4 and h >= 0.4:
-                    is_rounded = True
-            elif (prst.startswith('bentConnector')
-                  or prst.startswith('curvedConnector')):
-                # bentConnector2=1拐点、bentConnector4=3拐点 —— 不满足"两拐点"
-                pass
-            else:
-                try:
-                    if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                            and s._element.spPr.find('.//' + qn('a:arcTo')) is not None \
-                            and w >= 0.4 and h >= 0.4:
-                        is_rounded = True
-                except Exception:
-                    pass
-                if not is_rounded:
-                    try:
-                        ln = s._element.spPr.find(qn('a:ln'))
-                        if ln is not None and ln.find(qn('a:round')) is not None \
-                                and w >= 0.4 and h >= 0.4:
-                            is_rounded = True
-                    except Exception:
-                        pass
-            if not is_rounded:
-                continue
-            # ④ 折线箭头：末端带箭头
-            if not has_arrow_head(s):
-                continue
-            xfrm = s._element.find('.//' + qn('a:xfrm'))
-            flip_h = xfrm is not None and xfrm.get('flipH') == '1'
-            flip_v = xfrm is not None and xfrm.get('flipV') == '1'
-            # ⑦ 方向"右→下→右"：末端在右下、起点在左上；
-            #    箭头形状为单一折线，其 bbox 的右下角=末端(右下)，左上角=起点(左上)。
-            #    右→下→右 意味着终点 y 大于起点 y，且终点 x 大于起点 x（整体向右下延伸）。
-            #    对 bent/curved connector，flip 属性会改变实际走向，这里以 bbox+flip 综合判定：
-            #    - 未 flipH 且未 flipV：起点在左上，末端在右下 → 满足"右→下→右"
-            if flip_h or flip_v:
-                # 走向被翻转，不再是"右→下→右"
-                continue
-            gru_arrow_ok = True
-            break
-        self.add(3, 'GRU右侧黑色圆角折线箭头：先右→下→右、两拐点、线宽0.5–2磅(距左12.9–15.5/距上2.8–5.5cm)', gru_arrow_ok)
-
-        # 11. 第1页左侧紫色矩形形状。逐点检查：① 位于距左7.2–13.8cm、距上7.5–12.8cm
-        #    （已由 detect_key_objects 的 rrects 约束）；② 圆角矩形；③ 虚线；④ 紫色边线；
-        #    ⑤ 宽5–6cm、高4.7–5.6cm（已由 rrects 约束）；⑥ 线宽0.5–2磅；
-        #    ⑦ 填充为无填充或淡紫色（以办公软件实际渲染为准：近白视为无填充）。
-        pur = self.key.get('purple_box')
-        pur_ok = False
-        if pur is not None:
-            lw = get_line_width_pt(pur)
-            pur_ok = (is_rounded_rect(pur)                              # 圆角矩形
-                      and self.is_dashed_outline(pur)                   # 虚线
-                      and color_is_purple(get_line_color(pur))          # 紫色边线
-                      and lw is not None and in_range(lw, 0.5, 2)       # 线宽0.5–2磅
-                      and (fill_is_visually_empty(pur)                  # 无填充（含近白视觉无填充）
-                           or color_is_light_purple(get_fill_color(pur))))  # 或淡紫色
-        self.add(5, '左侧紫色虚线圆角矩形：位置尺寸达标、线宽0.5–2磅、无填充或淡紫色填充', pur_ok)
-
-        # 12. 第1页左侧紫色虚线矩形内部"2. Pattern Encoder"文本。逐点检查：
-        #    ① 位于紫色矩形内部；② 位于矩形顶部；③ 文本仅1行；
-        #    ④ 字体 Arial 或 Calibri；⑤ 字号12–18磅；⑥ 加粗；⑦ 字体颜色为紫色。
-        pat_ok = False
-        if pur is not None:
-            pl, pt_, pw, ph = shape_bounds(pur)
-            for s in self.find_text('2. Pattern Encoder'):
-                # ③ 仅1行
-                if rendered_line_count(s) != 1:
-                    continue
-                sl, st, sw, shh = shape_bounds(s)
-                cx, cy = center(s)
-                # ① 位于紫色矩形内部（文本中心落在框内）
-                inside = pl <= cx <= pl + pw and pt_ <= cy <= pt_ + ph
-                # ② 位于矩形顶部（文本中心在矩形上半部）
-                at_top = cy <= pt_ + ph / 2
-                if not (inside and at_top):
-                    continue
-                # ④⑤⑥⑦ 字体 Arial/Calibri、字号12–18磅、加粗、紫色
-                if text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 18), bold=True,
-                                color_pred=color_is_purple):
-                    pat_ok = True
-                    break
-        self.add(3, '紫色框内顶部"2. Pattern Encoder"：仅1行、Arial/Calibri 12–18磅加粗紫色', pat_ok)
-
-        # 13. 第1页"Gated Recurrent Unit"下方矩形组合图块（方格矩阵）。逐点检查：
-        #    ① 位于紫色虚线矩形中部，距左7.8–13.8cm、距上8.7–12.5cm；② 含紫色、浅紫色、白色小方格；
-        #    ③ 矩阵5列×3行；④ 边线为紫色；⑤ 线宽0.5–1磅。
-        cells = []
-        for s in sh:
-            if not looks_like_rect(s):
-                continue
-            if not box_in(s, left=(7.8, 13.8), top=(8.7, 12.5), width=(0.15, 1.5), height=(0.15, 1.5)):
-                continue
-            lw = get_line_width_pt(s)
-            # ④ 紫色边线；⑤ 线宽0.5–1磅
-            if not (color_is_purple(get_line_color(s)) and lw is not None and in_range(lw, 0.5, 1)):
-                continue
-            cells.append(s)
-
-        # ③ 5列×3行：按左/上坐标聚类出的列数、行数
-        def _cluster(vals, tol=0.25):
-            groups = []
-            for v in sorted(vals):
-                if not groups or v - groups[-1][-1] > tol:
-                    groups.append([v])
-                else:
-                    groups[-1].append(v)
-            return len(groups)
-        cols = _cluster([shape_bounds(s)[0] for s in cells])
-        rows = _cluster([shape_bounds(s)[1] for s in cells])
-        grid_ok = (cols == 5 and rows == 3 and len(cells) >= 15)
-
-        # ② 三种填充：紫色、浅紫色、白色均出现
-        has_purple = any(color_is_purple(get_fill_color(s)) for s in cells)
-        has_light_purple = any(color_is_light_purple(get_fill_color(s)) for s in cells)
-        has_white = any(color_is_white_or_near(get_fill_color(s)) for s in cells)
-        colors_ok = has_purple and has_light_purple and has_white
-
-        self.add(3, '紫色框中部矩形组合图块：5列×3行方格、紫色细线(0.5–1磅)、含紫/浅紫/白三色', grid_ok and colors_ok)
-
-        # 14. 第1页"Temporal Embedding"文本。逐点检查：
-        #    ① 位于紫色方格矩阵下方；② 文本分两行排列；③ 字体 Arial 或 Calibri；
-        #    ④ 字号9–18磅；⑤ 颜色黑色；⑥ 加粗；⑦ 水平居中。
-        # 矩阵底边（cells 来自第13项，取其最大下边界作为"下方"的参照）
-        matrix_bottom = max((shape_bounds(s)[1] + shape_bounds(s)[3] for s in cells), default=None)
-        temp_ok = False
-        for s in self.find_text('Temporal Embedding'):
-            # ② 两行
-            if rendered_line_count(s) != 2:
-                continue
-            # ① 位于矩阵下方：文本中心在矩阵底边之下
-            _cx, cy = center(s)
-            if matrix_bottom is not None and cy <= matrix_bottom:
-                continue
-            # ③④⑤⑥⑦ Arial/Calibri、9–18磅、黑色、加粗、水平居中
-            if text_font_ok(s, fonts=('arial', 'calibri'), size=(9, 18), bold=True,
-                            color_pred=color_is_black_or_dark, center_align=True):
-                temp_ok = True
-                break
-        self.add(3, '矩阵下方"Temporal Embedding"：两行、Arial/Calibri 9–18磅加粗黑色居中', temp_ok)
-
-        # 15. 第1页紫色虚线矩形右侧折线箭头。逐点检查（细则每一个点都必须踩到，
-        #    办公软件实际渲染为准；同一条箭头必须同时满足所有条件）：
-        #    ① 位于距左12.7–15.5cm、距上6.8–10.3cm范围内；
-        #    ② 紫色；
-        #    ③ 线宽0.5–2磅；
-        #    ④ 折线箭头（末端带箭头）；
-        #    ⑤ 虚线（形状自身 <a:prstDash> 为真正的虚线；不接受"透明实线 + 拼装短线段"）；
-        #    ⑥ 圆角箭头（办公软件里"圆角"呈现：bentConnector3/curvedConnector3 连接符、
-        #       或 FREEFORM 路径含 a:arcTo 弧段、或折线形状显式带 <a:round/> 连接样式）；
-        #    ⑦ 两个拐点（bentConnector3/curvedConnector3 天然=2 拐点；bentConnector2/4 排除）；
-        #    ⑧ 方向：先向右→再向上→最后指向右侧（起点靠区域左下、终点在右上）。
-        pur_arrow_ok = False
-        lx0, lx1, ty0, ty1 = 12.7, 15.5, 6.8, 10.3
-        tol = 0.4
-        for s in self.shapes:
-            if not (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s)
-                    or 'connector' in shape_name_or_prst(s)):
-                continue
-            # ② 紫色
-            if not color_is_purple(get_line_color(s)):
-                continue
-            # ③ 线宽0.5–2磅（含继承主题/默认线宽）
-            if not line_width_in_range(s, 0.5, 2):
-                continue
-            # ① 位置
-            l, t, w, h = shape_bounds(s)
-            if not (lx0 - tol <= l and l + w <= lx1 + tol
-                    and ty0 - tol <= t and t + h <= ty1 + tol):
-                continue
-            # ⑤ 虚线：形状自身 prstDash 为真正的虚线
-            if not is_dash_line(s):
-                continue
-            # ⑥ "一体的折线箭头"：必须是单一形状本身承载整条两拐点折线，
-            #      即 bentConnector3/curvedConnector3 连接符、或 FREEFORM+arcTo 弧段、
-            #      或显式 <a:round/> 连接样式的折线形状。
-            #    普通 line/straightConnector1 只能画一条直线，天然不具备"两个拐点"，
-            #    也无法体现"先右→再上→最后右"的折线走向，多段拼接冒充折线箭头不予认可。
-            prst = ''
-            try:
-                g = s._element.spPr.find(qn('a:prstGeom'))
-                if g is not None:
-                    prst = g.get('prst', '') or ''
-            except Exception:
-                pass
-            is_rounded = False
-            if prst in ('bentConnector3', 'curvedConnector3'):
-                if w >= 0.4 and h >= 0.4:
-                    is_rounded = True
-            elif (prst.startswith('bentConnector')
-                  or prst.startswith('curvedConnector')):
-                pass
-            else:
-                try:
-                    if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                            and s._element.spPr.find('.//' + qn('a:arcTo')) is not None \
-                            and w >= 0.4 and h >= 0.4:
-                        is_rounded = True
-                except Exception:
-                    pass
-                if not is_rounded:
-                    try:
-                        ln = s._element.spPr.find(qn('a:ln'))
-                        if ln is not None and ln.find(qn('a:round')) is not None \
-                                and w >= 0.4 and h >= 0.4:
-                            is_rounded = True
-                    except Exception:
-                        pass
-            if not is_rounded:
-                continue
-            # ④ 折线箭头：末端带箭头
-            if not has_arrow_head(s):
-                continue
-            # ⑧ 方向"右→上→右"：末端在右上、起点在左下；
-            #    对 bent/curved connector，flip 属性会改变实际走向，这里以 flip 综合判定。
-            #    未 flipH 未 flipV：起点在 bbox 左下、末端在右上 → 满足"右→上→右"。
-            xfrm = s._element.find('.//' + qn('a:xfrm'))
-            flip_h = xfrm is not None and xfrm.get('flipH') == '1'
-            flip_v = xfrm is not None and xfrm.get('flipV') == '1'
-            # "右→上→右"要求整体向右+向上：意味着相对未 flip 的 bentConnector3
-            # (起点左上→终点右下) 需要 flipV=1；flipH 不能变（否则末段变向左）。
-            if flip_h:
-                continue
-            if not flip_v:
-                continue
-            pur_arrow_ok = True
-            break
-        self.add(3, '紫色框右侧紫色虚线圆角折线箭头：先右→上→右、两拐点、线宽0.5–2磅(距左12.7–15.5/距上6.8–10.3cm)', pur_arrow_ok)
-
-        # 16. 第1页橙色矩形形状。逐点检查：① 位于距左15.1–29.7cm、距上1.2–9.3cm
-        #    （已由 detect_key_objects 的 rrects 约束）；② 圆角矩形；③ 虚线；④ 橙色边线；
-        #    ⑤ 宽13–15cm、高6–8cm（已由 rrects 约束）；⑥ 线宽0.5–2磅；
-        #    ⑦ 内部无填充或填充为浅橙色（以办公软件实际渲染为准：近白视为无填充）。
-        org = self.key.get('orange_box')
-        org_ok = False
-        if org is not None:
-            lw = get_line_width_pt(org)
-            org_ok = (is_rounded_rect(org)                             # 圆角矩形
-                      and self.is_dashed_outline(org)                  # 虚线
-                      and color_is_orange(get_line_color(org))         # 橙色边线
-                      and lw is not None and in_range(lw, 0.5, 2)      # 线宽0.5–2磅
-                      and (fill_is_visually_empty(org)                 # 无填充（含近白视觉无填充）
-                           or color_is_light_orange(get_fill_color(org))))  # 或浅橙色
-        self.add(5, '橙色虚线圆角矩形：位置尺寸达标、线宽0.5–2磅、无填充或浅橙色填充', org_ok)
-
-        # 17. 第1页"3. Fusion & Representation Learning"文本。逐点检查：
-        #    ① 位于橙色虚线矩形顶部上方；② 文本仅1行；③ 字体 Arial 或 Calibri；
-        #    ④ 字号12–18磅；⑤ 加粗；⑥ 颜色橙色；⑦ 水平居中。
-        fusion_ok = False
-        if org is not None:
-            ol, ot, ow, oh = shape_bounds(org)
-            for s in self.find_text('3. Fusion & Representation Learning'):
-                # ② 仅1行
-                if rendered_line_count(s) != 1:
-                    continue
-                sl, st, sw, sh2 = shape_bounds(s)
-                cx, cy = center(s)
-                # ① 位于橙色框顶部上方：文本中心在框顶边以上，且横向与框重叠
-                horiz_overlap = min(sl + sw, ol + ow) - max(sl, ol) > 0
-                if not (cy <= ot + 0.1 and horiz_overlap):
-                    continue
-                # ③④⑤⑥⑦ Arial/Calibri、12–18磅、加粗、橙色、水平居中
-                if text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 18), bold=True,
-                                color_pred=color_is_orange, center_align=True):
-                    fusion_ok = True
-                    break
-        self.add(3, '橙色框顶部上方"3. Fusion & Representation Learning"：仅1行、Arial/Calibri 12–18磅加粗橙色居中', fusion_ok)
-
-        # 18. 第1页橙色虚线矩形中4个大小一致的矩形形状。逐点检查：
-        #    ① 橙框内有4个矩形；② 大小一致；③ 位于同一水平线上；④ 间距相等；
-        #    ⑤ 圆角矩形；⑥ 浅橙色填充；⑦ 边线单实线；⑧ 线宽0.5–2磅；
-        #    ⑨ 4个矩形从左至右顶部依次出现文本 Concatenate/Self-Attention/Feed-Forward/Layer Normalization。
-        module_names = ['Concatenate', 'Self-Attention', 'Feed-Forward', 'Layer Normalization']
-        modules_ok = False
-        modules = []
-        if org is not None:
-            ol, ot, ow, oh = shape_bounds(org)
-            cand = []
-            for s in sh:
-                if s is org or not (looks_like_rect(s) and is_rounded_rect(s)):  # ⑤ 圆角矩形
-                    continue
-                cx, cy = center(s)
-                if not (ol <= cx <= ol + ow and ot <= cy <= ot + oh):           # ① 橙框内
-                    continue
-                lw = get_line_width_pt(s)
-                if not (color_is_orangey_light_fill(get_fill_color(s))          # ⑥ 浅橙色填充
-                        and line_is_single_solid(s)                             # ⑦ 单实线
-                        and color_is_orange(get_line_color(s))                  # 边线橙色
-                        and lw is not None and in_range(lw, 0.5, 2)):           # ⑧ 线宽0.5–2磅
-                    continue
-                cand.append(s)
-            modules = sorted(cand, key=lambda s: center(s)[0])
-            if len(modules) >= 4:
-                modules = modules[:4]
-                ws = [shape_bounds(s)[2] for s in modules]
-                hs = [shape_bounds(s)[3] for s in modules]
-                cys = [center(s)[1] for s in modules]
-                cxs = [center(s)[0] for s in modules]
-                # ② 大小一致（宽高相差在 0.3cm 内）
-                size_same = (max(ws) - min(ws) <= 0.3) and (max(hs) - min(hs) <= 0.3)
-                # ③ 同一水平线（中心 y 相差 <0.5cm）
-                same_line = max(cys) - min(cys) < 0.5
-                # ④ 间距相等（相邻中心间距相差在 0.3cm 内）
-                gaps = [cxs[i + 1] - cxs[i] for i in range(3)]
-                equal_gap = (max(gaps) - min(gaps)) <= 0.3
-                # ⑨ 从左至右每个矩形顶部依次出现对应文本
-                order_text_ok = True
-                for rect, name in zip(modules, module_names):
-                    rl, rt, rw, rh = shape_bounds(rect)
-                    hit = False
-                    for s in self.find_text(name):
-                        tcx, tcy = center(s)
-                        if rl <= tcx <= rl + rw and rt - 0.3 <= tcy <= rt + rh / 2:
-                            hit = True
-                            break
-                    if not hit:
-                        order_text_ok = False
-                        break
-                modules_ok = size_same and same_line and equal_gap and order_text_ok
-        self.add(5, '橙框内4个大小一致、等间距、同水平线的浅橙圆角矩形(单实线0.5–2磅)，顶部依次为4个模块标题', modules_ok)
-
-        # 19. 4个模块文本的字体/字号/颜色/行数。逐点检查：
-        #    ① 4个文本字体为 Arial 或 Calibri；② 字号10–15磅；③ 颜色黑色；
-        #    ④ Concatenate 仅1行；⑤ 其余3个（Self-Attention/Feed-Forward/
-        #       Layer Normalization）各分两行（要求文本框可见文本去掉空白后精确等于给定名字，
-        #       不接受额外内容）。
-        def _text_equals(shape, name):
-            raw = ''.join(shape_text(shape).split())
-            target = ''.join(name.split())
-            return raw == target
-        text_ok = True
-        for name in module_names:
-            matched = [s for s in self.shapes if _text_equals(s, name)]
-            if not matched:
-                text_ok = False
-                break
-            s = matched[0]
-            # ①②③ Arial/Calibri、10–15磅、黑色
-            if not text_font_ok(s, fonts=('arial', 'calibri'), size=(10, 15),
-                                color_pred=color_is_black_or_dark):
-                text_ok = False
-                break
-            # ④⑤ 行数：Concatenate=1，其余=2
-            want_lines = 1 if name == 'Concatenate' else 2
-            if rendered_line_count(s) != want_lines:
-                text_ok = False
-                break
-        self.add(3, '4个模块文本：Arial/Calibri 10–15磅黑色，Concatenate 1行、其余各名字2行', text_ok)
-
-        # 20. 第1页"Concatenate"文本下方2列矩形组合阵列。逐点检查：
-        #    ① 位于橙色矩形内部下方（Concatenate 文本下方）；② 8个橙色小方格矩形；
-        #    ③ 分两列排布；④ 两列不重合且留有间距；⑤ 间距之间出现4条直线相连，线宽0.5–1磅；
-        #    ⑥ 阵列整体宽1.5–2.5cm、高1.6–3.3cm。
-        def _is_line_like(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        concat_ok = False
-        cc = self.find_text('Concatenate')
-        if org is not None and cc:
-            ol, ot, ow, oh = shape_bounds(org)
-            cl, ct, cw, ch = shape_bounds(cc[0])
-            cc_cx = cl + cw / 2
-            below_top = ct + ch  # Concatenate 文本底边，阵列在其下方
-            # ② 橙色小方格：橙色（填充或边线）、位于橙框内、在文本下方、且横向靠近 Concatenate 列
-            cells = [s for s in sh
-                     if looks_like_rect(s) and s is not org
-                     and (color_is_orange(get_line_color(s)) or color_is_orange(get_fill_color(s))
-                          or color_is_light_orange(get_fill_color(s)))
-                     and ol <= center(s)[0] <= ol + ow and ot <= center(s)[1] <= ot + oh
-                     and center(s)[1] >= below_top
-                     and abs(center(s)[0] - cc_cx) <= ow / 3
-                     and shape_bounds(s)[2] < 1.3 and shape_bounds(s)[3] < 1.3]
-            if len(cells) == 8:
-                # ③ 两列：按中心 x 聚成的列数
-                def _cluster(vals, tol=0.25):
-                    groups = []
-                    for v in sorted(vals):
-                        if not groups or v - groups[-1][-1] > tol:
-                            groups.append([v])
-                        else:
-                            groups[-1].append(v)
-                    return groups
-                col_groups = _cluster([center(s)[0] for s in cells])
-                two_cols = len(col_groups) == 2
-                gap_ok = False
-                conn_ok = False
-                if two_cols:
-                    left_col = [s for s in cells if center(s)[0] in col_groups[0] or round(center(s)[0], 4) <= col_groups[0][-1] + 0.01]
-                    # ④ 两列不重合且留有间距：左列右缘 < 右列左缘
-                    left_right = max(shape_bounds(s)[0] + shape_bounds(s)[2]
-                                     for s in cells if center(s)[0] <= col_groups[0][-1] + 0.01)
-                    right_left = min(shape_bounds(s)[0]
-                                     for s in cells if center(s)[0] >= col_groups[1][0] - 0.01)
-                    gap_ok = right_left > left_right + 0.02
-                    # ⑤ 间距之间4条直线相连、线宽0.5–1磅
-                    conn = [s for s in sh if _is_line_like(s)
-                            and get_line_width_pt(s) is not None and in_range(get_line_width_pt(s), 0.5, 1)
-                            and left_right - 0.1 <= center(s)[0] <= right_left + 0.1]
-                    conn_ok = len(conn) >= 4
-                # ⑥ 阵列整体尺寸
-                l = min(shape_bounds(s)[0] for s in cells)
-                r = max(shape_bounds(s)[0] + shape_bounds(s)[2] for s in cells)
-                t = min(shape_bounds(s)[1] for s in cells)
-                b = max(shape_bounds(s)[1] + shape_bounds(s)[3] for s in cells)
-                size_ok = in_range(r - l, 1.5, 2.5) and in_range(b - t, 1.6, 3.3)
-                concat_ok = two_cols and gap_ok and conn_ok and size_ok
-        self.add(3, 'Concatenate下方阵列：橙框内8个橙色小方格分两列有间距、间距间4条连线(0.5–1磅)、整体1.5–2.5×1.6–3.3cm', concat_ok)
-
-        # 21. 第1页"Self-Attention"文本下方组合形状。逐点检查：
-        #    ① 位于 Self-Attention 文本下方；② 橙色节点圆点；③ 竖向线条；④ 底部小矩形；
-        #    ⑤ 三条虚线连接线；⑥ 三条虚线箭头；⑦ 整体宽1.8–2.4cm、高1.7–2.8cm；
-        #    ⑧ 线条为橙色；⑨ 线宽0.5–1.25磅。
-        def _is_line_like2(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        def _is_dot(s):
-            n = shape_name_or_prst(s)
-            return 'ellipse' in n or 'oval' in n or 'circle' in n
-
-        att_ok = False
-        sa = self.find_text('Self-Attention')
-        if org is not None and sa:
-            ol, ot, ow, oh = shape_bounds(org)
-            stx, sty, stw, sth = shape_bounds(sa[0])
-            below = sty + sth
-            sa_cx = stx + stw / 2
-            # 组合形状构件：位于橙框内、Self-Attention 文本下方、横向靠近该列
-            comp = [s for s in sh if s is not org
-                    and ol <= center(s)[0] <= ol + ow and ot <= center(s)[1] <= ot + oh
-                    and center(s)[1] >= below and abs(center(s)[0] - sa_cx) <= 1.3]
-            if comp:
-                dots = [s for s in comp if _is_dot(s) and
-                        (color_is_orange(get_line_color(s)) or color_is_orange(get_fill_color(s)))]
-                rects = [s for s in comp if looks_like_rect(s) and not _is_dot(s)
-                         and shape_bounds(s)[2] < 2.5 and shape_bounds(s)[3] < 1.0]
-                lines = [s for s in comp if _is_line_like2(s)]
-                # ⑧⑨ 线条橙色、线宽0.5–1.25磅
-                lines = [s for s in lines if color_is_orange(get_line_color(s))
-                         and get_line_width_pt(s) is not None and in_range(get_line_width_pt(s), 0.5, 1.25)]
-                vlines = [s for s in lines if is_vertical(s)]
-                # ⑤ 三条虚线连接线；⑥ 三条虚线箭头
-                dashed_conn = [s for s in lines if is_dash_line(s) and not has_arrow_head(s)]
-                dashed_arrows = [s for s in lines if is_dash_line(s) and has_arrow_head(s)]
-                # ⑦ 整体尺寸（组合全部构件包围盒）
-                elems = dots + rects + lines
-                if elems:
-                    l = min(shape_bounds(s)[0] for s in elems)
-                    r = max(shape_bounds(s)[0] + shape_bounds(s)[2] for s in elems)
-                    t = min(shape_bounds(s)[1] for s in elems)
-                    b = max(shape_bounds(s)[1] + shape_bounds(s)[3] for s in elems)
-                    size_ok = in_range(r - l, 1.8, 2.4) and in_range(b - t, 1.7, 2.8)
-                else:
-                    size_ok = False
-                att_ok = (len(dots) >= 1                      # ② 橙色节点圆点
-                          and len(vlines) >= 1                # ③ 竖向线条
-                          and len(rects) >= 1                 # ④ 底部小矩形
-                          and len(dashed_conn) >= 3           # ⑤ 三条虚线连接线
-                          and len(dashed_arrows) >= 3         # ⑥ 三条虚线箭头
-                          and size_ok)                        # ⑦ 尺寸
-        self.add(3, 'Self-Attention下方组合：橙色节点+竖线+底部矩形、3条虚线连线+3条虚线箭头、橙色0.5–1.25磅、整体1.8–2.4×1.7–2.8cm', att_ok)
-
-        # 22. 第1页"Feed-Forward"文本下方组合形状。逐点检查：
-        #    ① 位于 Feed-Forward 文本下方；② 6个橙色圆形节点；③ 10–16条橙色连接线；
-        #    ④ 节点呈左三、中一、右二结构分布；⑤ 整体宽1.6–2.5cm、高1.6–2.8cm。
-        def _is_line_like3(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        def _is_dot3(s):
-            n = shape_name_or_prst(s)
-            return 'ellipse' in n or 'oval' in n or 'circle' in n
-
-        ff_ok = False
-        ff = self.find_text('Feed-Forward')
-        if org is not None and ff:
-            ol, ot, ow, oh = shape_bounds(org)
-            ftl, ftt, ftw, fth = shape_bounds(ff[0])
-            below = ftt + fth
-            ff_cx = ftl + ftw / 2
-            comp = [s for s in sh if s is not org
-                    and ol <= center(s)[0] <= ol + ow and ot <= center(s)[1] <= ot + oh
-                    and center(s)[1] >= below and abs(center(s)[0] - ff_cx) <= 1.3]
-            # ② 橙色圆形节点
-            dots = [s for s in comp if _is_dot3(s)
-                    and (color_is_orange(get_line_color(s)) or color_is_orange(get_fill_color(s)))]
-            # ③ 橙色连接线：PPT里该组连线常使用浅橙棕色，按橙色系处理
-            def _is_orange_family(c):
-                if color_is_orange(c) or color_is_light_orange(c):
-                    return True
-                if c is None:
-                    return False
-                r, g, b = c[0], c[1], c[2]
-                return r >= 210 and g >= 160 and b >= 130 and r >= g >= b and r - b >= 35
-            lines = [s for s in comp if _is_line_like3(s) and _is_orange_family(get_line_color(s))]
-            # ④ 左三、中一、右二：按节点中心 x 聚成的列及每列数量
-            def _cluster(vals, tol=0.25):
-                groups = []
-                for v in sorted(vals):
-                    if not groups or v - groups[-1][-1] > tol:
-                        groups.append([v])
-                    else:
-                        groups[-1].append(v)
-                return groups
-            struct_ok = False
-            if dots:
-                cols = _cluster([center(s)[0] for s in dots])
-                counts = [len(c) for c in cols]
-                struct_ok = (counts == [3, 1, 2])
-            # ⑤ 整体尺寸
-            elems = dots + lines
-            if elems:
-                l = min(shape_bounds(s)[0] for s in elems)
-                r = max(shape_bounds(s)[0] + shape_bounds(s)[2] for s in elems)
-                t = min(shape_bounds(s)[1] for s in elems)
-                b = max(shape_bounds(s)[1] + shape_bounds(s)[3] for s in elems)
-                size_ok = in_range(r - l, 1.6, 2.5) and in_range(b - t, 1.6, 2.8)
-            else:
-                size_ok = False
-            ff_ok = (len(dots) == 6                    # ② 6个节点
-                     and 10 <= len(lines) <= 16        # ③ 10–16条连接线
-                     and struct_ok                     # ④ 左三中一右二
-                     and size_ok)                      # ⑤ 尺寸
-        self.add(3, 'Feed-Forward下方组合：6个橙色圆节点(左三中一右二)+10–16条橙色连线、整体1.6–2.5×1.6–2.8cm', ff_ok)
-
-        # 23. 第1页"Layer Normalization"文本下方组合图形/曲线图。逐点检查：
-        #    ① 位于 Layer Normalization 文本下方；② 黑色水平轴；③ 黑色竖轴；
-        #    ④ 橙色曲线；⑤ 曲线类似先上升后下降；⑥ 曲线线宽0.5–1.75磅；
-        #    ⑦ 整体宽1.4–2cm、高1.5–2.2cm。
-        def _is_line_like4(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        ln_ok = False
-        lnorm = self.find_text('Layer Normalization')
-        if org is not None and lnorm:
-            ol, ot, ow, oh = shape_bounds(org)
-            ltl, ltt, ltw, lth = shape_bounds(lnorm[0])
-            below = ltt + lth
-            ln_cx = ltl + ltw / 2
-            comp = [s for s in sh if s is not org and _is_line_like4(s)
-                    and ol <= center(s)[0] <= ol + ow and ot <= center(s)[1] <= ot + oh
-                    and center(s)[1] >= below and abs(center(s)[0] - ln_cx) <= 1.3]
-            # ② 黑色水平轴；③ 黑色竖轴
-            haxis = [s for s in comp if color_is_black_or_dark(get_line_color(s)) and is_horizontal(s)]
-            vaxis = [s for s in comp if color_is_black_or_dark(get_line_color(s)) and is_vertical(s)]
-            # ④ 橙色曲线；⑥ 线宽0.5–1.75磅：曲线可能是描边线条，也可能是无描边/0线宽的 FREEFORM
-            #    （PPT中该曲线用任意多边形实现），0线宽时改按线色或填充色是否橙色判断
-            def _is_orange_curve(s):
-                lw = get_line_width_pt(s)
-                if lw is not None and lw > 0:
-                    return color_is_orange(get_line_color(s)) and in_range(lw, 0.5, 1.75)
-                return s.shape_type == MSO_SHAPE_TYPE.FREEFORM and (
-                    color_is_orange(get_line_color(s)) or color_is_orange(get_fill_color(s)))
-            curve = [s for s in comp if _is_orange_curve(s)]
-            # ⑤ 先上升后下降：多段线条时按 x 排序检查中心 y 先减小(上升)后增大(下降)；
-            #    若曲线是单个填充多边形（无法拆分线段），改为检查其自身形状的上边界
-            #    是否呈"中间高、两端低"的先升后降轮廓（取形状顶点 y 坐标做同样的峰形判断）
-            rise_fall = False
-            if len(curve) >= 3:
-                ys = [center(s)[1] for s in sorted(curve, key=lambda s: center(s)[0])]
-                peak = ys.index(min(ys))  # 最高点(y最小)所在位置
-                if 0 < peak < len(ys) - 1:
-                    up = all(ys[i] >= ys[i + 1] for i in range(peak))          # 峰前上升
-                    down = all(ys[i] <= ys[i + 1] for i in range(peak, len(ys) - 1))  # 峰后下降
-                    rise_fall = up and down
-            elif len(curve) >= 1:
-                pts = freeform_points(curve[0])
-                if pts and len(pts) >= 3:
-                    xs_sorted = sorted(range(len(pts)), key=lambda i: pts[i][0])
-                    ys = [pts[i][1] for i in xs_sorted]
-                    peak = ys.index(min(ys))
-                    if 0 < peak < len(ys) - 1:
-                        # 曲线由多个采样点构成，允许局部小抖动（容差0.1cm），
-                        # 只要求峰值前总体呈上升趋势、峰值后总体呈下降趋势
-                        tol = 0.1
-                        up = all(ys[i] >= ys[i + 1] - tol for i in range(peak))
-                        down = all(ys[i] <= ys[i + 1] + tol for i in range(peak, len(ys) - 1))
-                        rise_fall = up and down
-            # ⑦ 整体尺寸
-            elems = haxis + vaxis + curve
-            if elems:
-                l = min(shape_bounds(s)[0] for s in elems)
-                r = max(shape_bounds(s)[0] + shape_bounds(s)[2] for s in elems)
-                t = min(shape_bounds(s)[1] for s in elems)
-                b = max(shape_bounds(s)[1] + shape_bounds(s)[3] for s in elems)
-                size_ok = in_range(r - l, 1.4, 2.0) and in_range(b - t, 1.5, 2.2)
-            else:
-                size_ok = False
-            ln_ok = (len(haxis) >= 1 and len(vaxis) >= 1 and len(curve) >= 1
-                     and rise_fall and size_ok)
-        self.add(3, 'Layer Normalization下方图形：黑色横轴+竖轴+橙色先升后降曲线(0.5–1.75磅)、整体1.4–2×1.5–2.2cm', ln_ok)
-
-        # 24. 第1页橙色虚线矩形内部三个黑色箭头。逐点检查：
-        #    ① 分别位于 Concatenate→Self-Attention、Self-Attention→Feed-Forward、
-        #       Feed-Forward→Layer Normalization 四个模块矩形之间的三条间隙；
-        #    ② 黑色；③ 水平；④ 箭头朝右；⑤ 线宽1–2磅；⑥ 单条长度0.4–1.1cm。
-        def _is_line_like5(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        internal_ok = False
-        if len(modules) == 4:
-            # 四个模块矩形按 x 排序后，相邻两框之间的间隙区间
-            mods_sorted = sorted(modules, key=lambda s: center(s)[0])
-            gaps = []
-            for i in range(3):
-                lb = shape_bounds(mods_sorted[i])
-                rb = shape_bounds(mods_sorted[i + 1])
-                gap_l = lb[0] + lb[2]          # 左框右缘
-                gap_r = rb[0]                  # 右框左缘
-                gap_cy = (lb[1] + lb[3] / 2 + rb[1] + rb[3] / 2) / 2  # 两框中心 y 均值
-                gaps.append((gap_l, gap_r, gap_cy))
-
-            found = 0
-            for gl, gr, gcy in gaps:
-                for s in sh:
-                    if not _is_line_like5(s):
-                        continue
-                    if not (color_is_black_or_dark(get_line_color(s)) and is_horizontal(s)):  # ②③
-                        continue
-                    if not horizontal_arrow_points_right(s):    # ④ 朝右
-                        continue
-                    lw = get_line_width_pt(s)
-                    if lw is None or not in_range(lw, 1, 2):    # ⑤ 线宽1–2磅
-                        continue
-                    l, t, w, h = shape_bounds(s)
-                    if not in_range(w, 0.4, 1.1):               # ⑥ 单条长度0.4–1.1cm
-                        continue
-                    cx, cy = center(s)
-                    # ① 位于该间隙内、且竖向与模块中心线接近
-                    if gl - 0.25 <= cx <= gr + 0.25 and abs(cy - gcy) <= 0.8:
-                        found += 1
-                        break
-            internal_ok = (found == 3)
-        self.add(3, '橙框内三个黑色水平右箭头：分居4个模块间的3条间隙、线宽1–2磅、单条长0.4–1.1cm', internal_ok)
-
-        # 25. 第1页橙色虚线矩形右侧连接橙框与绿框的箭头。逐点检查：
-        #    ① 位于距左27.8–31cm、距上4.2–5.6cm范围内；② 黑色；③ 水平；
-        #    ④ 箭头朝右；⑤ 线宽1.2–2磅；⑥ 连接橙色虚线矩形与绿色虚线矩形。
-        def _is_line_like6(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        grn = self.key.get('green_box')
-        o2g_ok = False
-        for s in sh:
-            if not _is_line_like6(s):
-                continue
-            l, t, w, h = shape_bounds(s)
-            # ① 范围
-            if not (27.8 - 0.3 <= l and l + w <= 31 + 0.3 and 4.2 - 0.3 <= t and t + h <= 5.6 + 0.3):
-                continue
-            if not (color_is_black_or_dark(get_line_color(s)) and is_horizontal(s)):  # ②③
-                continue
-            if not horizontal_arrow_points_right(s):        # ④ 朝右
-                continue
-            lw = get_line_width_pt(s)
-            if lw is None or not in_range(lw, 1.2, 2):       # ⑤ 线宽1.2–2磅
-                continue
-            # ⑥ 连接橙框与绿框：左端贴近橙框右缘、右端贴近绿框左缘
-            connect_ok = True
-            if org is not None:
-                connect_ok = connect_ok and abs(l - (shape_bounds(org)[0] + shape_bounds(org)[2])) <= 0.6
-            if grn is not None:
-                connect_ok = connect_ok and abs((l + w) - shape_bounds(grn)[0]) <= 0.6
-            if connect_ok:
-                o2g_ok = True
-                break
-        self.add(3, '橙框右侧黑色水平右箭头(线宽1.2–2磅)，连接橙色虚线框与绿色虚线框(距左27.8–31/距上4.2–5.6cm)', o2g_ok)
-
-        # 26. 第1页右上绿色矩形形状。逐点检查：① 位于距左29.2–36.5cm、距上1.6–11cm
-        #    （已由 detect_key_objects 的 rrects 约束）；② 圆角矩形；③ 虚线；④ 绿色边线；
-        #    ⑤ 宽4.5–5.5cm、高6.8–8.3cm（已由 rrects 约束）；⑥ 线宽0.75–2磅；
-        #    ⑦ 内部无填充或浅绿色（以办公软件实际渲染为准：近白视为无填充）。
-        green = self.key.get('green_box')
-        green_ok = False
-        if green is not None:
-            lw = get_line_width_pt(green)
-            green_ok = (is_rounded_rect(green)                          # 圆角矩形
-                        and self.is_dashed_outline(green)               # 虚线
-                        and color_is_green(get_line_color(green))       # 绿色边线
-                        and lw is not None and in_range(lw, 0.75, 2)    # 线宽0.75–2磅
-                        and (fill_is_visually_empty(green)              # 无填充（含近白视觉无填充）
-                             or color_is_light_green(get_fill_color(green))))  # 或浅绿色
-        strict_green_ok = green_ok
-        self.add(5, '右上绿色虚线圆角矩形：位置尺寸达标、线宽0.75–2磅、无填充或浅绿色填充', green_ok)
-
-        # 27. 第1页右上"4. Anomaly Scoring"文本。逐点检查：
-        #    ① 位于绿色虚线矩形上方；② 文本仅1行；③ 字体 Arial 或 Calibri；
-        #    ④ 字号12–18磅；⑤ 加粗；⑥ 颜色绿色。（细则未要求水平居中，故不加约束。）
-        anom_title_ok = False
-        if green is not None:
-            gl, gt, gw, gh = shape_bounds(green)
-            for s in self.find_text('4. Anomaly Scoring'):
-                # ② 仅1行
-                if rendered_line_count(s) != 1:
-                    continue
-                sl, st, sw, sh2 = shape_bounds(s)
-                cx, cy = center(s)
-                # ① 位于绿框上方：文本中心在框顶边以上，且横向与框重叠
-                horiz_overlap = min(sl + sw, gl + gw) - max(sl, gl) > 0
-                if not (cy <= gt + 0.1 and horiz_overlap):
-                    continue
-                # ③④⑤⑥ Arial/Calibri、12–18磅、加粗、绿色
-                if text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 18), bold=True,
-                                color_pred=color_is_green):
-                    anom_title_ok = True
-                    break
-        self.add(3, '绿框上方"4. Anomaly Scoring"：仅1行、Arial/Calibri 12–18磅加粗绿色', anom_title_ok)
-
-        # 28. 第1页右上绿色虚线矩形内部偏上的矩形。逐点检查：
-        #    ① 位于距左29.8–36cm、距上2.8–6cm范围内；② 圆角矩形；③ 浅绿色填充；
-        #    ④ 边线绿色单实线；⑤ 线宽0.5–2磅；⑥ 内部文本"Reconstruction Module"；
-        #    ⑦ 字号10–15磅；⑧ 颜色黑色；⑨ 文本分两行；⑩ 居中对齐。
-        rec_ok = False
-        for s in self.find_text('Reconstruction Module'):
-            # ⑨ 两行；⑩ 居中；⑦ 字号10–15磅；⑧ 黑色
-            if rendered_line_count(s) != 2:
-                continue
-            if not text_font_ok(s, size=(10, 15), color_pred=color_is_black_or_dark, center_align=True):
-                continue
-            # ②③④⑤ 承载文本的圆角矩形：浅绿填充、绿色单实线、线宽0.5–2磅
-            def _rect_pred(r):
-                lw = get_line_width_pt(r)
-                return (color_is_light_green(get_fill_color(r))         # ③ 浅绿填充
-                        and color_is_green(get_line_color(r))           # 绿色边线
-                        and line_is_single_solid(r)                     # ④ 单实线
-                        and not self.is_dashed_outline(r)               # 非虚线
-                        and lw is not None and in_range(lw, 0.5, 2))    # ⑤ 线宽0.5–2磅
-            rect = self.rect_covering_text(s, _rect_pred, margin=0.8)   # ② 圆角矩形
-            # ① 矩形位于指定范围
-            if rect is not None and box_in(rect, left=(29.8, 36), top=(2.8, 6)):
-                rec_ok = True
-                break
-        self.add(3, '绿框内偏上浅绿圆角矩形(绿色单实线0.5–2磅)，内含两行10–15磅黑色居中"Reconstruction Module"', rec_ok)
-
-        # 29. 第1页"Reconstruction Module"文本下方四个小方块。逐点检查：
-        #    ① 位于 Reconstruction Module 文本下方；② 恰好4个；③ 横向排列且同一水平线；
-        #    ④ 大小一致；⑤ 间距相等；⑥ 填充浅绿色或无填充；⑦ 边线绿色单实线；⑧ 线宽0.5–1磅。
-        square_ok = False
-        recs = self.find_text('Reconstruction Module')
-        if green is not None and recs:
-            gl, gt, gw, gh = shape_bounds(green)
-            rl, rt, rw, rh = shape_bounds(recs[0])
-            below = rt + rh
-            rec_cx = rl + rw / 2
-            squares = []
-            for s in sh:
-                if not looks_like_rect(s):
-                    continue
-                cx, cy = center(s)
-                if not (gl <= cx <= gl + gw and below <= cy <= gt + gh):   # 绿框内、文本下方
-                    continue
-                bw2, bh2 = shape_bounds(s)[2], shape_bounds(s)[3]
-                if not (bw2 < 1.2 and bh2 < 1.2):                          # 小方块
-                    continue
-                lw = get_line_width_pt(s)
-                if not (color_is_green(get_line_color(s))                  # ⑦ 绿色边线
-                        and line_is_single_solid(s)                        #    单实线
-                        and lw is not None and in_range(lw, 0.5, 1)        # ⑧ 线宽0.5–1磅
-                        and (color_is_light_green(get_fill_color(s))       # ⑥ 浅绿填充
-                             or fill_is_visually_empty(s))):               #    或无填充
-                    continue
-                squares.append(s)
-            if len(squares) == 4:                                          # ② 恰好4个
-                squares.sort(key=lambda s: center(s)[0])
-                cys = [center(s)[1] for s in squares]
-                cxs = [center(s)[0] for s in squares]
-                ws = [shape_bounds(s)[2] for s in squares]
-                hs = [shape_bounds(s)[3] for s in squares]
-                same_line = max(cys) - min(cys) < 0.15                     # ③ 同水平线
-                size_same = (max(ws) - min(ws) <= 0.1) and (max(hs) - min(hs) <= 0.1)  # ④ 大小一致
-                gaps = [cxs[i + 1] - cxs[i] for i in range(3)]
-                equal_gap = (max(gaps) - min(gaps)) <= 0.12                # ⑤ 间距相等
-                square_ok = same_line and size_same and equal_gap
-        self.add(3, 'Reconstruction Module下方4个小方块：同水平、大小一致、等距、浅绿/无填充、绿色单实线0.5–1磅', square_ok)
-
-        # 30. 第1页右上绿色虚线矩形内部偏下的矩形。逐点检查：
-        #    ① 位于距左29.8–36cm、距上6.5–9.8cm范围内；② 圆角矩形；③ 浅绿色填充；
-        #    ④ 边线绿色单实线；⑤ 线宽0.5–2磅；⑥ 内部文本"Anomaly Score"；
-        #    ⑦ 文本仅1行；⑧ 字号10–15磅；⑨ 颜色黑色。
-        score_ok = False
-        for s in self.find_text('Anomaly Score'):
-            # 排除标题"Anomaly Scoring"
-            if text_contains(s, 'Anomaly Scoring'):
-                continue
-            # ⑦ 仅1行；⑧ 字号10–15磅；⑨ 黑色
-            if rendered_line_count(s) != 1:
-                continue
-            if not text_font_ok(s, size=(10, 15), color_pred=color_is_black_or_dark):
-                continue
-            # ②③④⑤ 承载文本的圆角矩形：浅绿填充、绿色单实线、线宽0.5–2磅
-            def _rect_pred(r):
-                lw = get_line_width_pt(r)
-                return (color_is_light_green(get_fill_color(r))         # ③ 浅绿填充
-                        and color_is_green(get_line_color(r))           # 绿色边线
-                        and line_is_single_solid(r)                     # ④ 单实线
-                        and not self.is_dashed_outline(r)               # 非虚线
-                        and lw is not None and in_range(lw, 0.5, 2))    # ⑤ 线宽0.5–2磅
-            rect = self.rect_covering_text(s, _rect_pred, margin=0.8)   # ② 圆角矩形
-            # ① 矩形位于指定范围
-            if rect is not None and box_in(rect, left=(29.8, 36), top=(6.5, 9.8)):
-                score_ok = True
-                break
-        self.add(3, '绿框内偏下浅绿圆角矩形(绿色单实线0.5–2磅)，内含一行10–15磅黑色"Anomaly Score"', score_ok)
-
-        # 31. 第1页"Anomaly Score"下方曲线图标。逐点检查（细则每一个点都必须踩到，
-        #    办公软件实际渲染为准）：
-        #    ① 位于 Anomaly Score 文本下方；
-        #    ② 黑色钟形/分布曲线：必须是"单一形状"或"整体为一张图片"，或者由多段
-        #       小曲线拼接而成 —— 拼接时只允许一条大曲线（=一个连通分量），
-        #       组成它的小段必须首尾相连而非分散；
-        #    ③ 右侧红色高亮区域或红色曲线段；
-        #    ④ 线宽0.5–2磅；
-        #    ⑤ 图标整体宽2–3cm、高1–1.8cm。
-        def _is_line_like7(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        def _is_red(c):
-            return c is not None and c[0] > 150 and c[1] < 120 and c[2] < 120
-        def _is_curve_shape(s):
-            """单一形状承载的曲线：FREEFORM 路径含 arcTo 弧段、或路径含 quadBezTo/cubicBezTo。"""
-            try:
-                sp = s._element.spPr
-                if sp is None:
-                    return False
-                for tag in ('a:arcTo', 'a:quadBezTo', 'a:cubicBezTo'):
-                    if sp.find('.//' + qn(tag)) is not None:
-                        return True
-            except Exception:
-                pass
-            return False
-        def _segment_endpoints(s):
-            """按 xfrm + flipH/flipV 还原线段真实起终点，返回 [(x1,y1),(x2,y2)]。"""
-            l, t, w, h = shape_bounds(s)
-            xfrm = s._element.find('.//' + qn('a:xfrm'))
-            flip_h = xfrm is not None and xfrm.get('flipH') == '1'
-            flip_v = xfrm is not None and xfrm.get('flipV') == '1'
-            if flip_h and flip_v:
-                return [(l + w, t + h), (l, t)]
-            if flip_h:
-                return [(l + w, t), (l, t + h)]
-            if flip_v:
-                return [(l, t + h), (l + w, t)]
-            return [(l, t), (l + w, t + h)]
-        def _endpoints_connected(a, b, tol=0.05):
-            """两段线是否首尾相连：任一端点距离 ≤ tol cm。"""
-            ea = _segment_endpoints(a)
-            eb = _segment_endpoints(b)
-            for pa in ea:
-                for pb in eb:
-                    if abs(pa[0] - pb[0]) <= tol and abs(pa[1] - pb[1]) <= tol:
-                        return True
-            return False
-        def _connected_components(shapes, tol=0.05):
-            n = len(shapes)
-            parent = list(range(n))
-            def find(x):
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-            for i in range(n):
-                for j in range(i + 1, n):
-                    if _endpoints_connected(shapes[i], shapes[j], tol):
-                        a, b = find(i), find(j)
-                        if a != b:
-                            parent[a] = b
-            return len(set(find(i) for i in range(n)))
-
-        curve_ok = False
-        scs = [s for s in self.find_text('Anomaly Score') if not text_contains(s, 'Anomaly Scoring')]
-        if scs:
-            stl, stt, stw, sth = shape_bounds(scs[0])
-            below = stt + sth
-            sc_cx = stl + stw / 2
-            # 图标搜索窗口：紧贴 Anomaly Score 文本正下方
-            window = [s for s in sh
-                      if abs(center(s)[0] - sc_cx) <= 3.0
-                      and center(s)[1] >= below and center(s)[1] <= below + 2.0]
-            # ①④ 黑色/红色线条 且线宽0.5–2磅
-            lines = [s for s in window if _is_line_like7(s)
-                     and get_line_width_pt(s) is not None and in_range(get_line_width_pt(s), 0.5, 2)
-                     and (color_is_black_or_dark(get_line_color(s)) or _is_red(get_line_color(s)))]
-            # 排除水平基线（几乎 0 高，长度接近图标宽度）——它不是"钟形曲线"本身
-            def _looks_like_baseline(s):
-                l, t, w, h = shape_bounds(s)
-                return h < 0.05 and w > 1.5
-            black_lines = [s for s in lines
-                           if color_is_black_or_dark(get_line_color(s)) and not _looks_like_baseline(s)]
-            red_lines = [s for s in lines if _is_red(get_line_color(s))]
-
-            # ② 黑色钟形曲线：单一形状（PICTURE/FREEFORM+曲线控制点），
-            #   或多段拼接 = 一个连通分量（首尾相连）
-            has_black_curve = False
-            if black_lines:
-                pics = [s for s in window
-                        if getattr(s, 'shape_type', None) == MSO_SHAPE_TYPE.PICTURE]
-                single_curve = [s for s in black_lines if _is_curve_shape(s)]
-                if pics:
-                    has_black_curve = True
-                elif len(black_lines) == 1 and _is_curve_shape(black_lines[0]):
-                    has_black_curve = True
-                elif single_curve:
-                    has_black_curve = True
-                else:
-                    # 拼接：所有黑色段必须首尾相连，形成"一条大曲线"
-                    n_components = _connected_components(black_lines)
-                    has_black_curve = (n_components == 1)
-
-            has_red = len(red_lines) >= 1
-            red_on_right = False
-            if has_black_curve and has_red:
-                black_cx = [center(s)[0] for s in black_lines]
-                mid = (min(black_cx) + max(black_cx)) / 2
-                red_on_right = (sum(center(s)[0] for s in red_lines) / len(red_lines)) >= mid
-            # ⑤ 整体尺寸（黑+红曲线合并包围盒）
-            icon_shapes = black_lines + red_lines
-            if icon_shapes:
-                cl = min(shape_bounds(s)[0] for s in icon_shapes)
-                cr = max(shape_bounds(s)[0] + shape_bounds(s)[2] for s in icon_shapes)
-                ct = min(shape_bounds(s)[1] for s in icon_shapes)
-                cb = max(shape_bounds(s)[1] + shape_bounds(s)[3] for s in icon_shapes)
-                size_ok = in_range(cr - cl, 2.0, 3.0) and in_range(cb - ct, 1.0, 1.8)
-            else:
-                size_ok = False
-            curve_ok = has_black_curve and has_red and red_on_right and size_ok
-        self.add(3, 'Anomaly Score下方曲线图标：单一/连通拼接的黑色分布曲线+右侧红色高亮/曲线段(0.5–2磅)、整体2–3×1–1.8cm', curve_ok)
-
-        # 32. 第1页右上绿色虚线矩形内部、两个绿色实线矩形之间的箭头。逐点检查：
-        #    ① 位于绿框内部两个绿色实线圆角矩形之间；② 黑色；③ 竖向；
-        #    ④ 箭头朝下；⑤ 线宽0.5–2磅；⑥ 长度0.5–1cm。
-        def _is_line_like8(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        green_arrow_ok = False
-        if green is not None:
-            gl, gt, gw, gh = shape_bounds(green)
-            # 绿框内部的绿色实线圆角矩形（Reconstruction Module / Anomaly Score 两个承载框）
-            green_rects = [s for s in sh if s is not green and looks_like_rect(s) and is_rounded_rect(s)
-                           and color_is_green(get_line_color(s)) and line_is_single_solid(s)
-                           and not self.is_dashed_outline(s)
-                           and gl <= center(s)[0] <= gl + gw and gt <= center(s)[1] <= gt + gh]
-            for s in sh:
-                if not _is_line_like8(s):
-                    continue
-                if not (color_is_black_or_dark(get_line_color(s)) and is_vertical(s)):  # ②③
-                    continue
-                if not vertical_arrow_points_down(s):        # ④ 朝下
-                    continue
-                if not line_width_in_range(s, 0.5, 2):       # ⑤ 线宽0.5–2磅（未显式设线宽按默认0.75磅代入）
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if not in_range(h, 0.5, 1):                  # ⑥ 长度0.5–1cm
-                    continue
-                cx, cy = center(s)
-                if not (gl <= cx <= gl + gw and gt <= cy <= gt + gh):  # 在绿框内
-                    continue
-                # ① 位于两个绿色实线矩形之间：上方有一个、下方有一个绿色矩形，且横向对齐
-                above = any(center(r)[1] < t and abs(center(r)[0] - cx) <= 1.5 for r in green_rects)
-                below_r = any(center(r)[1] > t + h and abs(center(r)[0] - cx) <= 1.5 for r in green_rects)
-                if above and below_r:
-                    green_arrow_ok = True
-                    break
-        self.add(3, '绿框内两个绿色实线矩形之间黑色竖向下箭头(线宽0.5–2磅、长0.5–1cm)', green_arrow_ok)
-
-        # 33. 第1页右下粉色矩形形状。逐点检查：① 位于距左29.5–36.5cm、距上10.5–16.5cm
-        #    （已由 detect_key_objects 的 rrects 约束）；② 圆角矩形；③ 虚线；④ 粉色边线；
-        #    ⑤ 宽4.5–5.3cm、高4.5–5.5cm（已由 rrects 约束）；⑥ 线宽0.5–2磅；
-        #    ⑦ 填充为无填充或粉色（以办公软件实际渲染为准：近白视为无填充）。
-        pink = self.key.get('pink_box')
-        pink_ok = False
-        if pink is not None:
-            lw = get_line_width_pt(pink)
-            pink_ok = (is_rounded_rect(pink)                           # 圆角矩形
-                       and self.is_dashed_outline(pink)                # 虚线
-                       and color_is_pink(get_line_color(pink))         # 粉色边线
-                       and lw is not None and in_range(lw, 0.5, 2)     # 线宽0.5–2磅
-                       and (fill_is_visually_empty(pink)               # 无填充（含近白视觉无填充）
-                            or color_is_pink(get_fill_color(pink))))   # 或粉色
-        self.add(5, '右下粉色虚线圆角矩形：位置尺寸达标、线宽0.5–2磅、无填充或粉色填充', pink_ok)
-
-        # 34. 第1页右下"5. Decision"文本。逐点检查：
-        #    ① 位于粉色虚线矩形内部偏上；② 字体 Arial 或 Calibri；③ 字号12–16磅；
-        #    ④ 加粗；⑤ 颜色粉色；⑥ 文本仅1行。
-        decision_ok = False
-        if pink is not None:
-            pl, pt_, pw, ph = shape_bounds(pink)
-            for s in self.find_text('5. Decision'):
-                # ⑥ 仅1行
-                if rendered_line_count(s) != 1:
-                    continue
-                cx, cy = center(s)
-                # ① 位于粉框内部偏上（中心在框内且落在上半部）
-                inside = pl <= cx <= pl + pw and pt_ <= cy <= pt_ + ph
-                at_top = cy <= pt_ + ph / 2
-                if not (inside and at_top):
-                    continue
-                # ②③④⑤ Arial/Calibri、12–16磅、加粗、粉色
-                if text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 16), bold=True,
-                                color_pred=color_is_pink):
-                    decision_ok = True
-                    break
-        self.add(3, '粉框内偏上"5. Decision"：仅1行、Arial/Calibri 12–16磅加粗粉色', decision_ok)
-
-        # 35. 第1页粉色虚线矩形内部的一个矩形（Thresholding）。逐点检查：
-        #    ① 位于距左31–35.5cm、距上12.1–14.4cm范围内；② 圆角矩形；
-        #    ③ 白色或浅粉白色填充；④ 边线粉色单实线；⑤ 线宽0.5–1.75磅；
-        #    ⑥ 内部文本"Thresholding"；⑦ 字号8–15磅；⑧ 颜色黑色；⑨ 加粗；⑩ 文本仅1行。
-        th_ok = False
-        for s in self.find_text('Thresholding'):
-            # ⑩ 仅1行；⑦ 字号8–15磅；⑧ 黑色；⑨ 加粗
-            if rendered_line_count(s) != 1:
-                continue
-            if not text_font_ok(s, size=(8, 15), bold=True, color_pred=color_is_black_or_dark):
-                continue
-            # ②③④⑤ 承载文本的圆角矩形：白/浅粉白填充、粉色单实线、线宽0.5–1.75磅
-            def _rect_pred(r):
-                lw = get_line_width_pt(r)
-                return (color_is_white_or_near(get_fill_color(r))       # ③ 白/浅粉白填充
-                        and color_is_pink(get_line_color(r))            # 粉色边线
-                        and line_is_single_solid(r)                     # ④ 单实线
-                        and not self.is_dashed_outline(r)               # 非虚线
-                        and lw is not None and in_range(lw, 0.5, 1.75)) # ⑤ 线宽0.5–1.75磅
-            rect = self.rect_covering_text(s, _rect_pred, margin=0.8)   # ② 圆角矩形
-            # ① 矩形位于指定范围
-            if rect is not None and box_in(rect, left=(31, 35.5), top=(12.1, 14.4)):
-                th_ok = True
-                break
-        self.add(3, '粉框内白/浅粉白圆角矩形(粉色单实线0.5–1.75磅)，内含一行8–15磅加粗黑色"Thresholding"', th_ok)
-        # 36. 第1页粉色虚线矩形内部的另一个矩形（Normal / Anomaly）。逐点检查：
-        #    ① 位于距左31–35.5cm、距上14–15.8cm范围内；② 圆角矩形；
-        #    ③ 白色或浅粉白色填充；④ 边线粉色单实线；⑤ 线宽0.5–1.75磅；
-        #    ⑥ 内部文本"Normal / Anomaly"；⑦ 字号8–15磅；⑧ 颜色黑色；⑨ 加粗；⑩ 文本仅1行。
-        #    "白色或浅粉白色填充"覆盖办公软件可能的所有呈现：真正白/近白、无填充(视觉白)、极浅粉。
-        def _white_or_pinkish_light(shape):
-            if fill_is_visually_empty(shape):        # 无填充/透明/近白，视觉上为白
-                return True
-            c = get_fill_color(shape)
-            if c is None:
-                return True
-            if color_is_white_or_near(c):            # 白/近白
-                return True
-            # 浅粉白：高亮度、带极淡的粉红倾向（r 略高、整体很亮）
-            r, g, b = c[0], c[1], c[2]
-            return r >= 235 and g >= 220 and b >= 225 and r >= g
-
-        na_ok = False
-        for s in sh:
-            # ⑥ 文本包含 Normal / Anomaly（兼容全角/半角斜杠、空格差异）
-            txt = canonical_text(shape_text(s)).replace('／', '/')
-            if 'normal/anomaly' not in txt:
-                continue
-            # ⑩ 仅1行；⑦ 字号8–15磅；⑧ 黑色；⑨ 加粗
-            if rendered_line_count(s) != 1:
-                continue
-            if not text_font_ok(s, size=(8, 15), bold=True, color_pred=color_is_black_or_dark):
-                continue
-            # ②③④⑤ 承载文本的圆角矩形：白/浅粉白填充、粉色单实线、线宽0.5–1.75磅
-            def _rect_pred(r):
-                lw = get_line_width_pt(r)
-                return (_white_or_pinkish_light(r)                     # ③ 白/浅粉白填充
-                        and color_is_pink(get_line_color(r))           # 粉色边线
-                        and line_is_single_solid(r)                    # ④ 单实线
-                        and not self.is_dashed_outline(r)              # 非虚线
-                        and lw is not None and in_range(lw, 0.5, 1.75))# ⑤ 线宽0.5–1.75磅
-            rect = self.rect_covering_text(s, _rect_pred, margin=0.8)  # ② 圆角矩形
-            # ① 矩形位于指定范围
-            if rect is not None and box_in(rect, left=(31, 35.5), top=(14, 15.8)):
-                na_ok = True
-                break
-        self.add(3, '粉框内白/浅粉白圆角矩形(粉色单实线0.5–1.75磅)，内含一行8–15磅加粗黑色"Normal / Anomaly"', na_ok)
-
-        # 37. 第1页粉色虚线矩形内部、两个粉色实线矩形之间的箭头。逐点检查：
-        #    ① 位于粉框内部两个粉色实线圆角矩形之间；② 黑色；③ 竖向；
-        #    ④ 箭头朝下；⑤ 线宽0.5–2磅；⑥ 长度0.2–0.6cm。
-        def _is_line_like9(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        pink_arrow_ok = False
-        if pink is not None:
-            pl, pt_, pw, ph = shape_bounds(pink)
-            # 粉框内部的粉色实线圆角矩形（Thresholding / Normal-Anomaly 两个承载框）
-            pink_rects = [s for s in sh if s is not pink and looks_like_rect(s) and is_rounded_rect(s)
-                          and color_is_pink(get_line_color(s)) and line_is_single_solid(s)
-                          and not self.is_dashed_outline(s)
-                          and pl <= center(s)[0] <= pl + pw and pt_ <= center(s)[1] <= pt_ + ph]
-            for s in sh:
-                if not _is_line_like9(s):
-                    continue
-                if not (color_is_black_or_dark(get_line_color(s)) and is_vertical(s)):  # ②③
-                    continue
-                if not vertical_arrow_points_down(s):        # ④ 朝下
-                    continue
-                lw = get_line_width_pt(s)
-                if lw is None or not in_range(lw, 0.5, 2):   # ⑤ 线宽0.5–2磅
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if not in_range(h, 0.2, 0.6):                # ⑥ 长度0.2–0.6cm
-                    continue
-                cx, cy = center(s)
-                if not (pl <= cx <= pl + pw and pt_ <= cy <= pt_ + ph):  # 在粉框内
-                    continue
-                # ① 位于两个粉色实线矩形之间：上方有一个、下方有一个粉色矩形，横向对齐
-                above = any(center(r)[1] < t and abs(center(r)[0] - cx) <= 1.5 for r in pink_rects)
-                below_r = any(center(r)[1] > t + h and abs(center(r)[0] - cx) <= 1.5 for r in pink_rects)
-                if above and below_r:
-                    pink_arrow_ok = True
-                    break
-        self.add(3, '粉框内两个粉色实线矩形之间黑色竖向下箭头(线宽0.5–2磅、长0.2–0.6cm)', pink_arrow_ok)
-        # 38. 第1页绿色虚线矩形与粉色虚线矩形之间的竖向箭头。逐点检查：
-        #    ① 位于距左32–34cm、距上9.7–11.6cm范围内；② 黑色；③ 竖向；④ 箭头朝下；
-        #    ⑤ 线宽1.2–2磅；⑥ 长度1.2–1.6cm；⑦ 连接绿色虚线矩形与粉色虚线矩形。
-        def _is_line_like10(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-        g2p_ok = False
-        for s in sh:
-            if not _is_line_like10(s):
-                continue
-            l, t, w, h = shape_bounds(s)
-            # ① 范围
-            if not (32 - 0.3 <= l and l + w <= 34 + 0.3 and 9.7 - 0.3 <= t and t + h <= 11.6 + 0.3):
-                continue
-            if not (color_is_black_or_dark(get_line_color(s)) and is_vertical(s)):  # ②③
-                continue
-            if not vertical_arrow_points_down(s):        # ④ 朝下
-                continue
-            lw = get_line_width_pt(s)
-            if lw is None or not in_range(lw, 1.2, 2):   # ⑤ 线宽1.2–2磅
-                continue
-            if not in_range(h, 1.2, 1.6):                # ⑥ 长度1.2–1.6cm
-                continue
-            # ⑦ 连接绿框与粉框：上端贴近绿框底缘、下端贴近粉框顶缘
-            connect_ok = True
-            if green is not None:
-                connect_ok = connect_ok and abs(t - (shape_bounds(green)[1] + shape_bounds(green)[3])) <= 0.6
-            if pink is not None:
-                connect_ok = connect_ok and abs((t + h) - shape_bounds(pink)[1]) <= 0.6
-            if connect_ok:
-                g2p_ok = True
-                break
-        self.add(3, '绿框与粉框之间黑色竖向下箭头(线宽1.2–2磅、长1.2–1.6cm)，连接两框(距左32–34/距上9.7–11.6cm)', g2p_ok)
-
-        # 39. 第1页下方蓝色矩形形状。逐点检查：① 位于距左15.0–25.3cm、距上10.0–16cm
-        #    （已由 detect_key_objects 的 rrects 约束）；② 圆角矩形；③ 虚线；④ 蓝色边线；
-        #    ⑤ 宽8–9.5cm、高4.4–5cm（已由 rrects 约束）；⑥ 线宽0.5–2磅；
-        #    ⑦ 填充为无填充或浅蓝色（以办公软件实际渲染为准：近白视为无填充）。
-        blue = self.key.get('blue_box')
-        blue_ok = False
-        if blue is not None:
-            lw = get_line_width_pt(blue)
-            blue_ok = (is_rounded_rect(blue)                          # 圆角矩形
-                       and self.is_dashed_outline(blue)               # 虚线
-                       and color_is_blue(get_line_color(blue))        # 蓝色边线
-                       and lw is not None and in_range(lw, 0.5, 2)    # 线宽0.5–2磅
-                       and (fill_is_visually_empty(blue)              # 无填充（含近白视觉无填充）
-                            or color_is_light_blue(get_fill_color(blue))))  # 或浅蓝色
-        self.add(5, '下方蓝色虚线圆角矩形：位置尺寸达标、线宽0.5–2磅、无填充或浅蓝色填充', blue_ok)
-
-        # 40. 第1页蓝色虚线矩形内部"6. Training Objective"文本。逐点检查：
-        #    ① 位于蓝色矩形顶部；② 水平居中；③ 文本仅1行；④ 字体 Arial 或 Calibri；
-        #    ⑤ 字号12–18磅；⑥ 加粗；⑦ 颜色蓝色。
-        def _training_objective_single_line(shape):
-            """针对标题文本框严格判断视觉上是否只占一行。"""
-            if rendered_line_count(shape) != 1:
-                return False
-            try:
-                body = shape._element.find('.//' + qn('a:bodyPr'))
-                wrap = 'square'
-                l_ins = r_ins = 91440
-                font_scale = 1.0
-                if body is not None:
-                    wrap = body.get('wrap', 'square') or 'square'
-                    l_ins = int(body.get('lIns', str(l_ins)) or l_ins)
-                    r_ins = int(body.get('rIns', str(r_ins)) or r_ins)
-                    norm = body.find('.//' + qn('a:normAutofit'))
-                    if norm is not None and norm.get('fontScale'):
-                        font_scale = int(norm.get('fontScale')) / 100000.0
-                paragraphs = [p for p in shape.text_frame.paragraphs
-                              if ''.join(r.text for r in p.runs).strip()]
-                if len(paragraphs) != 1:
-                    return False
-                if wrap == 'none':
-                    return True
-                avail_cm = emu2cm(shape.width - l_ins - r_ins)
-                if avail_cm <= 0:
-                    return False
-                runs = _runs_of_paragraph(paragraphs[0])
-                if font_scale != 1.0:
-                    runs = [(t, n, b, sz * font_scale) for (t, n, b, sz) in runs]
-                full_w = sum(_measure_text_cm(t, n, b, sz) for (t, n, b, sz) in runs)
-                return full_w <= avail_cm
-            except Exception:
-                return False
-
-        train_ok = False
-        if blue is not None:
-            bl, bt, bw, bh = shape_bounds(blue)
-            for s in self.find_text('6. Training Objective'):
-                # ③ 仅1行：显式换行和文本框自动换行都不能出现
-                if not _training_objective_single_line(s):
-                    continue
-                cx, cy = center(s)
-                # ① 位于蓝框顶部：中心在框内且落在上半部
-                inside = bl <= cx <= bl + bw and bt <= cy <= bt + bh
-                at_top = cy <= bt + bh / 2
-                # ② 水平居中：文本中心 x 接近框中线（±0.8cm），或段落设为居中
-                centered_pos = abs(cx - (bl + bw / 2)) <= 0.8
-                if not (inside and at_top):
-                    continue
-                # ②(续)④⑤⑥⑦ 居中(段落对齐或位置居中)、Arial/Calibri、12–18磅、加粗、蓝色
-                font_ok = text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 18), bold=True,
-                                       color_pred=color_is_blue)
-                align_center = text_font_ok(s, fonts=('arial', 'calibri'), size=(12, 18), bold=True,
-                                            color_pred=color_is_blue, center_align=True)
-                if font_ok and (align_center or centered_pos):
-                    train_ok = True
-                    break
-        self.add(3, '蓝框顶部居中"6. Training Objective"：仅1行、Arial/Calibri 12–18磅加粗蓝色', train_ok)
-
-        # 41. 第1页蓝色虚线矩形形状内部出现一个矩形：位于"6. Training Objective"文本左下，
-        #     距左16–20cm、距上11.5–14.5cm范围内。逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于蓝色虚线矩形（blue）内部；② 位于"6. Training Objective"文本左下（在其下方、
-        #     不越过其右缘）；③ 位置范围：距左16–20cm、距上11.5–14.5cm；④ 形状为圆角矩形；
-        #     ⑤ 浅蓝色填充；⑥ 边线为蓝色单实线；⑦ 线宽0.5–1.5磅；⑧ 其内部出现"Reconstruction Loss"
-        #     和"Lrec"文本；⑨ 两文本分别位于独立的两行（各自独立一行、上下堆叠）；
-        #     ⑩ 字号8–18磅；⑪ 颜色为黑色；⑫ "Lrec"中 rec 字体小于 L。
-        def _blue_rect_pred(r):
-            lw = get_line_width_pt(r)
-            return (is_rounded_rect(r)                                      # ④ 圆角矩形
-                    and color_is_light_blue(get_fill_color(r))              # ⑤ 浅蓝色填充
-                    and color_is_blue(get_line_color(r))                    # ⑥ 蓝色边线
-                    and line_is_single_solid(r)                             # ⑥ 单实线
-                    and lw is not None and in_range(lw, 0.5, 1.5))          # ⑦ 线宽0.5–1.5磅
-
-        rl_ok = False
-        if blue is not None:
-            bbl, bbt, bbw, bbh = shape_bounds(blue)
-            to_refs = self.find_text('6. Training Objective')
-            to_ref = to_refs[0] if to_refs else None
-            for main in self.find_text('Reconstruction Loss'):
-                # ⑨ 主文本独立一行；⑩⑪ 字号8–18磅、黑色（不校验字体/加粗/居中——细则未要求）
-                if rendered_line_count(main) != 1:
-                    continue
-                if not text_font_ok(main, fonts=None, size=(8, 18),
-                                    color_pred=color_is_black_or_dark):
-                    continue
-                rect = self.rect_covering_text(main, _blue_rect_pred, margin=0.8)
-                if rect is None:
-                    continue
-                rl, rt, rw, rh = shape_bounds(rect)
-                rcx, rcy = rl + rw / 2, rt + rh / 2
-                # ① 承载矩形位于蓝色虚线矩形内部
-                if not (bbl <= rcx <= bbl + bbw and bbt <= rcy <= bbt + bbh):
-                    continue
-                # ③ 位置范围
-                if not box_in(rect, left=(16, 20), top=(11.5, 14.5)):
-                    continue
-                # ② 位于"6. Training Objective"文本左下（在其下方，且不越过其右缘）
-                if to_ref is not None:
-                    tl, tt, tw, th = shape_bounds(to_ref)
-                    if not (rcy >= tt + th and rcx <= tl + tw):
-                        continue
-                # ⑧ 内部还需出现"Lrec"文本；⑨ 与主文本独立两行；⑩⑪ 8–18磅黑色；⑫ rec 小于 L
-                mcy = center(main)[1]
-                found_lrec = False
-                for s in sh:
-                    if s is main:
-                        continue
-                    cn = canonical_text(shape_text(s)).replace('_', '')
-                    if 'lrec' not in cn:
-                        continue
-                    scx, scy = center(s)
-                    # 位于同一承载矩形内
-                    if not (rl <= scx <= rl + rw and rt <= scy <= rt + rh):
-                        continue
-                    # ⑨ 与主文本上下堆叠（不同行）；且各自独立一行
-                    if abs(scy - mcy) < 0.05:
-                        continue
-                    if rendered_line_count(s) != 1:
-                        continue
-                    # ⑩⑪ 字号8–18磅、黑色
-                    if not text_font_ok(s, fonts=None, size=(8, 18),
-                                        color_pred=color_is_black_or_dark):
-                        continue
-                    # ⑫ "Lrec"中 rec 字体小于 L（办公软件实际渲染更小：不同run更小/下标/上标）
-                    if not has_smaller_suffix_text(s, 'L', 'rec'):
-                        continue
-                    found_lrec = True
-                    break
-                if found_lrec:
-                    rl_ok = True
-                    break
-        self.add(3, '蓝框内左下浅蓝圆角矩形(蓝色单实线0.5–1.5磅)，位于"6. Training Objective"左下(距左16–20/距上11.5–14.5cm)：两行8–18磅黑色"Reconstruction Loss"/"Lrec"，rec小于L', rl_ok)
-        # 42. 第1页蓝色虚线矩形形状内部出现一个矩形：位于"6. Training Objective"文本右下，
-        #     距左20–24.6cm、距上11.5–14.5cm范围内。逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于蓝色虚线矩形（blue）内部；② 位于"6. Training Objective"文本右下（在其下方、
-        #     不越过其左缘，即整体位于该文本右侧下方）；③ 位置范围：距左20–24.6cm、距上11.5–14.5cm；
-        #     ④ 形状为圆角矩形；⑤ 浅蓝色填充；⑥ 边线为蓝色单实线；⑦ 线宽0.5–1.5磅；
-        #     ⑧ 其内部出现"Regularization Loss"和"Lreg"文本；⑨ 两文本分别位于独立的两行；
-        #     ⑩ 字号8–18磅；⑪ 颜色为黑色；⑫ "Lreg"中 reg 字体小于 L。
-        def _blue_rect_pred_reg(r):
-            lw = get_line_width_pt(r)
-            return (is_rounded_rect(r)                                      # ④ 圆角矩形
-                    and color_is_light_blue(get_fill_color(r))              # ⑤ 浅蓝色填充
-                    and color_is_blue(get_line_color(r))                    # ⑥ 蓝色边线
-                    and line_is_single_solid(r)                             # ⑥ 单实线
-                    and lw is not None and in_range(lw, 0.5, 1.5))          # ⑦ 线宽0.5–1.5磅
-
-        reg_ok = False
-        if blue is not None:
-            bbl, bbt, bbw, bbh = shape_bounds(blue)
-            to_refs = self.find_text('6. Training Objective')
-            to_ref = to_refs[0] if to_refs else None
-            for main in self.find_text('Regularization Loss'):
-                # ⑨ 主文本独立一行；⑩⑪ 字号8–18磅、黑色（不校验字体/加粗/居中——细则未要求）
-                if rendered_line_count(main) != 1:
-                    continue
-                if not text_font_ok(main, fonts=None, size=(8, 18),
-                                    color_pred=color_is_black_or_dark):
-                    continue
-                rect = self.rect_covering_text(main, _blue_rect_pred_reg, margin=0.8)
-                if rect is None:
-                    continue
-                rl, rt, rw, rh = shape_bounds(rect)
-                rcx, rcy = rl + rw / 2, rt + rh / 2
-                # ① 承载矩形位于蓝色虚线矩形内部
-                if not (bbl <= rcx <= bbl + bbw and bbt <= rcy <= bbt + bbh):
-                    continue
-                # ③ 位置范围
-                if not box_in(rect, left=(20, 24.6), top=(11.5, 14.5)):
-                    continue
-                # ② 位于"6. Training Objective"文本右下（在其下方，且不越过其左缘）
-                if to_ref is not None:
-                    tl, tt, tw, th = shape_bounds(to_ref)
-                    if not (rcy >= tt + th and rcx >= tl):
-                        continue
-                # ⑧ 内部还需出现"Lreg"文本；⑨ 与主文本独立两行；⑩⑪ 8–18磅黑色；⑫ reg 小于 L
-                mcy = center(main)[1]
-                found_lreg = False
-                for s in sh:
-                    if s is main:
-                        continue
-                    cn = canonical_text(shape_text(s)).replace('_', '')
-                    if 'lreg' not in cn:
-                        continue
-                    # 排除 Total Loss 公式那种"L = Lrec + λLreg"的长文本，公式在同一行里同时含 lrec 与 lreg
-                    if 'lrec' in cn:
-                        continue
-                    scx, scy = center(s)
-                    # 位于同一承载矩形内
-                    if not (rl <= scx <= rl + rw and rt <= scy <= rt + rh):
-                        continue
-                    # ⑨ 与主文本上下堆叠（不同行）；且各自独立一行
-                    if abs(scy - mcy) < 0.05:
-                        continue
-                    if rendered_line_count(s) != 1:
-                        continue
-                    # ⑩⑪ 字号8–18磅、黑色
-                    if not text_font_ok(s, fonts=None, size=(8, 18),
-                                        color_pred=color_is_black_or_dark):
-                        continue
-                    # ⑫ "Lreg"中 reg 字体小于 L（办公软件实际渲染更小：不同run更小/下标/上标）
-                    if not has_smaller_suffix_text(s, 'L', 'reg'):
-                        continue
-                    found_lreg = True
-                    break
-                if found_lreg:
-                    reg_ok = True
-                    break
-        self.add(3, '蓝框内右下浅蓝圆角矩形(蓝色单实线0.5–1.5磅)，位于"6. Training Objective"右下(距左20–24.6/距上11.5–14.5cm)：两行8–18磅黑色"Regularization Loss"/"Lreg"，reg小于L', reg_ok)
-
-        # 43. 第1页蓝色虚线矩形形状内部出现"+"文本：位于两个蓝色实线矩形之间，
-        #     距左19–21cm、距上12.2–13.6cm范围内，字体为 Arial 或 Calibri，字号14–18磅，颜色黑色。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于蓝色虚线矩形内部；② 文本为"+"；③ 位于两个蓝色实线矩形之间；
-        #     ④ 位置范围：距左19–21cm、距上12.2–13.6cm；
-        #     ⑤ 字体 Arial 或 Calibri；⑥ 字号14–18磅；⑦ 颜色黑色。
-        plus_ok = False
-        if blue is not None:
-            bbl, bbt, bbw, bbh = shape_bounds(blue)
-            # 蓝色虚线框内部的两个蓝色实线圆角矩形（承载 Reconstruction/Regularization Loss）
-            blue_solid_rects = [s for s in sh if s is not blue
-                                and looks_like_rect(s) and is_rounded_rect(s)
-                                and color_is_blue(get_line_color(s))
-                                and line_is_single_solid(s)
-                                and not self.is_dashed_outline(s)
-                                and bbl <= center(s)[0] <= bbl + bbw
-                                and bbt <= center(s)[1] <= bbt + bbh]
-            for s in sh:
-                # ② 文本为"+"
-                if shape_text(s).strip() != '+':
-                    continue
-                pcx, pcy = center(s)
-                # ① 位于蓝色虚线矩形内部
-                if not (bbl <= pcx <= bbl + bbw and bbt <= pcy <= bbt + bbh):
-                    continue
-                # ④ 距左19–21cm、距上12.2–13.6cm（按办公软件里形状定位=左上角坐标）
-                if not box_in(s, left=(19, 21), top=(12.2, 13.6)):
-                    continue
-                # ③ 位于两个蓝色实线矩形之间：至少存在一个在其左侧、一个在其右侧
-                left_side = any(center(r)[0] < pcx for r in blue_solid_rects)
-                right_side = any(center(r)[0] > pcx for r in blue_solid_rects)
-                if not (len(blue_solid_rects) >= 2 and left_side and right_side):
-                    continue
-                # ⑤⑥⑦ 字体 Arial/Calibri、字号14–18磅、颜色黑色
-                if not text_font_ok(s, fonts=('arial', 'calibri'),
-                                    size=(14, 18), color_pred=color_is_black_or_dark):
-                    continue
-                plus_ok = True
-                break
-        self.add(3, '蓝框内两个蓝色实线矩形之间"+"文本：Arial/Calibri 14–18磅黑色(距左19–21/距上12.2–13.6cm)', plus_ok)
-
-        # 44. 第1页蓝色虚线矩形形状内部出现蓝色直线：位于蓝色虚线矩形下部，长度7.3–7.8cm之间。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于蓝色虚线矩形内部；② 直线；③ 蓝色；④ 位于蓝框下部；⑤ 长度7.3–7.8cm。
-        def _is_line_like_blue(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        blue_line_ok = False
-        if blue is not None:
-            bbl, bbt, bbw, bbh = shape_bounds(blue)
-            for s in sh:
-                # ② 直线（线段/连接符/直线形状）
-                if not _is_line_like_blue(s):
-                    continue
-                # ③ 蓝色
-                if not color_is_blue(get_line_color(s)):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                cx, cy = l + w / 2, t + h / 2
-                # ① 位于蓝色虚线矩形内部（线段中心落在蓝框内）
-                if not (bbl <= cx <= bbl + bbw and bbt <= cy <= bbt + bbh):
-                    continue
-                # ④ 位于蓝框下部（线段中心在框下半区）
-                if not (cy >= bbt + bbh / 2):
-                    continue
-                # ⑤ 长度7.3–7.8cm（按办公软件里可见的线段长度：水平/竖直取较长边，其它取对角）
-                length = max(w, h) if (w < 0.05 or h < 0.05) else math.hypot(w, h)
-                if not in_range(length, 7.3, 7.8):
-                    continue
-                blue_line_ok = True
-                break
-        self.add(1, '蓝框内部下部蓝色直线(长度7.3–7.8cm)', blue_line_ok)
-
-        # 45. 第1页蓝色虚线矩形形状内部出现"Total Loss: L = Lrec + λLreg"文本或相近公式：
-        #     位于蓝色虚线矩形内部底部居中，距左17–23.3cm、距上10.7–15.9cm范围内，
-        #     文本或公式内容整体居于一行排列；字体 Arial 或 Calibri，字号9–18磅，颜色黑色。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于蓝色虚线矩形内部；② 位于蓝框内部底部；③ 水平居中；
-        #     ④ 距左17–23.3cm、距上10.7–15.9cm；⑤ 文本包含"Total Loss"及"Lrec""Lreg"等相近公式内容；
-        #     ⑥ 整体位于一行；⑦ 字体 Arial 或 Calibri；⑧ 字号9–18磅；⑨ 颜色黑色。
-        formula_ok = False
-        if blue is not None:
-            bbl, bbt, bbw, bbh = shape_bounds(blue)
-            for s in sh:
-                # ⑤ 文本包含 Total Loss + Lrec + Lreg（相近公式，兼容下划线/空格差异）
-                txt = canonical_text(shape_text(s))
-                if not (('totalloss' in txt and 'lrec' in txt and 'lreg' in txt)
-                        or ('l=lrec' in txt and 'lreg' in txt)):
-                    continue
-                fl, ft, fw, fh = shape_bounds(s)
-                fcx, fcy = fl + fw / 2, ft + fh / 2
-                # ① 位于蓝色虚线矩形内部（文本中心落在蓝框内）
-                if not (bbl <= fcx <= bbl + bbw and bbt <= fcy <= bbt + bbh):
-                    continue
-                # ② 位于蓝框内部底部（中心在下半区）
-                if not (fcy >= bbt + bbh / 2):
-                    continue
-                # ③ 水平居中：文本中心 x 接近蓝框中线（±0.8cm）或段落设为居中
-                center_pos = abs(fcx - (bbl + bbw / 2)) <= 0.8
-                center_align_ok = False
-                try:
-                    aligns = [p.alignment for p in s.text_frame.paragraphs if p.text.strip()]
-                    center_align_ok = any(
-                        (a is not None) and (str(a).upper().endswith('CENTER') or a == 2)
-                        for a in aligns
-                    )
-                except Exception:
-                    pass
-                if not (center_pos or center_align_ok):
-                    continue
-                # ④ 距左17–23.3cm、距上10.7–15.9cm
-                if not box_in(s, left=(17, 23.3), top=(10.7, 15.9)):
-                    continue
-                # ⑥ 整体位于一行
-                if rendered_line_count(s) != 1:
-                    continue
-                # ⑦⑧⑨ 字体 Arial/Calibri、字号9–18磅、颜色黑色
-                if not text_font_ok(s, fonts=('arial', 'calibri'),
-                                    size=(9, 18), color_pred=color_is_black_or_dark):
-                    continue
-                formula_ok = True
-                break
-        self.add(3, '蓝框内部底部居中"Total Loss: L = Lrec + λLreg"或相近公式：1行、Arial/Calibri 9–18磅黑色(距左17–23.3/距上10.7–15.9cm)', formula_ok)
-
-        # 46-47. 到蓝色框的箭头：必须是单一形状承载的圆角折线，不接受多段直线/短线段拼接
-        # 46. 第1页橙色虚线矩形到蓝色虚线矩形之间出现一个箭头：
-        #     位于距左19.5–22.8cm、距上8.5–11.2cm范围内，为黑色圆角折线箭头，有两个拐点；
-        #     线宽0.5–2磅，箭头方向为先向下再向左最后向下。
-        #     逐点检查（细则每一个点都必须踩到，办公软件实际渲染为准；同一条箭头必须同时满足所有条件）：
-        #     ① 位于距左19.5–22.8cm、距上8.5–11.2cm范围内；
-        #     ② 黑色；
-        #     ③ 线宽0.5–2磅；
-        #     ④ 末端带箭头；
-        #     ⑤ 圆角折线（bentConnector3/curvedConnector3、FREEFORM+arcTo、或折线+<a:round/>）；
-        #     ⑥ 两个拐点（bentConnector3/curvedConnector3 天然=2 拐点；bentConnector2/4 排除）；
-        #     ⑦ 方向：先向下→再向左→最后向下（上端起点、下端末端；箭头在下方左侧竖段）。
-        orange_to_blue_arrow = False
-        lx0, lx1, ty0, ty1 = 19.5, 22.8, 8.5, 11.2
-        tol_r = 0.4
-        for s in self.shapes:
-            if not (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s)
-                    or 'connector' in shape_name_or_prst(s)):
-                continue
-            if not line_color_is_black_or_dark(s):                # ② 黑色（含主题色/继承默认）
-                continue
-            if not line_width_in_range(s, 0.5, 2):                # ③ 线宽0.5–2磅（含继承主题/默认）
-                continue
-            l, t, w, h = shape_bounds(s)
-            if not (lx0 - tol_r <= l and l + w <= lx1 + tol_r
-                    and ty0 - tol_r <= t and t + h <= ty1 + tol_r):  # ①
-                continue
-            prst = ''
-            try:
-                g = s._element.spPr.find(qn('a:prstGeom'))
-                if g is not None:
-                    prst = g.get('prst', '') or ''
-            except Exception:
-                pass
-            # ⑤⑥ 只允许"单一形状承载的圆角折线且天然两个拐点"：
-            #     - bentConnector3 / curvedConnector3（天然=2拐点），或
-            #     - FREEFORM 路径含 a:arcTo 弧段的圆角折线，或
-            #     - 显式 <a:round/> 连接样式的折线形状。
-            #     直线（line / straightConnector1）不具备"两个拐点+圆角折线"，一律排除。
-            is_rounded = False
-            if prst in ('bentConnector3', 'curvedConnector3'):
-                if w >= 0.4 and h >= 0.4:                         # 两个拐点：bbox 同时跨水平+竖直
-                    is_rounded = True
-            elif (prst.startswith('bentConnector')
-                  or prst.startswith('curvedConnector')):
-                pass
-            else:
-                try:
-                    if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                            and s._element.spPr.find('.//' + qn('a:arcTo')) is not None \
-                            and w >= 0.4 and h >= 0.4:
-                        is_rounded = True
-                except Exception:
-                    pass
-                if not is_rounded:
-                    try:
-                        ln = s._element.spPr.find(qn('a:ln'))
-                        if ln is not None and ln.find(qn('a:round')) is not None \
-                                and w >= 0.4 and h >= 0.4:
-                            is_rounded = True
-                    except Exception:
-                        pass
-            if not is_rounded:
-                continue
-            if not has_arrow_head(s):                             # ④
-                continue
-            # ⑦ 方向"下→左→下"：起点在右上、末端在左下 —— 从 bbox+flip 反演：
-            #   未 flip 的 bentConnector3 起点(左上)→终点(右下)。
-            #   "右上→左下" 要求 x 反向 → flipH=1；y 保持 → flipV=0。
-            xfrm = s._element.find('.//' + qn('a:xfrm'))
-            flip_h = xfrm is not None and xfrm.get('flipH') == '1'
-            flip_v = xfrm is not None and xfrm.get('flipV') == '1'
-            if not flip_h:
-                continue
-            if flip_v:
-                continue
-            orange_to_blue_arrow = True
-            break
-        self.add(3, '橙框到蓝框黑色圆角折线箭头：先下→左→下、两拐点、线宽0.5–2磅(距左19.5–22.8/距上8.5–11.2cm)', orange_to_blue_arrow)
-
-        # 47. 第1页紫色虚线矩形到蓝色虚线矩形之间出现一个箭头：
-        #     位于距左10.6–19.9cm、距上7.5–12.8cm范围内，为蓝色虚线圆角折线箭头，
-        #     线宽0.5–2磅，箭头方向为先向左再向上。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于距左10.6–19.9cm、距上7.5–12.8cm范围内；② 蓝色；③ 虚线；
-        #     ④ 折线箭头（末端带箭头）；⑤ 线宽0.5–2磅；⑥ 方向：先向左→再向上；⑦ 圆角。
-        def _one_turn_arrow_in_region(region, dirs, color_pred=None, width=None,
-                                      dashed_only=True, tol=0.4):
-            """检测一条只含一个拐点的两段折线箭头（首段+末段带箭头）。
-            办公软件中虚线折线通常由多段共线短段拼成，先按方向把共线相邻短段合并成整段，
-            再枚举两段首尾相连 + 方向序列 + 末段带箭头。
-            细则要求"圆角折线"：要么由 bent/curved connector / FREEFORM+arcTo 单一形状承载，
-            要么参与拼接的每一段折线自身携带 <a:round/> 连接样式；普通直线/straightConnector1
-            拼出的直角折线不算圆角，一律排除。"""
-            def _prst(s):
-                try:
-                    g = s._element.spPr.find(qn('a:prstGeom'))
-                    if g is not None:
-                        return g.get('prst', '') or ''
-                except Exception:
-                    pass
-                return ''
-
-            def is_rounded_seg(s):
-                # bent/curved connector 单一形状承载圆角折线
-                p = _prst(s)
-                if p.startswith('bentConnector') or p.startswith('curvedConnector'):
-                    return True
-                # FREEFORM 路径含 arcTo 弧段
-                try:
-                    if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                            and s._element.spPr.find('.//' + qn('a:arcTo')) is not None:
-                        return True
-                except Exception:
-                    pass
-                # 折线段显式 <a:round/> 连接样式
-                try:
-                    ln = s._element.spPr.find(qn('a:ln'))
-                    if ln is not None and ln.find(qn('a:round')) is not None:
-                        return True
-                except Exception:
-                    pass
-                return False
-
-            def is_seg(s):
-                return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                        or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-            lx0, lx1, ty0, ty1 = region
-
-            # 快速路径：单一 bent/curved connector（一个拐点） 或 FREEFORM+arcTo 就承载整条折线
-            for s in self.shapes:
-                if not is_seg(s):
-                    continue
-                if color_pred and not color_pred(get_line_color(s)):
-                    continue
-                wpt = get_line_width_pt(s)
-                if width and wpt is not None and not in_range(wpt, *width):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if not (lx0 - tol <= l and l + w <= lx1 + tol
-                        and ty0 - tol <= t and t + h <= ty1 + tol):
-                    continue
-                if dashed_only and not is_dash_line(s):
-                    continue
-                if not has_arrow_head(s):
-                    continue
-                p = _prst(s)
-                single_rounded = False
-                # bentConnector2/curvedConnector2 天然=1 拐点；bentConnector3/curvedConnector3=2 拐点，
-                # 若两段路径与目标方向一致也接受（bbox 需同时跨水平+竖直）。
-                if p in ('bentConnector2', 'curvedConnector2',
-                         'bentConnector3', 'curvedConnector3'):
-                    if w >= 0.4 and h >= 0.4:
-                        single_rounded = True
-                elif p.startswith('bentConnector') or p.startswith('curvedConnector'):
-                    single_rounded = False
-                else:
-                    try:
-                        if s.shape_type == MSO_SHAPE_TYPE.FREEFORM \
-                                and s._element.spPr.find('.//' + qn('a:arcTo')) is not None \
-                                and w >= 0.4 and h >= 0.4:
-                            single_rounded = True
-                    except Exception:
-                        pass
-                if not single_rounded:
-                    continue
-                # 方向反演：未 flip 的 bent/curved connector 起点=左上→终点=右下。
-                #   dirs=('left','up') 要求末端指向左上 → flipH=1、flipV=1。
-                xfrm = s._element.find('.//' + qn('a:xfrm'))
-                flip_h = xfrm is not None and xfrm.get('flipH') == '1'
-                flip_v = xfrm is not None and xfrm.get('flipV') == '1'
-                want_flip_h = 'left' in dirs
-                want_flip_v = 'up' in dirs
-                if flip_h == want_flip_h and flip_v == want_flip_v:
-                    return True
-
-            # 回退：由多段折线段拼接的圆角折线——参与合并的每一段本身必须携带圆角样式。
-            raw = []
-            for s in self.shapes:
-                if not is_seg(s):
-                    continue
-                if color_pred and not color_pred(get_line_color(s)):
-                    continue
-                wpt = get_line_width_pt(s)
-                if width and wpt is not None and not in_range(wpt, *width):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if not (lx0 - tol <= l and l + w <= lx1 + tol
-                        and ty0 - tol <= t and t + h <= ty1 + tol):
-                    continue
-                # ③ 虚线（含短段拼虚线：任一分量≈0 且短段）
-                if dashed_only:
-                    seg_dashed = is_dash_line(s) or min(w, h) < 0.03
-                    if not seg_dashed:
-                        continue
-                # ⑦ 圆角：单段必须自带 bent/curved connector、arcTo 或 <a:round/> 连接样式
-                if not is_rounded_seg(s):
-                    continue
-                raw.append(s)
-            if len(raw) < 2:
-                return False
-
-            def merge(segments, orient):
-                runs = []
-                def bnd(s):
-                    l, t, w, h = shape_bounds(s)
-                    return l, t, l + w, t + h, has_arrow_head(s)
-                for s in segments:
-                    l, t, r, b, arr = bnd(s)
-                    placed = False
-                    for run in runs:
-                        if orient == 'H':
-                            if abs(((t + b) / 2) - ((run[2] + run[4]) / 2)) <= tol and \
-                               l <= run[3] + tol and r >= run[1] - tol:
-                                run[1] = min(run[1], l); run[3] = max(run[3], r)
-                                run[2] = min(run[2], t); run[4] = max(run[4], b)
-                                run[5] = run[5] or arr
-                                placed = True; break
-                        else:
-                            if abs(((l + r) / 2) - ((run[1] + run[3]) / 2)) <= tol and \
-                               t <= run[4] + tol and b >= run[2] - tol:
-                                run[2] = min(run[2], t); run[4] = max(run[4], b)
-                                run[1] = min(run[1], l); run[3] = max(run[3], r)
-                                run[5] = run[5] or arr
-                                placed = True; break
-                    if not placed:
-                        runs.append([orient, l, t, r, b, arr])
-                changed = True
-                while changed:
-                    changed = False
-                    for i in range(len(runs)):
-                        for j in range(i + 1, len(runs)):
-                            a, c = runs[i], runs[j]
-                            if orient == 'H':
-                                if abs(((a[2]+a[4])/2)-((c[2]+c[4])/2)) <= tol and \
-                                   a[1] <= c[3]+tol and a[3] >= c[1]-tol:
-                                    a[1]=min(a[1],c[1]);a[3]=max(a[3],c[3])
-                                    a[2]=min(a[2],c[2]);a[4]=max(a[4],c[4]);a[5]=a[5] or c[5]
-                                    runs.pop(j); changed=True; break
-                            else:
-                                if abs(((a[1]+a[3])/2)-((c[1]+c[3])/2)) <= tol and \
-                                   a[2] <= c[4]+tol and a[4] >= c[2]-tol:
-                                    a[2]=min(a[2],c[2]);a[4]=max(a[4],c[4])
-                                    a[1]=min(a[1],c[1]);a[3]=max(a[3],c[3]);a[5]=a[5] or c[5]
-                                    runs.pop(j); changed=True; break
-                        if changed: break
-                return runs
-
-            hsegs = [s for s in raw if is_horizontal(s) or (shape_bounds(s)[2] >= shape_bounds(s)[3])]
-            vsegs = [s for s in raw if is_vertical(s) or (shape_bounds(s)[3] > shape_bounds(s)[2])]
-            runs = merge(hsegs, 'H') + merge(vsegs, 'V')
-            if len(runs) < 2:
-                return False
-
-            def run_ends(run):
-                orient, l, t, r, b, arr = run
-                if orient == 'H':
-                    return (l, (t + b) / 2), (r, (t + b) / 2), arr
-                return ((l + r) / 2, t), ((l + r) / 2, b), arr
-
-            def near(p, q):
-                return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
-
-            def matches(want, p_from, p_to):
-                if want in ('right', 'left'):
-                    if abs(p_from[1] - p_to[1]) > tol:
-                        return False
-                    return (p_to[0] > p_from[0]) if want == 'right' else (p_to[0] < p_from[0])
-                else:
-                    if abs(p_from[0] - p_to[0]) > tol:
-                        return False
-                    return (p_to[1] > p_from[1]) if want == 'down' else (p_to[1] < p_from[1])
-
-            # 两段折线：首段(dirs[0]) 与 末段(dirs[1]) 首尾相连，且末段带箭头
-            for r1 in runs:
-                a1, b1, _ = run_ends(r1)
-                for start, end1 in ((a1, b1), (b1, a1)):
-                    if not matches(dirs[0], start, end1):
-                        continue
-                    for r2 in runs:
-                        if r2 is r1:
-                            continue
-                        a2, b2, arr2 = run_ends(r2)
-                        if not arr2:                    # ④ 末段带箭头
-                            continue
-                        for j2, e2 in ((a2, b2), (b2, a2)):
-                            if near(j2, end1) and matches(dirs[1], j2, e2):
-                                return True
-            return False
-
-        purple_to_blue_arrow = _one_turn_arrow_in_region(
-            region=(10.6, 19.9, 7.5, 12.8),                # ①
-            dirs=('left', 'up'),                           # ⑥ 先左→上（末段带箭头 ④）
-            color_pred=color_is_blue,                      # ②
-            width=(0.5, 2),                                # ⑤
-            dashed_only=True)                              # ③
-        self.add(3, '紫框到蓝框蓝色虚线圆角折线箭头：先左→上、线宽0.5–2磅(距左10.6–19.9/距上7.5–12.8cm)', purple_to_blue_arrow)
-
-        # 48. 第1页底部出现虚线圆角矩形图例框：位于距左8.8–29cm、距上16.5–18.7cm范围内，
-        #     边线为灰色，线宽0.5–2磅，宽18.5–19.2cm，高1.3–1.6cm。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 圆角矩形；② 虚线；③ 位置范围：距左8.8–29cm、距上16.5–18.7cm；
-        #     ④ 宽18.5–19.2cm；⑤ 高1.3–1.6cm；⑥ 边线灰色；⑦ 线宽0.5–2磅。
-        leg = None
-        for s in sh:
-            if not (looks_like_rect(s) and is_rounded_rect(s)):              # ①
-                continue
-            if not self.is_dashed_outline(s):                                # ②
-                continue
-            if not box_in(s, left=(8.8, 29), top=(16.5, 18.7),                # ③④⑤
-                          width=(18.5, 19.2), height=(1.3, 1.6)):
-                continue
-            if not color_is_light_gray(get_line_color(s)):                   # ⑥ 灰色边线
-                continue
-            lw = get_line_width_pt(s)
-            if not (lw is not None and in_range(lw, 0.5, 2)):                # ⑦ 线宽0.5–2磅
-                continue
-            leg = s
-            break
-        self.key['legend_box'] = leg
-        leg_ok = leg is not None
-        self.add(5, '底部灰色虚线圆角矩形图例框：位置尺寸达标(距左8.8–29/距上16.5–18.7cm，宽18.5–19.2/高1.3–1.6cm)、线宽0.5–2磅', leg_ok)
-
-        # 49. 第1页底部出现"Legend"文本：位于图例框内部最左侧，字体 Arial 或 Calibri，
-        #     字号8–16磅，加粗，颜色为黑色。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 文本为"Legend"；② 位于图例框内部（图例框只作为位置参考，
-        #     不要求其本身满足虚线/圆角等条件——细则里的"图例框内部"是位置描述）；
-        #     ③ 位于图例框最左侧（在图例框左半区，且左缘最靠近图例框左缘）；
-        #     ④ 字体 Arial 或 Calibri；⑤ 字号8–16磅；⑥ 加粗；⑦ 颜色黑色。
-        # 位置参考：优先用 detect_key_objects 中按坐标筛出的图例框候选（不管虚线等）
-        legend_ref = leg
-        if legend_ref is None:
-            for _s in sh:
-                if not (looks_like_rect(_s) and is_rounded_rect(_s)):
-                    continue
-                if box_in(_s, left=(8.8, 29), top=(16.5, 18.7),
-                          width=(18.5, 19.2), height=(1.3, 1.6)):
-                    legend_ref = _s
-                    break
-        legend_text_ok = False
-        if legend_ref is not None:
-            gl, gt, gw, gh = shape_bounds(legend_ref)
-            # 图例框内所有非空文本形状
-            texts_in_leg = []
-            for s in sh:
-                if not shape_text(s).strip():
-                    continue
-                cx, cy = center(s)
-                if gl <= cx <= gl + gw and gt <= cy <= gt + gh:              # ② 在图例框内
-                    texts_in_leg.append(s)
-            # ③ "最左侧"：图例框内文本中，左缘最小的一个
-            leftmost = min(texts_in_leg, key=lambda s: shape_bounds(s)[0]) if texts_in_leg else None
-            for s in texts_in_leg:
-                if not text_contains(s, 'Legend'):                            # ①
-                    continue
-                sl = shape_bounds(s)[0]
-                cx = center(s)[0]
-                # ③ 位于图例框最左侧：本文本是图例框内左缘最小的文本，且中心落在左半区
-                if leftmost is not None and s is not leftmost:
-                    continue
-                if not (cx <= gl + gw / 2):
-                    continue
-                # ④⑤⑥⑦ 字体 Arial/Calibri、字号8–16磅、加粗、黑色
-                if not text_font_ok(s, fonts=('arial', 'calibri'),
-                                    size=(8, 16), bold=True,
-                                    color_pred=color_is_black_or_dark):
-                    continue
-                legend_text_ok = True
-                break
-        self.add(3, '图例框内部最左侧"Legend"：Arial/Calibri 8–16磅加粗黑色', legend_text_ok)
-        # 50. "Legend"文本右侧出现一个黑色实线箭头：两者相距1.4–1.7cm之间，箭头方向向右。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于"Legend"文本右侧；② 黑色；③ 实线（非虚线）；
-        #     ④ 与"Legend"文本相距1.4–1.7cm；⑤ 箭头方向向右。
-        def _is_line_like_leg(s):
-            return (is_connector(s) or s.shape_type == MSO_SHAPE_TYPE.FREEFORM
-                    or 'line' in shape_name_or_prst(s) or 'connector' in shape_name_or_prst(s))
-
-        legend_arrow_ok = False
-        legend_txt = None
-        for s in sh:
-            if text_contains(s, 'Legend') and shape_text(s).strip().lower() == 'legend':
-                legend_txt = s
-                break
-        if legend_txt is None:
-            # 回退：找任何包含 Legend 的文本形状里，左缘最靠左的一个
-            cands = [s for s in sh if text_contains(s, 'Legend')]
-            if cands:
-                legend_txt = min(cands, key=lambda s: shape_bounds(s)[0])
-        if legend_txt is not None:
-            lgl, lgt, lgw, lgh = shape_bounds(legend_txt)
-            legend_right = lgl + lgw
-            legend_cy = lgt + lgh / 2
-            for s in sh:
-                if not _is_line_like_leg(s):
-                    continue
-                # ② 黑色
-                if not color_is_black_or_dark(get_line_color(s)):
-                    continue
-                # ③ 实线（非虚线）
-                if is_dash_line(s):
-                    continue
-                # ⑤ 箭头方向向右
-                if not (has_arrow_head(s) and horizontal_arrow_points_right(s)):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                # ① 位于 Legend 右侧（整段都在 Legend 右缘之后）
-                if not (l >= legend_right - 0.05):
-                    continue
-                # 竖向对齐 Legend 文本（同一行高度附近）
-                arrow_cy = t + h / 2
-                if abs(arrow_cy - legend_cy) > max(lgh, 0.6):
-                    continue
-                # ④ Legend 与箭头相距 1.4–1.7cm（Legend 右缘 → 箭头左端）
-                gap = l - legend_right
-                if not in_range(gap, 1.4, 1.7):
-                    continue
-                legend_arrow_ok = True
-                break
-        self.add(1, '"Legend"右侧黑色实线右箭头：与Legend相距1.4–1.7cm', legend_arrow_ok)
-        # 51. 第1页底部出现"Data Flow"文本：位于黑色箭头右侧，文本字号7–16磅，颜色为黑色。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 文本为"Data Flow"；② 位于黑色箭头右侧（Legend 右侧那个黑色实线右箭头）；
-        #     ③ 字号7–16磅；④ 颜色黑色。
-        data_flow_ok = False
-        # 找到 Legend 右侧那个黑色实线右箭头（用于确定"右侧"参照）
-        black_arrow_right = None
-        black_arrow_left_min = None
-        if legend_txt is not None:
-            lgl, lgt, lgw, lgh = shape_bounds(legend_txt)
-            legend_right = lgl + lgw
-            legend_cy = lgt + lgh / 2
-            for s in sh:
-                if not _is_line_like_leg(s):
-                    continue
-                if not color_is_black_or_dark(get_line_color(s)):
-                    continue
-                if is_dash_line(s):
-                    continue
-                if not (has_arrow_head(s) and horizontal_arrow_points_right(s)):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if l < legend_right - 0.05:
-                    continue
-                if abs((t + h / 2) - legend_cy) > max(lgh, 0.6):
-                    continue
-                # 记录 Legend 右侧最近的一个箭头（左缘最靠近 Legend 右缘）作为"该"黑色箭头
-                if black_arrow_left_min is None or l < black_arrow_left_min:
-                    black_arrow_left_min = l
-                    black_arrow_right = l + w
-        for s in sh:
-            if not text_contains(s, 'Data Flow'):                     # ①
-                continue
-            # ② 位于黑色箭头右侧（文本左缘在箭头右端之后）
-            if black_arrow_right is not None:
-                sl = shape_bounds(s)[0]
-                if not (sl >= black_arrow_right - 0.05):
-                    continue
-            # ③④ 字号7–16磅、颜色黑色（不校验字体/加粗——细则未要求）
-            if not text_font_ok(s, fonts=None, size=(7, 16),
-                                color_pred=color_is_black_or_dark):
-                continue
-            data_flow_ok = True
-            break
-        self.add(3, '图例内黑色箭头右侧"Data Flow"：字号7–16磅黑色', data_flow_ok)
-        # 52. "Data Flow"文本右侧出现一个黑色虚线箭头：两者相距1.4–1.7cm之间，箭头方向向右。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 位于"Data Flow"文本右侧；② 黑色；③ 虚线；
-        #     ④ 与"Data Flow"文本相距1.4–1.7cm（以办公软件实际渲染为准：文字肉眼末端 →
-        #        箭头左端；不是文本框右缘 → 箭头左端，因为文本框可能带右侧留白）；
-        #     ⑤ 箭头方向向右。
-        #     办公软件里的"虚线箭头"常见两种呈现：
-        #       (a) 单条线段本身 dash_style 为虚线且末端带箭头；
-        #       (b) 多段共线短线段拼出虚线视觉，末段带箭头（本文件即为此形式）。
-        data_flow_arrow_ok = False
-        # 找到"Data Flow"文本形状
-        df_txt = None
-        for s in sh:
-            if text_contains(s, 'Data Flow'):
-                df_txt = s
-                break
-        if df_txt is not None:
-            dfl, dft, dfw, dfh = shape_bounds(df_txt)
-            # 文字肉眼末端 = 文本框左缘 + lIns + 首行文字实际渲染宽度
-            body = df_txt._element.find('.//' + qn('a:bodyPr'))
-            l_ins_emu = 91440
-            if body is not None:
-                try:
-                    l_ins_emu = int(body.get('lIns', str(l_ins_emu)) or l_ins_emu)
-                except Exception:
-                    pass
-            l_ins_cm = l_ins_emu / 914400.0 * 2.54
-            runs_ = [(r.text, r.font.name or 'Arial', bool(r.font.bold),
-                      (r.font.size.pt if r.font.size else 18.0))
-                     for r in get_text_runs(df_txt) if r.text.strip()]
-            text_w = sum(_measure_text_cm(t, n, b, sz) for (t, n, b, sz) in runs_)
-            df_text_right = dfl + l_ins_cm + text_w
-            # 兜底：如果度量失败或落在文本框外，退回文本框右缘
-            if text_w <= 0 or df_text_right > dfl + dfw:
-                df_text_right = dfl + dfw
-            df_right = dfl + dfw       # 保留旁用于筛选右侧段
-            df_cy = dft + dfh / 2
-            # 收集"Data Flow"右侧、同一行、黑色的水平细段（含 arrowhead 段）
-            row_segs = []
-            for s in sh:
-                if not _is_line_like_leg(s):
-                    continue
-                if not color_is_black_or_dark(get_line_color(s)):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if not (l >= df_right - 0.05):
-                    continue
-                if abs((t + h / 2) - df_cy) > max(dfh, 0.6):
-                    continue
-                # 水平（含 0 高度的线段）
-                if not (w >= h or h < 0.05):
-                    continue
-                row_segs.append(s)
-            if row_segs:
-                # ⑤ 存在末段带右箭头的段
-                arrow_seg = None
-                for s in row_segs:
-                    if has_arrow_head(s) and horizontal_arrow_points_right(s):
-                        arrow_seg = s
-                        break
-                if arrow_seg is not None:
-                    # ① 位于文本右侧（已通过 l >= df_right 过滤）
-                    # 找出这组段的最左端 x（作为整段"箭头"的起点）
-                    leftmost = min(row_segs, key=lambda s: shape_bounds(s)[0])
-                    sl, st, sw, sh_ = shape_bounds(leftmost)
-                    arrow_left = sl
-                    # ③ 虚线：单段本身为虚线，或存在 ≥3 段共线短段（视觉虚线）
-                    dashed_ok = is_dash_line(arrow_seg)
-                    if not dashed_ok:
-                        short_segs = [s for s in row_segs
-                                      if shape_bounds(s)[2] < 0.5]
-                        dashed_ok = len(short_segs) >= 3
-                    # ④ 与 Data Flow 文本相距1.4–1.7cm（文字肉眼末端 → 箭头左端；
-                    #    ±0.5cm 容差，覆盖字体度量与办公软件实际渲染之间的偏差）
-                    gap = arrow_left - df_text_right
-                    if dashed_ok and in_range(gap, 1.4 - 0.5, 1.7 + 0.5):
-                        data_flow_arrow_ok = True
-        self.add(1, '"Data Flow"右侧黑色虚线右箭头：与Data Flow文字末端相距1.4–1.7cm', data_flow_arrow_ok)
-        # 53. 第1页底部出现"Auxiliary Flow"文本：位于黑色虚线箭头右侧，
-        #     字体为 Arial 或 Calibri，字号8–18磅，颜色为黑色。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 文本为"Auxiliary Flow"；② 位于黑色虚线箭头右侧（即 Data Flow 右侧那个虚线箭头）；
-        #     ③ 字体 Arial 或 Calibri；④ 字号8–18磅；⑤ 颜色黑色。
-        aux_flow_ok = False
-        # 找到 Data Flow 右侧的黑色虚线右箭头的右端 x（作为"右侧"参照）
-        dash_arrow_right = None
-        if df_txt is not None:
-            dfl, dft, dfw, dfh = shape_bounds(df_txt)
-            df_right = dfl + dfw
-            df_cy = dft + dfh / 2
-            # 收集 Data Flow 右侧同一行的黑色水平段（含带箭头段和短虚线段）
-            row_segs = []
-            for s in sh:
-                if not _is_line_like_leg(s):
-                    continue
-                if not color_is_black_or_dark(get_line_color(s)):
-                    continue
-                l, t, w, h = shape_bounds(s)
-                if not (l >= df_right - 0.05):
-                    continue
-                if abs((t + h / 2) - df_cy) > max(dfh, 0.6):
-                    continue
-                if not (w >= h or h < 0.05):
-                    continue
-                row_segs.append(s)
-            # 找到带右箭头的那段，取其右端 x
-            for s in row_segs:
-                if has_arrow_head(s) and horizontal_arrow_points_right(s):
-                    l, t, w, h = shape_bounds(s)
-                    right_end = l + w
-                    if dash_arrow_right is None or right_end > dash_arrow_right:
-                        dash_arrow_right = right_end
-        for s in sh:
-            if not text_contains(s, 'Auxiliary Flow'):                # ①
-                continue
-            # ② 位于黑色虚线箭头右侧（文本左缘在箭头右端之后）
-            if dash_arrow_right is not None:
-                sl = shape_bounds(s)[0]
-                if not (sl >= dash_arrow_right - 0.05):
-                    continue
-            # ③④⑤ 字体 Arial/Calibri、字号8–18磅、颜色黑色
-            if not text_font_ok(s, fonts=('arial', 'calibri'),
-                                size=(8, 18),
-                                color_pred=color_is_black_or_dark):
-                continue
-            aux_flow_ok = True
-            break
-        self.add(3, '图例内黑色虚线箭头右侧"Auxiliary Flow"：Arial/Calibri 8–18磅黑色', aux_flow_ok)
-        # 54. "Auxiliary Flow"文本右侧出现一个矩形：距左23–24.5cm，距上17.2–18.4cm；
-        #     宽0.9–1.2cm，高0.3–0.6cm。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 矩形；② 位于"Auxiliary Flow"文本右侧；
-        #     ③ 距左23–24.5cm、距上17.2–18.4cm；④ 宽0.9–1.2cm；⑤ 高0.3–0.6cm。
-        # 先找"Auxiliary Flow"文本形状，得到其右缘作为"右侧"的参照
-        af_txt = None
-        for s in sh:
-            if text_contains(s, 'Auxiliary Flow'):
-                af_txt = s
-                break
-        vec_rect_ok = False
-        for s in sh:
-            if not looks_like_rect(s):                                # ① 矩形
-                continue
-            # ③④⑤ 位置尺寸范围
-            if not box_in(s, left=(23, 24.5), top=(17.2, 18.4),
-                          width=(0.9, 1.2), height=(0.3, 0.6)):
-                continue
-            # ② 位于"Auxiliary Flow"文本右侧（矩形左缘 ≥ 文本右缘）
-            if af_txt is not None:
-                afl, aft, afw, afh = shape_bounds(af_txt)
-                if not (shape_bounds(s)[0] >= afl + afw - 0.05):
-                    continue
-            vec_rect_ok = True
-            break
-        self.add(1, '"Auxiliary Flow"右侧矩形：距左23–24.5/距上17.2–18.4cm、宽0.9–1.2/高0.3–0.6cm', vec_rect_ok)
-        # 55. 第1页底部出现"Vector Feature"文本：位于图例框最右侧，
-        #     文本字号7–16磅，颜色为黑色。
-        #     逐点检查（只针对细则的点，办公软件实际渲染为准）：
-        #     ① 文本为"Vector Feature"；② 位于图例框内部（图例框只作为位置参考，
-        #     不要求其本身满足虚线/圆角等条件——细则里的"图例框最右侧"是位置描述）；
-        #     ③ 位于图例框最右侧（图例框内所有文本中右缘最靠右的一个，且中心在右半区）；
-        #     ④ 字号7–16磅；⑤ 颜色黑色。
-        vf_ref = leg
-        if vf_ref is None:
-            for _s in sh:
-                if not (looks_like_rect(_s) and is_rounded_rect(_s)):
-                    continue
-                if box_in(_s, left=(8.8, 29), top=(16.5, 18.7),
-                          width=(18.5, 19.2), height=(1.3, 1.6)):
-                    vf_ref = _s
-                    break
-        vector_feature_ok = False
-        if vf_ref is not None:
-            gl, gt, gw, gh = shape_bounds(vf_ref)
-            # 图例框内所有非空文本形状
-            texts_in_leg = []
-            for s in sh:
-                if not shape_text(s).strip():
-                    continue
-                cx, cy = center(s)
-                if gl <= cx <= gl + gw and gt <= cy <= gt + gh:              # ② 在图例框内
-                    texts_in_leg.append(s)
-            # ③ "最右侧"：图例框内文本中，右缘最大的一个
-            rightmost = (max(texts_in_leg, key=lambda s: shape_bounds(s)[0] + shape_bounds(s)[2])
-                         if texts_in_leg else None)
-            for s in texts_in_leg:
-                if not text_contains(s, 'Vector Feature'):                    # ①
-                    continue
-                # ③ 位于图例框最右侧：本文本是图例框内右缘最大的文本，且中心落在右半区
-                if rightmost is not None and s is not rightmost:
-                    continue
-                cx = center(s)[0]
-                if not (cx >= gl + gw / 2):
-                    continue
-                # ④⑤ 字号7–16磅、颜色黑色（不校验字体/加粗——细则未要求）
-                if not text_font_ok(s, fonts=None, size=(7, 16),
-                                    color_pred=color_is_black_or_dark):
-                    continue
-                vector_feature_ok = True
-                break
-        self.add(3, '图例框最右侧"Vector Feature"：字号7–16磅黑色', vector_feature_ok)
-
-    def report(self):
-        max_score = sum(p for p, _, _ in self.hits) + sum(p for p, _, _ in self.misses)
-        print('维度二：评分结果')
-        for p, d, _detail in self.hits:
-            print(f'+{p}：{d}')
-        print(f'\n最终得分: {self.total} / {max_score}')
-
-
-def _locate_pptx(dir_path: str) -> Path:
-    """在脚本所在目录中定位待评估的 .pptx 文件。"""
-    d = Path(dir_path)
-    if d.is_file() and d.suffix.lower() == '.pptx':
-        return d
-    if not d.is_dir():
-        raise FileNotFoundError(f'目录不存在: {dir_path}')
-    for p in sorted(d.glob('*.pptx')):
-        if p.name.startswith('~$'):
+    off, ext = xf.find(_q(A_NS, "off")), xf.find(_q(A_NS, "ext"))
+    if off is None or ext is None:
+        return None
+    return (_fnum(off.get("x"), 0.0), _fnum(off.get("y"), 0.0),
+            _fnum(ext.get("cx"), 0.0), _fnum(ext.get("cy"), 0.0))
+
+
+def _fill_of(el, theme):
+    spPr = el.find(_q(P_NS, "spPr"))
+    if spPr is None:
+        return None
+    if spPr.find(_q(A_NS, "noFill")) is not None:
+        return "none"
+    sf = spPr.find(_q(A_NS, "solidFill"))
+    if sf is not None:
+        return _color_of(sf, theme)
+    if spPr.find(_q(A_NS, "gradFill")) is not None:
+        return "grad"
+    if spPr.find(_q(A_NS, "blipFill")) is not None:
+        return "blip"
+    return None
+
+
+def _line_of(el, theme):
+    out = {"color": None, "w": None, "dash": None,
+           "head": None, "tail": None, "nofill": False}
+    spPr = el.find(_q(P_NS, "spPr"))
+    if spPr is None:
+        return out
+    ln = spPr.find(_q(A_NS, "ln"))
+    if ln is None:
+        return out
+    wv = _fnum(ln.get("w"))
+    out["w"] = None if wv is None else wv / EMU_PER_PT
+    out["nofill"] = ln.find(_q(A_NS, "noFill")) is not None
+    out["color"] = _color_of(ln.find(_q(A_NS, "solidFill")), theme)
+    dash = ln.find(_q(A_NS, "prstDash"))
+    out["dash"] = dash.get("val") if dash is not None else None
+    head, tail = ln.find(_q(A_NS, "headEnd")), ln.find(_q(A_NS, "tailEnd"))
+    out["head"] = head.get("type") if head is not None else None
+    out["tail"] = tail.get("type") if tail is not None else None
+    return out
+
+
+def _text_of(el, theme):
+    tx = el.find(_q(P_NS, "txBody"))
+    if tx is None:
+        return None
+    paras = []
+    for p in tx.findall(_q(A_NS, "p")):
+        runs = []
+        for ch in p:
+            if ch.tag == _q(A_NS, "r"):
+                t = ch.find(_q(A_NS, "t"))
+                rPr = ch.find(_q(A_NS, "rPr"))
+                d = {"t": t.text if t is not None and t.text else "",
+                     "sz": None, "b": None, "i": None, "base": None,
+                     "color": None, "font": None}
+                if rPr is not None:
+                    sz = _fnum(rPr.get("sz"))
+                    d["sz"] = None if sz is None else sz / 100.0
+                    d["b"] = rPr.get("b")
+                    d["i"] = rPr.get("i")
+                    d["base"] = rPr.get("baseline")
+                    d["color"] = _color_of(rPr.find(_q(A_NS, "solidFill")), theme)
+                    lat = rPr.find(_q(A_NS, "latin"))
+                    d["font"] = lat.get("typeface") if lat is not None else None
+                runs.append(d)
+            elif ch.tag == _q(A_NS, "br"):
+                runs.append({"t": "\n", "sz": None, "b": None, "i": None,
+                             "base": None, "color": None, "font": None})
+        pPr = p.find(_q(A_NS, "pPr"))
+        paras.append({"algn": pPr.get("algn") if pPr is not None else None,
+                      "runs": runs})
+    bodyPr = tx.find(_q(A_NS, "bodyPr"))
+    body = {"lIns": None, "rIns": None, "tIns": None, "bIns": None,
+            "wrap": None, "anchor": None}
+    if bodyPr is not None:
+        for k in ("lIns", "rIns", "tIns", "bIns", "wrap", "anchor"):
+            body[k] = bodyPr.get(k)
+    return {"paras": paras, "body": body}
+
+
+def _nv_name(el):
+    for tag in ("nvSpPr", "nvGrpSpPr", "nvCxnSpPr", "nvPicPr", "nvGraphicFramePr"):
+        nv = el.find(_q(P_NS, tag))
+        if nv is None:
             continue
-        return p
-    raise FileNotFoundError(f'目录中未找到 .pptx 文件: {dir_path}')
+        cnv = nv.find(_q(P_NS, "cNvPr"))
+        if cnv is not None:
+            return cnv.get("name") or ""
+    return ""
 
 
-def evaluate(dir_path: str) -> dict:
-    """统一入口：接收脚本所在目录路径，脚本负责在该目录里定位并打开被评估文档。"""
-    script_id = '051'
+def _walk(spTree, theme):
+    """递归展开 spTree，返回展平后的形状列表。
+
+    组内子形状必须先经过 a:chOff/a:chExt 的坐标变换才能得到页面绝对坐标，
+    否则组合内的图标、连接线位置会全部错位。sw/sh 保留 a:ext 的原始符号，
+    箭头指向依赖它——一旦提前把负宽高规范化，就再也分不清箭头在头还是在尾。
+    """
+    out = []
+
+    def rec(container, tf, top_ref, depth):
+        for child in container:
+            kind = child.tag.split("}")[-1]
+            if kind not in _SHAPE_KINDS:
+                continue
+            xf = _own_xfrm(child)
+            oe = _off_ext(xf)
+            ax, bx, ay, by = tf
+            if oe is None:
+                x = y = w = h = sw = sh = None
+            else:
+                X, Y, CX, CY = oe
+                x = (ax + X * bx) / EMU_PER_CM
+                y = (ay + Y * by) / EMU_PER_CM
+                w = (CX * bx) / EMU_PER_CM
+                h = (CY * by) / EMU_PER_CM
+                sw, sh = w, h
+                if w < 0:
+                    x += w
+                    w = -w
+                if h < 0:
+                    y += h
+                    h = -h
+            idx = len(out)
+            top = idx if depth == 0 else top_ref
+            spPr = child.find(_q(P_NS, "spPr"))
+            prst = None
+            if spPr is not None:
+                geom = spPr.find(_q(A_NS, "prstGeom"))
+                if geom is not None:
+                    prst = geom.get("prst")
+                elif spPr.find(_q(A_NS, "custGeom")) is not None:
+                    prst = "custGeom"
+            out.append({
+                "i": idx, "top": top, "depth": depth, "kind": kind,
+                "name": _nv_name(child), "prst": prst,
+                "x": x, "y": y, "w": w, "h": h, "sw": sw, "sh": sh,
+                "fill": _fill_of(child, theme), "ln": _line_of(child, theme),
+                "flipH": _truthy(xf.get("flipH")) if xf is not None else False,
+                "flipV": _truthy(xf.get("flipV")) if xf is not None else False,
+                "rot": _fnum(xf.get("rot")) if xf is not None else None,
+                "tx": _text_of(child, theme),
+            })
+            if kind == "grpSp":
+                ntf = tf
+                if xf is not None and w:
+                    cho, che = xf.find(_q(A_NS, "chOff")), xf.find(_q(A_NS, "chExt"))
+                    if cho is not None and che is not None:
+                        ccx = _fnum(che.get("cx"), 1.0) or 1.0
+                        ccy = _fnum(che.get("cy"), 1.0) or 1.0
+                        kx = (w * EMU_PER_CM) / ccx
+                        ky = (h * EMU_PER_CM) / ccy
+                        ntf = (x * EMU_PER_CM - _fnum(cho.get("x"), 0.0) * kx, kx,
+                               y * EMU_PER_CM - _fnum(cho.get("y"), 0.0) * ky, ky)
+                rec(child, ntf, top, depth + 1)
+
+    rec(spTree, (0.0, 1.0, 0.0, 1.0), -1, 0)
+    return out
+
+
+def _load(file_path):
+    with zipfile.ZipFile(file_path) as zf:
+        pw, ph, n_slides = _slide_size(zf)
+        theme = _theme_lookup(zf)
+        blob, n_xml = _first_slide_xml(zf)
+    root = ET.fromstring(blob)
+    spTree = root.find(".//" + _q(P_NS, "spTree"))
+    if spTree is None:
+        raise ValueError("首页幻灯片缺少 p:spTree")
+    return {"pw": pw, "ph": ph,
+            "n_slides": max(n_slides, n_xml),
+            "shapes": _walk(spTree, theme), "theme": theme}
+
+
+# ---------------------------------------------------------------- 文本工具
+
+
+def _flat(tx):
+    if not tx:
+        return ""
+    return "\n".join("".join(r.get("t") or "" for r in p["runs"])
+                     for p in tx["paras"])
+
+
+def _paras_text(tx):
+    if not tx:
+        return []
+    return [re.sub(r"\s+", " ", "".join(r.get("t") or "" for r in p["runs"])).strip()
+            for p in tx["paras"]]
+
+
+def _nonempty_paras(tx):
+    return [t for t in _paras_text(tx) if t]
+
+
+def _norm(s):
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _squash(s):
+    return re.sub(r"\s+", "", (s or ""))
+
+
+def _runs(tx):
+    if not tx:
+        return []
+    return [r for p in tx["paras"] for r in p["runs"]]
+
+
+def _text_runs(tx):
+    return [r for r in _runs(tx) if (r.get("t") or "").strip()]
+
+
+def _sizes(tx):
+    return [r["sz"] for r in _text_runs(tx) if r.get("sz")]
+
+
+def _dom_sz(tx, default=18.0):
+    """取形状里“字数最多的字号”，避免被行首占位空格的小字号带偏。"""
+    tally = {}
+    for r in _text_runs(tx):
+        if r.get("sz"):
+            tally[r["sz"]] = tally.get(r["sz"], 0) + len((r.get("t") or "").strip())
+    if not tally:
+        return default
+    return sorted(tally.items(), key=lambda kv: (-kv[1], -kv[0]))[0][0]
+
+
+def _all_bold(tx):
+    rs = _text_runs(tx)
+    return bool(rs) and all(_truthy(r.get("b")) for r in rs)
+
+
+def _all_italic(tx):
+    rs = _text_runs(tx)
+    return bool(rs) and all(_truthy(r.get("i")) for r in rs)
+
+
+def _all_ctr(tx):
+    if not tx:
+        return False
+    ps = [p for p in tx["paras"] if "".join(r.get("t") or "" for r in p["runs"]).strip()]
+    return bool(ps) and all(p.get("algn") == "ctr" for p in ps)
+
+
+def _run_colors(tx):
+    return [r.get("color") for r in _text_runs(tx) if r.get("color")]
+
+
+# ---------------------------------------------------------------- 几何工具
+
+
+class _Page(object):
+    """把绝对 cm 坐标换算成占页面宽/高的百分比，让细则锚点与页面尺寸无关。"""
+
+    def __init__(self, pw, ph):
+        self.pw = pw or 33.87
+        self.ph = ph or 19.05
+
+    def px(self, v):
+        return None if v is None else v * 100.0 / self.pw
+
+    def py(self, v):
+        return None if v is None else v * 100.0 / self.ph
+
+    def at(self, s, x1, x2, y1, y2):
+        if s.get("x") is None or s.get("y") is None:
+            return False
+        return (x1 <= self.px(s["x"]) <= x2) and (y1 <= self.py(s["y"]) <= y2)
+
+    def at_pt(self, x, y, x1, x2, y1, y2):
+        return (x1 <= self.px(x) <= x2) and (y1 <= self.py(y) <= y2)
+
+
+def _x2(s):
+    return None if s.get("x") is None else s["x"] + s["w"]
+
+
+def _y2(s):
+    return None if s.get("y") is None else s["y"] + s["h"]
+
+
+def _cx(s):
+    return None if s.get("x") is None else s["x"] + s["w"] / 2.0
+
+
+def _cy(s):
+    return None if s.get("y") is None else s["y"] + s["h"] / 2.0
+
+
+def _is_conn(s):
+    return s["kind"] == "cxnSp" or s.get("prst") in _LINE_PRST
+
+
+def _has_arrow(s, which):
+    v = s["ln"].get(which)
+    return bool(v) and v != "none"
+
+
+def _ends(s):
+    """还原线条的起点与终点。
+
+    a:ext 的 cx/cy 允许为负，负值表示“从右往左/从下往上”画；再叠加
+    flipH/flipV 才是最终朝向。丢掉符号会让所有箭头看起来方向一致。
+    """
+    if s.get("sw") is None or s.get("x") is None:
+        return None
+    x1, x2 = (s["x"], s["x"] + s["w"]) if s["sw"] >= 0 else (s["x"] + s["w"], s["x"])
+    y1, y2 = (s["y"], s["y"] + s["h"]) if s["sh"] >= 0 else (s["y"] + s["h"], s["y"])
+    if s["flipH"]:
+        x1, x2 = x2, x1
+    if s["flipV"]:
+        y1, y2 = y2, y1
+    return ((x1, y1), (x2, y2))
+
+
+def _tip(s):
+    """带箭头端的坐标：tailEnd 在终点，headEnd 在起点；无箭头返回 None。"""
+    e = _ends(s)
+    if e is None:
+        return None
+    if _has_arrow(s, "tail"):
+        return e[1]
+    if _has_arrow(s, "head"):
+        return e[0]
+    return None
+
+
+def _tail_pt(s):
+    e = _ends(s)
+    if e is None:
+        return None
+    if _has_arrow(s, "tail"):
+        return e[0]
+    if _has_arrow(s, "head"):
+        return e[1]
+    return None
+
+
+def _bbox(shapes):
+    xs = [s["x"] for s in shapes if s.get("x") is not None]
+    if not xs:
+        return None
+    ys = [s["y"] for s in shapes]
+    return (min(xs), min(ys),
+            max(_x2(s) for s in shapes) - min(xs),
+            max(_y2(s) for s in shapes) - min(ys))
+
+
+def _box_dist(px, py, s):
+    """点到形状外接矩形的距离；点在矩形内返回 0。"""
+    dx = max(s["x"] - px, 0.0, px - _x2(s))
+    dy = max(s["y"] - py, 0.0, py - _y2(s))
+    return math.hypot(dx, dy)
+
+
+def _clusters(vals, gap):
+    """一维聚类：排序后相邻差值超过 gap 就切一刀，返回每簇的成员索引。"""
+    order = sorted(range(len(vals)), key=lambda k: vals[k])
+    groups, cur = [], []
+    for k in order:
+        if cur and vals[k] - vals[cur[-1]] > gap:
+            groups.append(cur)
+            cur = []
+        cur.append(k)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _interval_clusters(spans, gap):
+    """按区间 [x1, x2] 聚类：区间间空隙小于 gap 视为同一簇。"""
+    order = sorted(range(len(spans)), key=lambda k: spans[k][0])
+    groups, cur, right = [], [], None
+    for k in order:
+        a, b = spans[k]
+        if cur and a - right > gap:
+            groups.append(cur)
+            cur, right = [], None
+        cur.append(k)
+        right = b if right is None else max(right, b)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _icon_group(shapes, gap=0.12):
+    """从一个取点窗口里切出单个小图标的本体。窗口按百分比给定，边界上难免会把
+    相邻图标之间的横向箭头连线一起圈进来；这些连线与图标本体之间存在明显的横向
+    空隙，因此按横向区间聚类后取成员最多的一簇，即为图标本体。"""
+    live = [s for s in shapes if s.get("x") is not None]
+    if not live:
+        return []
+    groups = _interval_clusters([(s["x"], _x2(s)) for s in live], gap)
+    best = max(groups, key=lambda g: (len(g), -min(live[k]["x"] for k in g)))
+    return [live[k] for k in best]
+
+
+def _connected(shapes, tol):
+    """判断一组线段是否首尾相接成一条链：端点两两距离不超过 tol 即连通，
+    最终必须落在同一个连通分量里。单个形状天然连通。"""
+    n = len(shapes)
+    if n <= 1:
+        return n == 1
+    pts = []
+    for s in shapes:
+        e = _ends(s)
+        if e is None:
+            return False
+        pts.append(e)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for a in range(n):
+        for b in range(a + 1, n):
+            hit = False
+            for pa in pts[a]:
+                for pb in pts[b]:
+                    if math.hypot(pa[0] - pb[0], pa[1] - pb[1]) <= tol:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+    return len(set(find(a) for a in range(n))) == 1
+
+
+def _hruns(shapes, ytol=0.06, xgap=0.28):
+    """把同一水平线上、彼此间隙很小的多段短线合并成“视觉上的一条线”。
+
+    交付文件可能用一串独立实线短段去模拟虚线箭头，渲染出来与真虚线无异；
+    本条只负责还原“看起来是一条多长的线、末端有没有箭头”，是否用线型实现
+    在虚线边框那一条里单独判定，避免同一处缺陷被重复计分。
+    """
+    cand = [s for s in shapes
+            if s.get("x") is not None and s["h"] <= ytol and s["w"] > 0.02]
+    runs = []
+    for grp in _clusters([_cy(s) for s in cand], ytol):
+        members = sorted([cand[k] for k in grp], key=lambda s: s["x"])
+        cur = [members[0]]
+        for s in members[1:]:
+            if s["x"] - max(_x2(m) for m in cur) <= xgap:
+                cur.append(s)
+            else:
+                runs.append(cur)
+                cur = [s]
+        runs.append(cur)
+    out = []
+    for run in runs:
+        x1 = min(s["x"] for s in run)
+        x2 = max(_x2(s) for s in run)
+        out.append({"x1": x1, "x2": x2, "y": sum(_cy(s) for s in run) / len(run),
+                    "span": x2 - x1, "n": len(run), "parts": run,
+                    "arrow_right": any(_has_arrow(s, "tail") or _has_arrow(s, "head")
+                                       for s in run)})
+    return out
+
+
+def _dash_like(run):
+    """一条“看起来是虚线”的水平线：本身线型为虚线，或由三段以上短实线拼出。"""
+    if run["n"] >= 3:
+        return True
+    return any((s["ln"].get("dash") or "") in _DASH_PRST for s in run["parts"])
+
+
+def _solid_like(run):
+    if run["n"] >= 3:
+        return False
+    return all((s["ln"].get("dash") or "solid") not in _DASH_PRST
+               for s in run["parts"])
+
+
+def _pick(shapes, pred):
+    return [s for s in shapes if pred(s)]
+
+
+def _find_rr(shapes, page, x1, x2, y1, y2, w, h, ln_pred=None,
+             fill_pred=None, prsts=("roundRect",)):
+    """按“位置百分比 + 宽高区间 + 边线/填充色系”定位一个圆角矩形。"""
+    hits = []
+    for s in shapes:
+        if s.get("prst") not in prsts or s.get("x") is None:
+            continue
+        if not page.at(s, x1, x2, y1, y2):
+            continue
+        if not (_rng(s["w"], w[0], w[1]) and _rng(s["h"], h[0], h[1])):
+            continue
+        if ln_pred is not None and not ln_pred(s["ln"].get("color")):
+            continue
+        if fill_pred is not None and not fill_pred(s.get("fill")):
+            continue
+        hits.append(s)
+    return hits
+
+
+_AFM_ARIAL = {
+    " ": 278, "!": 278, "\"": 355, "#": 556, "$": 556, "%": 889, "&": 667,
+    "'": 191, "(": 333, ")": 333, "*": 389, "+": 584, ",": 278, "-": 333,
+    ".": 278, "/": 278, "0": 556, "1": 556, "2": 556, "3": 556, "4": 556,
+    "5": 556, "6": 556, "7": 556, "8": 556, "9": 556, ":": 278, ";": 278,
+    "<": 584, "=": 584, ">": 584, "?": 556, "@": 1015, "A": 667, "B": 667,
+    "C": 722, "D": 722, "E": 667, "F": 611, "G": 778, "H": 722, "I": 278,
+    "J": 500, "K": 667, "L": 556, "M": 833, "N": 722, "O": 778, "P": 667,
+    "Q": 778, "R": 722, "S": 667, "T": 611, "U": 722, "V": 667, "W": 944,
+    "X": 667, "Y": 667, "Z": 611, "[": 278, "\\": 278, "]": 278, "^": 469,
+    "_": 556, "`": 333, "a": 556, "b": 556, "c": 500, "d": 556, "e": 556,
+    "f": 278, "g": 556, "h": 556, "i": 222, "j": 222, "k": 500, "l": 222,
+    "m": 833, "n": 556, "o": 556, "p": 556, "q": 556, "r": 333, "s": 500,
+    "t": 278, "u": 556, "v": 500, "w": 722, "x": 500, "y": 500, "z": 500,
+    "{": 334, "|": 260, "}": 334, "~": 584, "λ": 500,
+}
+
+_AFM_ARIAL_BOLD = {
+    " ": 278, "-": 333, ".": 278, "/": 278, ":": 333, "+": 584, "=": 584,
+    "0": 556, "1": 556, "2": 556, "3": 556, "4": 556, "5": 556, "6": 556,
+    "7": 556, "8": 556, "9": 556, "A": 722, "B": 722, "C": 722, "D": 722,
+    "E": 667, "F": 611, "G": 778, "H": 722, "I": 278, "J": 556, "K": 722,
+    "L": 611, "M": 833, "N": 722, "O": 778, "P": 667, "Q": 778, "R": 722,
+    "S": 667, "T": 611, "U": 722, "V": 667, "W": 944, "X": 667, "Y": 667,
+    "Z": 611, "a": 556, "b": 611, "c": 556, "d": 611, "e": 556, "f": 333,
+    "g": 611, "h": 611, "i": 278, "j": 278, "k": 556, "l": 278, "m": 889,
+    "n": 611, "o": 611, "p": 611, "q": 611, "r": 389, "s": 556, "t": 333,
+    "u": 611, "v": 556, "w": 778, "x": 556, "y": 556, "z": 500,
+    "λ": 556,
+}
+
+
+def _adv(ch, bold):
+    tbl = _AFM_ARIAL_BOLD if bold else _AFM_ARIAL
+    if ch in tbl:
+        return tbl[ch]
+    if ord(ch) > 0x2E80:
+        return 1000
+    return 556 if bold else 500
+
+
+# 字宽表按 Arial 标定，其余西文字体按整体字宽相对 Arial 的比例折算。
+_FONT_W = {
+    "calibri": 0.855, "segoe ui": 0.895, "candara": 0.865, "corbel": 0.880,
+    "constantia": 0.930, "cambria": 0.945, "georgia": 1.010,
+    "times new roman": 0.900, "garamond": 0.855, "tahoma": 0.975,
+    "verdana": 1.090, "trebuchet ms": 0.930, "arial narrow": 0.820,
+}
+
+
+def _font_factor(name):
+    if not name:
+        return 1.0
+    return _FONT_W.get(str(name).strip().lower(), 1.0)
+
+
+def _est_lines(sh):
+    """按 AFM 字宽表估算文本框内每个段落实际排出的行数。
+
+    与办公软件对齐：可用排版宽度 = 文本框宽度 - 左内边距 - 右内边距；
+    未显式给出内边距时按默认 91440 EMU（0.254 厘米）计。字宽表以 Arial
+    标定，按 run 的西文字体名折算字宽比例；估算与真实排版存在细微差异，
+    因此判断是否折行时留 3% 宽度容差。
+    """
+    tx = sh.get("tx")
+    if not tx or sh.get("w") is None:
+        return 1
+    body = tx.get("body") or {}
+
+    def _ins(key):
+        v = body.get(key)
+        if v is None:
+            return 0.254
+        return _fnum(v, 0.0) / EMU_PER_CM
+
+    avail = sh["w"] - _ins("lIns") - _ins("rIns")
+    if avail <= 0.05:
+        return 1
+    avail *= 1.03
+    total = 0
+    for para in tx["paras"]:
+        segs = [""]
+        bolds = [False]
+        fonts = [None]
+        for run in para["runs"]:
+            t = run.get("t") or ""
+            if t == "\n":
+                segs.append("")
+                bolds.append(False)
+                fonts.append(None)
+                continue
+            segs[-1] += t
+            if _truthy(run.get("b")):
+                bolds[-1] = True
+            if fonts[-1] is None:
+                fonts[-1] = run.get("font")
+        for seg, bold, font in zip(segs, bolds, fonts):
+            words = seg.split()
+            if not words:
+                total += 1
+                continue
+            sz = _dom_sz(tx)
+            unit = sz * PT_TO_CM / 1000.0 * _font_factor(font)
+            lines = 1
+            cur = 0.0
+            space = _adv(" ", bold) * unit
+            for w in words:
+                wid = sum(_adv(c, bold) for c in w) * unit
+                if cur <= 0.0:
+                    cur = wid
+                elif cur + space + wid <= avail + 1e-6:
+                    cur += space + wid
+                else:
+                    lines += 1
+                    cur = wid
+                if cur > avail + 1e-6:
+                    # 单个词本身超过一行可排宽度时，办公软件会把它断开续排
+                    extra = int(math.ceil(cur / avail)) - 1
+                    lines += extra
+                    cur -= extra * avail
+            total += lines
+    return max(1, total)
+
+
+def _para_lines(sh):
+    """文本框内的段落数（含换行符产生的行），不含空段。"""
+    tx = sh.get("tx")
+    if not tx:
+        return 0
+    n = 0
+    for para in tx["paras"]:
+        txt = "".join(r.get("t") or "" for r in para["runs"])
+        if not txt.strip():
+            continue
+        n += 1 + txt.count("\n")
+    return max(1, n)
+
+
+def _no_wrap(sh):
+    """估算行数与文本自身的行数一致，即没有因为框太窄而额外折行。"""
+    return _est_lines(sh) == _para_lines(sh)
+
+
+def _check_dim1(file_path, data):
+    """维度1 硬门槛：格式可用、单页、内容可编辑。任一条不满足则完成度记 0 分。"""
+    # ① 交付文件必须是 .pptx，并且能被正常解包解析。
+    #    解析失败会在 evaluate 里落到 status=error，不会走到这里。
+    if not os.path.basename(file_path).lower().endswith(".pptx"):
+        return (False, "交付文件不是 .pptx 格式")
+
+    # ② 只允许 1 页幻灯片。
+    n = data["n_slides"]
+    if n != 1:
+        return (False, "交付 PPT 包含 %d 页幻灯片，不是 1 页" % n)
+
+    shapes = data["shapes"]
+
+    # ③ 流程图整体或其中任一区块都不能是图片：既不能有 p:pic 对象，
+    #    也不能有用图片填充（a:blipFill）去铺一大块版面的形状。
+    pics = [s for s in shapes if s["kind"] == "pic"]
+    if pics:
+        return (False, "页面存在 %d 个图片对象，流程图或其中区块以图片形式呈现" % len(pics))
+    page_area = max(data["pw"] * data["ph"], 1e-6)
+    for s in shapes:
+        if s.get("fill") != "blip" or s.get("w") is None:
+            continue
+        if s["w"] * s["h"] >= 0.05 * page_area:
+            return (False, "页面存在以图片填充的大面积形状，流程图以图片形式呈现")
+
+    # ④ 文字必须落在可编辑文本框内：页面上要真实存在带 a:t 文本的 p:txBody。
+    txt = [s for s in shapes if s.get("tx") and _flat(s["tx"]).strip()]
+    if not txt:
+        return (False, "页面未发现任何可编辑文本框，文字不可编辑")
+
+    # ⑤ 整页可编辑：顶层不能只有孤零零一个对象，否则等同于整页一块死图。
+    tops = [s for s in shapes if s["depth"] == 0]
+    if len(tops) < 2:
+        return (False, "页面顶层仅 %d 个对象，出现整页不可编辑的情况" % len(tops))
+
+    # ⑥ 图形必须是可编辑的形状或线条：至少要有带预置几何或自定义几何的形状。
+    geo = [s for s in shapes if s["kind"] in ("sp", "cxnSp") and s.get("prst")]
+    if not geo:
+        return (False, "页面未发现可编辑的形状或线条对象")
+
+    return (True, "")
+
+
+def _evaluate_impl(file_path, result):
+    data = _load(file_path)
+    page = _Page(data["pw"], data["ph"])
+    shapes = data["shapes"]
+    tops = [s for s in shapes if s["depth"] == 0]
+
+    ok1, why1 = _check_dim1(file_path, data)
+    result["dim1_pass"] = bool(ok1)
+    # 约定：dim1_pass 为 False 时 dim1_reason 必须带错误摘要，通过时必须为空串。
+    if ok1:
+        result["dim1_reason"] = ""
+    else:
+        result["dim1_reason"] = why1 or "维度一未通过（未给出具体原因）"
+    if not ok1:
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = MAX_SCORE_TOTAL
+        return result
+
+    texts = [s for s in shapes if s.get("tx") and _flat(s["tx"]).strip()]
+
+    def tf(*keys):
+        """按“去掉全部空白后依次包含这些片段”找文本形状，兼容多 run 拆词与填充空格。"""
+        out = []
+        for s in texts:
+            k = _squash(_flat(s["tx"])).lower()
+            pos, ok = 0, True
+            for frag in keys:
+                f = _squash(frag).lower()
+                idx = k.find(f, pos)
+                if idx < 0:
+                    ok = False
+                    break
+                pos = idx + len(f)
+            if ok:
+                out.append(s)
+        return out
+
+    def one(hits):
+        return hits[0] if hits else None
+
+    conns = [s for s in shapes if _is_conn(s) and s.get("x") is not None]
+    blacks = [s for s in conns if _is_black(s["ln"].get("color"))]
+
+    # 六个区块框、图例框、两个评分子框、四个并排子矩形：多条规则共用的位置基准，
+    # 这里用比细则本身稍宽的窗口先定位一次，各条规则再按自己的严格区间复核。
+    a_teal = one(_find_rr(shapes, page, 0, 10, 18, 32, (4.2, 5.8), (5.2, 6.8),
+                          ln_pred=_is_teal))
+    a_seq = one(_find_rr(shapes, page, 16, 30, 2, 14, (5.2, 6.8), (4.0, 5.2),
+                         ln_pred=_is_teal))
+    a_pat = one(_find_rr(shapes, page, 16, 30, 36, 47, (4.8, 6.2), (4.6, 5.6),
+                         ln_pred=_is_purple))
+    a_fus = one(_find_rr(shapes, page, 38, 48, 2, 14, (12.5, 15.5), (6.8, 8.0),
+                         ln_pred=_is_orange))
+    a_ano = one(_find_rr(shapes, page, 80, 90, 8, 17, (4.3, 5.6), (7.0, 8.2),
+                         ln_pred=_is_green))
+    a_dec = one(_find_rr(shapes, page, 80, 90, 55, 64, (4.2, 5.4), (4.3, 5.2),
+                         ln_pred=_is_pink))
+    a_trn = one(_find_rr(shapes, page, 40, 48, 53, 62, (7.8, 9.5), (4.3, 5.2),
+                         ln_pred=_is_blue))
+    a_lgd = one(_find_rr(shapes, page, 20, 29, 86, 94, (17.5, 20.5), (1.2, 1.8),
+                         ln_pred=_is_lightgray, fill_pred=_is_white))
+    a_rec = one(_find_rr(shapes, page, 82, 91, 12, 20, (3.3, 4.3), (2.4, 3.2),
+                         ln_pred=_is_green))
+    a_scr = one(_find_rr(shapes, page, 82, 91, 31, 40, (3.3, 4.3), (2.4, 3.2),
+                         ln_pred=_is_green))
+    inner4 = sorted(_find_rr(shapes, page, 40, 80, 12, 18, (2.4, 3.2), (4.6, 5.3),
+                             ln_pred=_is_orange), key=lambda s: s["x"])
+
+    results = []
+
+    # 01 左侧数据输入区块框。严格对齐细则，仅踩细则明确写出的点：
+    #    ① 位置 0%–8% / 20%–30%；② 宽 4.5–5.5、高 5.5–6.5；③ 填充为极浅青色；
+    #    ④ 边线为青绿色且是单实线（线型不能是虚线）；⑤ 边线色逐通道落在
+    #    #0F9F9A–#37ADA0 之间。与办公软件对齐：未写 a:prstDash 时按实线计。
+    hit = False
+    for s in _find_rr(shapes, page, 0, 8, 20, 30, (4.5, 5.5), (5.5, 6.5),
+                      ln_pred=lambda c: _near_rgb(c, "0F9F9A", "37ADA0"),
+                      fill_pred=lambda c: _is_verylight(c) and (_is_teal(c) or _is_white(c))):
+        if (s["ln"].get("dash") or "solid") not in _DASH_PRST:
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右0%–8%、从上至下20%–30%出现一个圆角矩形，宽4.5–5.5cm，高5.5–6.5cm，填充为极浅青色，边线为青绿色单实线，边线颜色RGB接近#0F9F9A–#37ADA0")
+
+    # 02 输入标签两行文本：位置 0%–12% / 22%–32%，两行、居中、加粗、13–16 磅，
+    #    字色逐通道落在 #0A6F74–#1A787D 之间。换行既可能来自 a:br，也可能来自
+    #    两个 a:p，这里统一按“去空白后依次包含两个词”＋“非空行数为 2”判定。
+    hit = False
+    for s in tf("Multivariate", "TimeSeries"):
+        if not page.at(s, 0.0, 12.0, 22.0, 32.0):
+            continue
+        lines = [t for t in _flat(s["tx"]).split("\n") if t.strip()]
+        if len(lines) != 2:
+            continue
+        if not (_all_ctr(s["tx"]) and _all_bold(s["tx"])):
+            continue
+        if not _rng(_dom_sz(s["tx"]), 13.0, 16.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_near_rgb(c, "0A6F74", "1A787D") for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右0%–12%、从上至下22%–32%出现“Multivariate”与“Time Series”两行文本，居中对齐，加粗，字号13–16磅，颜色RGB接近#0A6F74–#1A787D")
+
+    # 03 折线图竖直网格线。逐条踩点：① 竖直细线（宽≤0.08）且长 3.0–3.6；
+    #    ② 顶端 34%–38%、最左端 2%–6%；③ 数量≥6；④ 等间距（相邻中心距与均值
+    #    偏差≤0.2cm）；⑤ 线型为点线或短划线；⑥ 网格内部不出现贯穿整体宽度的
+    #    横向网格线——只把“浅灰色、宽度≥网格宽 80%、且纵向严格落在网格内部”的
+    #    横线算作贯穿，网格上下边缘处的坐标轴线不计入。
+    grid = [s for s in shapes
+            if s.get("x") is not None and s["w"] <= 0.08
+            and _rng(s["h"], 3.0, 3.6)
+            and _is_lightgray(s["ln"].get("color"))
+            and _rng(page.py(s["y"]), 34.0, 38.0)]
+    hit = False
+    if len(grid) >= 6:
+        xs = sorted(_cx(s) for s in grid)
+        gaps = [xs[k + 1] - xs[k] for k in range(len(xs) - 1)]
+        mean = sum(gaps) / len(gaps)
+        even = all(abs(g - mean) <= 0.2 for g in gaps)
+        dashed = all((s["ln"].get("dash") or "") in _DASH_PRST for s in grid)
+        left_ok = _rng(page.px(min(s["x"] for s in grid)), 2.0, 6.0)
+        gx1, gx2 = xs[0], xs[-1]
+        gy1 = min(s["y"] for s in grid)
+        gy2 = max(_y2(s) for s in grid)
+        cross = False
+        for s in shapes:
+            if s.get("x") is None or s["h"] > 0.08:
+                continue
+            if s["w"] < 0.8 * max(gx2 - gx1, 0.01):
+                continue
+            if not _is_lightgray(s["ln"].get("color")):
+                continue
+            if s["x"] > gx1 + 0.2 or _x2(s) < gx2 - 0.2:
+                continue
+            if gy1 + 0.15 <= _cy(s) <= gy2 - 0.15:
+                cross = True
+        hit = even and dashed and left_ok and not cross
+    results.append(("+3：" if hit else "+0：") + "页面出现折线图竖直网格线，顶端位于从上至下34%–38%、左端位于从左至右2%–6%，数量不少于6条且等间距排列，长度3.0–3.6cm，颜色为浅灰色，线型为点线或短划线，该网格范围内不出现贯穿其整体宽度的横向网格线")
+
+    # 04 四条数据曲线。逐条踩点：① 区域 2%–16% / 35%–55%；② 蓝、橙、紫、绿四
+    #    种颜色各自都要有；③ 每种颜色要么是单个形状，要么其全部线段首尾相接
+    #    （端点间距≤0.05cm 视为相接），互不相接的独立短线段拼接不算；
+    #    ④ 四条曲线纵向中心两两相距≥0.25cm，体现上下错开；⑤ 合并外框宽
+    #    3.0–4.0、高 2.0–3.5。近黑色的坐标轴/引线不参与配色归类。
+    cand = [s for s in shapes
+            if s.get("x") is not None and page.at(s, 2.0, 16.0, 35.0, 55.0)
+            and s["ln"].get("color") and s.get("fill") in (None, "none")
+            and not _is_black(s["ln"].get("color"))]
+    groups = []
+    for pred in (_is_blue, _is_orange, _is_purple, _is_green):
+        groups.append([s for s in cand if pred(s["ln"].get("color"))])
+    hit = False
+    if all(groups) and all(_connected(g, 0.05) for g in groups):
+        boxes = [_bbox(g) for g in groups]
+        ys = sorted(b[1] + b[3] / 2.0 for b in boxes)
+        sep = all(ys[k + 1] - ys[k] >= 0.25 for k in range(len(ys) - 1))
+        uw = max(b[0] + b[2] for b in boxes) - min(b[0] for b in boxes)
+        uh = max(b[1] + b[3] for b in boxes) - min(b[1] for b in boxes)
+        hit = sep and _rng(uw, 3.0, 4.0) and _rng(uh, 2.0, 3.5)
+    results.append(("+5：" if hit else "+0：") + "页面从左至右2%–16%、从上至下35%–55%范围内出现蓝色、橙色、紫色、绿色四条数据曲线，每种颜色各为一条自左至右连贯的折线或曲线，为单个曲线形状或首尾相接的连续线段，不由互不相接的独立短线段拼接，四条曲线上下错开分布，整体宽3.0–4.0cm，高2.0–3.5cm")
+
+    def inside(t, r, pad=0.35, ctol=0.45):
+        """文本框是否落在目标矩形内部：纵向落在矩形高度范围内，横向中心基本对齐。"""
+        if t is None or r is None:
+            return False
+        return (r["y"] - pad <= t["y"] <= r["y"] + r["h"] + pad
+                and abs(_cx(t) - _cx(r)) <= ctol)
+
+    # 05 序列编码区块框：位置 18%–28% / 4%–12%，宽 5.5–6.5、高 4.2–5.0，边线青绿。
+    #    本条只判外框本身，不涉及线型，虚线与实线都算。
+    hit = bool(_find_rr(shapes, page, 18, 28, 4, 12, (5.5, 6.5), (4.2, 5.0),
+                        ln_pred=_is_teal))
+    results.append(("+1：" if hit else "+0：") + "页面从左至右18%–28%、从上至下4%–12%出现一个圆角矩形，宽5.5–6.5cm，高4.2–5.0cm，边线为青绿色")
+
+    # 06 序列编码标题：位置 20%–28% / 0%–8%，字号 13–16、加粗、青绿色。
+    #    “1. Sequence Encoder”与“1.Sequence Encoder”去空白后完全一致，统一匹配。
+    hit = False
+    for s in tf("1.SequenceEncoder"):
+        if not page.at(s, 20.0, 28.0, 0.0, 8.0):
+            continue
+        if not _all_bold(s["tx"]) or not _rng(_dom_sz(s["tx"]), 13.0, 16.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_is_teal(c) for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右20%–28%、从上至下0%–8%出现“1. Sequence Encoder”或“1.Sequence Encoder”文本，字号13–16磅，加粗，颜色为青绿色")
+
+    # 07 两个 GRU 圆角矩形。逐条踩点：① 横向 22%–28%；② 上框顶端 9%–13%、下框
+    #    顶端 19%–23%；③ 各宽 4.4–5.2、高 1.5–1.9；④ 垂直间距 0.3–0.7；
+    #    ⑤ 填充浅青、边线青绿；⑥ 两框内各有“Gated Recurrent”“Unit”两行居中
+    #    文本，字号 12–15。居中按几何居中判定：文本框中心与矩形中心横向对齐，
+    #    这样段落对齐属性缺省（继承）时也不会误判。
+    def _gru(y1, y2):
+        return _find_rr(shapes, page, 22, 28, y1, y2, (4.4, 5.2), (1.5, 1.9),
+                        ln_pred=_is_teal,
+                        fill_pred=lambda c: _is_light(c) and (_is_teal(c) or _is_white(c)))
+
+    hit = False
+    for up in _gru(9, 13):
+        for lo in _gru(19, 23):
+            if not _rng(lo["y"] - (up["y"] + up["h"]), 0.3, 0.7):
+                continue
+            good = 0
+            for r in (up, lo):
+                for t in tf("GatedRecurrent", "Unit"):
+                    lines = [z for z in _flat(t["tx"]).split("\n") if z.strip()]
+                    if len(lines) == 2 and _rng(_dom_sz(t["tx"]), 12.0, 15.0) and inside(t, r):
+                        good += 1
+                        break
+            if good == 2:
+                hit = True
+    results.append(("+3：" if hit else "+0：") + "页面从左至右22%–28%出现上下并列的两个圆角矩形，上方矩形顶端位于从上至下9%–13%、下方矩形顶端位于从上至下19%–23%，各宽4.4–5.2cm、高1.5–1.9cm，垂直间距0.3–0.7cm，填充为浅青色，边线为青绿色，两者内部各出现居中的“Gated Recurrent”与“Unit”两行文本，字号12–15磅")
+
+    # 08 模式编码区块框：位置 18%–28% / 38%–45%，宽 5.0–6.0、高 4.8–5.4，
+    #    边线色逐通道落在 #8A65C5–#9877C7 之间。
+    hit = bool(_find_rr(shapes, page, 18, 28, 38, 45, (5.0, 6.0), (4.8, 5.4),
+                        ln_pred=lambda c: _near_rgb(c, "8A65C5", "9877C7")))
+    results.append(("+1：" if hit else "+0：") + "页面从左至右18%–28%、从上至下38%–45%出现一个圆角矩形，宽5.0–6.0cm，高4.8–5.4cm，边线为紫色，边线颜色RGB接近#8A65C5–#9877C7")
+
+    # 09 模式编码标题：位置 21%–27% / 38%–45%，字号 13–16、加粗、紫色。
+    #    文本可能被拆成多个 run（如“2. Pattern Encode”＋“r”），按去空白后包含判定。
+    hit = False
+    for s in tf("2.PatternEncoder"):
+        if not page.at(s, 21.0, 27.0, 38.0, 45.0):
+            continue
+        if not _all_bold(s["tx"]) or not _rng(_dom_sz(s["tx"]), 13.0, 16.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_is_purple(c) for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右21%–27%、从上至下38%–45%出现“2. Pattern Encoder”文本，字号13–16磅，加粗，颜色为紫色")
+
+    def _txt_bottom(t):
+        """文本末行底端位置（cm）：按文本框底端取，不依赖办公软件实测的文本块高度。"""
+        return t["y"] + t["h"]
+
+    # 10 紫色方块矩阵。逐条踩点：① 区域 22%–30% / 44%–54%；② 小方块数量≥15；
+    #    ③ 行列数为 3×5 或 4×4；④ 整体宽 2.8–3.4、高 1.7–2.2；⑤ 各方块填充为
+    #    深浅不同的紫色系（至少两种不同填充色）、边线为紫色；⑥ 无缝拼接——整体
+    #    宽高应约等于“单块尺寸 × 列数/行数”，块间留白会使乘积明显小于整体尺寸。
+    #    注意矩阵底衬矩形用的是主题色（解析后为蓝色），不参与本条判定。
+    cells = [s for s in shapes
+             if s.get("x") is not None and page.at(s, 20.0, 36.0, 42.0, 58.0)
+             and _rng(s["w"], 0.5, 0.75) and _rng(s["h"], 0.5, 0.75)
+             and _is_purple(s.get("fill")) and _is_purple(s["ln"].get("color"))]
+    hit = False
+    if len(cells) >= 15:
+        rows = _clusters([_cy(s) for s in cells], 0.2)
+        cols = _clusters([_cx(s) for s in cells], 0.2)
+        bx, by, bw, bh = _bbox(cells)
+        aw = sum(s["w"] for s in cells) / len(cells)
+        ah = sum(s["h"] for s in cells) / len(cells)
+        seamless = (abs(bw - aw * len(cols)) <= 0.3
+                    and abs(bh - ah * len(rows)) <= 0.3)
+        hit = ((len(rows), len(cols)) in ((3, 5), (4, 4))
+               and len(set(s.get("fill") for s in cells)) >= 2
+               and seamless and _rng(bw, 2.8, 3.4) and _rng(bh, 1.7, 2.2)
+               and _rng(page.px(bx), 22.0, 30.0) and _rng(page.py(by), 44.0, 54.0))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右22%–30%、从上至下44%–54%范围内出现由不少于15个小方块无缝拼接成的矩阵，排列为3行5列或4行4列，整体宽2.8–3.4cm、高1.7–2.2cm，各方块填充为深浅不同的紫色系颜色，边线为紫色")
+
+    # 11 Temporal / Embedding 两行文本。逐条踩点：① 区域 24%–30% / 56%–62%；
+    #    ② 居中、加粗、字号 12–15；③ 文本仅占两行且无跨行断词——文本自身两行，
+    #    实际排出来也必须正好两行，框太窄折成三行即不满足；④ 末行底端≤67%。
+    #    ③④ 的行数按字宽表估算，末行底端按文本框底端取。
+    hit = False
+    for s in tf("Temporal", "Embedding"):
+        if not page.at(s, 24.0, 30.0, 56.0, 62.0):
+            continue
+        if not (_all_ctr(s["tx"]) and _all_bold(s["tx"])):
+            continue
+        if not _rng(_dom_sz(s["tx"]), 12.0, 15.0):
+            continue
+        if _para_lines(s) != 2 or _est_lines(s) != 2:
+            continue
+        if page.py(_txt_bottom(s)) <= 67.0:
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右24%–30%、从上至下56%–62%出现“Temporal”与“Embedding”两行居中文本，字号12–15磅，加粗，文本仅占两行且无跨行断词，末行底端位于从上至下67%以内")
+
+    # 12 融合区块框：位置 40%–46% / 4%–12%，宽 13.0–15.0、高 7.0–7.8，填充极浅
+    #    橙色，边线色逐通道落在 #FF6B1A–#FBAB63 之间。
+    hit = bool(_find_rr(shapes, page, 40, 46, 4, 12, (13.0, 15.0), (7.0, 7.8),
+                        ln_pred=lambda c: _near_rgb(c, "FF6B1A", "FBAB63"),
+                        fill_pred=lambda c: _is_verylight(c) and _is_paleorange(c)))
+    results.append(("+1：" if hit else "+0：") + "页面从左至右40%–46%、从上至下4%–12%出现一个圆角矩形，宽13.0–15.0cm，高7.0–7.8cm，填充为极浅橙色，边线为橙色，边线颜色RGB接近#FF6B1A–#FBAB63")
+
+    # 13 融合区块标题：位置 45%–52% / 0%–8%，字号 15–17、加粗、橙色。
+    hit = False
+    for s in tf("3.Fusion", "RepresentationLearning"):
+        if not page.at(s, 45.0, 52.0, 0.0, 8.0):
+            continue
+        if not _all_bold(s["tx"]) or not _rng(_dom_sz(s["tx"]), 15.0, 17.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_is_orange(c) for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右45%–52%、从上至下0%–8%出现“3. Fusion & Representation Learning”文本，字号15–17磅，加粗，颜色为橙色")
+
+    # 14 融合区块内横向并排的四个圆角矩形。逐条踩点：① 顶端均在 13%–17% 的同一
+    #    水平线上（顶端极差≤0.15cm）；② 最左者左端 41%–46%；③ 各宽 2.5–3.1、高
+    #    4.7–5.2；④ 相邻间距 0.5–0.8；⑤ 填充浅橙且颜色深于外围橙色框的填充色
+    #    （用亮度比较，浅于外框即不满足）；⑥ 边线橙色；⑦ 自左至右四处文本齐全、
+    #    字号 11–14；⑧ “Layer Normalization”必须以两行完整显示，排成三行即
+    #    出现跨行断词，不满足。
+    quad = sorted(_find_rr(shapes, page, 41, 78, 13, 17, (2.5, 3.1), (4.7, 5.2),
+                           ln_pred=_is_orange,
+                           fill_pred=lambda c: _is_paleorange(c) and _is_light(c)),
+                  key=lambda s: s["x"])
+    hit = False
+    if len(quad) == 4 and a_fus is not None:
+        ytops = [s["y"] for s in quad]
+        gaps = [quad[k + 1]["x"] - _x2(quad[k]) for k in range(3)]
+        base_lum = _lum(a_fus.get("fill"))
+        darker = base_lum is not None and all(
+            _lum(s.get("fill")) is not None and _lum(s["fill"]) < base_lum
+            for s in quad)
+        labels = (("Concatenate",), ("Self-Attention", "Block"),
+                  ("Feed-Forward", "Network"), ("Layer", "Normalization"))
+        ok_txt = True
+        for r, keys in zip(quad, labels):
+            found = None
+            for t in tf(*keys):
+                if inside(t, r) and _rng(_dom_sz(t["tx"]), 11.0, 14.0):
+                    found = t
+                    break
+            if found is None:
+                ok_txt = False
+                break
+            if keys[0] == "Layer" and not (_para_lines(found) == 2
+                                           and _est_lines(found) == 2):
+                ok_txt = False
+                break
+        hit = (max(ytops) - min(ytops) <= 0.15
+               and _rng(page.px(quad[0]["x"]), 41.0, 46.0)
+               and all(_rng(g, 0.5, 0.8) for g in gaps)
+               and darker and ok_txt)
+    results.append(("+3：" if hit else "+0：") + "页面出现横向并排的四个圆角矩形，顶端均位于从上至下13%–17%的同一水平线上，最左者左端位于从左至右41%–46%，各宽2.5–3.1cm、高4.7–5.2cm，相邻间距0.5–0.8cm，填充为浅橙色且深于其外围橙色圆角矩形的填充色，边线为橙色，四者内部自左至右分别出现居中的“Concatenate”、“Self-Attention Block”、“Feed-Forward Network”、“Layer Normalization”文本，字号11–14磅，其中“Layer Normalization”以“Layer”“Normalization”两行完整显示且无跨行断词")
+
+    # 15 网格状表格图形。逐条踩点：① 区域 43%–48% / 23%–29%；② 线条橙棕色；
+    #    ③ 拆分为左右两组且两组之间存在间隙——把成员矩形按横向区间聚类，必须
+    #    聚出不少于 2 组；④ 每组内可辨识出不少于 2 列 3 行的网格，故要求存在
+    #    独立的橙棕色横向分隔线不少于 2 条；⑤ 整体宽 1.3–2.0、高 2.2–2.8；
+    #    ⑥ 填充为浅橙色或无填充。仅靠竖向切分成多列、没有横向分隔线的画法，
+    #    辨识不出行，不满足。
+    mem = [s for s in shapes
+           if s.get("x") is not None and page.at(s, 43.0, 48.0, 23.0, 29.0)
+           and _is_brownorange(s["ln"].get("color"))]
+    hit = False
+    if mem:
+        cellr = [s for s in mem if s["h"] >= 0.3 and s["w"] >= 0.2]
+        divs = [s for s in mem if s["h"] <= 0.06 and s["w"] >= 0.15]
+        grp = _interval_clusters([(s["x"], _x2(s)) for s in cellr], 0.15)
+        bx, by, bw, bh = _bbox(mem)
+        fills_ok = all(s.get("fill") in (None, "none")
+                       or (_is_light(s.get("fill")) and _is_paleorange(s.get("fill")))
+                       for s in mem)
+        rows_ok = True
+        for g in grp:
+            gx1 = min(cellr[k]["x"] for k in g)
+            gx2 = max(_x2(cellr[k]) for k in g)
+            n = sum(1 for d in divs
+                    if d["x"] >= gx1 - 0.1 and _x2(d) <= gx2 + 0.1)
+            if n < 2:
+                rows_ok = False
+        hit = (len(grp) >= 2 and len(divs) >= 2 and rows_ok and fills_ok
+               and _rng(bw, 1.3, 2.0) and _rng(bh, 2.2, 2.8))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右43%–48%、从上至下23%–29%出现网格状表格图形，由矩形与横竖分隔线或多个小矩形拼接构成，拆分为左右两组且两组之间存在间隙，每组可辨识出不少于2列3行的网格，整体宽1.3–2.0cm、高2.2–2.8cm，填充为浅橙色，线条为橙棕色")
+
+    # 16 注意力示意图形。逐条踩点：① 整体外框左上角 52%–58% / 25%–29%；
+    #    ② 底部一个横向矩形条（宽≥1.2、高≤0.4）；③ 其上方≥4 个圆形，直径
+    #    0.2–0.45，纵向聚成上下两层；④ 上下层之间≥3 条连线；⑤ 各连线两端都要
+    #    落在圆形的圆心或边缘处（端点到圆心距离≤半径+0.15），出现穿出圆形之外
+    #    或反向延伸的连线即不满足；⑥ 整体宽 1.5–2.2、高 1.6–2.2。
+    #    圆形到底部矩形条的引线属于层与底条之间的连线，不计入上下层连线。
+    reg = _icon_group([s for s in shapes
+                       if s.get("x") is not None and s["kind"] != "grpSp"
+                       and page.at(s, 48.0, 62.0, 20.0, 40.0)])
+    circ = [s for s in reg if s.get("prst") == "ellipse"
+            and _rng(s["w"], 0.2, 0.45) and _rng(s["h"], 0.2, 0.45)]
+    bars = [s for s in reg if not _is_conn(s) and s["w"] >= 1.2 and s["h"] <= 0.4]
+    hit = False
+    if len(circ) >= 4 and bars:
+        yc = _clusters([_cy(s) for s in circ], 0.2)
+        if len(yc) >= 2:
+            layers = sorted(yc, key=lambda g: sum(_cy(circ[k]) for k in g) / len(g))
+            btop = min(circ[k]["y"] for k in layers[-1])
+            good_lk = bad_lk = 0
+            for s in reg:
+                if not _is_conn(s) or s["h"] < 0.2:
+                    continue
+                e = _ends(s)
+                if e is None or min(e[0][1], e[1][1]) >= btop + 0.05:
+                    continue
+                ok = True
+                for (qx, qy) in e:
+                    if not any(math.hypot(qx - _cx(c), qy - _cy(c))
+                               <= max(c["w"], c["h"]) / 2.0 + 0.15 for c in circ):
+                        ok = False
+                if ok:
+                    good_lk += 1
+                else:
+                    bad_lk += 1
+            bx, by, bw, bh = _bbox(circ + bars)
+            hit = (good_lk >= 3 and bad_lk == 0
+                   and _rng(bw, 1.5, 2.2) and _rng(bh, 1.6, 2.2)
+                   and _rng(page.px(bx), 52.0, 58.0)
+                   and _rng(page.py(by), 25.0, 29.0))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右52%–58%、从上至下25%–29%出现注意力示意图形，底部为一个横向矩形条，其上方有不少于4个圆形分上下两层排布，圆形直径0.2–0.45cm，上下层圆形之间由不少于3条连线相连，各连线两端均落在圆形的圆心或边缘处且无穿出圆形之外或反向延伸的连线，整体宽1.5–2.2cm、高1.6–2.2cm")
+
+    # 17 神经网络示意图形。逐条踩点：① 节点外框左上角 62%–68% / 25%–29%；
+    #    ② ≥6 个圆形节点，直径 0.25–0.5，横向聚成不少于两列；③ ≥6 条连线；
+    #    ④ 每条连线的两个端点都必须落在某个节点上（到节点外框距离≤0.22），
+    #    出现穿出节点之外或方向错误的连线即不满足；⑤ 每个节点至少被 2 个连线
+    #    端点连上，孤立的多余节点即不满足；⑥ 整体宽 1.4–2.0、高 1.5–2.1。
+    reg = _icon_group([s for s in shapes
+                       if s.get("x") is not None and s["kind"] != "grpSp"
+                       and page.at(s, 62.0, 72.0, 20.0, 40.0)])
+    nodes = [s for s in reg if s.get("prst") == "ellipse"
+             and _rng(s["w"], 0.25, 0.5) and _rng(s["h"], 0.25, 0.5)]
+    links = [s for s in reg if _is_conn(s)]
+    hit = False
+    if len(nodes) >= 6 and len(links) >= 6:
+        touch = [0] * len(nodes)
+        ok = True
+        for s in links:
+            e = _ends(s)
+            if e is None:
+                ok = False
+                continue
+            for (qx, qy) in e:
+                best, bi = 1e9, -1
+                for k, nd in enumerate(nodes):
+                    d = _box_dist(qx, qy, nd)
+                    if d < best:
+                        best, bi = d, k
+                if best > 0.22:
+                    ok = False
+                else:
+                    touch[bi] += 1
+        bx, by, bw, bh = _bbox(nodes)
+        hit = (ok and len(_clusters([_cx(s) for s in nodes], 0.2)) >= 2
+               and all(t >= 2 for t in touch)
+               and _rng(bw, 1.4, 2.0) and _rng(bh, 1.5, 2.1)
+               and _rng(page.px(bx), 62.0, 68.0)
+               and _rng(page.py(by), 25.0, 29.0))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右62%–68%、从上至下25%–29%出现神经网络示意图形，不少于6个圆形节点分两列排布，节点直径0.25–0.5cm，节点之间由不少于6条连线交叉相连，各连线两端均分别落在左右两列节点上且无穿出节点之外或方向错误的连线，两列之外不出现多余的孤立节点，整体宽1.4–2.0cm、高1.5–2.1cm")
+
+    # 18 曲线示意图形。逐条踩点：① 整体外框左上角 72%–78% / 26%–32%；
+    #    ② 一条带右向箭头的水平坐标轴线（高≤0.1、宽 1.0–1.8、箭头端在右）；
+    #    ③ 一条自左至右连贯的单峰隆起曲线：单个形状，或全部线段首尾相接
+    #    （端点间距≤0.05cm）；互不相接的独立短线段拼接不满足；
+    #    ④ 整体宽 1.3–1.8、高 1.3–1.8。纵向细线属于坐标轴，不计入曲线。
+    reg = _icon_group([s for s in shapes
+                       if s.get("x") is not None and s["kind"] != "grpSp"
+                       and page.at(s, 70.0, 82.0, 22.0, 40.0)])
+    axis = []
+    for s in reg:
+        if s["h"] > 0.1 or not _rng(s["w"], 1.0, 1.8):
+            continue
+        tp, tl = _tip(s), _tail_pt(s)
+        if tp is not None and tl is not None and tp[0] > tl[0]:
+            axis.append(s)
+    hit = False
+    if axis:
+        curve = [s for s in reg if s not in axis and s["w"] > 0.1]
+        if curve and (len(curve) == 1 or _connected(curve, 0.05)):
+            bx, by, bw, bh = _bbox(reg)
+            hit = (_rng(bw, 1.3, 1.8) and _rng(bh, 1.3, 1.8)
+                   and _rng(page.px(bx), 72.0, 78.0)
+                   and _rng(page.py(by), 26.0, 32.0))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右72%–78%、从上至下26%–32%出现曲线示意图形，包含一条自左至右连贯的单峰隆起曲线，为单个曲线形状或首尾相接的连续线段，不由互不相接的独立短线段拼接，并包含一条带右向箭头的水平坐标轴线，整体宽1.3–1.8cm、高1.3–1.8cm")
+
+    # 19 异常评分区块框：位置 82%–88% / 10%–15%，宽 4.5–5.4、高 7.2–8.0，
+    #    边线色逐通道落在 #6CB447–#82C358 之间。
+    hit = bool(_find_rr(shapes, page, 82, 88, 10, 15, (4.5, 5.4), (7.2, 8.0),
+                        ln_pred=lambda c: _near_rgb(c, "6CB447", "82C358")))
+    results.append(("+1：" if hit else "+0：") + "页面从左至右82%–88%、从上至下10%–15%出现一个圆角矩形，宽4.5–5.4cm，高7.2–8.0cm，边线为绿色，边线颜色RGB接近#6CB447–#82C358")
+
+    # 20 异常评分标题：位置 82%–88% / 4%–9%，字号 15–17、加粗、绿色。
+    hit = False
+    for s in tf("4.AnomalyScoring"):
+        if not page.at(s, 82.0, 88.0, 4.0, 9.0):
+            continue
+        if not _all_bold(s["tx"]) or not _rng(_dom_sz(s["tx"]), 15.0, 17.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_is_green(c) for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右82%–88%、从上至下4%–9%出现“4. Anomaly Scoring”或“4.Anomaly Scoring”文本，字号15–17磅，加粗，颜色为绿色")
+
+    def _lightgreen(c):
+        return _is_light(c) and (_is_green(c) or _is_white(c))
+
+    # 21 重构模块矩形＋其下 4 个小矩形。逐条踩点：① 矩形位置 84%–89% / 14%–18%，
+    #    宽 3.5–4.1、高 2.6–3.0，填充浅绿、边线绿色；② 内上部有居中的
+    #    “Reconstruction”“Module”两行文本，字号 11–14；③ 该文本必须两行完整
+    #    显示，排成三行即出现跨行断词，不满足；④ 其下并排的小矩形数量正好 4 个，
+    #    顶端 24%–27%，各宽 0.35–0.55、高 0.4–0.6，填充浅绿、边线绿色；
+    #    ⑤ 4 个小矩形整体宽 1.8–2.6。多出一个方块会同时破坏数量与整体宽度。
+    rec_r = one(_find_rr(shapes, page, 84, 89, 14, 18, (3.5, 4.1), (2.6, 3.0),
+                         ln_pred=_is_green, fill_pred=_lightgreen))
+    hit = False
+    if rec_r is not None:
+        t = None
+        for z in tf("Reconstruction", "Module"):
+            if inside(z, rec_r) and _rng(_dom_sz(z["tx"]), 11.0, 14.0):
+                t = z
+                break
+        sq = [s for s in shapes
+              if s.get("x") is not None and _rng(page.py(s["y"]), 24.0, 27.0)
+              and _rng(s["w"], 0.35, 0.55) and _rng(s["h"], 0.4, 0.6)
+              and _is_green(s["ln"].get("color")) and _lightgreen(s.get("fill"))
+              and s["x"] >= rec_r["x"] - 0.2 and _x2(s) <= _x2(rec_r) + 0.2]
+        if t is not None and len(sq) == 4:
+            hit = (_para_lines(t) == 2 and _est_lines(t) == 2
+                   and _rng(_bbox(sq)[2], 1.8, 2.6))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右84%–89%、从上至下14%–18%出现一个圆角矩形，宽3.5–4.1cm、高2.6–3.0cm，填充为浅绿色，边线为绿色，其内上部出现居中的“Reconstruction”与“Module”两行文本，字号11–14磅，两行完整显示且无跨行断词，该文本下方并排出现4个小矩形，顶端位于从上至下24%–27%，各宽0.35–0.55cm、高0.4–0.6cm，填充为浅绿色，边线为绿色，4个小矩形整体宽1.8–2.6cm")
+
+    # 22 异常分数矩形：位置 84%–89% / 33%–38%，宽 3.5–4.1、高 2.6–3.0，填充浅绿、
+    #    边线绿色，内上部居中的“Anomaly Score”字号 11–14，且必须单行完整显示。
+    #    行数按字宽表估算，框宽不足折成两行即不满足。
+    scr_r = one(_find_rr(shapes, page, 84, 89, 33, 38, (3.5, 4.1), (2.6, 3.0),
+                         ln_pred=_is_green, fill_pred=_lightgreen))
+    hit = False
+    if scr_r is not None:
+        for z in tf("AnomalyScore"):
+            if not inside(z, scr_r) or not _rng(_dom_sz(z["tx"]), 11.0, 14.0):
+                continue
+            if _para_lines(z) == 1 and _est_lines(z) == 1:
+                hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右84%–89%、从上至下33%–38%出现一个圆角矩形，宽3.5–4.1cm、高2.6–3.0cm，填充为浅绿色，边线为绿色，其内上部出现居中的“Anomaly Score”文本，字号11–14磅，单行完整显示且未折行为两行")
+
+    # 23 概率分布示意图形。逐条踩点：① 水平基线顶端 45%–49%、左端 86%–92%，
+    #    长度 2.0–2.6；② 基线上方一条自左至右连贯的钟形曲线：单个形状，或全部
+    #    线段首尾相接（端点间距≤0.05cm），互不相接的独立短线段拼接不满足；
+    #    ③ 钟形曲线右侧尾部（横向中心位于基线中点右侧）存在橙色或浅红色填充的
+    #    小面积区域，面积 0.05–1.0 平方厘米。纵向细线为分位线，不计入曲线。
+    base = [s for s in shapes
+            if s.get("x") is not None and s["h"] <= 0.1
+            and _rng(s["w"], 2.0, 2.6)
+            and _rng(page.py(s["y"]), 45.0, 49.0)
+            and _rng(page.px(s["x"]), 86.0, 92.0)]
+    hit = False
+    if base:
+        b0 = base[0]
+        near = [s for s in shapes
+                if s.get("x") is not None and page.at(s, 84.0, 100.0, 38.0, 50.0)]
+        bell = [s for s in near if s is not b0 and s["w"] >= 0.5 and s["h"] >= 0.15
+                and s.get("fill") in (None, "none")]
+        tail = [s for s in near
+                if 0.05 <= s["w"] * s["h"] <= 1.0 and _cx(s) > _cx(b0)
+                and (_is_paleorange(s.get("fill")) or _is_pink(s.get("fill")))]
+        hit = bool(bell) and bool(tail) and (len(bell) == 1 or _connected(bell, 0.05))
+    results.append(("+3：" if hit else "+0：") + "页面出现概率分布示意图形，水平基线顶端位于从上至下45%–49%、左端位于从左至右86%–92%，基线长度2.0–2.6cm，其上方出现一条自左至右连贯的钟形曲线，为单个曲线形状或首尾相接的连续线段，不由互不相接的独立短线段拼接，钟形曲线右侧尾部存在橙色或浅红色填充的小面积区域")
+
+    # 24 决策区块框：位置 82%–88% / 57%–62%，宽 4.4–5.2、高 4.5–5.0，边线色逐通道
+    #    落在 #D95F8B–#DA7292 之间。
+    hit = bool(_find_rr(shapes, page, 82, 88, 57, 62, (4.4, 5.2), (4.5, 5.0),
+                        ln_pred=lambda c: _near_rgb(c, "D95F8B", "DA7292")))
+    results.append(("+1：" if hit else "+0：") + "页面从左至右82%–88%、从上至下57%–62%出现一个圆角矩形，宽4.4–5.2cm，高4.5–5.0cm，边线为粉红色，边线颜色RGB接近#D95F8B–#DA7292")
+
+    # 25 决策区块标题：位置 85%–90% / 60%–64%，字号 15–17、加粗、粉红色。
+    hit = False
+    for s in tf("5.Decision"):
+        if not page.at(s, 85.0, 90.0, 60.0, 64.0):
+            continue
+        if not _all_bold(s["tx"]) or not _rng(_dom_sz(s["tx"]), 15.0, 17.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_is_pink(c) for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右85%–90%、从上至下60%–64%出现“5. Decision”或“5.Decision”文本，字号15–17磅，加粗，颜色为粉红色")
+
+    # 26 阈值判定与结论两个圆角矩形。逐条踩点：① 横向 85%–90%；② 上框高 1.2–1.5
+    #    且顶端 65%–69%，下框高 0.8–1.1 且顶端 75%–78%，均宽 3.4–4.0；
+    #    ③ 填充接近白色、边线粉红；④ 上框内“Thresholding”、下框内
+    #    “Normal / Anomaly”居中，字号 11–15，且两处都必须单行完整显示，
+    #    框宽不足折成两行即不满足；⑤ 两框之间一条长度 0.3–0.6cm 的竖直向下箭头。
+    up = one(_find_rr(shapes, page, 85, 90, 65, 69, (3.4, 4.0), (1.2, 1.5),
+                      ln_pred=_is_pink, fill_pred=_is_verylight))
+    lo = one(_find_rr(shapes, page, 85, 90, 75, 78, (3.4, 4.0), (0.8, 1.1),
+                      ln_pred=_is_pink, fill_pred=_is_verylight))
+    hit = False
+    if up is not None and lo is not None:
+        t1 = t2 = None
+        for z in tf("Thresholding"):
+            if inside(z, up) and _rng(_dom_sz(z["tx"]), 11.0, 15.0):
+                t1 = z
+        for z in tf("Normal", "Anomaly"):
+            if inside(z, lo) and _rng(_dom_sz(z["tx"]), 11.0, 15.0):
+                t2 = z
+        arw = False
+        for s in shapes:
+            if s.get("x") is None or s["w"] > 0.15 or not _rng(s["h"], 0.3, 0.6):
+                continue
+            tp, tl = _tip(s), _tail_pt(s)
+            if tp is None or tl is None or tp[1] <= tl[1]:
+                continue
+            if (min(tp[1], tl[1]) >= _y2(up) - 0.25
+                    and max(tp[1], tl[1]) <= lo["y"] + 0.25
+                    and abs(_cx(s) - _cx(up)) <= 0.6):
+                arw = True
+        if t1 is not None and t2 is not None and arw:
+            hit = (_para_lines(t1) == 1 and _est_lines(t1) == 1
+                   and _para_lines(t2) == 1 and _est_lines(t2) == 1)
+    results.append(("+3：" if hit else "+0：") + "页面从左至右85%–90%出现上下两个圆角矩形，均宽3.4–4.0cm，上方矩形高1.2–1.5cm且顶端位于从上至下65%–69%，下方矩形高0.8–1.1cm且顶端位于从上至下75%–78%，填充为接近白色，边线为粉红色，上方矩形内出现“Thresholding”、下方矩形内出现“Normal / Anomaly”或“Normal/Anomaly”居中文本，字号11–15磅且均单行完整显示，两矩形之间出现一条长度0.3–0.6cm的竖直向下箭头线")
+
+    # 27 训练目标区块框：位置 42%–46% / 55%–60%，宽 8.0–9.3、高 4.5–5.0，填充极浅
+    #    蓝色，边线色逐通道落在 #136AC7–#2B7AD8 之间。极浅蓝填充的饱和度很低，
+    #    按色相区间 195°–250° 判定，不套用一般蓝色的饱和度门槛。
+    hit = bool(_find_rr(shapes, page, 42, 46, 55, 60, (8.0, 9.3), (4.5, 5.0),
+                        ln_pred=lambda c: _near_rgb(c, "136AC7", "2B7AD8"),
+                        fill_pred=lambda c: _is_verylight(c) and _hue_in(c, 195, 250, 0.01)))
+    results.append(("+1：" if hit else "+0：") + "页面从左至右42%–46%、从上至下55%–60%出现一个圆角矩形，宽8.0–9.3cm，高4.5–5.0cm，填充为极浅蓝色，边线为蓝色，边线颜色RGB接近#136AC7–#2B7AD8")
+
+    # 28 训练目标标题：位置 44%–51% / 57%–61%，字号 14–17、加粗、蓝色。
+    hit = False
+    for s in tf("6.TrainingObjective"):
+        if not page.at(s, 44.0, 51.0, 57.0, 61.0):
+            continue
+        if not _all_bold(s["tx"]) or not _rng(_dom_sz(s["tx"]), 14.0, 17.0):
+            continue
+        cols = _run_colors(s["tx"])
+        if cols and all(_is_blue(c) for c in cols):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面从左至右44%–51%、从上至下57%–61%出现“6. Training Objective”或“6.Training Objective”文本，字号14–17磅，加粗，颜色为蓝色")
+
+    # 29 两项损失的左右并排矩形。逐条踩点：① 顶端均在 62%–65% 的同一水平线上
+    #    （顶端极差≤0.15cm）；② 左者左端 43%–47%、右者左端 55%–59%；
+    #    ③ 各宽 3.3–3.9、高 1.8–2.1；④ 边线蓝色；⑤ 左框内“Reconstruction Loss”、
+    #    右框内“Regularization Loss”，字号 9–11.5。
+    lft = _find_rr(shapes, page, 43, 47, 62, 65, (3.3, 3.9), (1.8, 2.1), ln_pred=_is_blue)
+    rgt = _find_rr(shapes, page, 55, 59, 62, 65, (3.3, 3.9), (1.8, 2.1), ln_pred=_is_blue)
+    hit = False
+    for a in lft:
+        for b in rgt:
+            if abs(a["y"] - b["y"]) > 0.15:
+                continue
+            ok = True
+            for r, key in ((a, "ReconstructionLoss"), (b, "RegularizationLoss")):
+                if not any(inside(z, r) and _rng(_dom_sz(z["tx"]), 9.0, 11.5)
+                           for z in tf(key)):
+                    ok = False
+            if ok:
+                hit = True
+    results.append(("+3：" if hit else "+0：") + "页面出现左右并排的两个圆角矩形，顶端均位于从上至下62%–65%的同一水平线上，左侧者左端位于从左至右43%–47%、右侧者左端位于从左至右55%–59%，各宽3.3–3.9cm、高1.8–2.1cm，边线为蓝色，左侧矩形内上部出现“Reconstruction Loss”文本、右侧矩形内上部出现“Regularization Loss”文本，字号9–11.5磅")
+
+    # 30 两处带下标的数学符号。逐条踩点：① 区域 46%–62% / 66%–70%；② 去空白后
+    #    恰为“Lrec”“Lreg”；③ 均为斜体；④ “rec”“reg”真正以下标格式呈现，即存在
+    #    baseline 为负值的 run，靠字号缩小或位置摆放模拟的不算；⑤ 文本中不含
+    #    下划线字符“_”；⑥ 不折行；⑦ 53%–57% / 65%–69% 另有“+”文本。
+    def _sub_sym(word):
+        for s in tf(word):
+            if not page.at(s, 46.0, 62.0, 66.0, 70.0):
+                continue
+            flat = _flat(s["tx"])
+            if "_" in flat or _squash(flat).lower() != word.lower():
+                continue
+            if not _all_italic(s["tx"]):
+                continue
+            if not any(_fnum(r.get("base"), 0.0) < 0 for r in _runs(s["tx"])):
+                continue
+            if _no_wrap(s):
+                return True
+        return False
+
+    plus = any(page.at(s, 53.0, 57.0, 65.0, 69.0) and _squash(_flat(s["tx"])) == "+"
+               for s in tf("+"))
+    hit = plus and _sub_sym("Lrec") and _sub_sym("Lreg")
+    results.append(("+3：" if hit else "+0：") + "页面从左至右46%–62%、从上至下66%–70%出现“Lrec”与“Lreg”两处数学符号文本，均为斜体，其中“rec”“reg”以下标格式呈现，基线降低，文本中不含下划线字符“_”且不折行，页面从左至右53%–57%、从上至下65%–69%出现“+”文本")
+
+    # 31 总损失公式上方的水平分隔线：左端 43%–47%、顶端 75%–77%，长度 7.2–8.0，
+    #    必须是单实线（线型不能是虚线），颜色为深灰或深蓝。
+    hit = False
+    for s in shapes:
+        if s.get("x") is None or s["h"] > 0.06:
+            continue
+        if not _rng(s["w"], 7.2, 8.0):
+            continue
+        if not (_rng(page.px(s["x"]), 43.0, 47.0) and _rng(page.py(s["y"]), 75.0, 77.0)):
+            continue
+        if (s["ln"].get("dash") or "solid") in _DASH_PRST:
+            continue
+        if _is_darkgrayblue(s["ln"].get("color")):
+            hit = True
+    results.append(("+1：" if hit else "+0：") + "页面出现一条水平单实线，左端位于从左至右43%–47%，顶端位于从上至下75%–77%，长度7.2–8.0cm，颜色为深灰色或深蓝色")
+
+    # 32 总损失公式文本。逐条踩点：① 区域 44%–50% / 76%–80%；② 去空白后包含
+    #    “L=Lrec+λLreg”；③ 含希腊字母“λ”；④ 字号 12–17；⑤ “rec”“reg”真正以下标
+    #    格式呈现，即存在 baseline 为负值的 run；⑥ 文本中不含下划线字符“_”。
+    #    用“L_rec”这类下划线写法虽然肉眼可读，但不是下标格式，不满足。
+    hit = False
+    for s in tf("TotalLoss"):
+        if not page.at(s, 44.0, 50.0, 76.0, 80.0):
+            continue
+        flat = _flat(s["tx"])
+        if "_" in flat or "λ" not in flat:
+            continue
+        if "l=lrec+λlreg" not in _squash(flat).lower():
+            continue
+        if not _rng(_dom_sz(s["tx"]), 12.0, 17.0):
+            continue
+        if any(_fnum(r.get("base"), 0.0) < 0 for r in _runs(s["tx"])):
+            hit = True
+    results.append(("+3：" if hit else "+0：") + "页面从左至右44%–50%、从上至下76%–80%出现“Total Loss: L = Lrec + λLreg”文本，包含希腊字母“λ”，字号12–17磅，其中“rec”“reg”以下标格式呈现，文本中不含下划线字符“_”")
+
+    # 33 底部图例框及其内部七项内容。逐条踩点：① 圆角矩形位置 22%–27% / 88%–92%，
+    #    宽 18.0–20.0、高 1.3–1.6，白色填充、灰色边线；② 框内自左至右依次为
+    #    “Legend:”、一条 1.0–1.4cm 带箭头水平实线、“Data Flow”、一条 1.0–1.4cm
+    #    带箭头水平虚线、“Auxiliary Flow”、一个 0.9–1.2×0.4–0.6 的圆角矩形色块、
+    #    “Vector / Feature”；③ “Legend:”加粗且字号 11–15；④ 后三处说明文本字号
+    #    9–11.5；⑤ 七项的横向中心必须严格自左至右递增。本条按渲染出来的样子判定
+    #    实线与虚线，是否由短线段拼出在虚线边框那一条里单独判定。
+    lgd = one(_find_rr(shapes, page, 22, 27, 88, 92, (18.0, 20.0), (1.3, 1.6),
+                       ln_pred=_is_lightgray, fill_pred=_is_white))
+    hit = False
+    if lgd is not None:
+        ins = [s for s in shapes
+               if s.get("x") is not None and s is not lgd
+               and s["x"] >= lgd["x"] - 0.1 and _x2(s) <= _x2(lgd) + 0.1
+               and s["y"] >= lgd["y"] - 0.35 and _y2(s) <= _y2(lgd) + 0.35]
+        ids = set(id(s) for s in ins)
+        lines = sorted([r for r in _hruns(ins)
+                        if _rng(r["span"], 1.0, 1.4) and r["arrow_right"]],
+                       key=lambda r: r["x1"])
+        solid = [r for r in lines if _solid_like(r)]
+        dashr = [r for r in lines if _dash_like(r)]
+        swat = [s for s in ins if s.get("prst") == "roundRect"
+                and _rng(s["w"], 0.9, 1.2) and _rng(s["h"], 0.4, 0.6)]
+
+        def _pickt(keys, lo_sz, hi_sz, need_bold=False):
+            for z in tf(*keys):
+                if id(z) not in ids or not _rng(_dom_sz(z["tx"]), lo_sz, hi_sz):
+                    continue
+                if need_bold and not _all_bold(z["tx"]):
+                    continue
+                return z
+            return None
+
+        t_lg = _pickt(("Legend:",), 11.0, 15.0, True)
+        t_df = _pickt(("DataFlow",), 9.0, 11.5)
+        t_af = _pickt(("AuxiliaryFlow",), 9.0, 11.5)
+        t_vf = _pickt(("Vector", "Feature"), 9.0, 11.5)
+        if solid and dashr and swat and t_lg and t_df and t_af and t_vf:
+            seq = [_cx(t_lg), (solid[0]["x1"] + solid[0]["x2"]) / 2.0, _cx(t_df),
+                   (dashr[0]["x1"] + dashr[0]["x2"]) / 2.0, _cx(t_af),
+                   _cx(swat[0]), _cx(t_vf)]
+            hit = all(seq[k] < seq[k + 1] for k in range(6))
+    results.append(("+3：" if hit else "+0：") + "页面从左至右22%–27%、从上至下88%–92%出现一个横向圆角矩形，宽18.0–20.0cm，高1.3–1.6cm，填充为白色，边线为灰色，其内部自左至右依次出现“Legend:”文本、一条长度1.0–1.4cm的带右向箭头水平实线、“Data Flow”文本、一条长度1.0–1.4cm的带右向箭头水平虚线、“Auxiliary Flow”文本、一个宽0.9–1.2cm高0.4–0.6cm的圆角矩形、“Vector / Feature”或“Vector/Feature”文本，其中“Legend:”加粗且字号11–15磅，后三处说明文本字号9–11.5磅")
+
+    # 34 七处黑色带箭头连接线及其走向。逐条踩点，任一处缺失或方向反了都不给分：
+    #    ①②③ 三处折线箭头，用“横段贴着源矩形右边线引出 + 竖段落在两矩形之间 +
+    #    箭头端落在目标矩形左边线上”三要素判定，并用箭头端纵坐标相对源矩形中心
+    #    的上下关系区分“向右上”与“向右下”；④ 融合区块内并排矩形之间三条长度
+    #    0.5–0.8cm 的水平右向箭头且位于同一水平线上；⑤ 一条长度 1.0–1.6cm 的水平
+    #    右向箭头指向绿色框左边线；⑥ 一条长度 0.6–1.0cm 的竖直向下箭头连接两个
+    #    绿色小矩形；⑦ 一条长度 1.2–1.6cm 的竖直向下箭头由绿色框下边线指向粉红
+    #    色框上边线。箭头方向按 a:ext 的正负号叠加 flipH/flipV 还原，不取绝对值。
+    def _elbow(src, dst, down):
+        if src is None or dst is None:
+            return False
+        tipped = False
+        for s in blacks:
+            tp = _tip(s)
+            if tp is None or abs(tp[0] - dst["x"]) > 0.25:
+                continue
+            if not (dst["y"] - 0.25 <= tp[1] <= _y2(dst) + 0.25):
+                continue
+            if down and tp[1] <= _cy(src):
+                continue
+            if not down and tp[1] >= _cy(src):
+                continue
+            tipped = True
+        vert = any(s["w"] <= 0.12 and s["h"] >= 0.2
+                   and _x2(src) - 0.3 <= _cx(s) <= dst["x"] + 0.1 for s in blacks)
+        horz = any(s["h"] <= 0.12 and s["w"] >= 0.2
+                   and abs(s["x"] - _x2(src)) <= 0.8
+                   and src["y"] <= _cy(s) <= _y2(src) for s in blacks)
+        return tipped and vert and horz
+
+    trio = [s for s in blacks
+            if s["h"] <= 0.12 and _rng(s["w"], 0.5, 0.8) and _tip(s) is not None]
+    d_ok = any(len(g) >= 3 for g in _clusters([_cy(s) for s in trio], 0.1))
+    e_ok = False
+    for s in blacks:
+        tp = _tip(s)
+        if s["h"] <= 0.12 and _rng(s["w"], 1.0, 1.6) and tp is not None \
+                and a_ano is not None and abs(tp[0] - a_ano["x"]) <= 0.25:
+            e_ok = True
+
+    def _vdown(h_lo, h_hi, y_from, y_to, tol_from, tol_to):
+        if y_from is None or y_to is None:
+            return False
+        for s in blacks:
+            if s["w"] > 0.15 or not _rng(s["h"], h_lo, h_hi):
+                continue
+            tp, tl = _tip(s), _tail_pt(s)
+            if tp is None or tl is None or tp[1] <= tl[1]:
+                continue
+            if abs(tl[1] - y_from) <= tol_from and abs(tp[1] - y_to) <= tol_to:
+                return True
+        return False
+
+    r_up = rec_r if rec_r is not None else a_rec
+    r_dn = scr_r if scr_r is not None else a_scr
+    f_ok = _vdown(0.6, 1.0, _y2(r_up) if r_up else None,
+                  r_dn["y"] if r_dn else None, 0.35, 0.25)
+    g_ok = _vdown(1.2, 1.6, _y2(a_ano) if a_ano else None,
+                  a_dec["y"] if a_dec else None, 0.35, 0.35)
+    hit = (_elbow(a_teal, a_seq, False) and _elbow(a_teal, a_pat, True)
+           and _elbow(a_seq, a_fus, True) and d_ok and e_ok and f_ok and g_ok)
+    results.append(("+5：" if hit else "+0：") + "页面出现七处黑色带箭头连接线且走向正确，分别为自左侧青色圆角矩形右侧向右上折入青绿色圆角矩形左侧，自左侧青色圆角矩形右侧向右下折入紫色圆角矩形左侧，自青绿色圆角矩形右侧向右下折入橙色圆角矩形左侧，橙色圆角矩形内四个并排矩形之间的三条水平右向箭头且长度0.5–0.8cm并位于同一水平线上，自橙色圆角矩形右侧一条长度1.0–1.6cm的水平右向箭头指向绿色圆角矩形左侧，“Reconstruction”所在矩形与“Anomaly Score”所在矩形之间一条长度0.6–1.0cm的竖直向下箭头，自绿色圆角矩形下方一条长度1.2–1.6cm的竖直向下箭头指向粉红色圆角矩形")
+
+    # 35 两条虚线折线箭头。紫色一条：整体自紫色框右侧引出（合并外框左端与紫色框
+    #    右边线相距≤0.5），纵向跨度≥1.5，箭头端落在橙色框左边线上（横向≤0.3）
+    #    且纵向位于橙色框下半部。蓝色一条：整体右端与蓝色框左边线相距≤0.4，
+    #    纵向跨度≥1.0，存在一条向上的箭头且箭头端落在紫色框底边（≤0.4）。
+    #    本条判定的是走向与连通位置，是否用线型画虚线在最后一条里单独判定。
+    #    区块框自身的边框线段（含用短线段拼出来的边框）落在框的边界上，不属于
+    #    连接线，按“整体落在框内”剔除；右侧的水平分隔线也是深蓝色，用“整体位于
+    #    蓝色框左边线以左”把它排除掉。
+    def _on_frame(s, f, pad=0.12):
+        if f is None:
+            return False
+        return (s["x"] >= f["x"] - pad and _x2(s) <= _x2(f) + pad
+                and s["y"] >= f["y"] - pad and _y2(s) <= _y2(f) + pad)
+
+    pur = [s for s in conns if _is_purple(s["ln"].get("color"))
+           and page.at(s, 33.0, 48.0, 30.0, 58.0) and not _on_frame(s, a_pat)]
+    p_ok = False
+    if pur and a_fus is not None and a_pat is not None:
+        bx, by, bw, bh = _bbox(pur)
+        tipped = False
+        for s in pur:
+            tp = _tip(s)
+            if tp is None or abs(tp[0] - a_fus["x"]) > 0.3:
+                continue
+            if _cy(a_fus) <= tp[1] <= _y2(a_fus) + 0.3:
+                tipped = True
+        p_ok = tipped and abs(bx - _x2(a_pat)) <= 0.5 and bh >= 1.5
+    blu = [s for s in conns if _is_blue(s["ln"].get("color"))
+           and page.at(s, 25.0, 50.0, 60.0, 80.0)
+           and a_trn is not None and _x2(s) <= a_trn["x"] + 0.15]
+    b_ok = False
+    if blu and a_trn is not None and a_pat is not None:
+        bx, by, bw, bh = _bbox(blu)
+        upward = False
+        for s in blu:
+            tp, tl = _tip(s), _tail_pt(s)
+            if tp is None or tl is None or tp[1] >= tl[1]:
+                continue
+            if abs(tp[1] - _y2(a_pat)) <= 0.4:
+                upward = True
+        b_ok = upward and abs((bx + bw) - a_trn["x"]) <= 0.4 and bh >= 1.0
+    hit = p_ok and b_ok
+    results.append(("+3：" if hit else "+0：") + "页面出现两条虚线折线箭头，一条紫色虚线自紫色圆角矩形右上方向右上折行并以右向箭头指向橙色圆角矩形左侧下部，一条蓝色虚线自蓝色圆角矩形左侧向左延伸后向上折行并以向上箭头指向紫色圆角矩形底部")
+
+    # 36 橙色框到蓝色框的黑色折线箭头：全部线段落在 52%–64% / 45%–58%，整体顶端
+    #    贴着橙色框下边线（≤0.25），纵向跨度≥1.5，末端向下的箭头落在蓝色框上边线
+    #    （≤0.25）。
+    mid = [s for s in blacks if page.at(s, 52.0, 64.0, 45.0, 58.0)]
+    hit = False
+    if mid and a_fus is not None and a_trn is not None:
+        bx, by, bw, bh = _bbox(mid)
+        dn = False
+        for s in mid:
+            tp, tl = _tip(s), _tail_pt(s)
+            if tp is None or tl is None or tp[1] <= tl[1]:
+                continue
+            if abs(tp[1] - a_trn["y"]) <= 0.25:
+                dn = True
+        hit = dn and abs(by - _y2(a_fus)) <= 0.25 and bh >= 1.5
+    results.append(("+1：" if hit else "+0：") + "页面从左至右52%–64%、从上至下45%–58%范围内出现一条黑色折线箭头，自上而下连接橙色圆角矩形下边线与蓝色圆角矩形上边线，末端带向下箭头")
+
+    # 37 六处区块标题的排版。逐条踩点：① 六处标题都要能找到；② 每处都必须单行
+    #    完整显示，框宽不足折成两行即不满足；③ 不压住其下方圆角矩形的上边线、也
+    #    不侵入矩形内部——要么文本末行底端在矩形上边线之上（含 0.15cm 容差），
+    #    要么文本整体在上边线之下，正好横跨上边线的情况不满足。
+    #    行数按字宽表估算，末行底端按文本框底端取。
+    pairs = ((("1.SequenceEncoder",), a_seq), (("2.PatternEncoder",), a_pat),
+             (("3.Fusion", "RepresentationLearning"), a_fus),
+             (("4.AnomalyScoring",), a_ano), (("5.Decision",), a_dec),
+             (("6.TrainingObjective",), a_trn))
+    hit = True
+    for keys, r in pairs:
+        t = one(tf(*keys))
+        if t is None or r is None or _est_lines(t) != 1:
+            hit = False
+            break
+        if not (_txt_bottom(t) <= r["y"] + 0.15 or t["y"] >= r["y"] - 0.15):
+            hit = False
+            break
+    results.append(("+1：" if hit else "+0：") + "页面上“1. Sequence Encoder”“2. Pattern Encoder”“3. Fusion & Representation Learning”“4. Anomaly Scoring”“5. Decision”“6. Training Objective”六处文本均在各自文本框内单行完整显示，未因文本框宽度不足折行为两行，未压住其下方圆角矩形的上边线，未侵入矩形内部")
+
+    # 38 虚线边框的实现方式与整页结构。逐条踩点：① 青绿、紫、橙、绿、粉红、蓝六个
+    #    区块框以及底部图例框，七处都必须在形状边线上写有虚线线型 a:prstDash；
+    #    用一串独立实线短段逐段拼出的“虚线”不满足，因为整条边框无法被整体选中、
+    #    移动和调整尺寸；② 单页顶层形状总数不超过 300 个；③ 图标类图形已成组，
+    #    即顶层存在不少于 4 个组合对象。短线段拼虚线会同时把顶层形状数量顶到
+    #    数百个并使成组数量归零，三个条件相互印证。
+    frames = (a_seq, a_pat, a_fus, a_ano, a_dec, a_trn, a_lgd)
+    dashed = all(f is not None and (f["ln"].get("dash") or "") in _DASH_PRST
+                 for f in frames)
+    ngrp = sum(1 for s in tops if s["kind"] == "grpSp")
+    hit = dashed and len(tops) <= 300 and ngrp >= 4
+    results.append(("+5：" if hit else "+0：") + "页面上青绿色、紫色、橙色、绿色、粉红色、蓝色六处区块框及底部图例框的虚线边框均通过形状边线的虚线线型实现，未由多条独立实线短线段逐段拼接模拟，单页幻灯片顶层形状总数不超过300个，图标类图形已成组，各虚线边框可被整体选中、移动并调整尺寸")
+
+    # 汇总：results 的顺序必须与 _MAX_DELTAS_ORDER 完全一致，逐项反解出得分。
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            "dim2 项数不一致：results=%d vs order=%d" % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit_item = delta > 0
+        dim2_items.append({"rule": rule, "max_delta": max_delta,
+                           "delta": max_delta if hit_item else 0,
+                           "hit": hit_item})
+        total_score += (max_delta if hit_item else 0)
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def evaluate(dir_path):
+    """对目录下的交付 PPTX 打分，返回统一约定的结果字典。
+
+    status='error' 只在“这份提交没被真正评过”时出现——目录不存在、目录内没有
+    .pptx、或脚本自身抛异常；此时 dim1_pass 为空串（未判定）、dim1_reason 为
+    空串、dim2_items 为空表、total_score 与 max_score 一律为 0。
+    文件能定位到但门槛不达标，仍按 status='ok' + 维度一未通过处理，此时
+    dim1_pass=False 且 dim1_reason 带有未通过的错误摘要。"""
     result = {
-        'id': script_id,
-        'file_name': '',
-        'status': 'ok',
-        'error': None,
-        'dim1_pass': False,
-        'dim1_reason': '',
-        'dim2_items': [],
-        'total_score': 0,
-        'max_score': 0,
+        "id": SCRIPT_ID,
+        "file_name": "",
+        "status": "ok",
+        "error": None,
+        # 空串表示“维度一尚未判定”；status='error' 的三条出口都保持空串，
+        # 只有真正跑过 _check_dim1 才会写入 True / False。
+        "dim1_pass": "",
+        "dim1_reason": "",
+        "dim2_items": [],
+        "total_score": 0,
+        "max_score": 0,
     }
     try:
-        pptx_path = _locate_pptx(dir_path)
-        result['file_name'] = pptx_path.name
-        ev = Evaluator(pptx_path)
-        ok, reasons = ev.dimension1()
-        result['dim1_pass'] = ok
-        if not ok:
-            result['dim1_reason'] = '；'.join(reasons)
-            result['total_score'] = 0
-            result['max_score'] = 0
+        if not dir_path or not os.path.isdir(dir_path):
+            result["status"] = "error"
+            result["error"] = "目录不存在：%s" % dir_path
             return result
-        ev.score()
-        items = []
-        for p, d, _ in ev.hits:
-            items.append({
-                'rule': d,
-                'max_delta': p,
-                'delta': p,
-                'hit': True,
-                'detail': '',
-            })
-        for p, d, _ in ev.misses:
-            items.append({
-                'rule': d,
-                'max_delta': p,
-                'delta': 0,
-                'hit': False,
-                'detail': '',
-            })
-        result['dim2_items'] = items
-        result['total_score'] = ev.total
-        result['max_score'] = sum(it['max_delta'] for it in items)
-        return result
-    except Exception as e:
-        result['status'] = 'error'
-        result['error'] = f'{type(e).__name__}: {e}'
-        return result
+        names = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith(".pptx") and not f.startswith("~"))
+        if not names:
+            result["status"] = "error"
+            result["error"] = "目录中未找到 .pptx 文件：%s" % dir_path
+            return result
+        result["file_name"] = names[0]
+        _evaluate_impl(os.path.join(dir_path, names[0]), result)
+    except Exception as exc:
+        # _evaluate_impl 是就地写 result 的，异常可能发生在它写了一半之后，
+        # 因此这里把所有承载评分结论的字段显式复位，保证 error 的返回值是干净的全 0；
+        # dim1_pass 复位为空串而不是 False——异常意味着维度一的结论作废，不是判定为不通过。
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+    return result
 
 
-if __name__ == '__main__':
-    target = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent)
-    print(json.dumps(evaluate(target), ensure_ascii=False, indent=2))
+if __name__ == "__main__":
+    _dir = sys.argv[1] if len(sys.argv) >= 2 else os.path.dirname(os.path.abspath(__file__))
+    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))

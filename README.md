@@ -43,23 +43,26 @@ with fine-grained rubrics and executable verifiers.
 - Isolated subprocess execution with configurable concurrency and timeout.
 - Visible progress, active verifier IDs, execution channel, and elapsed time.
 - Atomic JSON and CSV reports with one result per verifier.
-- Cross-platform normal mode for 91 verifiers.
-- A serialized Office COM channel on Windows for verifiers `001`, `008`,
-  `019`, `022`, `023`, `030`, `039`, `074`, and `081`.
+- Cross-platform normal mode for 94 verifiers.
+- A serialized Office COM channel on Windows for verifiers `001`, `021`,
+  `023`, `024`, `025`, and `039`.
 
 
 ## Requirements
 
 - Python 3.10 or newer.
 - Windows, macOS, or Linux for normal-mode verification.
-- Microsoft Office on Windows only when the nine COM-required verifiers must
+- Microsoft Office on Windows only when the six COM-required verifiers must
   run.
+- Runtime Python dependencies are declared in
+  [`pyproject.toml`](pyproject.toml); their licenses are summarized in
+  [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 ## Platform Compatibility
 
 | Platform | Normal mode | Office COM | Continuous integration |
 | --- | --- | --- | --- |
-| Windows | Supported | Supported for nine designated verifiers when Microsoft Office is installed | Tested on Python 3.10 and 3.12 |
+| Windows | Supported | Supported for six designated verifiers when Microsoft Office is installed | Tested on Python 3.10 and 3.12 |
 | Linux | Supported | Not available; COM-required verifiers are skipped in `auto` mode | Tested on Ubuntu with Python 3.10 and 3.12 |
 | macOS | Expected to work | Not available; COM-required verifiers are skipped in `auto` mode | Not currently covered by CI |
 
@@ -142,16 +145,15 @@ Common options:
 --com-mode auto|enabled|disabled
 ```
 
-COM modes affect verifiers `001`, `008`, `019`, `022`, `023`, `030`, `039`,
-`074`, and `081`:
+COM modes affect verifiers `001`, `021`, `023`, `024`, `025`, and `039`:
 
 - `auto`: enable COM for those verifiers on Windows and skip them elsewhere.
 - `enabled`: require Windows and enable COM for those verifiers.
-- `disabled`: skip those nine verifiers on every platform.
+- `disabled`: skip those six verifiers on every platform.
 
-Verifier `011` keeps a controlled COM fallback, but the scheduler always runs
-it in normal mode with that fallback disabled. Other verifiers do not start
-Office COM.
+Verifier `007` also contains a COM code path, but the scheduler always runs
+it in normal mode. Every verifier listed in `COM_FORCED_NORMAL_VERIFIER_IDS`
+receives `OFFICEVAL_COM_ENABLED=0`, and no other verifier starts Office COM.
 
 
 After validation, the CLI displays Fatal and Warning issues and asks for

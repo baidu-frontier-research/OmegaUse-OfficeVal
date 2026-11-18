@@ -89,7 +89,9 @@ def validate_verifier_result(result: dict) -> list[str]:
             if not isinstance(item, dict):
                 errors.append(f"dim2_items[{i}] 不是字典")
                 continue
-            for key in ("rule", "max_delta", "delta", "hit", "detail"):
+            # detail 为可选的证据字段：verifier 未提供时，
+            # csv_reporter 会按空字符串输出，不影响评分字段。
+            for key in ("rule", "max_delta", "delta", "hit"):
                 if key not in item:
                     errors.append(f"dim2_items[{i}] 缺少字段 {key!r}")
             if "hit" in item and not isinstance(item["hit"], bool):
@@ -101,6 +103,13 @@ def validate_verifier_result(result: dict) -> list[str]:
                     )
 
     return errors
+
+
+def _nonnegative_total_score(value: object) -> int | float:
+    """将 verifier 总分统一限制为非负数，异常类型按 0 分处理。"""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return 0
+    return max(0, value)
 
 
 def build_system_result(
@@ -146,7 +155,7 @@ def build_system_result(
         "dim1_pass":        False if missing_deliverable_reason else base.get("dim1_pass", False),
         "dim1_reason":      missing_deliverable_reason or base.get("dim1_reason", ""),
         "dim2_items":       base.get("dim2_items", []) if not struct_errors and not missing_deliverable_reason else [],
-        "total_score":      base.get("total_score", 0) if status == "ok" and not missing_deliverable_reason else 0,
+        "total_score":      _nonnegative_total_score(base.get("total_score", 0)) if status == "ok" and not missing_deliverable_reason else 0,
         "max_score":        base.get("max_score", 0),
         "duration_seconds": duration_seconds,
         "started_at":       started_at,

@@ -1,705 +1,1437 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-自动评估脚本：对 PPTX 目录标签作业按"打分细则"进行评分。
-
-评估流程：
-  维度1（可用与可修改性）—— 不满足 => 直接 0 分，不再检查维度2。
-  维度2（完成度）—— 逐条评分细则检测：
-        加分细则：必须满足该细则中的【每一个】点才加分。
-        扣分细则：只要满足细则中的【任意一个】点即扣分。
-  对外仅暴露 evaluate(dir_path: str) -> dict，返回结构化评估结果。
-"""
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
 import os
+import re
 import sys
 import json
+import zipfile
+import colorsys
+import xml.etree.ElementTree as ET
+
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 被评估任务：给"中国电影业面临的挑战"演示文稿的目录页（第2页）四组小标题下方
+# 各补 3 个小标签（共 12 个），圆角胶囊形、深绿底白字、MiSans、10.5 磅、
+# 自左至右等距排列、大小一致。
 
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-EMU_PER_CM = 360000.0
-def to_cm(emu):
-    return None if emu is None else emu / EMU_PER_CM
-
-# ---------- 预期文字（四组目录项 × 3 个标签） ----------
-EXPECTED = {
-    "文化沟通": ["儒家伦理", "叙事逻辑", "文化折扣"],
-    "工业体系": ["特效能力", "宣发困境", "产业链断点"],
-    "全球竞争": ["好莱坞", "韩国电影", "发行网络"],
-    "认知偏差": ["预设立场", "误解误读", "题材受限"],
-}
-# 目录项文字 -> 大致的 top（cm），用于把标签按行归到对应目录组
-# 由文件实测：01=4.88, 02=7.54, 03=10.21, 04=12.88（目录项 Text 顶部）
-GROUP_ORDER = ["文化沟通", "工业体系", "全球竞争", "认知偏差"]
-
-# 各加分项对应的"评分细则内容"原文（命中时打印用）
-RULE_TEXT = {
-    "文化沟通": '第2页"文化沟通"目录项下方从左往右数第1个标签：文字为"儒家伦理"。第2个标签：文字为"叙事逻辑"。第3个标签：文字为"文化折扣"。',
-    "工业体系": '第2页"工业体系"目录项下方从左往右数第1个标签：文字为"特效能力"。第2个标签：文字为"宣发困境"。第3个标签：文字为"产业链断点"。',
-    "全球竞争": '第2页"全球竞争"目录项下方从左往右数第1个标签：文字为"好莱坞"。第2个标签：文字为"韩国电影"。第3个标签：文字为"发行网络"。',
-    "认知偏差": '第2页"认知偏差"目录项下方从左往右数第1个标签：文字为"预设立场"。第2个标签：文字为"误解误读"。第3个标签：文字为"题材受限"。',
-    "位置": '第2页标签整体位置：四组标签分别位于对应目录项文字下方的空白区域，不进入右侧图片区域或页面底部页码区域。每个目录项下方恰好放置3个标签，同组标签从左至右排列',
-    "尺寸": '第2页全部12个标签尺寸：宽度约1.8至2.5厘米、高度约0.55至0.85厘米，同组及不同组标签大小一致，宽高偏差不超过0.1厘米。水平间距相等，建议保持0.25至0.45厘米，任意两个间距差不超过0.1厘米。',
-    "文字": '第2页全部标签文字：字体统一为MiSans，字号统一为10.5磅，文字水平居中、垂直居中。',
-    "形状": '第2页全部标签形状：使用胶囊形或高圆角矩形，无明显尖角，边框为无轮廓或与填充色一致。形状使用深绿色填充，文字使用白色，颜色在12个标签中保持一致。',
-    "扣-3-尺寸": '任意三个以上标签大小差异超过1厘米。',
-    "扣-3-页数": 'PPT页数不是8页。',
-    "扣-1": '文件中出现批注、临时说明文字、红色标记、截图边框或多余占位对象。',
-}
-
-
-# =========================================================
-# 工具函数
-# =========================================================
-def normalize(s):
-    return (s or "").strip().replace("　", "").replace(" ", "")
-
-def is_rounded_label(sh):
-    """判断是否为我们新增的圆角标签。"""
-    if sh.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
-        return False
-    try:
-        ast = sh.auto_shape_type
-    except Exception:
-        return False
-    # 胶囊/圆角矩形
-    from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
-    if ast not in (MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,):
-        # 也接受名称包含 Rounded / 文字命中预期的形状
-        if "Rounded" not in sh.name:
-            return False
-    # 必须有文字
-    if not sh.has_text_frame:
-        return False
-    return True
-
-
-# =========================================================
-# 读取文件
-# =========================================================
-def load(pptx_path):
-    try:
-        prs = Presentation(pptx_path)
-    except Exception as e:
-        return None, f"无法打开文件：{e}"
-    return prs, None
-
-
-# =========================================================
-# 维度 1：可用与可修改性
-# =========================================================
-def check_dimension1(prs):
-    """返回 (passed: bool, reasons: list[str], labels: list)
-
-    维度1目前只做“文件能被 python-pptx 正常打开/解析”这一条底线校验——
-    load() 已经在打开失败时返回 err，本函数在此基础上仅收集第2页的圆角标签
-    供维度2使用，不再对页数、标签数、整页图覆盖、越界排版等做门槛判断。
-    """
-    reasons = ["✓ 文件为 .pptx 且可正常打开/解析"]
-    labels: list[object] = []
-    if len(prs.slides) >= 2:
-        slide2 = prs.slides[1]
-        labels = [sh for sh in slide2.shapes if is_rounded_label(sh)]
-    return True, reasons, labels
-
-
-
-# =========================================================
-# 维度 2 辅助：把 12 个标签归到 4 组（按 top 行聚类，再按 left 排序）
-# =========================================================
-def group_labels(labels):
-    """返回 {组名: [按 left 排序的 label,...]}，按 top 升序的四行映射到 GROUP_ORDER。"""
-    if len(labels) != 12:
-        # 仍尽力分组
-        pass
-    # 按 top 聚类成行（容差 1cm）
-    items = sorted(labels, key=lambda s: (s.top or 0))
-    rows = []
-    for l in items:
-        placed = False
-        for row in rows:
-            if abs((l.top or 0) - row[0]) < 1.0 * EMU_PER_CM:
-                row[1].append(l); placed = True; break
-        if not placed:
-            rows.append([(l.top or 0), [l]])
-    rows.sort(key=lambda r: r[0])
-    groups = {}
-    for idx, (_, row) in enumerate(rows):
-        if idx < len(GROUP_ORDER):
-            gname = GROUP_ORDER[idx]
-        else:
-            gname = f"额外行{idx+1}"
-        groups[gname] = sorted(row, key=lambda s: (s.left or 0))
-    return groups
-
-
-# =========================================================
-# 维度 2：完成度评分细则
-# =========================================================
-def check_dimension2(prs, labels):
-    """返回 (total_score, hits: list[(score, desc, detail)])"""
-    hits = []
-    groups = group_labels(labels)
-    slide2 = prs.slides[1]
-
-    # ---------- 加分项 1~4：四组文字正确 ----------
-    # 细则原文（以"文化沟通"为例）：
-    #   第2页"X"目录项下方从左往右数第1个标签：文字为"…"。
-    #   第2个标签：文字为"…"。第3个标签：文字为"…"。
-    # 逐点踩：① 位于该目录项"下方"；② 从左往右数第1个=…；③ 第2个=…；④ 第3个=…。
-    # 加分细则需"每一个点"都满足才 +3。
-    DIR_TOP_TEXT = {  # 各目录项文字（Text 形状）的 top（cm），用于判定"下方"
-        "文化沟通": 4.826, "工业体系": 7.493, "全球竞争": 10.16, "认知偏差": 12.827,
-    }
-    for gname in GROUP_ORDER:
-        exp = EXPECTED[gname]
-        g = groups.get(gname, [])  # 已按 left 升序（即"从左往右数"）
-        ordinal = ["第1个", "第2个", "第3个"]
-        pts = []  # (point_desc, passed)
-        # 点①：三个标签均位于该目录项文字下方
-        below = len(g) >= 3 and all(to_cm(l.top) >= DIR_TOP_TEXT[gname] for l in g[:3])
-        pts.append((f'位于"{gname}"目录项下方', below))
-        # 点②③④：从左往右数第N个标签文字 == 指定值
-        for i in range(3):
-            actual = normalize(g[i].text_frame.text) if i < len(g) else ""
-            pts.append((f'从左往右数{ordinal[i]}标签文字为"{exp[i]}"', actual == normalize(exp[i])))
-        all_ok = all(p for _, p in pts)
-        if all_ok:
-            hits.append((+3, RULE_TEXT[gname], "全部点命中"))
-        else:
-            miss = [d for d, p in pts if not p]
-            hits.append((0, RULE_TEXT[gname], "未踩到：" + "；".join(miss)))
-
-    # ---------- 加分项 5：标签整体位置 ----------
-    # 细则原文：四组标签分别位于对应目录项文字下方的空白区域，不进入右侧图片区域
-    #           或页面底部页码区域。每个目录项下方恰好放置3个标签，同组标签从左至右排列。
-    # 逐点踩：
-    #   ① 四组标签分别位于"对应目录项文字"下方
-    #   ② 不进入右侧图片区域
-    #   ③ 不进入页面底部页码区域
-    #   ④ 每个目录项下方恰好放置3个标签
-    #   ⑤ 同组标签从左至右排列
-    # 取各目录项文字形状的真实位置（不硬编码）：通过组名文字匹配 slide2 中的目录项 Text 形状。
-    dir_item_shape = {}   # 组名 -> 目录项文字形状
-    img_left = None
-    page_no_shape = None
-    for sh in slide2.shapes:
-        if is_rounded_label(sh):
-            continue
-        if sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
-            img_left = sh.left if img_left is None else min(img_left, sh.left)
-        if sh.has_text_frame:
-            t = normalize(sh.text_frame.text)
-            if t in GROUP_ORDER:
-                dir_item_shape[t] = sh
-            if t == "02":   # 第2页页码
-                page_no_shape = sh
-
-    pos_pts = []  # (point_desc, passed)
-
-    # 点①：四组标签分别位于"对应目录项文字"下方（标签 top >= 该目录项文字 top）
-    p1 = True
-    for gname in GROUP_ORDER:
-        g = groups.get(gname, [])
-        ds = dir_item_shape.get(gname)
-        if ds is None or not g:
-            p1 = False; continue
-        if not all((l.top or 0) >= ds.top for l in g):
-            p1 = False
-    pos_pts.append(("四组标签分别位于对应目录项文字下方", p1))
-
-    # 点②：不进入右侧图片区域（标签右边界 <= 最靠左图片的左边界）
-    if img_left is not None:
-        p2 = all((l.left or 0) + (l.width or 0) <= img_left for l in labels)
-    else:
-        p2 = True
-    pos_pts.append(("不进入右侧图片区域", p2))
-
-    # 点③：不进入页面底部页码区域（标签下边界 <= 页码 top）
-    if page_no_shape is not None:
-        p3 = all((l.top or 0) + (l.height or 0) <= page_no_shape.top for l in labels)
-    else:
-        p3 = True
-    pos_pts.append(("不进入页面底部页码区域", p3))
-
-    # 点④：每个目录项下方恰好放置3个标签
-    p4 = all(len(groups.get(gname, [])) == 3 for gname in GROUP_ORDER)
-    pos_pts.append(("每个目录项下方恰好放置3个标签", p4))
-
-    # 点⑤：同组标签从左至右排列（组内 left 严格递增）
-    p5 = True
-    for gname in GROUP_ORDER:
-        lefts = [l.left or 0 for l in groups.get(gname, [])]
-        if lefts != sorted(lefts) or len(set(lefts)) != len(lefts):
-            p5 = False
-    pos_pts.append(("同组标签从左至右排列", p5))
-
-    pos_ok = all(p for _, p in pos_pts)
-    if pos_ok:
-        hits.append((+3, RULE_TEXT["位置"], "全部点命中"))
-    else:
-        miss = [d for d, p in pos_pts if not p]
-        hits.append((0, RULE_TEXT["位置"], "未踩到：" + "；".join(miss)))
-
-    # ---------- 加分项 6：尺寸（宽1.8~2.5cm 高0.55~0.85cm；同/不同组大小一致，宽高偏差≤0.1cm；水平间距相等 0.25~0.45cm，间距差≤0.1cm） ----------
-    widths = [to_cm(l.width) for l in labels]
-    heights = [to_cm(l.height) for l in labels]
-    # 细则原文：宽度约1.8至2.5厘米、高度约0.55至0.85厘米，同组及不同组标签大小一致，
-    #           宽高偏差不超过0.1厘米。水平间距相等，建议保持0.25至0.45厘米，
-    #           任意两个间距差不超过0.1厘米。
-    # 逐点踩：
-    #   ① 宽度约1.8~2.5厘米（全部标签）
-    #   ② 高度约0.55~0.85厘米（全部标签）
-    #   ③ 同组及不同组标签大小一致，宽高偏差不超过0.1厘米（即全部标签间宽偏差≤0.1且高偏差≤0.1）
-    #   ④ 水平间距相等（任意两个间距差不超过0.1厘米）
-    #   ⑤ 建议保持0.25至0.45厘米（"建议"项，仅作提示，不影响是否加分）
-    size_pts = []   # (point_desc, passed)
-
-    # 点①：宽度约1.8~2.5厘米
-    p1 = all(1.8 <= w <= 2.5 for w in widths)
-    size_pts.append(("全部标签宽度约1.8~2.5厘米", p1))
-
-    # 点②：高度约0.55~0.85厘米
-    p2 = all(0.55 <= h <= 0.85 for h in heights)
-    size_pts.append(("全部标签高度约0.55~0.85厘米", p2))
-
-    # 点③：同组及不同组标签大小一致，宽高偏差不超过0.1厘米
-    p3 = bool(widths) and (max(widths) - min(widths) <= 0.1) and (max(heights) - min(heights) <= 0.1)
-    size_pts.append(("同组及不同组标签大小一致（宽高偏差≤0.1厘米）", p3))
-
-    # 计算各组内相邻标签的水平间距
-    gaps = []
-    for gname in GROUP_ORDER:
-        g = groups.get(gname, [])
-        for a, b in zip(g, g[1:]):
-            gaps.append(to_cm(b.left) - (to_cm(a.left) + to_cm(a.width)))
-
-    # 点④：水平间距相等，任意两个间距差不超过0.1厘米
-    p4 = bool(gaps) and (max(gaps) - min(gaps) <= 0.1)
-    size_pts.append(("水平间距相等（任意两间距差≤0.1厘米）", p4))
-
-    # 是否加分：①②③④四个硬性点全部满足
-    size_ok = all(p for _, p in size_pts)
-
-    # 点⑤：建议保持0.25~0.45厘米（"建议"项，仅提示，不参与加分判定）
-    p5 = bool(gaps) and all(0.25 <= round(gp, 3) <= 0.45 for gp in gaps)
-
-    if size_ok:
-        suggest = "符合" if p5 else "未落入0.25~0.45建议区间(不影响加分)"
-        hits.append((+3, RULE_TEXT["尺寸"],
-                     f"间距建议项：{suggest} gaps={[round(g,3) for g in gaps]}"))
-    else:
-        miss = [d for d, p in size_pts if not p]
-        hits.append((0, RULE_TEXT["尺寸"], "未踩到：" + "；".join(miss)))
-
-    # ---------- 加分项 7：文字字体 MiSans、字号 10.5磅、水平+垂直居中 ----------
-    # 细则原文：第2页全部标签文字：字体统一为MiSans，字号统一为10.5磅，
-    #           文字水平居中、垂直居中。
-    # 逐点踩（"全部标签"=12个均需满足，"统一"=取值一致）：
-    #   ① 字体统一为 MiSans
-    #   ② 字号统一为 10.5 磅
-    #   ③ 文字水平居中
-    #   ④ 文字垂直居中
-    #
-    # 【字体判定的正确口径】OOXML 中一个 run 的字体分三个槽位：
-    #   <a:latin> 西文/数字、<a:ea> 东亚(中文)、<a:cs> 复杂文种。
-    #   标签文字是中文，决定中文显示的是 <a:ea>，与 <a:latin> 无关。
-    #   因此判定"中文字体"必须读 <a:ea typeface="…"> 子元素：
-    #     · 注意 rPr 上的 eastAsia="…" 属性是非法写法，PowerPoint/WPS 不认，不能采信；
-    #     · 若 run 含中文却没有合法 <a:ea>，则中文回落到主题/默认东亚字体
-    #       （本主题 ea 为空 -> 实际显示为等线类回落字体），绝不能拿 <a:latin> 的值冒充。
-    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    fonts_seen = set()      # 收集每个 run "实际生效的中文字体"（用于"统一为MiSans"）
-    sizes_seen = set()      # 收集每个 run 的字号（用于"统一为10.5磅"）
-    halign_ok = True        # 全部段落水平居中
-    valign_ok = True        # 全部标签垂直居中
-
-    def _has_cjk(s):
-        return any('一' <= ch <= '鿿' for ch in (s or ""))
-
-    def _effective_cjk_font(r):
-        """返回该 run 中文字符实际生效的字体名。
-        仅认合法的 <a:ea> 子元素；缺失则视为回落（返回 None，代表非 MiSans）。"""
-        rPr = r._r.find(f'{{{A}}}rPr')
-        if rPr is not None:
-            ea = rPr.find(f'{{{A}}}ea')          # 合法的东亚字体子元素
-            if ea is not None and ea.get('typeface'):
-                return ea.get('typeface')
-        # 没有合法 <a:ea> -> 中文回落到主题/默认字体（本文件即等线），按"非 MiSans"处理
-        return None
-
-    for l in labels:
-        tf = l.text_frame
-        # 点④：垂直居中（bodyPr anchor="ctr" -> MIDDLE）
-        if "MIDDLE" not in str(tf.vertical_anchor):
-            valign_ok = False
-        for p in tf.paragraphs:
-            # 点③：水平居中（pPr algn="ctr" -> CENTER）
-            if "CENTER" not in str(p.alignment):
-                halign_ok = False
-            for r in p.runs:
-                # 点①：字体——标签是中文，取中文实际生效字体（<a:ea>）；
-                #       含中文但无合法 <a:ea> 即记为回落字体(None)。
-                if _has_cjk(r.text):
-                    fonts_seen.add(_effective_cjk_font(r))
-                else:
-                    fonts_seen.add(r.font.name)   # 纯西文/数字 run 看 latin
-                # 点②：字号
-                sz = r.font.size
-                sizes_seen.add(round(sz.pt, 2) if sz is not None else None)
-
-    font_pts = []  # (point_desc, passed)
-    # 点①：字体统一为 MiSans —— 所有 run "实际生效字体"只出现 MiSans 这一个值
-    #       （含中文却回落的 run 会把 None 混入集合，使其 != {"MiSans"} 而判失败）
-    p1 = (fonts_seen == {"MiSans"})
-    font_pts.append(("字体统一为 MiSans", p1))
-    # 点②：字号统一为 10.5 磅 —— 所有 run 字号只出现 10.5 这一个值
-    p2 = (sizes_seen == {10.5})
-    font_pts.append(("字号统一为 10.5 磅", p2))
-    # 点③：文字水平居中
-    font_pts.append(("文字水平居中", halign_ok))
-    # 点④：文字垂直居中
-    font_pts.append(("文字垂直居中", valign_ok))
-
-    font_ok = all(p for _, p in font_pts)
-    if font_ok:
-        hits.append((+3, RULE_TEXT["文字"], "全部点命中"))
-    else:
-        miss = [d for d, p in font_pts if not p]
-        hits.append((0, RULE_TEXT["文字"],
-                     "未踩到：" + "；".join(miss) + f"  [fonts={fonts_seen} sizes={sizes_seen}]"))
-
-    # ---------- 加分项 8：标签形状 ----------
-    # 细则原文：第2页全部标签形状：使用胶囊形或高圆角矩形，无明显尖角，
-    #           边框为无轮廓或与填充色一致。形状使用深绿色填充，文字使用白色，
-    #           颜色在12个标签中保持一致。
-    # 逐点踩（"全部标签"=12个均需满足）：
-    #   ① 使用胶囊形或高圆角矩形
-    #   ② 无明显尖角
-    #   ③ 边框为无轮廓 或 与填充色一致
-    #   ④ 形状使用深绿色填充
-    #   ⑤ 文字使用白色
-    #   ⑥ 颜色在12个标签中保持一致（填充色一致 且 文字色一致）
-    from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
-    from pptx.enum.shapes import MSO_SHAPE_TYPE as _MST
-
-    fills = []         # 每个标签的填充色
-    txt_colors = []    # 每个 run 的文字色
-    p1 = True          # 胶囊形/高圆角矩形
-    p2 = True          # 无明显尖角
-    p3 = True          # 边框无轮廓或与填充一致
-
-    for l in labels:
-        # 点①：胶囊形(PILL/ROUND) 或 高圆角矩形(ROUNDED_RECTANGLE)
-        try:
-            ast = l.auto_shape_type
-        except Exception:
-            ast = None
-        is_capsule_or_round = ast in (
-            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
-            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGULAR_CALLOUT,
-        )
-        # 胶囊形在 PPT 中本质是圆角比例很大的圆角矩形；这里把圆角矩形纳入
-        if not is_capsule_or_round:
-            p1 = False
-
-        # 点②：无明显尖角（圆角矩形的圆角调整值需足够大；普通矩形/无圆角=尖角）
-        try:
-            adj = list(l.adjustments)
-            if not adj or adj[0] < 0.3:   # 圆角比例过小 => 尖角明显
-                p2 = False
-        except Exception:
-            p2 = False
-
-        # 填充色
-        try:
-            fills.append(str(l.fill.fore_color.rgb))
-        except Exception:
-            fills.append(None)
-
-        # 文字色
-        for p in l.text_frame.paragraphs:
-            for r in p.runs:
-                try:
-                    txt_colors.append(str(r.font.color.rgb))
-                except Exception:
-                    txt_colors.append(None)
-
-        # 点③：边框为无轮廓 或 与填充色一致
-        try:
-            ln = l.line
-            if ln.fill.type is None:
-                pass  # 无轮廓 => 满足
-            else:
-                lc = None
-                try:
-                    lc = str(ln.color.rgb)
-                except Exception:
-                    lc = None
-                # 有轮廓时须与填充色一致
-                if lc is None or fills[-1] is None or not _close_color(lc, fills[-1]):
-                    p3 = False
-        except Exception:
-            p3 = False
-
-    # 点④：形状使用深绿色填充（全部标签）
-    def is_dark_green(hexc):
-        if not hexc or len(hexc) != 6:
-            return False
-        r = int(hexc[0:2], 16); g = int(hexc[2:4], 16); b = int(hexc[4:6], 16)
-        return g > r and g > b and g < 170 and r < 120 and b < 140
-    p4 = bool(fills) and all(is_dark_green(c) for c in fills)
-
-    # 点⑤：文字使用白色（全部 run）
-    p5 = bool(txt_colors) and all(c and c.upper() == "FFFFFF" for c in txt_colors)
-
-    # 点⑥：颜色在12个标签中保持一致（填充色一致 且 文字色一致）
-    p6 = (len(set(fills)) == 1) and (len(set(txt_colors)) == 1)
-
-    shape_pts = [
-        ("使用胶囊形或高圆角矩形", p1),
-        ("无明显尖角", p2),
-        ("边框为无轮廓或与填充色一致", p3),
-        ("形状使用深绿色填充", p4),
-        ("文字使用白色", p5),
-        ("颜色在12个标签中保持一致", p6),
-    ]
-    shape_ok = all(p for _, p in shape_pts)
-    if shape_ok:
-        hits.append((+3, RULE_TEXT["形状"], "全部点命中"))
-    else:
-        miss = [d for d, p in shape_pts if not p]
-        hits.append((0, RULE_TEXT["形状"],
-                     "未踩到：" + "；".join(miss) + f"  [fills={set(fills)} txt={set(txt_colors)}]"))
-
-    # =========================================================
-    # 扣分项
-    # =========================================================
-    # -3：任意三个以上标签大小差异超过1厘米。
-    # 细则单一点（扣分项，命中即扣）：存在"三个以上"标签，其大小差异超过1厘米。
-    # 判定口径：统计有多少个标签"卷入"了大小差异——
-    #   只要某标签与任意另一标签的宽差或高差 > 1cm，即视为该标签卷入差异。
-    #   当卷入差异的标签数 ≥ 3（即"三个以上"，含3个）时扣 -3。
-    involved = set()
-    for i in range(len(widths)):
-        for j in range(i + 1, len(widths)):
-            if abs(widths[i] - widths[j]) > 1.0 or abs(heights[i] - heights[j]) > 1.0:
-                involved.add(i); involved.add(j)
-    if len(involved) >= 3:
-        hits.append((-3, RULE_TEXT["扣-3-尺寸"], f"卷入差异的标签数={len(involved)}（差异阈值>1cm）"))
-
-    # -3：PPT页数不是8页。
-    # 细则单一点（扣分项，命中即扣）：PPT 总页数 ≠ 8。
-    if len(prs.slides) != 8:
-        hits.append((-3, RULE_TEXT["扣-3-页数"], f"页数={len(prs.slides)}"))
-
-    # -1：文件中出现批注、临时说明文字、红色标记、截图边框或多余占位对象。
-    # 细则单一点（扣分项，命中任一类即扣 -1）。范围为"文件中"=整个 PPT 全部页面。
-    # 细则点名的 5 类：
-    #   ① 批注：PPT 的批注对象（comments / 批注关系），或文字含"批注"
-    #   ② 临时说明文字：含临时性说明措辞的文本
-    #   ③ 红色标记：红色字体/红色文字标注
-    #   ④ 截图边框：以图片形式插入且带边框的截图类对象（图片且 line 有可见轮廓）
-    #   ⑤ 多余占位对象：空的/占位符文本（如"占位""placeholder"，或空占位形状）
-    junk_detail = []
-    JUNK_WORDS = ["批注", "备注", "TODO", "待修改", "说明：", "临时", "placeholder", "占位"]
-
-    # 我们新增的合法标签集合（避免把它们误判为多余对象）
-    label_ids = {id(l) for l in labels}
-
-    # ① 批注：检查整个包是否存在批注部件
-    try:
-        for sld in prs.slides:
-            part = sld.part
-            for rel in part.rels.values():
-                if "comment" in rel.reltype.lower():
-                    junk_detail.append("批注对象")
-                    break
-    except Exception:
-        pass
-
-    for sld in prs.slides:
-        for sh in sld.shapes:
-            if id(sh) in label_ids:
-                continue  # 跳过本次新增的合法标签
-            # ④ 截图边框：图片且带可见轮廓
-            if sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                try:
-                    if sh.line.fill.type is not None and (sh.line.width or 0) > 0:
-                        junk_detail.append("截图边框(带轮廓的图片)")
-                except Exception:
-                    pass
-            if not sh.has_text_frame:
-                continue
-            t = sh.text_frame.text
-            tn = normalize(t)
-            # ②/①(文字)/⑤(占位词)：关键词命中
-            for w in JUNK_WORDS:
-                if w.lower() in t.lower():
-                    junk_detail.append(f"临时/批注/占位文字('{w}')")
-            # ⑤ 多余占位对象：占位符类型的形状（is_placeholder）且为空
-            try:
-                if sh.is_placeholder and tn == "":
-                    junk_detail.append("空占位对象")
-            except Exception:
-                pass
-            # ③ 红色标记：红色字体
-            for p in sh.text_frame.paragraphs:
-                for r in p.runs:
-                    try:
-                        c = str(r.font.color.rgb).upper()
-                        # 纯红或偏红（R 高、G/B 低）
-                        if c == "FF0000" or (len(c) == 6 and
-                            int(c[0:2],16) >= 200 and int(c[2:4],16) <= 80 and int(c[4:6],16) <= 80):
-                            junk_detail.append("红色标记文字")
-                    except Exception:
-                        pass
-
-    if junk_detail:
-        hits.append((-1, RULE_TEXT["扣-1"],
-                     "命中：" + "；".join(sorted(set(junk_detail)))))
-
-    total = sum(s for s, _, _ in hits if s != 0)
-    return total, hits
-
-
-def _close_color(a, b, tol=24):
-    try:
-        ar=int(a[0:2],16); ag=int(a[2:4],16); ab=int(a[4:6],16)
-        br=int(b[0:2],16); bg=int(b[2:4],16); bb=int(b[4:6],16)
-        return abs(ar-br)<=tol and abs(ag-bg)<=tol and abs(ab-bb)<=tol
-    except Exception:
-        return False
-
-
-# =========================================================
-# 主流程：统一入口 evaluate(dir_path)
-# =========================================================
 SCRIPT_ID = "058"
+# 维度二所有加分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 45
 
-# 维度2的规则清单：加分项每项满分 +3；扣分项固定负值，命中即扣。
-_ADD_RULE_KEYS = ["文化沟通", "工业体系", "全球竞争", "认知偏差",
-                  "位置", "尺寸", "文字", "形状"]
-_DEDUCT_RULE_SPECS = [
-    ("扣-3-尺寸", -3),
-    ("扣-3-页数", -3),
-    ("扣-1", -1),
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 results.append(...) 的顺序严格一致；共 35 项，
+# 其中正值 15 项累加 = MAX_SCORE_TOTAL，负值 20 项为减分项。
+_MAX_DELTAS_ORDER = [
+    5,   # 01 12个标签齐全、分组对应、无错漏、全在目录页
+    5,   # 02 中文实际生效 MiSans（a:ea 与 a:latin 同时指定）
+    3,   # 03 标签为可单独点选编辑的形状
+    3,   # 04 字号统一 10.5 磅
+    3,   # 05 底色深绿且12个统一
+    3,   # 06 文字白色
+    3,   # 07 圆角胶囊形（adj≥40%）
+    3,   # 08 同组自左至右、顶边齐平
+    3,   # 09 等距 + 同列对齐 + 行距与小标题一致（规整矩阵）
+    3,   # 10 12个尺寸一致
+    5,   # 11 落在该组小标题下方空白区
+    3,   # 12 与既有元素互不重叠
+    1,   # 13 色块尺寸与文字匹配、文字居中
+    1,   # 14 扁平纯色块（无描边、无效果）
+    1,   # 15 常规字重纯文本
+    -1,  # 16 目录页页首 CONTENTS / 目录
+    -1,  # 17 目录页 01-04 序号
+    -1,  # 18 目录页金色短横线与竖向分隔线
+    -3,  # 19 目录页四个小标题
+    -3,  # 20 目录页四条说明文字
+    -3,  # 21 目录页右侧配图
+    -3,  # 22 目录页右下角总结句
+    -1,  # 23 目录页页脚细线与页码 02
+    -3,  # 24 添加了指令未要求的元素
+    -3,  # 25 第1页封面元素
+    -3,  # 26 第3页标题与四张卡片
+    -3,  # 27 第4页标题与四张卡片
+    -3,  # 28 第5页标题与三张卡片
+    -3,  # 29 第6页标题与三个圆点
+    -3,  # 30 第7页深色页元素
+    -3,  # 31 第8页资料条目
+    -3,  # 32 页数/页序/页码标注
+    -1,  # 33 页面底色与页面尺寸
+    -1,  # 34 字体主题 / 配色主题
+    -3,  # 35 出现乱码
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+
+
+# ==================== OOXML 命名空间与单位 ====================
+NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+NS_PKG = 'http://schemas.openxmlformats.org/package/2006/relationships'
+
+EMU_CM = 360000.0          # 1cm = 360000 EMU
+EMU_PT = 12700.0           # 1磅 = 12700 EMU
+TOL_002 = int(0.02 * EMU_CM)   # 尺寸一致容差 0.02cm
+TOL_005 = int(0.05 * EMU_CM)   # 对齐/等距容差 0.05cm
+TOL_015 = int(0.15 * EMU_CM)   # 行距一致容差 0.15cm
+TOL_POS = int(0.05 * EMU_CM)   # 既有元素"未被移动"的位置容差
+
+# ==================== 指令要求的 12 个小标签 ====================
+# (小标题, [自左至右三个标签文字])
+LABEL_GROUPS = [
+    ('文化沟通', ['儒家伦理', '叙事逻辑', '文化折扣']),
+    ('工业体系', ['特效能力', '宣发困境', '产业链断点']),
+    ('全球竞争', ['好莱坞', '韩国电影', '发行网络']),
+    ('认知偏差', ['预设立场', '误解误读', '题材受限']),
+]
+LABEL_WORDS = [w for _, ws in LABEL_GROUPS for w in ws]
+LABEL_SLIDE = 2            # 目录页为第2页
+LABEL_SZ = 1050            # 10.5磅
+LABEL_FONT = 'MiSans'
+LABEL_ADJ_MIN = 40000      # 圆角调节值 ≥40%
+LABEL_CY_MIN = int(0.55 * EMU_CM)
+LABEL_CY_MAX = int(0.90 * EMU_CM)
+BAND_GAP_MIN = int(0.35 * EMU_CM)
+BAND_GAP_MAX = int(2.00 * EMU_CM)
+
+# ==================== 目录页四组小标题 / 分隔线基准坐标 ====================
+HEADING_XY = [(2788920, 1737360), (2788920, 2697480),
+              (2788920, 3657600), (2788920, 4617720)]
+HEADING_EXT = (1691640, 292608)
+HAIRLINE_Y = 6473952       # 页面底部横向细分隔线纵坐标
+
+# ==================== 字体别名（不同办公软件保存后的同义名） ====================
+FONT_ALIAS = {
+    '微软雅黑': 'Microsoft YaHei',
+    'microsoft yahei': 'Microsoft YaHei',
+    'msyh': 'Microsoft YaHei',
+    'misans': 'MiSans',
+    '小米兰亭': 'MiSans',
+}
+
+# ==================== 基准：8页页面底色 / 顶层形状数 / 主题 ====================
+BG_COLORS = ['F4EFE6', 'E9F0EC', 'F4EFE6', 'F1E8DA',
+             'EAF1F2', 'F5EEE8', '112A35', 'EFE6D7']
+SHAPE_COUNTS = [9, 23, 19, 20, 16, 17, 24, 15]
+THEME_SCHEME = {
+    'dk1': '000000', 'lt1': 'FFFFFF', 'dk2': '44546A', 'lt2': 'E7E6E6',
+    'accent1': '4472C4', 'accent2': 'ED7D31', 'accent3': 'A5A5A5',
+    'accent4': 'FFC000', 'accent5': '5B9BD5', 'accent6': '70AD47',
+    'hlink': '0563C1', 'folHlink': '954F72',
+}
+THEME_FONT = 'Microsoft YaHei'
+SLD_CX_CM = (33.5, 34.2)
+SLD_CY_CM = (18.8, 19.3)
+
+# ==================== 基准：各页页码文本框 ====================
+# (页序, x, y, cx, cy, 文字, 字号, 字色)
+PAGE_NUMBERS = [
+    (1, 11247120, 6345936, 411480, 228600, '01', 950, '65737B'),
+    (2, 11247120, 6345936, 411480, 228600, '02', 950, '65737B'),
+    (3, 11247120, 6345936, 411480, 228600, '03', 950, '65737B'),
+    (4, 11247120, 6345936, 411480, 228600, '04', 950, '65737B'),
+    (5, 11247120, 6345936, 411480, 228600, '05', 950, '65737B'),
+    (6, 11247120, 6345936, 411480, 228600, '06', 950, '65737B'),
+    (7, 5532120, 6345936, 320040, 228600, '07', 950, '9FB4B6'),
+    (8, 11247120, 6345936, 411480, 228600, '08', 950, '65737B'),
 ]
 
 
-def _build_dim2_items(hits):
-    """把内部 hits 列表转成统一约定的 dim2_items 结构。
-
-    - 加分项：max_delta=+3，delta=0/3，hit 反映是否命中；
-    - 扣分项：max_delta 为负值，delta=0（未命中）或 = max_delta（命中），
-      未命中项也补齐，保证 100 个脚本能对齐评分项矩阵。
-    """
-    add_index = {RULE_TEXT[k]: 3 for k in _ADD_RULE_KEYS}
-    hit_deduct = {}
-    items = []
-    for s, desc, detail in hits:
-        if desc in add_index:
-            items.append({
-                "rule": desc,
-                "max_delta": add_index[desc],
-                "delta": s,
-                "hit": s > 0,
-                "detail": "",
-            })
-        else:
-            hit_deduct[desc] = (s, detail)
-    for key, max_delta in _DEDUCT_RULE_SPECS:
-        rule_text = RULE_TEXT[key]
-        if rule_text in hit_deduct:
-            s, detail = hit_deduct[rule_text]
-            items.append({
-                "rule": rule_text,
-                "max_delta": max_delta,
-                "delta": s,
-                "hit": True,
-                "detail": "",
-            })
-        else:
-            items.append({
-                "rule": rule_text,
-                "max_delta": max_delta,
-                "delta": 0,
-                "hit": False,
-                "detail": "",
-            })
-    return items
+# ==================== 基准：必须保持原样的既有元素签名 ====================
+# 每条签名 = (页序, x, y, cx, cy, 期望属性)；按 (x, y, cx, cy) 在该页定位形状，
+# 再逐项比对期望属性。属性键：text 文字、sz 字号(百分磅)、b 加粗、clr 字色、
+# font 字体、fill 填充色、lnw 线宽、lnclr 线色、geom 几何、kind 形状类别。
+def _sig(slide, x, y, cx, cy, **props):
+    return (slide, x, y, cx, cy, props)
 
 
-def _find_pptx(dir_path):
-    """在 dir_path 中定位被评估的 .pptx 文件，忽略 Office 临时/隐藏文件。"""
-    if not os.path.isdir(dir_path):
+_S2_ROW_Y = [1755648, 2715768, 3675888, 4636008]     # 序号/说明文字行纵坐标
+_S2_RULE_Y = [1975104, 2935224, 3895344, 4855464]    # 金色短横线纵坐标
+_S2_DESCS = ['本土表达跨语境传播的第一道门槛', '创作热情与标准流程之间的磨合',
+             '成熟市场、平台渠道与类型片规则的挤压', '外部视角如何影响作品理解与进入机会']
+
+PROTECTED = {
+    # ---- 目录页页首 ----
+    's2_header': [
+        _sig(2, 658368, 502920, 1828800, 256032, text='CONTENTS', sz=1100, b=1,
+             clr='C77A42', font=THEME_FONT),
+        _sig(2, 658368, 868680, 2011680, 502920, text='目录', sz=3100, b=1,
+             clr='112A35', font=THEME_FONT),
+    ],
+    # ---- 目录页 01-04 序号 ----
+    's2_numbers': [
+        _sig(2, 786384, y, 640080, 384048, text='%02d' % (i + 1), sz=2000, b=1,
+             clr='D9A441', font=THEME_FONT)
+        for i, y in enumerate(_S2_ROW_Y)
+    ],
+    # ---- 目录页金色短横线 + 右侧竖向金色分隔线 ----
+    's2_goldlines': [
+        _sig(2, 1572768, y, 1051560, 0, geom='line', lnw=19050, lnclr='D9A441')
+        for y in _S2_RULE_Y
+    ] + [_sig(2, 6510528, 1627632, 0, 4389120, geom='line', lnw=25400, lnclr='D9A441')],
+    # ---- 目录页四个小标题 ----
+    's2_headings': [
+        _sig(2, x, y, HEADING_EXT[0], HEADING_EXT[1], text=LABEL_GROUPS[i][0],
+             sz=1700, b=1, clr='112A35', font=THEME_FONT)
+        for i, (x, y) in enumerate(HEADING_XY)
+    ],
+    # ---- 目录页四条说明文字 ----
+    's2_descs': [
+        _sig(2, 4526280, _S2_ROW_Y[i], 1920240, 301752, text=_S2_DESCS[i],
+             sz=1200, clr='65737B', font=THEME_FONT)
+        for i in range(4)
+    ],
+    # ---- 目录页右侧配图 ----
+    's2_pic': [_sig(2, 6748272, 1611493, 4736592, 2665749, kind='pic')],
+    # ---- 目录页右下角总结句 ----
+    's2_summary': [
+        _sig(2, 6839712, 4718304, 4434840, 603504, sz=1600, b=1, clr='1E5B64',
+             font=THEME_FONT,
+             text='四个维度共同构成影片海外传播的主要压力面：理解、生产、渠道、评价。'),
+    ],
+    # ---- 目录页页脚：底部细分隔线 + 页码 02 ----
+    's2_footer': [
+        _sig(2, 594360, HAIRLINE_Y, 10469880, 0, geom='line', lnw=7620, lnclr='D6C9B8'),
+        _sig(2, 11247120, 6345936, 411480, 228600, text='02', sz=950, clr='65737B',
+             font=THEME_FONT, algn='r'),
+    ],
+}
+
+# ---- 第1页封面 ----
+PROTECTED['s1'] = [
+    _sig(1, 658368, 676656, 5212080, 274320, sz=1100, b=1, clr='C77A42',
+         font=THEME_FONT, text='CHINESE FILM INDUSTRY CHALLENGES'),
+    _sig(1, 640080, 1417320, 5257800, 1325880, sz=3400, b=1, clr='112A35',
+         font=THEME_FONT, text='中国电影业面临的挑战'),
+    _sig(1, 658368, 3346704, 5212080, 329184, sz=1450, clr='1E5B64',
+         font=THEME_FONT, text='文化沟通 · 工业体系 · 全球竞争 · 认知偏差'),
+    _sig(1, 658368, 5422392, 2011680, 274320, sz=1100, clr='65737B',
+         font=THEME_FONT, text='行业观察稿'),
+    _sig(1, 6336792, 0, 146304, 6858000, fill='D9A441'),
+    _sig(1, 6492240, 1825176, 5699455, 3207648, kind='pic'),
+]
+
+# ---- 第3页：01 CULTURAL COMMUNICATION + 四张 FFF9EF 圆角卡片 ----
+_S3_CARD_XY = [(685800, 1755648), (3977640, 1755648), (685800, 3767328), (3977640, 3767328)]
+_S3_TITLE_XY = [(850392, 1883664), (4142232, 1883664), (850392, 3895344), (4142232, 3895344)]
+_S3_TITLES = ['文化语境落差', '叙事节奏差异', '语言幽默损耗', '情感转译压力']
+PROTECTED['s3'] = [
+    _sig(3, 658368, 384048, 1143000, 274320, sz=1100, b=1, clr='D9A441',
+         font=THEME_FONT, text='01  CULTURAL COMMUNICATION'),
+] + [
+    _sig(3, x, y, 3063240, 1600200, geom='roundRect', fill='FFF9EF')
+    for x, y in _S3_CARD_XY
+] + [
+    _sig(3, x, y, 2734056, 292608, sz=1300, b=1, clr='112A35', font=THEME_FONT,
+         text=_S3_TITLES[i])
+    for i, (x, y) in enumerate(_S3_TITLE_XY)
+]
+
+# ---- 第4页：02 INDUSTRIAL CAPABILITY + 四张 FFF5E8 圆角卡片 + 核心判断 ----
+_S4_CARD_XY = [(5742432, 1682496), (8668512, 1682496), (5742432, 3255264), (8668512, 3255264)]
+_S4_TITLE_XY = [(5907024, 1810512), (8833104, 1810512), (5907024, 3383280), (8833104, 3383280)]
+_S4_TITLES = ['制作端', '宣发端', '触达端', '协同端']
+PROTECTED['s4'] = [
+    _sig(4, 658368, 384048, 1143000, 274320, sz=1100, b=1, clr='D9A441',
+         font=THEME_FONT, text='02  INDUSTRIAL CAPABILITY'),
+] + [
+    _sig(4, x, y, 2697480, 1280160, geom='roundRect', fill='FFF5E8')
+    for x, y in _S4_CARD_XY
+] + [
+    _sig(4, x, y, 2368296, 292608, sz=1300, b=1, clr='112A35', font=THEME_FONT,
+         text=_S4_TITLES[i])
+    for i, (x, y) in enumerate(_S4_TITLE_XY)
+] + [
+    _sig(4, 5806440, 5138928, 5349240, 530352, sz=1500, b=1, clr='1E5B64',
+         font=THEME_FONT,
+         text='核心判断：不是缺少优秀单点能力，而是需要更稳定、可复制、可协作的工业链条。'),
+]
+
+# ---- 第5页：03 GLOBAL COMPETITION + 三张 FFF9EF 圆角卡片 + 左侧配图 ----
+_S5_TITLES = ['成熟工业体系', '区域市场崛起', '中国内容压力']
+PROTECTED['s5'] = [
+    _sig(5, 658368, 384048, 1143000, 274320, sz=1100, b=1, clr='D9A441',
+         font=THEME_FONT, text='03  GLOBAL COMPETITION'),
+    _sig(5, 658368, 1573659, 5504688, 3098033, kind='pic'),
+] + [
+    _sig(5, 6446520, y, 5074920, 1097280, geom='roundRect', fill='FFF9EF')
+    for y in (1554480, 2889504, 4224528)
+] + [
+    _sig(5, 6611112, y, 4745736, 292608, sz=1300, b=1, clr='1E5B64',
+         font=THEME_FONT, text=_S5_TITLES[i])
+    for i, y in enumerate((1682496, 3017520, 4352544))
+]
+
+# ---- 第6页：04 PERCEPTION BARRIERS + 三个圆点 + 三段小标题 ----
+_S6_TITLES = ['预设立场', '文化陌生', '双重审视']
+_S6_DOT_FILL = ['D9A441', '1E5B64', 'C85C4A']
+PROTECTED['s6'] = [
+    _sig(6, 658368, 384048, 1143000, 274320, sz=1100, b=1, clr='D9A441',
+         font=THEME_FONT, text='04  PERCEPTION BARRIERS'),
+] + [
+    _sig(6, 749808, y, 310896, 310896, geom='ellipse', fill=_S6_DOT_FILL[i])
+    for i, y in enumerate((1728216, 2889504, 4050792))
+] + [
+    _sig(6, 1225296, y, 1600200, 256032, sz=1500, b=1, clr='112A35',
+         font=THEME_FONT, text=_S6_TITLES[i])
+    for i, y in enumerate((1682496, 2843784, 4005072))
+]
+
+# ---- 第7页：突破之道（深色页）+ 金色竖条 + 四条编号条目 ----
+_S7_TITLES = ['情感转译', '工业协同', '渠道前置', '类型创新']
+PROTECTED['s7'] = [
+    _sig(7, 676656, 932688, 2926080, 512064, sz=3000, b=1, clr='FFFFFF',
+         font=THEME_FONT, text='突破之道'),
+    _sig(7, 6181344, 0, 164592, 6858000, fill='D9A441'),
+] + [
+    _sig(7, 1810512, y, 1371600, 256032, sz=1420, b=1, clr='FFFFFF',
+         font=THEME_FONT, text=_S7_TITLES[i])
+    for i, y in enumerate((2359152, 3200400, 4041648, 4882896))
+]
+
+# ---- 第8页：资料依据 + 五条圆角条目（底色交替）+ 谢谢观看 ----
+_S8_BAR_FILL = ['FFF9EF', 'F7F0E4', 'FFF9EF', 'F7F0E4', 'FFF9EF']
+PROTECTED['s8'] = [
+    _sig(8, 713232, 658368, 2377440, 457200, sz=2900, b=1, clr='112A35',
+         font=THEME_FONT, text='资料依据'),
+    _sig(8, 713232, 5742432, 2011680, 347472, sz=1900, b=1, clr='1E5B64',
+         font=THEME_FONT, text='谢谢观看'),
+] + [
+    _sig(8, 932688, y, 9555480, 603504, geom='roundRect', fill=_S8_BAR_FILL[i])
+    for i, y in enumerate((1874520, 2660904, 3447288, 4233672, 5020056))
+]
+# ==================== 基础工具：命名空间 / 文本 / 字体 ====================
+def _qa(tag):
+    return '{%s}%s' % (NS_A, tag)
+
+
+def _qp(tag):
+    return '{%s}%s' % (NS_P, tag)
+
+
+def _qr(tag):
+    return '{%s}%s' % (NS_R, tag)
+
+
+def _norm_text(s):
+    """归一化文本：连续空白折叠成单个空格并去除首尾空白。"""
+    return re.sub(r'\s+', ' ', s or '').strip()
+
+
+def _norm_font(name):
+    """归一化字体名：处理不同办公软件保存后的同义名（微软雅黑 ≡ Microsoft YaHei）。"""
+    if not name:
+        return ''
+    key = name.strip()
+    if key in FONT_ALIAS:
+        return FONT_ALIAS[key]
+    return FONT_ALIAS.get(key.lower(), key)
+
+
+def _hex6(v):
+    if not v:
         return None
-    for name in sorted(os.listdir(dir_path)):
-        if name.startswith("~$") or name.startswith("."):
+    v = v.strip().lstrip('#').upper()
+    return v if re.match(r'^[0-9A-F]{6}$', v) else None
+
+
+def _hls(hexv):
+    r = int(hexv[0:2], 16) / 255.0
+    g = int(hexv[2:4], 16) / 255.0
+    b = int(hexv[4:6], 16) / 255.0
+    return colorsys.rgb_to_hls(r, g, b)
+
+
+def _to_hex(h, l, s):
+    l = min(1.0, max(0.0, l))
+    s = min(1.0, max(0.0, s))
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return '%02X%02X%02X' % (int(round(r * 255)), int(round(g * 255)),
+                             int(round(b * 255)))
+
+# ==================== 基础工具：颜色解析 ====================
+def _apply_clr_mods(hexv, node):
+    """把 a:lumMod / a:lumOff / a:shade / a:tint / a:satMod 作用到基色上。
+    例：accent6(70AD47) + lumMod 75% -> 548235。"""
+    h, l, s = _hls(hexv)
+    for c in list(node):
+        tag = c.tag.split('}')[-1]
+        try:
+            val = int(c.get('val')) / 100000.0
+        except (TypeError, ValueError):
             continue
-        if name.lower().endswith(".pptx"):
-            return os.path.join(dir_path, name)
+        if tag == 'lumMod':
+            l *= val
+        elif tag == 'lumOff':
+            l += val
+        elif tag == 'shade':
+            l *= val
+        elif tag == 'tint':
+            l = l * val + (1.0 - val)
+        elif tag == 'satMod':
+            s *= val
+    return _to_hex(h, l, s)
+
+
+def _clr_of(node, ctx):
+    """把 a:srgbClr / a:schemeClr / a:sysClr 解析为 6 位十六进制色值。"""
+    if node is None:
+        return None
+    tag = node.tag.split('}')[-1]
+    if tag == 'srgbClr':
+        base = _hex6(node.get('val'))
+    elif tag == 'sysClr':
+        base = _hex6(node.get('lastClr')) or 'FFFFFF'
+    elif tag == 'schemeClr':
+        name = node.get('val') or ''
+        name = ctx['clrmap'].get(name, name)
+        base = ctx['theme'].get(name)
+    else:
+        return None
+    if not base:
+        return None
+    return _apply_clr_mods(base, node)
+
+
+def _solid_of(parent, ctx):
+    """取 parent 下的填充色：a:noFill -> 'noFill'，渐变/图片/图案 -> 类型名，
+    a:solidFill -> 色值，未指定 -> None。"""
+    if parent is None:
+        return None
+    if parent.find(_qa('noFill')) is not None:
+        return 'noFill'
+    for tag in ('gradFill', 'blipFill', 'pattFill'):
+        if parent.find(_qa(tag)) is not None:
+            return tag
+    sf = parent.find(_qa('solidFill'))
+    if sf is None:
+        return None
+    for c in list(sf):
+        v = _clr_of(c, ctx)
+        if v:
+            return v
+    return None
+
+def _is_dark_green(hexv):
+    """深绿色系：色相落在黄绿-青绿之间、饱和度足够、明度偏低。"""
+    if not hexv or not re.match(r'^[0-9A-F]{6}$', hexv):
+        return False
+    h, l, s = _hls(hexv)
+    return 0.20 <= h <= 0.53 and s >= 0.15 and l <= 0.45
+
+
+def _is_white(hexv):
+    """白色或等效浅色1。"""
+    if not hexv or not re.match(r'^[0-9A-F]{6}$', hexv):
+        return False
+    if hexv == 'FFFFFF':
+        return True
+    h, l, s = _hls(hexv)
+    return l >= 0.92 and s <= 0.12
+
+
+# ==================== 基础工具：主题 / 颜色映射 / 页部件 ====================
+def _parse_theme(z, part):
+    """返回 (配色方案 dict, 字体方案 dict)。"""
+    scheme, fonts = {}, {}
+    try:
+        root = ET.fromstring(z.read(part))
+    except Exception:
+        return scheme, fonts
+    cs = root.find('.//' + _qa('clrScheme'))
+    if cs is not None:
+        for c in list(cs):
+            name = c.tag.split('}')[-1]
+            srgb = c.find(_qa('srgbClr'))
+            if srgb is not None:
+                scheme[name] = _hex6(srgb.get('val'))
+                continue
+            sysc = c.find(_qa('sysClr'))
+            if sysc is not None:
+                scheme[name] = _hex6(sysc.get('lastClr'))
+    fs = root.find('.//' + _qa('fontScheme'))
+    if fs is not None:
+        for kind in ('majorFont', 'minorFont'):
+            f = fs.find(_qa(kind))
+            if f is None:
+                continue
+            la, ea = f.find(_qa('latin')), f.find(_qa('ea'))
+            fonts[kind] = (
+                _norm_font(la.get('typeface') if la is not None else ''),
+                _norm_font(ea.get('typeface') if ea is not None else ''))
+    return scheme, fonts
+
+def _rels(z, part):
+    """读取某部件的 .rels，返回 {Id: 归一化后的部件名}。"""
+    base = part.rsplit('/', 1)
+    rel_name = (base[0] + '/_rels/' + base[1] + '.rels') if len(base) == 2 \
+        else '_rels/' + part + '.rels'
+    out = {}
+    try:
+        root = ET.fromstring(z.read(rel_name))
+    except Exception:
+        return out
+    prefix = base[0] if len(base) == 2 else ''
+    for r in root:
+        tgt = (r.get('Target') or '').replace('\\', '/')
+        if not tgt or tgt.startswith('http'):
+            continue
+        if tgt.startswith('/'):
+            name = tgt.lstrip('/')
+        else:
+            cur = prefix
+            while tgt.startswith('../'):
+                tgt = tgt[3:]
+                cur = cur.rsplit('/', 1)[0] if '/' in cur else ''
+            name = (cur + '/' + tgt) if cur else tgt
+        out[r.get('Id')] = name
+    return out
+
+
+def _slide_parts(z):
+    """按 p:sldIdLst 的放映顺序返回幻灯片部件名列表。"""
+    root = ET.fromstring(z.read('ppt/presentation.xml'))
+    rmap = _rels(z, 'ppt/presentation.xml')
+    parts = []
+    lst = root.find(_qp('sldIdLst'))
+    if lst is not None:
+        for sid in lst.findall(_qp('sldId')):
+            name = rmap.get(sid.get(_qr('id')))
+            if name:
+                parts.append(name)
+    return parts
+
+
+def _master_clrmap(z):
+    """从 slideMaster1 读取 p:clrMap（bg1->lt1 等）。"""
+    try:
+        mst = ET.fromstring(z.read('ppt/slideMasters/slideMaster1.xml'))
+    except Exception:
+        return {}
+    cm = mst.find(_qp('clrMap'))
+    return dict(cm.attrib) if cm is not None else {}
+
+# ==================== 基础工具：形状遍历（含组合坐标换算） ====================
+SHAPE_KINDS = ('sp', 'pic', 'cxnSp', 'graphicFrame', 'grpSp')
+
+
+def _shape_xfrm(el):
+    for tag in ('spPr', 'grpSpPr'):
+        pr = el.find(_qp(tag))
+        if pr is not None:
+            xf = pr.find(_qa('xfrm'))
+            if xf is not None:
+                return xf
+    return el.find(_qp('xfrm'))
+
+
+def _compose_tf(tf, grp):
+    """把组合的子坐标系叠加到已有变换上；tf = (dx, dy, sx, sy)。"""
+    xf = _shape_xfrm(grp)
+    if xf is None:
+        return tf
+    off, ext = xf.find(_qa('off')), xf.find(_qa('ext'))
+    ch_off, ch_ext = xf.find(_qa('chOff')), xf.find(_qa('chExt'))
+    if off is None or ext is None or ch_off is None or ch_ext is None:
+        return tf
+    try:
+        ox, oy = int(off.get('x')), int(off.get('y'))
+        ecx, ecy = int(ext.get('cx')), int(ext.get('cy'))
+        cox, coy = int(ch_off.get('x')), int(ch_off.get('y'))
+        ccx, ccy = int(ch_ext.get('cx')), int(ch_ext.get('cy'))
+    except (TypeError, ValueError):
+        return tf
+    gx = (ecx / float(ccx)) if ccx else 1.0
+    gy = (ecy / float(ccy)) if ccy else 1.0
+    sx, sy = gx * tf[2], gy * tf[3]
+    return (tf[0] + ox * tf[2] - cox * sx, tf[1] + oy * tf[3] - coy * sy, sx, sy)
+
+
+def _norm_geom(g):
+    return 'line' if g in ('line', 'straightConnector1') else g
+
+def _mk_shape(el, kind, tf, ctx, in_group, top):
+    """把一个形状元素抽成便于比对的记录。坐标已换算为页面绝对坐标（EMU）。"""
+    spPr = el.find(_qp('spPr'))
+    xf = _shape_xfrm(el)
+    rec = {'el': el, 'kind': kind, 'x': None, 'y': None, 'cx': None, 'cy': None,
+           'rot': 0, 'in_group': in_group, 'top': top, 'is_label': False}
+    if xf is not None:
+        try:
+            rec['rot'] = int(xf.get('rot') or 0)
+        except ValueError:
+            rec['rot'] = 0
+        off, ext = xf.find(_qa('off')), xf.find(_qa('ext'))
+        if off is not None:
+            try:
+                rec['x'] = tf[0] + int(off.get('x') or 0) * tf[2]
+                rec['y'] = tf[1] + int(off.get('y') or 0) * tf[3]
+            except ValueError:
+                pass
+        if ext is not None:
+            try:
+                rec['cx'] = int(ext.get('cx') or 0) * tf[2]
+                rec['cy'] = int(ext.get('cy') or 0) * tf[3]
+            except ValueError:
+                pass
+    rec['geom'] = None
+    rec['adj'] = {}
+    if spPr is not None:
+        pg = spPr.find(_qa('prstGeom'))
+        if pg is not None:
+            rec['geom'] = _norm_geom(pg.get('prst'))
+            for gd in pg.iter(_qa('gd')):
+                m = re.search(r'val\s+(-?\d+)', gd.get('fmla') or '')
+                if m:
+                    rec['adj'][gd.get('name')] = int(m.group(1))
+        elif spPr.find(_qa('custGeom')) is not None:
+            rec['geom'] = 'custGeom'
+    style = el.find(_qp('style'))
+    rec['fill'] = _solid_of(spPr, ctx)
+    if rec['fill'] is None and style is not None:
+        fr = style.find(_qa('fillRef'))
+        if fr is not None and (fr.get('idx') or '0') != '0':
+            for c in list(fr):
+                v = _clr_of(c, ctx)
+                if v:
+                    rec['fill'] = v
+                    break
+    _fill_line_and_effect(rec, el, spPr, style, ctx)
+    _fill_text(rec, el, style, ctx)
+    return rec
+
+def _fill_line_and_effect(rec, el, spPr, style, ctx):
+    """描边与效果：ln_w / ln_clr / ln_explicit_nofill / effects / eff_ref。"""
+    rec['ln_w'] = None
+    rec['ln_clr'] = None
+    rec['ln_nofill'] = False
+    ln = spPr.find(_qa('ln')) if spPr is not None else None
+    rec['ln_present'] = ln is not None
+    if ln is not None:
+        if ln.get('w'):
+            try:
+                rec['ln_w'] = int(ln.get('w'))
+            except ValueError:
+                rec['ln_w'] = None
+        rec['ln_clr'] = _solid_of(ln, ctx)
+        rec['ln_nofill'] = rec['ln_clr'] == 'noFill'
+    rec['effects'] = []
+    if spPr is not None:
+        lst = spPr.find(_qa('effectLst'))
+        if lst is not None:
+            rec['effects'] = [c.tag.split('}')[-1] for c in list(lst)]
+        for tag in ('scene3d', 'sp3d'):
+            if spPr.find(_qa(tag)) is not None:
+                rec['effects'].append(tag)
+    rec['eff_ref'] = None
+    rec['ln_ref'] = None
+    rec['font_ref_clr'] = None
+    if style is not None:
+        er = style.find(_qa('effectRef'))
+        if er is not None:
+            try:
+                rec['eff_ref'] = int(er.get('idx') or 0)
+            except ValueError:
+                rec['eff_ref'] = None
+        lr = style.find(_qa('lnRef'))
+        if lr is not None:
+            try:
+                rec['ln_ref'] = int(lr.get('idx') or 0)
+            except ValueError:
+                rec['ln_ref'] = None
+        fr = style.find(_qa('fontRef'))
+        if fr is not None:
+            for c in list(fr):
+                v = _clr_of(c, ctx)
+                if v and v != 'noFill':
+                    rec['font_ref_clr'] = v
+                    break
+
+def _fill_text(rec, el, style, ctx):
+    """文本层：runs（字号/字重/字体/字色）、段落对齐、bodyPr 参数、项目符号。"""
+    rec.update({'text': '', 'runs': [], 'algn': None, 'anchor': None,
+                'anchor_ctr': None, 'wrap': None, 'l_ins': None, 'r_ins': None,
+                'autofit': None, 'bullet': False})
+    body = el.find(_qp('txBody'))
+    if body is None:
+        return
+    bodyPr = body.find(_qa('bodyPr'))
+    if bodyPr is not None:
+        rec['anchor'] = bodyPr.get('anchor')
+        rec['anchor_ctr'] = bodyPr.get('anchorCtr')
+        rec['wrap'] = bodyPr.get('wrap')
+        rec['l_ins'] = bodyPr.get('lIns')
+        rec['r_ins'] = bodyPr.get('rIns')
+        na = bodyPr.find(_qa('normAutofit'))
+        if na is not None:
+            try:
+                rec['autofit'] = int(na.get('fontScale') or 100000)
+            except ValueError:
+                rec['autofit'] = None
+    for p in body.findall(_qa('p')):
+        pPr = p.find(_qa('pPr'))
+        if pPr is not None:
+            if rec['algn'] is None:
+                rec['algn'] = pPr.get('algn')
+            if pPr.find(_qa('buChar')) is not None or \
+                    pPr.find(_qa('buAutoNum')) is not None:
+                rec['bullet'] = True
+        for r in p.findall(_qa('r')):
+            rPr = r.find(_qa('rPr'))
+            t = r.find(_qa('t'))
+            la = rPr.find(_qa('latin')) if rPr is not None else None
+            ea = rPr.find(_qa('ea')) if rPr is not None else None
+            clr = _solid_of(rPr, ctx)
+            sz_raw = rPr.get('sz') if rPr is not None else None
+            rec['runs'].append({
+                'text': (t.text or '') if t is not None else '',
+                'sz': int(sz_raw) if (sz_raw or '').isdigit() else None,
+                'b': rPr is not None and rPr.get('b') == '1',
+                'i': rPr is not None and rPr.get('i') == '1',
+                'u': rPr is not None and (rPr.get('u') or 'none') != 'none',
+                'latin': _norm_font(la.get('typeface') if la is not None else ''),
+                'ea': _norm_font(ea.get('typeface') if ea is not None else ''),
+                'clr': clr if clr not in ('noFill',) else None,
+            })
+    rec['text'] = _norm_text(''.join(t.text or '' for t in body.iter(_qa('t'))))
+
+def _walk_tree(parent, ctx, tf, in_group, out, top):
+    for c in list(parent):
+        kind = c.tag.split('}')[-1]
+        if kind not in SHAPE_KINDS:
+            continue
+        out.append(_mk_shape(c, kind, tf, ctx, in_group, top))
+        if kind == 'grpSp':
+            _walk_tree(c, ctx, _compose_tf(tf, c), True, out, False)
+
+
+def _shapes_of(slide_root, ctx):
+    tree = slide_root.find(_qp('cSld') + '/' + _qp('spTree'))
+    out = []
+    if tree is not None:
+        _walk_tree(tree, ctx, (0, 0, 1.0, 1.0), False, out, True)
+    return out
+
+
+def _slide_bg(slide_root, ctx):
+    """页面底色：p:sld/p:cSld/p:bg 下的 p:bgPr 或 p:bgRef。"""
+    bg = slide_root.find(_qp('cSld') + '/' + _qp('bg'))
+    if bg is None:
+        return None
+    bgPr = bg.find(_qp('bgPr'))
+    if bgPr is not None:
+        return _solid_of(bgPr, ctx)
+    ref = bg.find(_qp('bgRef'))
+    if ref is not None:
+        for c in list(ref):
+            v = _clr_of(c, ctx)
+            if v:
+                return v
     return None
 
 
-def evaluate(dir_path: str) -> dict:
-    """评估 dir_path 目录下的 PPTX 文件，返回结构化结果。
+def _eff_run_clr(rec, run, ctx):
+    """字色的生效值：显式 run 填充 -> 形状 fontRef -> 主题正文色。"""
+    if run.get('clr'):
+        return run['clr']
+    if rec.get('font_ref_clr'):
+        return rec['font_ref_clr']
+    name = ctx['clrmap'].get('tx1', 'dk1')
+    return ctx['theme'].get(name) or '000000'
 
-    dir_path 应为脚本所在目录的路径，脚本自行在该目录内定位被评估文档。
-    返回结构详见《脚本接口差异与统一建议》§2.2。
-    """
-    # 满分 = 所有加分项 max_delta 之和（扣分项不参与"满分"计算）
-    max_score = sum(3 for _ in _ADD_RULE_KEYS)
+
+def _eff_run_font(run):
+    """生效字体名集合：东亚字体与西文字体都算（中文看 a:ea，西文看 a:latin）。"""
+    return set(f for f in (run.get('ea'), run.get('latin')) if f)
+
+# ==================== 基础工具：定位 / 几何 / 签名比对 ====================
+def _near(rec, x, y, cx, cy, tol):
+    for got, want in ((rec['x'], x), (rec['y'], y), (rec['cx'], cx), (rec['cy'], cy)):
+        if got is None or abs(got - want) > tol:
+            return False
+    return True
+
+
+def _rect_overlap(r1, r2, tol=TOL_005):
+    """矩形是否真正交叠；细线等零厚度元素在该方向上不给容差。"""
+    x1, y1, w1, h1 = r1
+    x2, y2, w2, h2 = r2
+    tx = 0 if (w1 <= 0 or w2 <= 0) else tol
+    ty = 0 if (h1 <= 0 or h2 <= 0) else tol
+    iw = min(x1 + max(w1, 0), x2 + max(w2, 0)) - max(x1, x2)
+    ih = min(y1 + max(h1, 0), y2 + max(h2, 0)) - max(y1, y2)
+    return iw > tx and ih > ty
+
+
+def _text_width_emu(text, sz):
+    """单行文字宽度估算：中日韩全宽字符按 1.0 em，其余按 0.55 em。"""
+    em = sz / 100.0 * EMU_PT
+    total = 0.0
+    for ch in text:
+        total += em if ord(ch) > 0x2E7F else em * 0.55
+    return total
+
+
+def _real_runs(rec):
+    return [r for r in rec['runs'] if (r.get('text') or '').strip()]
+
+
+def _props_ok(rec, props, ctx):
+    """逐项比对期望属性；只比对签名里写明的键。"""
+    if 'kind' in props and rec['kind'] != props['kind']:
+        return False
+    if 'geom' in props and rec['geom'] != props['geom']:
+        return False
+    if 'fill' in props and rec['fill'] != props['fill']:
+        return False
+    if 'lnw' in props and rec['ln_w'] != props['lnw']:
+        return False
+    if 'lnclr' in props and rec['ln_clr'] != props['lnclr']:
+        return False
+    if 'algn' in props and rec['algn'] != props['algn']:
+        return False
+    if 'text' in props and rec['text'] != _norm_text(props['text']):
+        return False
+    runs = _real_runs(rec)
+    if any(k in props for k in ('sz', 'b', 'clr', 'font')) and not runs:
+        return False
+    for run in runs:
+        if 'sz' in props and run['sz'] != props['sz']:
+            return False
+        if 'b' in props and run['b'] != bool(props['b']):
+            return False
+        if 'clr' in props and _eff_run_clr(rec, run, ctx) != props['clr']:
+            return False
+        if 'font' in props and props['font'] not in _eff_run_font(run):
+            return False
+    return True
+
+
+def _sig_ok(by_slide, sig, ctx):
+    """签名命中：先按 (x, y, cx, cy) 定位，再比对属性。"""
+    slide, x, y, cx, cy, props = sig
+    for rec in by_slide.get(slide, []):
+        if _near(rec, x, y, cx, cy, TOL_POS) and _props_ok(rec, props, ctx):
+            return True
+    return False
+
+
+def _group_kept(by_slide, key, ctx):
+    """PROTECTED 里某一组签名是否全部保持原样。"""
+    return all(_sig_ok(by_slide, sig, ctx) for sig in PROTECTED[key])
+
+def _theme_effects(z, part):
+    """主题 effectStyleLst 各级是否真的带可见效果（本模板 1、2 级为空效果）。"""
+    out = []
+    try:
+        root = ET.fromstring(z.read(part))
+    except Exception:
+        return out
+    lst = root.find('.//' + _qa('effectStyleLst'))
+    if lst is None:
+        return out
+    for es in list(lst):
+        lst2 = es.find(_qa('effectLst'))
+        visible = bool(lst2 is not None and len(list(lst2)))
+        if es.find(_qa('scene3d')) is not None or es.find(_qa('sp3d')) is not None:
+            visible = True
+        out.append(visible)
+    return out
+
+
+def _theme_effect_visible(ctx, idx):
+    effs = ctx.get('effects') or []
+    if not idx or idx < 1 or idx > len(effs):
+        return False
+    return effs[idx - 1]
+
+
+def _is_protected_pos(slide, rec):
+    """该形状是否落在某条基准签名的位置上（用于识别既有元素）。"""
+    for sigs in PROTECTED.values():
+        for sig in sigs:
+            if sig[0] == slide and _near(rec, sig[1], sig[2], sig[3], sig[4], TOL_POS):
+                return True
+    for pg, x, y, cx, cy, _t, _sz, _clr in PAGE_NUMBERS:
+        if pg == slide and _near(rec, x, y, cx, cy, TOL_POS):
+            return True
+    return False
+
+
+def _label_container(rec):
+    """组合形状内是否只装了指令要求的小标签（用于统计新增元素时不误判）。"""
+    if rec['kind'] != 'grpSp':
+        return False
+    texts = []
+    for sp in rec['el'].iter(_qp('sp')):
+        body = sp.find(_qp('txBody'))
+        if body is None:
+            continue
+        t = _norm_text(''.join(x.text or '' for x in body.iter(_qa('t'))))
+        if t:
+            texts.append(t)
+    return bool(texts) and all(t in LABEL_WORDS for t in texts)
+
+# ==================== 对外接口 ====================
+class _TargetMissing(Exception):
+    """目录不存在或目录中没有 .pptx：连待评测对象都没有，不进入维度判定。"""
+
+
+def evaluate(dir_path):
+    """入参为脚本所在目录；在该目录内定位 .pptx 并返回评分结果 dict。"""
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": max_score,
+        "max_score": MAX_SCORE_TOTAL,
     }
     try:
-        pptx_path = _find_pptx(dir_path)
-        if pptx_path is None:
-            result["status"] = "error"
-            result["error"] = f"目录 {dir_path} 中未找到 .pptx 文件"
-            return result
-        result["file_name"] = os.path.basename(pptx_path)
-
-        prs, err = load(pptx_path)
-        if err:
-            result["status"] = "error"
-            result["error"] = err
-            result["dim1_reason"] = err
-            return result
-
-        d1_ok, d1_reasons, labels = check_dimension1(prs)
-        if not d1_ok:
-            result["dim1_pass"] = False
-            result["dim1_reason"] = "；".join(r for r in d1_reasons if r.startswith("✗"))
-            return result
-
-        result["dim1_pass"] = True
-        total, hits = check_dimension2(prs, labels)
-        result["dim2_items"] = _build_dim2_items(hits)
-        result["total_score"] = max(0, total)
-        return result
-    except Exception as e:
+        if not dir_path or not os.path.isdir(dir_path):
+            raise _TargetMissing("目录不存在：%s" % dir_path)
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith('.pptx') and not f.startswith('~$'))
+        if not cands:
+            raise _TargetMissing("目录中未找到 .pptx 文件：%s" % dir_path)
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except _TargetMissing as exc:
+        # 找不到待评测文件：维度1 未参与判定，dim1_pass / dim1_reason 一律留空，满分也置 0
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
+    except Exception as exc:
+        # 文件存在但打不开 / 解析失败：维度1 判不通过，dim1_reason 给出错误摘要
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "文件无法解析或无法打开：%s: %s" % (type(exc).__name__, exc)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = MAX_SCORE_TOTAL
+        return result
+
+
+def _open_deck(file_path):
+    """打开并解析演示文稿；返回 (zip, presentation 根, 幻灯片根列表)。"""
+    z = zipfile.ZipFile(file_path)
+    broken = z.testzip()
+    if broken:
+        raise zipfile.BadZipFile("包内文件损坏：%s" % broken)
+    pres = ET.fromstring(z.read('ppt/presentation.xml'))
+    parts = _slide_parts(z)
+    if not parts:
+        raise ValueError("演示文稿内没有可用的幻灯片")
+    roots = [ET.fromstring(z.read(p)) for p in parts]
+    return z, pres, roots
+
+def _build_ctx(z):
+    """组装配色 / 字体 / 效果解析上下文。"""
+    theme_part = 'ppt/theme/theme1.xml'
+    for name in _rels(z, 'ppt/slideMasters/slideMaster1.xml').values():
+        if name.startswith('ppt/theme/') and name.endswith('.xml'):
+            theme_part = name
+            break
+    theme, fonts = _parse_theme(z, theme_part)
+    if not theme:
+        theme = dict(THEME_SCHEME)
+    clrmap = _master_clrmap(z) or {
+        'bg1': 'lt1', 'tx1': 'dk1', 'bg2': 'lt2', 'tx2': 'dk2'}
+    return {'theme': theme, 'fonts': fonts, 'clrmap': clrmap,
+            'effects': _theme_effects(z, theme_part), 'theme_part': theme_part}
+
+
+def _collect_labels(by_slide, ctx):
+    """在目录页找出指令要求的小标签，并按四组归位。"""
+    labels = []
+    for rec in by_slide.get(LABEL_SLIDE, []):
+        if rec['kind'] == 'grpSp' or rec['x'] is None:
+            continue
+        if rec['text'] in LABEL_WORDS:
+            rec['is_label'] = True
+            labels.append(rec)
+    heads = []
+    for i, (hx, hy) in enumerate(HEADING_XY):
+        found = None
+        for rec in by_slide.get(LABEL_SLIDE, []):
+            if rec['is_label'] or rec['x'] is None:
+                continue
+            if rec['text'] == LABEL_GROUPS[i][0]:
+                found = rec
+                break
+        if found is not None and found['cy']:
+            heads.append((found['x'], found['y'], found['cx'], found['cy']))
+        else:
+            heads.append((hx, hy, HEADING_EXT[0], HEADING_EXT[1]))
+    groups = dict((i, []) for i in range(4))
+    for rec in labels:
+        idx = -1
+        for i, head in enumerate(heads):
+            if rec['y'] >= head[1]:
+                idx = i
+        if idx >= 0:
+            groups[idx].append(rec)
+    for i in range(4):
+        groups[i].sort(key=lambda r: r['x'])
+    return labels, heads, groups
+
+# ==================== 维度二：加分项 01-15 ====================
+def _check_bonus(results, by_slide, labels, heads, groups, ctx):
+    n12 = len(labels) == 12
+
+    # 01 12个标签齐全、分组对应、无错漏、全在目录页
+    ok = n12 and sorted(r['text'] for r in labels) == sorted(LABEL_WORDS)
+    if ok:
+        for i in range(4):
+            grp = groups[i]
+            if len(grp) != 3 or sorted(r['text'] for r in grp) != \
+                    sorted(LABEL_GROUPS[i][1]):
+                ok = False
+                break
+    if ok:
+        for si, recs in by_slide.items():
+            if si == LABEL_SLIDE:
+                continue
+            for rec in recs:
+                if rec['text'] in LABEL_WORDS and rec['x'] is not None and \
+                        not _is_protected_pos(si, rec):
+                    ok = False
+                    break
+    results.append(("+5：" if ok else "+0：") +
+                   "目录页四组小标题下方共新增12个小标签（每组3个），文字与所属组严格对应、"
+                   "无错字无漏项无多余标签，且全部位于目录页")
+
+    # 02 中文实际生效 MiSans（a:ea 与 a:latin 同时指定）
+    ok = n12
+    for rec in labels:
+        runs = _real_runs(rec)
+        if not runs:
+            ok = False
+        for run in runs:
+            if run['ea'] != LABEL_FONT or run['latin'] != LABEL_FONT:
+                ok = False
+    results.append(("+5：" if ok else "+0：") +
+                   "标签中文字符实际生效为 MiSans——东亚字体（a:ea）与西文字体（a:latin）"
+                   "同时指定为 MiSans")
+
+    # 03 标签为可单独点选编辑的形状
+    ok = n12 and all(rec['kind'] == 'sp' and not rec['in_group'] for rec in labels)
+    results.append(("+3：" if ok else "+0：") +
+                   "12个小标签均为可单独点选、单独编辑的形状，未以图片形式贴入、"
+                   "未被合并进无法单独拆分的组合")
+
+    # 04 字号统一 10.5 磅
+    ok = n12
+    for rec in labels:
+        if rec['autofit'] not in (None, 100000):
+            ok = False
+        for run in _real_runs(rec):
+            if run['sz'] != LABEL_SZ:
+                ok = False
+    results.append(("+3：" if ok else "+0：") +
+                   "12个标签文字字号统一为10.5磅，未出现放大、缩小或自动缩放导致的字号不一致")
+
+    # 05 底色深绿且12个统一
+    fills = set(rec['fill'] for rec in labels)
+    ok = n12 and len(fills) == 1 and _is_dark_green(list(fills)[0])
+    results.append(("+3：" if ok else "+0：") +
+                   "标签底色为深绿色系且12个完全统一")
+    # 06 文字白色
+    ok = n12
+    for rec in labels:
+        runs = _real_runs(rec)
+        if not runs:
+            ok = False
+        for run in runs:
+            if not _is_white(_eff_run_clr(rec, run, ctx)):
+                ok = False
+    results.append(("+3：" if ok else "+0：") +
+                   "标签文字为白色（#FFFFFF 或等效浅色1），与深绿底形成清晰对比")
+
+    # 07 圆角胶囊形（adj≥40%）
+    ok = n12 and all(rec['geom'] == 'roundRect' and
+                     rec['adj'].get('adj', 0) >= LABEL_ADJ_MIN for rec in labels)
+    results.append(("+3：" if ok else "+0：") +
+                   "标签为圆角胶囊形（圆角矩形且圆角调节值≥40%），不是直角矩形、椭圆或其他形状")
+
+    # 08 同组自左至右、顶边齐平
+    ok = n12
+    for i in range(4):
+        grp = groups[i]
+        if len(grp) != 3:
+            ok = False
+            continue
+        if [r['text'] for r in grp] != list(LABEL_GROUPS[i][1]):
+            ok = False
+        ys = [r['y'] for r in grp]
+        if max(ys) - min(ys) > TOL_005:
+            ok = False
+    results.append(("+3：" if ok else "+0：") +
+                   "同组三个标签自左至右的次序与指令词序完全一致，且三者顶边纵坐标一致（≤0.05cm）")
+
+    # 09 等距 + 同列对齐 + 行距与小标题一致（规整矩阵）
+    ok = n12
+    cols = []
+    for i in range(4):
+        grp = groups[i]
+        if len(grp) != 3:
+            ok = False
+            continue
+        xs = [r['x'] for r in grp]
+        if abs((xs[1] - xs[0]) - (xs[2] - xs[1])) > TOL_005:
+            ok = False
+        cols.append(xs)
+    if ok and len(cols) == 4:
+        for j in range(3):
+            vals = [c[j] for c in cols]
+            if max(vals) - min(vals) > TOL_005:
+                ok = False
+        rows = [min(r['y'] for r in groups[i]) for i in range(4)]
+        row_gaps = [rows[i + 1] - rows[i] for i in range(3)]
+        head_gaps = [heads[i + 1][1] - heads[i][1] for i in range(3)]
+        if max(row_gaps) - min(row_gaps) > TOL_005:
+            ok = False
+        for got, want in zip(row_gaps, head_gaps):
+            if abs(got - want) > TOL_015:
+                ok = False
+    else:
+        ok = False
+    results.append(("+3：" if ok else "+0：") +
+                   "四行三列对齐成规整矩阵——同组水平间距相等、四组共用同一套横向坐标、"
+                   "相邻两行标签顶边间距与相邻两组小标题顶边间距一致")
+    # 10 12个尺寸一致
+    ok = n12
+    if ok:
+        cxs = [r['cx'] or 0 for r in labels]
+        cys = [r['cy'] or 0 for r in labels]
+        ok = (max(cxs) - min(cxs) <= TOL_002) and (max(cys) - min(cys) <= TOL_002)
+    results.append(("+3：" if ok else "+0：") +
+                   "12个标签尺寸完全一致（同一宽度、同一高度，偏差≤0.02cm）")
+
+    # 11 落在该组小标题下方空白区
+    ok = n12
+    for i in range(4):
+        grp = groups[i]
+        if len(grp) != 3:
+            ok = False
+            continue
+        top = min(r['y'] for r in grp)
+        bottom = max(r['y'] + (r['cy'] or 0) for r in grp)
+        gap = top - (heads[i][1] + heads[i][3])
+        if not (BAND_GAP_MIN <= gap <= BAND_GAP_MAX):
+            ok = False
+        limit = heads[i + 1][1] if i < 3 else HAIRLINE_Y
+        if bottom > limit:
+            ok = False
+    results.append(("+5：" if ok else "+0：") +
+                   "每组三个标签整体落在该组小标题下方空白区——上边缘位于小标题底边下方"
+                   "0.35–2.0cm，下边缘不越过下一组小标题顶边（第四组不越过页脚细分隔线）")
+
+    # 12 与既有元素互不重叠
+    others = [r for r in by_slide.get(LABEL_SLIDE, [])
+              if not r['is_label'] and r['kind'] != 'grpSp' and r['x'] is not None]
+    ok = n12
+    for rec in labels:
+        r1 = (rec['x'], rec['y'], rec['cx'] or 0, rec['cy'] or 0)
+        for other in others:
+            r2 = (other['x'], other['y'], other['cx'] or 0, other['cy'] or 0)
+            if _rect_overlap(r1, r2):
+                ok = False
+                break
+    results.append(("+3：" if ok else "+0：") +
+                   "标签块与目录页既有元素互不重叠——未覆盖01–04序号、金色短横线、四个小标题、"
+                   "右侧说明文字、竖向金色分隔线、右侧配图及右下角总结句")
+
+    # 13 色块尺寸与文字匹配、文字居中
+    ok = n12
+    for rec in labels:
+        cy = rec['cy'] or 0
+        if not (LABEL_CY_MIN <= cy <= LABEL_CY_MAX):
+            ok = False
+        if rec['algn'] != 'ctr' or (rec['anchor'] or '') != 'ctr':
+            ok = False
+        runs = _real_runs(rec)
+        sz = (runs[0]['sz'] if runs and runs[0]['sz'] else LABEL_SZ)
+        l_ins = int(rec['l_ins']) if (rec['l_ins'] or '').isdigit() else 91440
+        r_ins = int(rec['r_ins']) if (rec['r_ins'] or '').isdigit() else 91440
+        if (rec['cx'] or 0) - l_ins - r_ins < _text_width_emu(rec['text'], sz):
+            ok = False
+    results.append(("+1：" if ok else "+0：") +
+                   "色块尺寸与10.5磅文字匹配——最长的“产业链断点”不截断不换行不溢出，"
+                   "标签高度在0.55–0.90cm之间，文字在色块内上下左右居中")
+    # 14 扁平纯色块（无描边、无效果）
+    ok = n12
+    for rec in labels:
+        if rec['fill'] in ('noFill', 'gradFill', 'blipFill', 'pattFill'):
+            ok = False
+        if not rec['ln_nofill']:
+            if rec['ln_clr'] and rec['ln_clr'] != rec['fill']:
+                ok = False
+            elif rec['ln_clr'] is None and (rec['ln_ref'] or 0) != 0:
+                ok = False
+        if rec['effects']:
+            ok = False
+        if _theme_effect_visible(ctx, rec['eff_ref']):
+            ok = False
+    results.append(("+1：" if ok else "+0：") +
+                   "标签为扁平纯色块——无可见描边，且未附加阴影、发光、三维、渐变等效果")
+
+    # 15 常规字重纯文本
+    ok = n12
+    for rec in labels:
+        if rec['bullet']:
+            ok = False
+        raw = ''.join(r['text'] for r in rec['runs'])
+        if raw.strip() != rec['text'] or rec['text'] not in LABEL_WORDS:
+            ok = False
+        for run in _real_runs(rec):
+            if run['b'] or run['i'] or run['u']:
+                ok = False
+    results.append(("+1：" if ok else "+0：") +
+                   "标签文字为常规字重的纯文本——未加粗未倾斜未加下划线，"
+                   "无项目符号、编号、多余空格或标点")
+
+# ==================== 维度二：减分项 16-35 ====================
+def _check_deduct(results, by_slide, roots, pres, labels, ctx):
+    def kept(key):
+        return _group_kept(by_slide, key, ctx)
+
+    # 16 目录页页首 CONTENTS / 目录
+    bad = not kept('s2_header')
+    results.append(("-1：" if bad else "-0：") +
+                   "第2页页首“CONTENTS”（Microsoft YaHei、11磅、加粗、#C77A42）与“目录”"
+                   "（31磅、加粗、#112A35）被改写、改变字体字号字色或移动位置")
+
+    # 17 目录页 01-04 序号
+    bad = not kept('s2_numbers')
+    results.append(("-1：" if bad else "-0：") +
+                   "第2页左侧“01”“02”“03”“04”四个序号不满足 Microsoft YaHei、20磅、加粗、"
+                   "#D9A441，或四者纵向间距被改动")
+
+    # 18 目录页金色短横线与竖向分隔线
+    bad = not kept('s2_goldlines')
+    results.append(("-1：" if bad else "-0：") +
+                   "第2页四条金色短横线（线宽1.5磅）与右侧竖向金色分隔线（线宽2磅）不满足"
+                   "#D9A441，或出现缺失、变长、位置偏移")
+
+    # 19 目录页四个小标题
+    bad = not kept('s2_headings')
+    results.append(("-3：" if bad else "-0：") +
+                   "第2页四个小标题“文化沟通”“工业体系”“全球竞争”“认知偏差”被改写，"
+                   "或不满足 Microsoft YaHei、17磅、加粗、#112A35，或位置被移动")
+
+    # 20 目录页四条说明文字
+    bad = not kept('s2_descs')
+    results.append(("-3：" if bad else "-0：") +
+                   "第2页四条说明文字被删除、改写，或不满足 Microsoft YaHei、12磅、#65737B")
+
+    # 21 目录页右侧配图
+    bad = not kept('s2_pic')
+    results.append(("-3：" if bad else "-0：") +
+                   "第2页右侧配图（约13.16cm×7.40cm）被替换、缩放、移动、裁剪、加边框或删除")
+
+    # 22 目录页右下角总结句
+    bad = not kept('s2_summary')
+    results.append(("-3：" if bad else "-0：") +
+                   "第2页右下角总结句被改写，或不满足 Microsoft YaHei、16磅、加粗、#1E5B64")
+
+    # 23 目录页页脚细线与页码 02
+    bad = not kept('s2_footer')
+    results.append(("-1：" if bad else "-0：") +
+                   "第2页页脚被改动——底部横向细分隔线（线宽0.6磅、#D6C9B8）被删除变色移动，"
+                   "或右下角页码“02”不满足9.5磅、#65737B、右对齐")
+    # 24 添加了指令未要求的元素
+    bad = False
+    for idx in range(1, len(SHAPE_COUNTS) + 1):
+        tops = [r for r in by_slide.get(idx, []) if r['top']]
+        expect = SHAPE_COUNTS[idx - 1]
+        if idx == LABEL_SLIDE:
+            expect += len([r for r in tops if r['is_label'] or _label_container(r)])
+        if len(tops) != expect:
+            bad = True
+            break
+    if len(roots) > len(SHAPE_COUNTS):
+        bad = True
+    results.append(("-3：" if bad else "-0：") +
+                   "添加了指令未要求的元素——目录页出现额外说明文字、图标、装饰线条、背景色块、"
+                   "多余标签，或在其他页面新增小标签、色块、重复元素")
+
+    # 25 第1页封面元素
+    bad = not kept('s1')
+    results.append(("-3：" if bad else "-0：") +
+                   "第1页封面英文行、主标题“中国电影业面临的挑战”（34磅、加粗、#112A35）、"
+                   "副标题行（14.5磅、#1E5B64）、“行业观察稿”、右侧通高金色竖条（#D9A441）"
+                   "或右侧配图被改写、移动、缩放、删除")
+
+    # 26 第3页标题与四张卡片
+    bad = not kept('s3')
+    results.append(("-3：" if bad else "-0：") +
+                   "第3页“01 CULTURAL COMMUNICATION”标题及四张底色 #FFF9EF 的圆角卡片"
+                   "（约8.51cm×4.44cm）的文字、底色、尺寸或位置被改动")
+
+    # 27 第4页标题与四张卡片
+    bad = not kept('s4')
+    results.append(("-3：" if bad else "-0：") +
+                   "第4页“02 INDUSTRIAL CAPABILITY”标题及四张底色 #FFF5E8 的圆角卡片"
+                   "（约7.49cm×3.56cm）与“核心判断”整句的文字、底色、尺寸或位置被改动")
+
+    # 28 第5页标题与三张卡片
+    bad = not kept('s5')
+    results.append(("-3：" if bad else "-0：") +
+                   "第5页“03 GLOBAL COMPETITION”标题及三张底色 #FFF9EF 的圆角卡片与页内配图的"
+                   "文字、底色、尺寸或位置被改动")
+
+    # 29 第6页标题与三个圆点
+    bad = not kept('s6')
+    results.append(("-3：" if bad else "-0：") +
+                   "第6页“04 PERCEPTION BARRIERS”标题、三个圆点（直径约0.86cm，"
+                   "#D9A441／#1E5B64／#C85C4A）及“预设立场”“文化陌生”“双重审视”被改动、变色或删除")
+
+    # 30 第7页深色页元素
+    bad = not kept('s7')
+    results.append(("-3：" if bad else "-0：") +
+                   "第7页“突破之道”白色标题（30磅）、左侧金色竖条（#D9A441）、"
+                   "四条编号条目（“情感转译”“工业协同”“渠道前置”“类型创新”）被改动")
+
+    # 31 第8页资料条目
+    bad = not kept('s8')
+    results.append(("-3：" if bad else "-0：") +
+                   "第8页“资料依据”（29磅）标题、五条底色交替为 #FFF9EF／#F7F0E4 的圆角条目"
+                   "（约26.51cm×1.68cm）、“谢谢观看”（19磅、#1E5B64）被改写、变色、删除")
+    # 32 页数/页序/页码标注
+    bad = len(roots) != len(SHAPE_COUNTS)
+    if not bad:
+        for pg, x, y, cx, cy, txt, sz, clr in PAGE_NUMBERS:
+            sig = _sig(pg, x, y, cx, cy, text=txt, sz=sz, clr=clr)
+            if not _sig_ok(by_slide, sig, ctx):
+                bad = True
+                break
+    results.append(("-3：" if bad else "-0：") +
+                   "文稿页数不再是8页，或页序被调换，或各页右下角页码标注（01–08）"
+                   "与实际页序不一致")
+
+    # 33 页面底色与页面尺寸
+    bad = False
+    for idx, want in enumerate(BG_COLORS, 1):
+        got = _slide_bg(roots[idx - 1], ctx) if idx <= len(roots) else None
+        if got != want:
+            bad = True
+            break
+    sld_sz = pres.find(_qp('sldSz'))
+    try:
+        sz_cx = int(sld_sz.get('cx'))
+        sz_cy = int(sld_sz.get('cy'))
+    except (AttributeError, TypeError, ValueError):
+        sz_cx = sz_cy = 0
+    if not (SLD_CX_CM[0] <= sz_cx / EMU_CM <= SLD_CX_CM[1] and
+            SLD_CY_CM[0] <= sz_cy / EMU_CM <= SLD_CY_CM[1]):
+        bad = True
+    if not sz_cy or abs(sz_cx / float(sz_cy) - 16.0 / 9.0) > 0.02:
+        bad = True
+    results.append(("-1：" if bad else "-0：") +
+                   "整体版式参数被改动——任一页面底色不再依次为 #F4EFE6、#E9F0EC、#F4EFE6、"
+                   "#F1E8DA、#EAF1F2、#F5EEE8、#112A35、#EFE6D7，或页面尺寸不再是16:9宽屏")
+
+    # 34 字体主题 / 配色主题
+    bad = False
+    for name, want in THEME_SCHEME.items():
+        if (ctx['theme'].get(name) or '') != want:
+            bad = True
+            break
+    for kind in ('majorFont', 'minorFont'):
+        pair = ctx['fonts'].get(kind)
+        if not pair or THEME_FONT not in pair:
+            bad = True
+            break
+    results.append(("-1：" if bad else "-0：") +
+                   "整份文稿的字体主题、配色主题被整体替换，导致既有文字字体或色彩连带发生变化")
+
+    # 35 出现乱码
+    bad = False
+    for recs in by_slide.values():
+        for rec in recs:
+            text = rec['text']
+            if not text:
+                continue
+            if any(m in text for m in ('�', '□', 'ï¿½')):
+                bad = True
+            if re.search('[À-ÿ][-¿]', text):
+                bad = True
+    results.append(("-3：" if bad else "-0：") +
+                   "文稿中出现乱码——既有中文标题、说明文字或新增标签文字显示为乱码、方框、问号")
+
+# ==================== 主评估流程 ====================
+def _evaluate_impl(file_path, result):
+    # ---- 维度一：交付文件能否作为 .pptx 正常打开 ----
+    try:
+        z, pres, roots = _open_deck(file_path)
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "交付文件无法作为 PowerPoint 演示文稿正常打开（%s: %s），" \
+                                "完成度总分记0" % (type(exc).__name__, exc)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = MAX_SCORE_TOTAL
+        return result
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "交付文件为1个可正常打开的 PowerPoint 演示文稿（.pptx，共%d页）" \
+                            % len(roots)
+
+    # ---- 维度二：完成度 ----
+    ctx = _build_ctx(z)
+    by_slide = {}
+    for idx, root in enumerate(roots, 1):
+        by_slide[idx] = _shapes_of(root, ctx)
+    labels, heads, groups = _collect_labels(by_slide, ctx)
+
+    results = []
+    _check_bonus(results, by_slide, labels, heads, groups, ctx)
+    _check_deduct(results, by_slide, roots, pres, labels, ctx)
+    z.close()
+
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta != 0
+        dim2_items.append({"rule": rule, "max_delta": max_delta,
+                           "delta": max_delta if hit else 0,
+                           "hit": hit})
+        total_score += (max_delta if hit else 0)
+    result["dim2_items"] = dim2_items
+    result["total_score"] = max(0, min(MAX_SCORE_TOTAL, total_score))
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 仅用于本地调试：命令行传入目录，或默认使用脚本所在目录
-    _reconfigure = getattr(sys.stdout, "reconfigure", None)
-    if _reconfigure is not None:
-        try:
-            _reconfigure(encoding="utf-8")  # 仅调试路径下调整，避免作为 import 副作用
-        except Exception:
-            pass
-    _target = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    print(json.dumps(evaluate(_target), ensure_ascii=False, indent=2))
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

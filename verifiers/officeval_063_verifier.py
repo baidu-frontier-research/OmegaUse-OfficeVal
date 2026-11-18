@@ -1,1469 +1,2323 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pyright: reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportMissingImports=false
+
 """
-自动评估脚本：对 officeval_063 目录下的 PPT 文档进行打分。
-
-评估逻辑：
-  维度1（可用与可修改性）—— 任一硬性条件不满足，整份文件直接 0 分；
-  维度2（完成度评分细则）—— 加分项需细则中“每一个点”都满足才累加；
-                            扣分项只要细则中“任一点”命中即累减。
-
-对外只暴露一个函数 `evaluate(dir_path: str) -> dict`：
-  - dir_path 为脚本所在目录，脚本自行在其中定位被评估的 .pptx 文档；
-  - 主结果不通过 print 输出，而是以结构化字典返回；
-  - 顶层 try/except 兜底，脚本自身异常统一表达为 status="error"。
+按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+主结果统一由 evaluate(dir_path) -> dict 返回，入参为“脚本所在目录的路径”，
+由脚本自己在该目录内定位并打开被评估的 .pptx。
+本文件仅在 __main__ 下作为本地调试入口，把 dict 序列化为 JSON 打印。
 """
 
 import os
+import re
 import sys
 import json
-import re
-from lxml import etree
+import math
+import shutil
+import zipfile
+import tempfile
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.util import Emu
-
-# --------------------------- 通用工具 ---------------------------
-
-NS = {
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
-}
-
-
-def emu_to_cm(emu):
-    return (emu or 0) / 360000.0
-
-
-def emu_to_inch(emu):
-    return (emu or 0) / 914400.0
-
-
-def hex_to_rgb(hex_str):
-    hex_str = hex_str.lstrip("#")
-    return tuple(int(hex_str[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def color_distance(c1_hex, c2_hex):
-    """两个十六进制颜色的欧氏距离（0~441）。"""
-    r1, g1, b1 = hex_to_rgb(c1_hex)
-    r2, g2, b2 = hex_to_rgb(c2_hex)
-    return ((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2) ** 0.5
-
-
-def is_blueish(hex_color):
-    """判断是否为浅蓝/青色系（B 通道相对较强、整体偏亮）。"""
-    r, g, b = hex_to_rgb(hex_color)
-    brightness = (r + g + b) / 3
-    return brightness > 200 and b >= r and (b + g) / 2 > r
-
-
-def is_beige(hex_color):
-    """判断是否为米黄色系（R≈G > B，且偏暖）。"""
-    r, g, b = hex_to_rgb(hex_color)
-    return r > 200 and g > 190 and b < r and b < g and (r - b) > 15
-
-
-# --------------------------- 维度1 检查 ---------------------------
-
-
-def check_dim1(pptx_path: str):
-    """维度1：交付文件为 .pptx 格式，能够正常打开。
-
-    只做两件事：
-      1) 后缀是 .pptx；
-      2) 能够被 python-pptx 正常打开。
-    其它（页数、可编辑、放映等）不再作为维度一的判据。
-    """
-    fails = []
-
-    # 1. 后缀
-    if not pptx_path.lower().endswith(".pptx"):
-        fails.append("文件格式不是 .pptx")
-        return False, fails
-
-    # 2. 能否打开
-    try:
-        _ = Presentation(pptx_path)
-    except Exception as e:
-        fails.append(f"无法打开 PPT：{e}")
-        return False, fails
-
-    return True, []
-
-
-# --------------------------- 维度2 工具函数 ---------------------------
-
-
-def get_chart_on_slide(slide):
-    for shp in slide.shapes:
-        if getattr(shp, "has_chart", False):
-            return shp.chart
-    return None
-
-
-def iter_runs(shape):
-    if not shape.has_text_frame:
-        return
-    for p in shape.text_frame.paragraphs:
-        for r in p.runs:
-            yield p, r
-
-
-def get_run_color_hex(run):
-    """尽量取出 run 的 RGB 十六进制（大写）；取不到返回 None。"""
-    try:
-        c = run.font.color
-        if c and c.rgb is not None:
-            return str(c.rgb).upper()
-    except Exception:
-        pass
-    # 退化：从 XML 直接抓 solidFill
-    rPr = run._r.find(".//a:rPr", NS)
-    if rPr is not None:
-        clr = rPr.find(".//a:solidFill/a:srgbClr", NS)
-        if clr is not None:
-            return clr.get("val", "").upper()
-    return None
-
-
-def slide_bg_hex(slide):
-    """兼容旧调用点：仅返回 slide 级 p:bg 内的 a:srgbClr 十六进制值（大写）。
-
-    新代码请使用 :func:`resolve_slide_background_hex`，它会补充解析主题色/
-    layout/master 背景、bgRef、gradFill、以及全页背景形状。
-    """
-    bg = slide._element.find(".//p:cSld/p:bg", NS)
-    if bg is None:
-        return None
-    clr = bg.find(".//a:srgbClr", NS)
-    return clr.get("val").upper() if clr is not None else None
-
-
-# ---------- 背景色的完整 OOXML 解析（用于 +3 第5页背景规则） ---------- #
-
-_PRESET_COLOR_HEX = {
-    # 常用命名色 → 十六进制（不完全，够用即可，覆盖 rubric 场景）
-    "beige": "F5F5DC",
-    "bisque": "FFE4C4",
-    "cornsilk": "FFF8DC",
-    "wheat": "F5DEB3",
-    "lightblue": "ADD8E6",
-    "lightcyan": "E0FFFF",
-    "aliceblue": "F0F8FF",
-    "azure": "F0FFFF",
-    "powderblue": "B0E0E6",
-    "skyblue": "87CEEB",
-    "lightsteelblue": "B0C4DE",
-    "white": "FFFFFF",
-    "black": "000000",
-}
-
-
-def _apply_lum_shade(rgb, lum_mod, lum_off, shade, tint):
-    """按 OOXML 的 lumMod/lumOff/shade/tint（千分制值，0..100000）近似还原 RGB。"""
-    r, g, b = rgb
-    # lumMod: 亮度乘以百分比
-    if lum_mod is not None:
-        factor = lum_mod / 100000.0
-        r = r * factor
-        g = g * factor
-        b = b * factor
-    # lumOff: 亮度加偏移（相对 255 * off/100000）
-    if lum_off is not None:
-        off = lum_off / 100000.0 * 255.0
-        r += off
-        g += off
-        b += off
-    # shade: 变暗
-    if shade is not None:
-        factor = shade / 100000.0
-        r *= factor
-        g *= factor
-        b *= factor
-    # tint: 与白色混合
-    if tint is not None:
-        factor = tint / 100000.0
-        r = r + (255 - r) * factor
-        g = g + (255 - g) * factor
-        b = b + (255 - b) * factor
-    r = int(max(0, min(255, round(r))))
-    g = int(max(0, min(255, round(g))))
-    b = int(max(0, min(255, round(b))))
-    return (r, g, b)
-
-
-def _theme_scheme_map(prs):
-    """从主题包(theme1.xml)中读取 a:clrScheme → {schemeClr键: hex}。
-
-    schemeClr 的常见 val：bg1/bg2/tx1/tx2/accent1..6/hlink/folHlink。
-    theme 中对应的元素名（顺序）：lt1/dk1/lt2/dk2/accent1..6/hlink/folHlink，
-    以及 bg1<->lt1, tx1<->dk1, bg2<->lt2, tx2<->dk2 的等价映射。
-    """
-    scheme = {}
-    theme_root = None
-    for master in prs.slide_masters:
-        for rel in master.part.rels.values():
-            if "theme" in rel.reltype:
-                try:
-                    theme_root = etree.fromstring(rel.target_part.blob)
-                    break
-                except Exception:
-                    continue
-        if theme_root is not None:
-            break
-    if theme_root is None:
-        return scheme
-
-    clr_scheme = theme_root.find(".//a:clrScheme", NS)
-    if clr_scheme is None:
-        return scheme
-
-    # 对每一个 clr 元素解析其 srgbClr / sysClr / prstClr
-    for child in clr_scheme:
-        tag = etree.QName(child.tag).localname
-        srgb = child.find("a:srgbClr", NS)
-        sysc = child.find("a:sysClr", NS)
-        prst = child.find("a:prstClr", NS)
-        hex_val = None
-        if srgb is not None:
-            hex_val = (srgb.get("val") or "").upper()
-        elif sysc is not None:
-            hex_val = (sysc.get("lastClr") or "").upper()
-        elif prst is not None:
-            hex_val = _PRESET_COLOR_HEX.get((prst.get("val") or "").lower())
-        if hex_val:
-            scheme[tag] = hex_val
-    # 等价别名
-    aliases = {"bg1": "lt1", "bg2": "lt2", "tx1": "dk1", "tx2": "dk2"}
-    for a, b in aliases.items():
-        if a not in scheme and b in scheme:
-            scheme[a] = scheme[b]
-        if b not in scheme and a in scheme:
-            scheme[b] = scheme[a]
-    return scheme
-
-
-def _resolve_color_element(color_el, scheme_map):
-    """把一个 color 容器元素 (a:solidFill 或 a:srgbClr/a:schemeClr/a:prstClr 的父节点)
-    解析成 RGB 元组，处理 lumMod/lumOff/shade/tint 修饰。找不到返回 None。
-    """
-    if color_el is None:
-        return None
-    # 定位实际颜色节点
-    srgb = color_el.find(".//a:srgbClr", NS)
-    scheme = color_el.find(".//a:schemeClr", NS)
-    sysc = color_el.find(".//a:sysClr", NS)
-    prst = color_el.find(".//a:prstClr", NS)
-    chosen = srgb if srgb is not None else scheme if scheme is not None else sysc if sysc is not None else prst
-    if chosen is None:
-        return None
-
-    def _get_int(el, name):
-        node = el.find(f"a:{name}", NS)
-        if node is not None and node.get("val") is not None:
-            try:
-                return int(node.get("val"))
-            except Exception:
-                return None
-        return None
-
-    lum_mod = _get_int(chosen, "lumMod")
-    lum_off = _get_int(chosen, "lumOff")
-    shade = _get_int(chosen, "shade")
-    tint = _get_int(chosen, "tint")
-
-    if chosen is srgb:
-        try:
-            hx = (chosen.get("val") or "").upper()
-            base = hex_to_rgb(hx)
-        except Exception:
-            return None
-    elif chosen is sysc:
-        hx = (chosen.get("lastClr") or "").upper()
-        if not hx:
-            return None
-        base = hex_to_rgb(hx)
-    elif chosen is prst:
-        hx = _PRESET_COLOR_HEX.get((chosen.get("val") or "").lower())
-        if not hx:
-            return None
-        base = hex_to_rgb(hx)
-    else:  # schemeClr
-        key = chosen.get("val") or ""
-        hx = scheme_map.get(key)
-        if not hx:
-            return None
-        base = hex_to_rgb(hx)
-
-    return _apply_lum_shade(base, lum_mod, lum_off, shade, tint)
-
-
-def _extract_bg_rgb_from_bg_element(bg_el, scheme_map):
-    """从 p:bg 元素抽出背景 RGB。支持 p:bgPr/a:solidFill、p:bgRef、a:gradFill。返回 (r,g,b) 或 None。"""
-    if bg_el is None:
-        return None
-    # p:bgPr → a:solidFill
-    solid = bg_el.find(".//p:bgPr/a:solidFill", NS)
-    if solid is not None:
-        return _resolve_color_element(solid, scheme_map)
-    # p:bgPr → a:gradFill：取第一/最后色标里最亮者作为主色
-    grad = bg_el.find(".//p:bgPr/a:gradFill", NS)
-    if grad is not None:
-        stops = grad.findall(".//a:gsLst/a:gs", NS)
-        rgbs = []
-        for gs in stops:
-            rgb = _resolve_color_element(gs, scheme_map)
-            if rgb:
-                rgbs.append(rgb)
-        if rgbs:
-            # 选择"亮度中位"色作为主色，避免过深/过浅极端
-            rgbs.sort(key=lambda t: sum(t))
-            return rgbs[len(rgbs) // 2]
-    # p:bgRef → 引用主题色
-    bgref = bg_el.find(".//p:bgRef", NS)
-    if bgref is not None:
-        return _resolve_color_element(bgref, scheme_map)
-    # p:bgPr → a:blipFill：图片背景，无稳定主色 → 交由上层用形状扫描兜底
-    return None
-
-
-def _fullpage_shape_bg_rgb(slide, scheme_map):
-    """扫描 slide 上覆盖近整页的形状；若存在实心填充，返回该主色 RGB。"""
-    sw = slide.part.package.presentation_part.presentation.slide_width
-    sh = slide.part.package.presentation_part.presentation.slide_height
-    page_area = max(sw * sh, 1)
-    for shp in slide.shapes:
-        w = shp.width or 0
-        h = shp.height or 0
-        if w * h < page_area * 0.9:
-            continue
-        # 需为实心填充：a:solidFill；避免文本框/带内容的形状
-        sp_pr = None
-        try:
-            sp_pr = shp._element.find(".//p:spPr", NS)
-        except Exception:
-            sp_pr = None
-        if sp_pr is None:
-            # 某些形状使用 wp:spPr / 直接 a:spPr —— 兜底
-            sp_pr = shp._element.find(".//a:spPr", NS)
-        if sp_pr is None:
-            continue
-        solid = sp_pr.find("a:solidFill", NS)
-        if solid is None:
-            continue
-        rgb = _resolve_color_element(solid, scheme_map)
-        if rgb is not None:
-            return rgb
-    return None
-
-
-def resolve_slide_background_hex(prs, slide):
-    """返回该幻灯片"生效背景色"的十六进制 (RRGGBB 大写)，找不到返回 None。
-
-    解析顺序（模仿 PowerPoint 渲染背景的选取过程）：
-      1) slide 级 p:cSld/p:bg
-      2) slide 级覆盖近整页的实色形状（视觉背景）
-      3) slide layout 级 p:cSld/p:bg
-      4) slide master 级 p:cSld/p:bg
-    颜色源支持 srgbClr/schemeClr/sysClr/prstClr + lumMod/lumOff/shade/tint。
-    """
-    scheme_map = _theme_scheme_map(prs)
-
-    # 1) slide bg
-    bg_el = slide._element.find(".//p:cSld/p:bg", NS)
-    rgb = _extract_bg_rgb_from_bg_element(bg_el, scheme_map)
-    if rgb is not None:
-        return "%02X%02X%02X" % rgb
-
-    # 2) 全页背景形状（兜底"以形状充当背景"）
-    rgb = _fullpage_shape_bg_rgb(slide, scheme_map)
-    if rgb is not None:
-        return "%02X%02X%02X" % rgb
-
-    # 3) layout bg
-    layout = slide.slide_layout
-    bg_el = layout.element.find(".//p:cSld/p:bg", NS)
-    rgb = _extract_bg_rgb_from_bg_element(bg_el, scheme_map)
-    if rgb is not None:
-        return "%02X%02X%02X" % rgb
-
-    # 4) master bg
-    master = layout.slide_master
-    bg_el = master.element.find(".//p:cSld/p:bg", NS)
-    rgb = _extract_bg_rgb_from_bg_element(bg_el, scheme_map)
-    if rgb is not None:
-        return "%02X%02X%02X" % rgb
-
-    return None
-
-
-# --------------------------- 维度2 逐条规则 ---------------------------
-
-
-def rule_10_chart(prs):
-    """+5  第10页曲线图对象 —— 严格按打分细则逐点校验：
-      (1) 在结束页右侧或中部空白区域
-      (2) 可编辑的折线图或平滑曲线图（原生 chart）
-      (3) 含 "营收数值" 和 "盈利比值" 两个数据系列
-      (4) 两条曲线颜色不同
-      (5) 横轴从左至右依次为 "1月、2月、3月、4月、5月"
-      (6) 营收数值五个月数据依次 68000、352000、486000、423000、579000
-      (7) 盈利比值五个月数据依次 1.42、1.56、1.71、1.63、1.85
-      (8) 准确显示 "营收数值"、"盈利比值"（图例文字）
-      (9) 图例颜色与两条曲线一一对应
-    任何一点不满足即不加分。
-
-    严格化（回应反馈）：
-      · (1) 位置判定不再只看图表中心 x 是否落在右/中部；还必须验证图表矩形
-            与结束页上其它非背景内容元素**不相交**（占用面积 ≤ 图表面积 5%），
-            以确认所处区域为"空白区域"。
-      · (9) 图例↔曲线颜色一一对应不再只看 legendEntry 覆写颜色的唯一性和
-            c:idx 唯一性；改为解析每个系列(c:order/c:idx)与其显示名称及
-            线条颜色的实际映射，并检查图例条目未被 c:delete 删除。这样，
-            即便某系列被隐藏（图例项被删除），或图例文字通过 legendEntry
-            重命名/串位，也能被识别出来。
-    """
-    slide10 = prs.slides[9]
-    sw = prs.slide_width
-    sh = prs.slide_height
-
-    # ---- (2) 原生可编辑图表对象 ----
-    chart_shape = None
-    for shp in slide10.shapes:
-        if getattr(shp, "has_chart", False):
-            chart_shape = shp
-            break
-    if chart_shape is None:
-        return False, "未检测到第 10 页的原生图表对象（非可编辑图表）"
-
-    chart = chart_shape.chart
-    ct_name = str(chart.chart_type).upper()
-    if "LINE" not in ct_name:
-        return False, f"图表类型不是折线/平滑曲线图（实际 {chart.chart_type}）"
-
-    # ---- (1) 位置：右侧或中部 + 所在矩形为空白区域 ----
-    chart_L = chart_shape.left or 0
-    chart_T = chart_shape.top or 0
-    chart_W = chart_shape.width or 0
-    chart_H = chart_shape.height or 0
-    chart_R = chart_L + chart_W
-    chart_B = chart_T + chart_H
-    cx = chart_L + chart_W / 2
-    cy = chart_T + chart_H / 2
-
-    # 必须在页面内
-    if not (0 <= cx <= sw and 0 <= cy <= sh):
-        return False, "图表不在结束页页面范围内"
-    in_right = cx >= sw * 0.5
-    in_center = (sw * 1 / 3) <= cx <= (sw * 2 / 3)
-    if not (in_right or in_center):
-        return False, f"图表中心 x={emu_to_cm(cx):.1f}cm 既不在页面右侧也不在中部"
-
-    # "空白区域" —— 图表矩形与结束页任何"非背景内容元素"的相交面积必须显著为 0。
-    #   忽略：图表自身；覆盖近整页的装饰底图/背景形状（面积 ≥ 页面 95%）；
-    #         无文本无可见几何轮廓的空形状（宽或高为 0）。
-    chart_area = max(chart_W * chart_H, 1)
-    page_area = max(sw * sh, 1)
-    overlap_details = []
-    for shp in slide10.shapes:
-        if shp is chart_shape:
-            continue
-        sl = shp.left or 0
-        st = shp.top or 0
-        sw_ = shp.width or 0
-        sh_ = shp.height or 0
-        if sw_ <= 0 or sh_ <= 0:
-            continue
-        # 忽略覆盖近整页的装饰底图/背景
-        if (sw_ * sh_) >= page_area * 0.95:
-            continue
-        # 空白文本框（无文本内容）不视作占位内容
-        if shp.has_text_frame and not shp.text_frame.text.strip():
-            continue
-        sr_ = sl + sw_
-        sb_ = st + sh_
-        ix = max(0, min(chart_R, sr_) - max(chart_L, sl))
-        iy = max(0, min(chart_B, sb_) - max(chart_T, st))
-        inter = ix * iy
-        if inter <= 0:
-            continue
-        # 相交面积超过图表面积 5% 视为占用图表所在区域
-        if inter / chart_area > 0.05:
-            overlap_details.append(
-                f"{shp.name}(相交 {inter / chart_area * 100:.0f}%图表面积)"
-            )
-    if overlap_details:
-        return False, "图表所在区域并非空白，与内容形状重叠：" + "; ".join(overlap_details[:3])
-
-    # ---- (5) 横轴类别顺序 ----
-    try:
-        categories = list(chart.plots[0].categories)
-    except Exception as e:
-        return False, f"无法读取图表类别（横轴）：{e}"
-    expected_cats = ["1月", "2月", "3月", "4月", "5月"]
-    cat_strs = [str(c).strip() for c in categories]
-    if cat_strs != expected_cats:
-        return False, f"横轴月份/顺序不正确，期望 {expected_cats}，实际 {cat_strs}"
-
-    # ---- (3) 两个数据系列：名称必须为 营收数值 与 盈利比值 ----
-    series_list = list(chart.series)
-    if len(series_list) != 2:
-        return False, f"系列数量不是 2（实际 {len(series_list)}）"
-    series_names = [(s.name or "").strip() for s in series_list]
-    if set(series_names) != {"营收数值", "盈利比值"}:
-        return False, f"系列名称不正确，需要 营收数值 与 盈利比值，实际 {series_names}"
-
-    # ---- (6)(7) 系列数据精确比对 ----
-    exp_rev = [68000, 352000, 486000, 423000, 579000]
-    exp_ratio = [1.42, 1.56, 1.71, 1.63, 1.85]
-    series_by_name = {(s.name or "").strip(): list(s.values) for s in series_list}
-    rev = series_by_name["营收数值"]
-    ratio = series_by_name["盈利比值"]
-    if len(rev) != 5 or any(abs(a - b) > 0.5 for a, b in zip(rev, exp_rev)):
-        return False, f"营收数值数据不正确，期望 {exp_rev}，实际 {rev}"
-    if len(ratio) != 5 or any(abs(a - b) > 0.01 for a, b in zip(ratio, exp_ratio)):
-        return False, f"盈利比值数据不正确，期望 {exp_ratio}，实际 {ratio}"
-
-    # ---- (4) 两条曲线颜色不同 ----
-    chart_xml = chart._chartSpace
-    ser_nodes = chart_xml.findall(".//c:ser", NS)
-    if len(ser_nodes) != 2:
-        return False, f"chart XML 中 c:ser 数量异常：{len(ser_nodes)}"
-
-    def _series_line_color(ser):
-        """提取 series 的折线主颜色（按 OOXML 优先级）。返回 ('srgb'|'scheme'|'auto', value) 或 None。"""
-        # 顺序：c:ser/c:spPr/a:ln 下 solidFill；其次 c:spPr/a:solidFill
-        ln = ser.find(".//c:spPr/a:ln", NS)
-        if ln is not None:
-            srgb = ln.find(".//a:solidFill/a:srgbClr", NS)
-            if srgb is not None:
-                return ("srgb", srgb.get("val", "").upper())
-            sch = ln.find(".//a:solidFill/a:schemeClr", NS)
-            if sch is not None:
-                return ("scheme", sch.get("val", ""))
-        sp = ser.find(".//c:spPr", NS)
-        if sp is not None:
-            srgb = sp.find(".//a:solidFill/a:srgbClr", NS)
-            if srgb is not None:
-                return ("srgb", srgb.get("val", "").upper())
-            sch = sp.find(".//a:solidFill/a:schemeClr", NS)
-            if sch is not None:
-                return ("scheme", sch.get("val", ""))
-        # 找不到显式颜色（依赖默认主题）：以 series index 区分（PPT 默认每个 series 颜色不同）
-        idx = ser.find("c:idx", NS)
-        return ("auto", idx.get("val") if idx is not None else None)
-
-    def _series_meta(ser):
-        idx_el = ser.find("c:idx", NS)
-        order_el = ser.find("c:order", NS)
-        name_el = ser.find(".//c:tx//c:v", NS)
-        return {
-            "idx": int(idx_el.get("val")) if idx_el is not None and idx_el.get("val") else None,
-            "order": int(order_el.get("val")) if order_el is not None and order_el.get("val") else None,
-            "name": (name_el.text.strip() if name_el is not None and name_el.text else ""),
-            "color": _series_line_color(ser),
-        }
-
-    series_meta = [_series_meta(s) for s in ser_nodes]
-    line_colors = [m["color"] for m in series_meta]
-    if any(c is None for c in line_colors):
-        return False, "无法解析两条曲线的颜色"
-    if line_colors[0] == line_colors[1]:
-        return False, f"两条曲线颜色相同：{line_colors[0]}"
-
-    # ---- 图例存在 ----
-    if not chart.has_legend:
-        return False, "图表未启用图例"
-
-    # ---- (8) 图例文字准确显示 "营收数值"、"盈利比值" ----
-    legend_texts = []
-    for t in chart_xml.findall(".//c:legend//a:t", NS):
-        if t.text:
-            legend_texts.append(t.text.strip())
-    legend_pool = set(legend_texts) | {m["name"] for m in series_meta}
-    if "营收数值" not in legend_pool or "盈利比值" not in legend_pool:
-        return False, (
-            f"图例文本未准确显示 营收数值/盈利比值（图例文字={legend_texts}, "
-            f"系列名={[m['name'] for m in series_meta]}）"
-        )
-
-    # ---- (9) 图例颜色与两条曲线一一对应 ----
-    # 在 OOXML 中，legend 默认按 c:order 依次渲染每个 series 一个条目，
-    # 标记色 = series 线条色。可能破坏"一一对应"的实际方式只有两类：
-    #   A. c:legendEntry 用 c:delete val="1" 删除某条条目 → 只剩一条，无法一一对应
-    #   B. c:legendEntry 通过 c:txPr 覆写文本颜色使两条条目看起来变成同色
-    # 若两 series 的 order/idx 冲突（重复），说明源数据本身就已经不能与图例
-    # 一一对应；一并作为失败条件。
-    orders = [m["order"] for m in series_meta]
-    idxs = [m["idx"] for m in series_meta]
-    if len(set(orders)) != len(orders) or len(set(idxs)) != len(idxs):
-        return False, f"系列 c:idx/c:order 存在重复，图例无法与曲线一一对应：idxs={idxs}, orders={orders}"
-
-    deleted_entry_idxs = []
-    override_text_colors: "dict[int, str]" = {}
-    for le in chart_xml.findall(".//c:legend/c:legendEntry", NS):
-        idx_el = le.find("c:idx", NS)
-        entry_idx = int(idx_el.get("val")) if (idx_el is not None and idx_el.get("val")) else None
-        delete = le.find("c:delete", NS)
-        if delete is not None and delete.get("val", "1") in ("1", "true"):
-            deleted_entry_idxs.append(entry_idx)
-        # 覆写文本颜色（可能把两条图例文字都染成同色，视觉上无法区分）
-        srgb = le.find(".//c:txPr//a:solidFill/a:srgbClr", NS)
-        if srgb is not None and entry_idx is not None:
-            override_text_colors[entry_idx] = srgb.get("val", "").upper()
-    if deleted_entry_idxs:
-        return False, f"图例条目被删除：idx={deleted_entry_idxs}，与曲线无法一一对应"
-    if override_text_colors and len(set(override_text_colors.values())) < len(override_text_colors):
-        return False, f"图例条目文本颜色被覆写为相同值：{override_text_colors}"
-
-    # 构造对应关系摘要（系列名 → 线条色）便于回看
-    mapping = ", ".join(f"{m['name']}→{m['color']}" for m in series_meta)
-
-    return True, (
-        f"位置={'右侧' if in_right else '中部'}空白区; 类型={chart.chart_type}; "
-        f"系列={series_names}; 横轴={cat_strs}; "
-        f"营收={rev}; 盈利={ratio}; 双色映射={{{mapping}}}; "
-        f"图例文字含 营收数值/盈利比值，且颜色/条目与曲线一一对应"
-    )
-
-
-def rule_2_paiban(prs):
-    """+1  第2页右侧第3个岗位卡片：空白处有标题 "排班岗"，
-         字体为深绿色微软雅黑 24磅 加粗。逐点校验：
-      (1) 位于第 2 页右侧第 3 个岗位卡片（按卡片中心 x 升序排列后取第 3 张，且其位于右侧）
-      (2) 该卡片"空白处"有标题文本 "排班岗"
-      (3) 字体 = 微软雅黑（Microsoft YaHei / 微软雅黑）
-      (4) 颜色 = 深绿色
-      (5) 字号 = 24 磅
-      (6) 加粗
-    任一不满足即不加分。
-    """
-    s2 = prs.slides[1]
-    sw = prs.slide_width
-
-    # ---- (1) 找出 3 张岗位卡片（高度较大的矩形容器），按中心 x 排序，取第 3 张 ----
-    # 岗位卡片在本 PPT 中为高度 ≥ 3 inch 的 AUTO_SHAPE 容器
-    # 注意：本页内容框（如 Text 5/Text 8）同样是 AUTO_SHAPE 且尺寸接近卡片外框，
-    # 需排除"被另一个更大形状几乎完全包住"的内嵌内容框，避免索引错位。
-    candidates = []
-    for shp in s2.shapes:
-        if shp.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
-            continue
-        w = shp.width or 0
-        h = shp.height or 0
-        # 卡片特征：宽 ≥ 2 inch、高 ≥ 3 inch
-        if w >= Emu(2 * 914400) and h >= Emu(3 * 914400):
-            candidates.append(shp)
-
-    def _rect(shp):
-        l = shp.left or 0
-        t = shp.top or 0
-        return l, t, l + (shp.width or 0), t + (shp.height or 0)
-
-    def _contained_in(inner, outer):
-        # inner 的矩形几乎完全位于 outer 内部（允许 1mm 误差）
-        if inner is outer:
-            return False
-        tol = Emu(int(0.1 * 360000))  # 0.1cm
-        il, it, ir, ib = _rect(inner)
-        ol, ot, or_, ob = _rect(outer)
-        return (il >= ol - tol and it >= ot - tol
-                and ir <= or_ + tol and ib <= ob + tol)
-
-    cards = []
-    for shp in candidates:
-        # 若该候选形状被其他更大候选完全包住，则视为内容框，跳过
-        nested = any(
-            _contained_in(shp, other)
-            and (other.width or 0) * (other.height or 0)
-                > (shp.width or 0) * (shp.height or 0)
-            for other in candidates
-        )
-        if not nested:
-            cards.append(shp)
-    cards.sort(key=lambda s: (s.left or 0) + (s.width or 0) / 2)
-
-    if len(cards) < 3:
-        return False, f"第 2 页未识别到 3 张岗位卡片（识别到 {len(cards)} 张）"
-
-    third_card = cards[2]
-    # 第 3 张必须在页面右侧
-    third_cx = (third_card.left or 0) + (third_card.width or 0) / 2
-    if third_cx < sw * 0.5:
-        return False, f"第 3 张岗位卡片中心 x={emu_to_cm(third_cx):.1f}cm，不在右侧"
-
-    # ---- (2) 在第 3 张卡片范围内查找文本 "排班岗"，且必须位于该卡片"空白处" ----
-    tcx0 = third_card.left or 0
-    tcy0 = third_card.top or 0
-    tcx1 = tcx0 + (third_card.width or 0)
-    tcy1 = tcy0 + (third_card.height or 0)
-
-    # "空白处" 判定 —— 收集第 3 张卡片范围内、除标题候选之外的既有内容：
-    #   · 卡片内的其它文本框（非空文本）
-    #   · 图片 / 图标 / 自选图形（AUTO_SHAPE/FREEFORM/PICTURE/GROUP 等有实际视觉占位的形状）
-    # 卡片外框（third_card 本身）不计入内容占位；标题候选自身自然也不算重叠。
-    def _rect_of(shp):
-        l = shp.left or 0
-        t = shp.top or 0
-        return l, t, l + (shp.width or 0), t + (shp.height or 0)
-
-    def _center_inside_card(shp):
-        scx = (shp.left or 0) + (shp.width or 0) / 2
-        scy = (shp.top or 0) + (shp.height or 0) / 2
-        return tcx0 <= scx <= tcx1 and tcy0 <= scy <= tcy1
-
-    def _rects_overlap(a, b, tol=0):
-        # a/b: (l, t, r, b)  tol 允许的最大间距（EMU）
-        return not (a[2] + tol <= b[0] or b[2] + tol <= a[0]
-                    or a[3] + tol <= b[1] or b[3] + tol <= a[1])
-
-    existing_content_rects = []  # (rect, tag) 已有非空文本 / 视觉占位形状
-    for shp in s2.shapes:
-        if shp is third_card:
-            continue
-        if not _center_inside_card(shp):
-            continue
-        # 文本内容
-        if shp.has_text_frame:
-            txt = shp.text_frame.text.strip()
-            if txt and txt != "排班岗":
-                existing_content_rects.append((_rect_of(shp), f"卡内文本'{txt[:6]}'"))
-                continue
-            if not txt:
-                # 空文本框不视作占位内容
-                continue
-        # 视觉占位（图片/图标/自选图形/成组）
-        if shp.shape_type in (
-            MSO_SHAPE_TYPE.PICTURE,
-            MSO_SHAPE_TYPE.AUTO_SHAPE,
-            MSO_SHAPE_TYPE.FREEFORM,
-            MSO_SHAPE_TYPE.GROUP,
-        ):
-            # 排除卡片自身（前面已 continue）；把明显是卡片主体轮廓的形状排除
-            w = shp.width or 0
-            h = shp.height or 0
-            card_w = (third_card.width or 1)
-            card_h = (third_card.height or 1)
-            if w >= card_w * 0.85 and h >= card_h * 0.85:
-                # 与卡片外框几乎重合的形状，视作卡片主体，不计入内容占位
-                continue
-            existing_content_rects.append((_rect_of(shp), f"卡内形状'{shp.name}'"))
-
-    target_shp = None
-    target_run = None
-    blocked_reason = ""
-    for shp in s2.shapes:
-        if shp is third_card or not shp.has_text_frame:
-            continue
-        if not _center_inside_card(shp):
-            continue
-        if shp.text_frame.text.strip() != "排班岗":
-            continue
-        # ---- "空白处" 检查：标题矩形与卡片内已有内容不得显著重叠 ----
-        title_rect = _rect_of(shp)
-        title_area = max(
-            (title_rect[2] - title_rect[0]) * (title_rect[3] - title_rect[1]), 1
-        )
-        overlap_hits = []
-        for rc, tag in existing_content_rects:
-            if not _rects_overlap(title_rect, rc):
-                continue
-            ix = max(0, min(title_rect[2], rc[2]) - max(title_rect[0], rc[0]))
-            iy = max(0, min(title_rect[3], rc[3]) - max(title_rect[1], rc[1]))
-            inter = ix * iy
-            # 相交面积 > 标题面积 10% 即视为覆盖已有内容（非空白处）
-            if inter / title_area > 0.10:
-                overlap_hits.append(
-                    f"{tag}(相交 {inter / title_area * 100:.0f}%标题面积)"
-                )
-        if overlap_hits:
-            blocked_reason = (
-                "标题'排班岗'未位于卡片空白处，与已有内容重叠：" + "; ".join(overlap_hits[:3])
-            )
-            continue
-
-        target_shp = shp
-        for _, r in iter_runs(shp):
-            if r.text.strip() == "排班岗":
-                target_run = r
-                break
-        if target_run is not None:
-            break
-
-    if target_run is None:
-        if blocked_reason:
-            return False, blocked_reason
-        return False, "第 2 页右侧第 3 个岗位卡片内未找到标题 '排班岗'"
-
-    # ---- (3)(4)(5)(6) 字体属性 ----
-    font = target_run.font
-    name = font.name or ""
-    size_pt = font.size.pt if font.size else None
-    bold = bool(font.bold)
-    color_hex = get_run_color_hex(target_run) or ""
-
-    reasons = []
-    # (3) 微软雅黑
-    if not ("YaHei" in name or "Microsoft YaHei" in name or "微软雅黑" in name):
-        reasons.append(f"字体非微软雅黑（实际 '{name}'）")
-    # (5) 24 磅
-    if size_pt is None or abs(size_pt - 24) > 0.01:
-        reasons.append(f"字号非 24 磅（实际 {size_pt}）")
-    # (6) 加粗
-    if not bold:
-        reasons.append("未加粗")
-    # (4) 深绿色：G 通道占优 且 整体偏暗（亮度 < ~120）
-    if not color_hex:
-        reasons.append("未识别到字体颜色")
-    else:
-        r, g, b = hex_to_rgb(color_hex)
-        brightness = (r + g + b) / 3
-        is_dark_green = (g > r) and (g >= b - 30) and brightness < 130
-        if not is_dark_green:
-            reasons.append(f"颜色非深绿色（#{color_hex}）")
-
-    if reasons:
-        return False, "; ".join(reasons)
-
-    return True, (
-        f"第 3 张岗位卡片(右侧)内 '排班岗' 标题：字体={name}, "
-        f"字号={size_pt}磅, 加粗={bold}, 颜色=#{color_hex}（深绿）"
-    )
-
-
-def rule_5_rotation(prs):
-    """+3  第5页全部卡片和右侧图片：旋转角度调整为 0 度或接近 0 度，
-         卡片边线、文字基线和图片上下边缘保持水平。逐点校验：
-      (1) 第 5 页"全部卡片"旋转角 ≈ 0°
-      (2) 第 5 页"右侧图片"旋转角 ≈ 0°
-      (3) 卡片边线水平（即矩形未发生旋转/倾斜）
-      (4) 卡片内文字基线水平（每个 run 的字符方向无旋转/无倾斜变形）
-      (5) 图片上下边缘水平（picture 未旋转，且未应用任何 a:xfrm rot 或非零 skew）
-    """
-    s5 = prs.slides[4]
-    sw = prs.slide_width
-
-    TOL_DEG = 2.0  # "接近 0 度" 容差
-
-    def _shape_rotation(shp):
-        """归一化到 [0, 180]，便于做 ≈0 判断（179° 与 -1° 都视为 1°）。"""
-        rot = (getattr(shp, "rotation", 0) or 0) % 360
-        if rot > 180:
-            rot = 360 - rot
-        return rot
-
-    def _shape_skew(shp):
-        """读取 spPr/xfrm 上是否存在非零 skew（极少见，保险起见检查）。"""
-        x = shp._element.find(".//a:xfrm", NS)
-        if x is None:
-            return 0
-        # rot 已通过 shp.rotation 拿到；这里检查 flipH/flipV 不影响"水平"
-        # OOXML 标准里 a:xfrm 没有显式 skew 字段，倾斜通常通过 rot 表达；
-        # 若存在 a:custGeom 旋转节点也已经被 rotation 涵盖
-        return 0
-
-    # ---- 卡片识别：第 5 页中宽 ≥ 2″、高 ≥ 1″ 的 AUTO_SHAPE 视作卡片容器 ----
-    cards = []
-    for shp in s5.shapes:
-        if shp.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
-            continue
-        w = shp.width or 0
-        h = shp.height or 0
-        if w >= Emu(2 * 914400) and h >= Emu(1 * 914400):
-            cards.append(shp)
-
-    if not cards:
-        return False, "第 5 页未识别到任何卡片"
-
-    # ---- 右侧图片识别：shape_type == PICTURE 且中心 x ≥ slide_width / 2 ----
-    right_pics = [
-        shp for shp in s5.shapes
-        if shp.shape_type == MSO_SHAPE_TYPE.PICTURE
-        and ((shp.left or 0) + (shp.width or 0) / 2) >= sw * 0.5
-    ]
-    if not right_pics:
-        return False, "第 5 页未识别到右侧图片"
-
-    bad = []
-
-    # ---- (1)(3) 全部卡片旋转 ≈ 0° → 卡片边线水平 ----
-    for c in cards:
-        rot = _shape_rotation(c)
-        if rot > TOL_DEG:
-            bad.append(f"卡片 {c.name} 旋转 {rot:.1f}°（边线不水平）")
-        if _shape_skew(c):
-            bad.append(f"卡片 {c.name} 存在倾斜变形")
-
-    # ---- (4) 卡片内文字基线水平：文本框自身及其每个段落必须无旋转 ----
-    for shp in s5.shapes:
-        if not shp.has_text_frame:
-            continue
-        # 文本框本体旋转
-        rot = _shape_rotation(shp)
-        if rot > TOL_DEG:
-            bad.append(f"文字框 {shp.name} 旋转 {rot:.1f}°（基线不水平）")
-            continue
-        # 段落内 run 是否带 vert/rot（极少见的字符级旋转/竖排）
-        bodyPr = shp._element.find(".//a:bodyPr", NS)
-        if bodyPr is not None:
-            vert = bodyPr.get("vert", "")
-            if vert and vert not in ("horz", ""):
-                bad.append(f"文字框 {shp.name} 文本方向 vert={vert}（基线不水平）")
-            body_rot = bodyPr.get("rot")
-            if body_rot:
-                try:
-                    deg = int(body_rot) / 60000.0
-                    if abs(deg) > TOL_DEG:
-                        bad.append(f"文字框 {shp.name} bodyPr rot={deg:.1f}°")
-                except ValueError:
-                    pass
-
-    # ---- (2)(5) 右侧图片旋转 ≈ 0°：上下边缘水平 ----
-    for pic in right_pics:
-        rot = _shape_rotation(pic)
-        if rot > TOL_DEG:
-            bad.append(f"右侧图片 {pic.name} 旋转 {rot:.1f}°（上下边缘不水平）")
-        # picture 内部 blipFill / xfrm 的 rot
-        pic_xfrm = pic._element.find(".//p:spPr/a:xfrm", NS)
-        if pic_xfrm is not None:
-            r = pic_xfrm.get("rot")
-            if r:
-                try:
-                    deg = int(r) / 60000.0
-                    if abs(deg) > TOL_DEG:
-                        bad.append(f"右侧图片 {pic.name} xfrm rot={deg:.1f}°")
-                except ValueError:
-                    pass
-
-    if bad:
-        return False, "; ".join(bad)
-
-    return True, (
-        f"第 5 页共 {len(cards)} 张卡片、{len(right_pics)} 张右侧图片：旋转角均 ≤ {TOL_DEG}°，"
-        f"卡片边线/文字基线/图片上下边缘均水平"
-    )
-
-
-def rule_5_background(prs):
-    """+3  第5页背景更换为与第2、3页一致或高度接近的浅蓝色背景，
-         不再使用米黄色背景。逐点校验：
-      (1) 能读取到第 5 页的背景颜色
-      (2) 第 5 页背景是"浅蓝色"
-      (3) 与第 2、3 页背景"一致或高度接近"
-      (4) 不再是"米黄色"背景
-    任一不满足即不加分。
-
-    严格化（回应反馈）：
-      · 背景色不再只读 p:cSld/p:bg 下的 a:srgbClr；改为 resolve_slide_background_hex
-        依次解析 slide bg → 全页背景形状 → layout bg → master bg，并支持
-        srgbClr/schemeClr/sysClr/prstClr + lumMod/lumOff/shade/tint 主题色链。
-    """
-    bg5 = resolve_slide_background_hex(prs, prs.slides[4])
-    bg2 = resolve_slide_background_hex(prs, prs.slides[1])
-    bg3 = resolve_slide_background_hex(prs, prs.slides[2])
-
-    # ---- (1) 必须能读取到第 5 页背景 ----
-    if bg5 is None:
-        return False, "无法读取第 5 页背景色（已尝试 slide/形状/layout/master）"
-
-    # ---- (4) 不再是米黄色 ----
-    if is_beige(bg5):
-        return False, f"第 5 页仍为米黄色背景 #{bg5}"
-
-    # ---- (2) 浅蓝色 ----
-    if not is_blueish(bg5):
-        return False, f"第 5 页背景 #{bg5} 不在浅蓝色范围"
-
-    # ---- (3) 与第 2、3 页一致 或 高度接近 ----
-    # "一致"：完全相等；"高度接近"：与第 2 页或第 3 页其中之一颜色欧氏距离 ≤ 40
-    if bg2 is None and bg3 is None:
-        return False, "无法读取第 2、3 页背景色，无法比较"
-
-    same_as_2 = (bg2 is not None and bg5 == bg2)
-    same_as_3 = (bg3 is not None and bg5 == bg3)
-    d2 = color_distance(bg5, bg2) if bg2 else 9999
-    d3 = color_distance(bg5, bg3) if bg3 else 9999
-    closeness = min(d2, d3)
-
-    if not (same_as_2 or same_as_3 or closeness <= 40):
-        return False, (
-            f"第 5 页背景 #{bg5} 与第 2/3 页 (#{bg2}/#{bg3}) 既不一致也不接近 "
-            f"(最小色距 {closeness:.1f} > 40)"
-        )
-
-    relation = "一致" if (same_as_2 or same_as_3) else f"高度接近(最小色距 {closeness:.1f})"
-    return True, (
-        f"第 5 页背景 #{bg5}（浅蓝、非米黄），与第 2/3 页 #{bg2}/#{bg3} {relation}"
-    )
-
-
-def rule_6_optimize(prs):
-    """+1  第6页"优化动作"区域："将敏感表达改为场景化、说明式表达" 内容
-         出现次数不能超过 1。逐点校验：
-      (1) 第 6 页存在 "优化动作" 区域（含标题文本框）
-      (2) 在该区域的内容框中，目标语句 "将敏感表达改为场景化、说明式表达"
-          的出现次数 ≤ 1（0 次或 1 次都算通过；≥ 2 次则不通过）
-    """
-    s6 = prs.slides[5]
-
-    # ---- (1) 定位 "优化动作" 标题 ----
-    title_shp = None
-    for shp in s6.shapes:
-        if shp.has_text_frame and shp.text_frame.text.strip() == "优化动作":
-            title_shp = shp
-            break
-    if title_shp is None:
-        return False, "第 6 页未找到 '优化动作' 区域标题"
-
-    # 在标题正下方、横向重叠的文本框中找到"优化动作"区域的内容框
-    title_cx = (title_shp.left or 0) + (title_shp.width or 0) / 2
-    title_w = title_shp.width or 0
-    title_cy = (title_shp.top or 0) + (title_shp.height or 0) / 2
-
-    content_shp = None
-    for shp in s6.shapes:
-        if shp is title_shp or not shp.has_text_frame:
-            continue
-        if shp.text_frame.text.strip() == "优化动作":
-            continue
-        if not shp.text_frame.text.strip():
-            continue
-        cx = (shp.left or 0) + (shp.width or 0) / 2
-        cy = (shp.top or 0) + (shp.height or 0) / 2
-        # 横向中心在标题宽度范围内 + 纵向中心在标题中心下方
-        if abs(cx - title_cx) <= max(title_w, 1) / 2 + 1 and cy > title_cy:
-            content_shp = shp
-            break
-
-    if content_shp is None:
-        return False, "第 6 页未找到 '优化动作' 区域的内容框"
-
-    # ---- (2) 目标语句出现次数 ≤ 1 ----
-    target = "将敏感表达改为场景化、说明式表达"
-    # 以"段落"为粒度统计：每个段落若包含目标语句即计 1 次
-    # （去除行首项目符号 • · - 后再判断，避免误计）
-    occurrences = 0
-    for p in content_shp.text_frame.paragraphs:
-        line = re.sub(r"^[•·\-\s]+", "", p.text.strip())
-        if target in line:
-            occurrences += 1
-
-    if occurrences > 1:
-        return False, (
-            f"'优化动作' 区域内 '{target}' 出现 {occurrences} 次（超过 1 次）"
-        )
-
-    return True, (
-        f"第 6 页 '优化动作' 区域内 '{target}' 出现 {occurrences} 次（≤ 1，通过）"
-    )
-
-
-def rule_9_two_blocks(prs):
-    """+5  第9页 PPT 除标题和背景外只出现两个板块："近期" 板块和 "长期" 板块，
-         两个板块居中放置，板块下方无其余内容。逐点校验：
-      (1) 除标题(本页大标题)和背景外，板块标题集合恰好为 {"近期", "长期"}
-          —— 不能出现 "中期" / "短期" 等其他板块
-      (2) 除标题和背景外，没有"无关"的其他可见内容形状
-      (3) 两个板块居中放置（两板块整体在页面水平方向居中、左右对称）
-      (4) 两个板块下方无其余内容
-    """
-    s9 = prs.slides[8]
-    sw = prs.slide_width
-    sh = prs.slide_height
-
-    # ---- 识别本页"大标题"（页面顶部、含本页标题文本）----
-    # 第 9 页大标题为 "后续规划"。为通用起见：取 top < 页高 15% 且文字非空的最顶端文本框
-    title_shapes = []
-    for shp in s9.shapes:
-        if not shp.has_text_frame:
-            continue
-        if not shp.text_frame.text.strip():
-            continue
-        if (shp.top or 0) < sh * 0.15:
-            title_shapes.append(shp)
-    title_top_y = min(((s.top or 0) + (s.height or 0)) for s in title_shapes) if title_shapes else 0
-
-    # ---- 标识"背景元素"：占满或几乎占满整页的 PICTURE / AUTO_SHAPE 视为背景，跳过 ----
-    def _is_background(shp):
-        w = shp.width or 0
-        h = shp.height or 0
-        area_ratio = (w * h) / float(sw * sh)
-        return area_ratio >= 0.85
-
-    # ---- 收集"非标题、非背景、非空"的内容 shape ----
-    BLOCK_TITLES = {"近期", "中期", "长期", "短期"}
-    block_title_shapes = []   # 板块标题文本框
-    block_body_shapes = []    # 板块内容文本框（位置紧邻某个板块标题下方）
-    other_shapes = []         # 其他与上述均无关的可见内容
-
-    # 先确定板块标题
-    for shp in s9.shapes:
-        if shp in title_shapes:
-            continue
-        if _is_background(shp):
-            continue
-        if shp.has_text_frame and shp.text_frame.text.strip() in BLOCK_TITLES:
-            block_title_shapes.append(shp)
-
-    # ---- (1) 板块标题集合必须恰好 == {"近期", "长期"} ----
-    names = sorted({s.text_frame.text.strip() for s in block_title_shapes})
-    if names != ["近期", "长期"]:
-        return False, f"第 9 页板块标题为 {names}，不是恰好 '近期'+'长期'"
-
-    # 找出每个板块标题对应的"内容文本框"（横向中心与标题重叠、纵向在标题之下）
-    for shp in s9.shapes:
-        if shp in title_shapes or shp in block_title_shapes:
-            continue
-        if _is_background(shp):
-            continue
-        if not shp.has_text_frame or not shp.text_frame.text.strip():
-            # 装饰性形状（线条/小圆点等），不视为"其余内容"——其没有可见文字
-            # 但仍要校验其纵向位置（细则要求板块下方无其余内容）
-            other_shapes.append(shp)
-            continue
-        belongs = False
-        for tshp in block_title_shapes:
-            tcx = (tshp.left or 0) + (tshp.width or 0) / 2
-            tw = tshp.width or 0
-            cx = (shp.left or 0) + (shp.width or 0) / 2
-            if abs(cx - tcx) <= max(tw, 1) / 2 + 1 and (shp.top or 0) > (tshp.top or 0):
-                block_body_shapes.append(shp)
-                belongs = True
-                break
-        if not belongs:
-            other_shapes.append(shp)
-
-    # ---- (2) 不能出现与板块/标题/背景无关的额外文字内容 ----
-    extra_texts = [
-        s.text_frame.text.strip() for s in other_shapes
-        if s.has_text_frame and s.text_frame.text.strip()
-    ]
-    if extra_texts:
-        return False, f"第 9 页除标题/背景/板块外仍有其他文字内容：{extra_texts}"
-
-    # ---- (4) 两个板块下方无其余内容 ----
-    # 取两个板块（标题 + 其内容框）的最大底边 y，再检查 other_shapes 中是否有位置低于它
-    block_bottom = 0
-    for shp in (block_title_shapes + block_body_shapes):
-        block_bottom = max(block_bottom, (shp.top or 0) + (shp.height or 0))
-
-    below_items = []
-    for shp in other_shapes:
-        if (shp.top or 0) >= block_bottom - 1:
-            # 形状位于板块下方
-            below_items.append(f"{shp.name} top={emu_to_cm(shp.top or 0):.1f}cm")
-
-    if below_items:
-        return False, f"第 9 页板块下方仍有其余内容：{below_items}"
-
-    # ---- (3) 两个板块居中放置：两个板块的整体中心 x ≈ 页面中点；左右对称 ----
-    centers = []
-    for tshp in block_title_shapes:
-        # 板块以"标题 + 内容框"整体作为一个板块的水平包围盒
-        body = next(
-            (b for b in block_body_shapes if abs(((b.left or 0) + (b.width or 0) / 2) -
-                                                 ((tshp.left or 0) + (tshp.width or 0) / 2))
-             <= max(tshp.width or 0, 1) / 2 + 1),
-            None,
-        )
-        l = (tshp.left or 0)
-        r = l + (tshp.width or 0)
-        if body is not None:
-            l = min(l, body.left or 0)
-            r = max(r, (body.left or 0) + (body.width or 0))
-        centers.append((l + r) / 2)
-
-    centers.sort()
-    mid = sw / 2
-    overall_center = sum(centers) / len(centers)
-    left_off = mid - centers[0]
-    right_off = centers[1] - mid
-    # 容差：±8% 页面宽度
-    tol = sw * 0.08
-    if abs(overall_center - mid) > tol:
-        return False, f"两个板块整体未居中：整体中心 {emu_to_cm(overall_center):.1f}cm，页面中点 {emu_to_cm(mid):.1f}cm"
-    if abs(left_off - right_off) > tol:
-        return False, (
-            f"两个板块未居中对称：左板块距中点 {emu_to_cm(left_off):.1f}cm，"
-            f"右板块距中点 {emu_to_cm(right_off):.1f}cm"
-        )
-
-    return True, (
-        f"第 9 页除标题/背景外仅 '近期'+'长期' 两板块，两板块整体居中且左右对称，"
-        f"板块下方无其余内容"
-    )
-
-
-def rule_9_long_term(prs):
-    """+1  第9页右侧 "长期" 板块：三行内容为
-         "搭建标准化复盘范式" "强化岗位协同配合效能" "赋能团队稳步长效发展"，
-         每句独立一行。逐点校验：
-      (1) 位于第 9 页
-      (2) "长期" 板块位于页面右侧
-      (3) 该板块包含三行内容，依次为指定三句
-      (4) 每句独立成一行（一个段落只对应一句）
-    """
-    s9 = prs.slides[8]
-    sw = prs.slide_width
-
-    # ---- (1)(2) 定位"长期"标题，必须位于页面右侧 ----
-    long_title = None
-    for shp in s9.shapes:
-        if shp.has_text_frame and shp.text_frame.text.strip() == "长期":
-            long_title = shp
-            break
-    if long_title is None:
-        return False, "第 9 页未找到 '长期' 标题"
-
-    title_cx = (long_title.left or 0) + (long_title.width or 0) / 2
-    if title_cx < sw * 0.5:
-        return False, f"'长期' 板块位于左侧（中心 x={emu_to_cm(title_cx):.1f}cm），不在右侧"
-
-    # ---- 定位"长期"板块下方的内容框 ----
-    content_shp = None
-    for shp in s9.shapes:
-        if shp is long_title or not shp.has_text_frame:
-            continue
-        if not shp.text_frame.text.strip():
-            continue
-        cx = (shp.left or 0) + (shp.width or 0) / 2
-        if abs(cx - title_cx) <= max(long_title.width or 0, 1) / 2 + 1 \
-                and (shp.top or 0) > (long_title.top or 0):
-            content_shp = shp
-            break
-
-    if content_shp is None:
-        return False, "未在 '长期' 板块下方找到内容框"
-
-    # ---- (3)(4) 三行内容、每句独立一行：以"段落"为粒度比较 ----
-    expected = [
-        "搭建标准化复盘范式",
-        "强化岗位协同配合效能",
-        "赋能团队稳步长效发展",
-    ]
-    paras = [p.text.strip() for p in content_shp.text_frame.paragraphs if p.text.strip()]
-
-    if len(paras) != 3:
-        return False, f"'长期' 板块行数为 {len(paras)}（需恰好 3 行）：{paras}"
-
-    if paras != expected:
-        return False, f"'长期' 板块内容为 {paras}，与期望 {expected} 不一致"
-
-    return True, "第 9 页右侧 '长期' 板块三行内容完全匹配且每句独立成行"
-
-
-def rule_10_chart_title(prs):
-    """+1  第10页曲线图标题：使用 "月度营收与盈利比值趋势" 或语义一致的标题。
-         逐点校验：
-      (1) 第 10 页存在曲线图（图表对象）
-      (2) 该图表"有标题"
-      (3) 标题文本为 "月度营收与盈利比值趋势"，或语义一致
-         （语义一致 ≈ 同时包含 "营收"+"盈利" 关键语义，且含 "趋势/月度/月" 时间维度）
-    """
-    chart = get_chart_on_slide(prs.slides[9])
-
-    # ---- (1) 必须有图表对象 ----
-    if chart is None:
-        return False, "第 10 页无图表对象"
-
-    # ---- (2) 必须有标题 ----
-    if not chart.has_title:
-        return False, "图表无标题"
-
-    title_tf = chart.chart_title.text_frame
-    title_text = title_tf.text.strip()
-    if not title_text:
-        return False, "标题为空白"
-
-    # ---- (3) 标题文本：完全匹配 或 语义一致 ----
-    expected = "月度营收与盈利比值趋势"
-    semantic_ok = (
-        ("营收" in title_text)
-        and ("盈利" in title_text)
-        and (("趋势" in title_text) or ("月度" in title_text) or ("月" in title_text))
-    )
-    if title_text != expected and not semantic_ok:
-        return False, f"标题 '{title_text}' 与 '{expected}' 不一致也不语义相近"
-
-    match_kind = "完全匹配" if title_text == expected else "语义一致"
-    return True, f"第 10 页图表标题 '{title_text}'（{match_kind}）"
-
-
-def rule_10_chart_size(prs):
-    """+1  第10页曲线图版式：宽度约13至17厘米、高度约7至10厘米，
-         与结束页其他元素之间保留合理间距。逐点校验：
-      (1) 第 10 页存在曲线图对象
-      (2) 宽度约 13~17 cm
-      (3) 高度约 7~10 cm
-      (4) 与结束页其他元素之间保留合理间距（不与其他元素重叠/紧贴）
-    """
-    # ---- (1) 必须存在曲线图对象 ----
-    chart_shape = None
-    for shp in prs.slides[9].shapes:
-        if getattr(shp, "has_chart", False):
-            chart_shape = shp
-            break
-    if chart_shape is None:
-        return False, "第 10 页无图表对象"
-
-    # ---- (2) 宽度约 13~17 cm ----
-    w_cm = emu_to_cm(chart_shape.width)
-    if not (13 <= w_cm <= 17):
-        return False, f"图表宽度 {w_cm:.2f}cm 不在 13~17cm 范围"
-
-    # ---- (3) 高度约 7~10 cm ----
-    h_cm = emu_to_cm(chart_shape.height)
-    if not (7 <= h_cm <= 10):
-        return False, f"图表高度 {h_cm:.2f}cm 不在 7~10cm 范围"
-
-    # ---- (4) 与结束页其他元素之间保留合理间距 ----
-    # "合理间距" 判定：图表与"真实需避让元素"（标题、姓名、正文、装饰对象等）
-    # 不相交，且最小矩形距离 ≥ MIN_GAP_CM。
-    #
-    # 严格化（回应反馈）：不再遍历所有非零尺寸 shape，会排除：
-    #   ① 覆盖近整页的背景形状 / 装饰底图（面积 ≥ 页面 90%）
-    #   ② 母版/版式层继承的背景（slide.shapes 遍历的是 slide 级，不含 layout/master；
-    #      python-pptx 的 slide.shapes 已经天然排除 layout/master 形状，这里再做一层
-    #      面积兜底，避免"作者在 slide 上放了一张全屏背景图"造成误判）
-    #   ③ 图表内部/子元素（chart_shape 自身及其 group 子形状）
-    #   ④ 完全无内容的空文本框（无文字且无实心填充/边线的占位）
-    MIN_GAP_CM = 0.2
-
-    def _rect_of(shp):
-        return (
-            shp.left or 0,
-            shp.top or 0,
-            (shp.left or 0) + (shp.width or 0),
-            (shp.top or 0) + (shp.height or 0),
-        )
-
-    slide10 = prs.slides[9]
-    sw = prs.slide_width
-    sh = prs.slide_height
-    page_area = max(sw * sh, 1)
-
-    # 图表自身（+group 子孙）需被排除
-    def _iter_self_and_descendants(root):
-        stack = [root]
-        while stack:
-            cur = stack.pop()
-            yield cur
-            if getattr(cur, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
-                try:
-                    stack.extend(list(cur.shapes))
-                except Exception:
-                    pass
-
-    chart_self_ids = {id(s) for s in _iter_self_and_descendants(chart_shape)}
-
-    def _looks_like_background(shp):
-        w = shp.width or 0
-        h = shp.height or 0
-        if w * h >= page_area * 0.9:
-            return True
-        # 图片且尺寸接近整页短边任一维度、且没有文本 → 装饰底图
-        if shp.shape_type == MSO_SHAPE_TYPE.PICTURE and (w >= sw * 0.95 or h >= sh * 0.95):
-            return True
-        return False
-
-    def _is_empty_placeholder(shp):
-        # 无文本 + 非图片 + 无实心填充 + 无可见线条 → 视为空占位，不作为需避让元素
-        try:
-            if shp.has_text_frame and shp.text_frame.text.strip():
-                return False
-        except Exception:
-            return False
-        if shp.shape_type == MSO_SHAPE_TYPE.PICTURE:
-            return False
-        try:
-            sp_pr = shp._element.find(".//p:spPr", NS)
-        except Exception:
-            sp_pr = None
-        if sp_pr is not None:
-            if sp_pr.find("a:solidFill", NS) is not None:
-                return False
-            if sp_pr.find("a:ln//a:solidFill", NS) is not None:
-                return False
-        return True
-
-    cr = _rect_of(chart_shape)
-    min_gap_cm = None
-    overlapping = []
-    scanned = 0
-    for shp in slide10.shapes:
-        if id(shp) in chart_self_ids:
-            continue
-        if (shp.width or 0) == 0 or (shp.height or 0) == 0:
-            continue
-        if _looks_like_background(shp):
-            continue
-        if _is_empty_placeholder(shp):
-            continue
-
-        scanned += 1
-        r = _rect_of(shp)
-        dx = max(0, max(cr[0] - r[2], r[0] - cr[2]))
-        dy = max(0, max(cr[1] - r[3], r[1] - cr[3]))
-        if dx == 0 and dy == 0:
-            overlapping.append(shp.name)
-            continue
-        gap_cm = emu_to_cm((dx ** 2 + dy ** 2) ** 0.5)
-        if min_gap_cm is None or gap_cm < min_gap_cm:
-            min_gap_cm = gap_cm
-
-    if overlapping:
-        return False, f"图表与真实需避让元素重叠：{overlapping}"
-    if min_gap_cm is not None and min_gap_cm < MIN_GAP_CM:
-        return False, f"图表与最近需避让元素间距仅 {min_gap_cm:.2f}cm（需 ≥ {MIN_GAP_CM}cm）"
-
-    gap_desc = f"{min_gap_cm:.2f}cm" if min_gap_cm is not None else f"页内无真实需避让元素(扫描 {scanned})"
-    return True, (
-        f"第 10 页图表 {w_cm:.1f}×{h_cm:.1f}cm（宽 13~17、高 7~10），"
-        f"与真实需避让元素最小间距 {gap_desc}（合理，已排除背景/图表自身/空占位）"
-    )
-
-
-# --------------------------- 维度2 扣分项 ---------------------------
-
-
-# --------------------------- 主程序 ---------------------------
-
+from pptx.oxml.ns import qn
 
 SCRIPT_ID = "063"
-MAX_SCORE = 5 + 1 + 3 + 3 + 1 + 5 + 1 + 1 + 1  # 维度二所有加分项满分之和 = 21
 
+# 完成度分母 = 加分项合计 46 分；减分项不进入分母，只从实得分里扣。
+MAX_SCORE_TOTAL = 46
+
+# 减分项合计（21 条），仅用于自检 RULE_MAX_DELTA 写全了没有。
+MAX_PENALTY_TOTAL = -59
+
+EMU_PER_CM = 360000.0
+
+# 统一允差 ±0.3 cm，另有注明的从其注明。
+TOL = 0.3
+
+PAGE_W_CM = 33.87
+PAGE_H_CM = 19.05
+
+YAHEI_NAMES = ("Microsoft YaHei", "微软雅黑")
+
+# 页序：封面／岗位职责／协作关系／核心品类／工作成效／问题复盘／能力成长／团队协作／后续规划／感谢聆听
+PAGE_KEYS = [
+    "直播运营阶段复盘", "岗位职责", "协作关系", "核心品类", "工作成效",
+    "问题复盘", "能力成长", "团队协作", "后续规划", "感谢聆听",
+]
+
+# 各页背景纯色色值；工作成效页（索引 4）由加分项单独评，此处置空。
+BG_COLORS = [
+    "EAF8F9", "F3FAFB", "F6FBFC", "EFF9FA", None,
+    "FFFDF8", "F3FAFB", "F6FBFC", "F0FAFB", "EAF8F9",
+]
+
+# 工作成效页背景允许区间（浅青白）：EAF8F9–F6FBFC
+BG_WORK_LO = (0xEA, 0xF8, 0xF9)
+BG_WORK_HI = (0xF6, 0xFB, 0xFC)
+
+TITLE_COLOR = "17323A"        # 页面标题色
+LINE_TEAL = "29A7A5"          # 标题下方装饰短线色
+LINE_LIGHT = "B9E1E4"         # 右下角装饰横线色
+
+# 图表数据
+CHART_CATS = ["1月", "2月", "3月", "4月", "5月"]
+CHART_REVENUE = [68000.0, 352000.0, 486000.0, 423000.0, 579000.0]
+CHART_REVENUE_ALT = [6.8, 35.2, 48.6, 42.3, 57.9]
+CHART_RATIO = [1.42, 1.56, 1.71, 1.63, 1.85]
+CHART_SER_NAMES = ("营收数值", "盈利比值")
+
+# 感谢聆听页原有 7 个对象（文字用于定位，图片/底板/短线用几何定位）
+THANKS_TEXTS = [
+    ("感谢聆听", 2.4, 5.8),
+    ("营养品自播项目·内容运营组", 2.5, 8.3),
+    ("许泠瞻", 2.5, 9.5),
+    ("以更稳的流程、更清晰的表达、更快的反馈完成下一阶段工作。", 2.5, 12.1),
+]
+
+# 五页原状清单：封面／协作关系／核心品类／能力成长／团队协作
+COVER_SPEC = {
+    "count": 10,
+    "texts": [
+        ("直播运营阶段复盘", 2.0, 4.3),
+        ("营养品自播项目·内容运营组", 2.1, 8.9),
+        ("许泠瞻·2026年春季", 2.1, 10.0),
+        ("围绕主播执行、互动场控与客户服务的阶段性整理。", 2.0, 11.8),
+        ("阶段复盘", 2.3, 2.3),
+    ],
+    "pic": (16.1, 0.0, 17.7, 19.05),
+}
+
+COLLAB_SPEC = {
+    "count": 18,
+    "bars": [
+        ("销售管理中心", 2.1, 3.9),
+        ("营养健康事业部", 3.0, 5.8),
+        ("社群与内容业务部", 4.0, 7.7),
+        ("短视频运营组", 5.0, 9.6),
+        ("自播执行小组", 5.9, 11.5),
+        ("内容运营专员", 6.9, 13.3),
+    ],
+    "note": ("虚构组织名称用于公开汇报表达，层级关系保留“中心—部门—小组—岗位”的业务逻辑。", 21.6, 12.6),
+    "pic": (22.0, 3.0, 9.5, 7.9),
+}
+
+CATEGORY_SPEC = {
+    "count": 15,
+    "sub": ("复合营养片与矿物质补充场景", 5.1, 1.3),
+    "cards": [3.4, 6.9, 10.4],
+    "card_left": 16.6,
+    "card_size": (14.9, 2.7),
+    "titles": ["钙质支持", "铁元素关注", "锌元素补充"],
+    "bodies": [
+        ["骨骼与牙齿维护", "运动后恢复辅助", "家庭日常营养补给"],
+        ["活力状态管理", "特殊阶段营养补充", "搭配饮食建议"],
+        ["成长发育支持", "食欲与代谢相关沟通", "亲子人群常见咨询"],
+    ],
+    "bottom": ("表达原则：突出适用场景，弱化绝对化承诺；用通俗语言解释配方逻辑。", 16.9, 14.6),
+    "pic": (1.8, 3.4, 13.8, 11.0),
+}
+
+GROWTH_SPEC = {
+    "count": 17,
+    "axis": (5.6, 7.6, 21.3),
+    "dots": [(4.7, 6.6), (15.2, 6.7), (25.8, 6.7)],
+    "dot_size": (1.8, 1.8),
+    "cards": [3.3, 13.0, 22.8],
+    "card_top": 9.2,
+    "card_size": (6.9, 4.1),
+    "titles": ["熟悉期", "提升期", "稳定期"],
+    "bodies": [
+        ["了解产品基础信息", "掌握开播前准备", "完成基础讲解任务"],
+        ["能处理常见咨询", "独立配合场控节奏", "开始参与复盘整理"],
+        ["形成个人话术库", "协助新人熟悉流程", "支持活动型直播"],
+    ],
+    "bottom": ("核心变化：少一点“被动执行”，多一点“主动发现与提前准备”", 6.0, 15.4),
+}
+
+TEAM_SPEC = {
+    "count": 15,
+    "cards": [(15.9, 3.4), (24.0, 3.4)],
+    "card_size": (7.2, 3.2),
+    "titles": ["主播协作", "运营协作"],
+    "bodies": ["共享话术、提醒节奏、复盘高频问题", "同步活动重点、反馈用户关注点、配合调整机制"],
+    "keep_card": (15.9, 7.7, 15.4, 3.6),
+    "bar": (15.9, 12.6, 15.4, 1.9),
+    "bar_text": "同一条信息在直播前、直播中、直播后反复确认，减少遗漏。",
+    "pic": (1.8, 3.2, 13.0, 10.8),
+    "keep_body": (16.5, 9.4, 14.1, 1.6),
+    "keep_lines": ["复盘清单每日更新；复盘清单每日更新", "用户问题及时记录；用户问题及时记录"],
+}
+
+DUTY_SPEC = {
+    "count": 15,
+    "cards": [2.1, 11.7, 21.4],
+    "card_top": 3.7,
+    "card_size": (8.3, 11.0),
+    "arrows": [(10.6, 8.3), (20.3, 8.3)],
+    "arrow_size": (0.9, 1.2),
+    "sub": ("多角色协同，保障直播链路稳定", 5.1, 1.3),
+    "bottom": ("一人多岗，重点在“信息准确、节奏顺畅、反馈及时”", 5.4, 15.7),
+    "t1": ("主播执行", 2.7, 4.2),
+    "b1": (["按脚本完成产品讲解与互动引导", "根据实时反馈调整表达节奏", "沉淀常见问题与标准回应"], 2.5, 5.3),
+    "t2": ("互动场控", 12.6, 4.1),
+    "b2": (["关注评论氛围与咨询集中点", "提醒主播补充关键信息", "记录异常情况并同步运营"], 12.2, 5.4),
+    "b3": ["协助排班、物料确认与备注核对", "跟进用户咨询与售后反馈", "整理复盘要点，推动流程闭环"],
+}
+
+WORK_SPEC = {
+    "card_size": (7.0, 3.4),
+    # 原文件卡底为白色系填充：两张 F9FEFE、两张 FFFFFF
+    "card_fills": ("F9FEFE", "FFFFFF"),
+    "groups": [
+        ("直播执行", "按计划完成日常场次，讲解流程更顺滑"),
+        ("互动维护", "评论区咨询响应更快，氛围更可控"),
+        ("服务跟进", "备注核对、订单反馈与售后转交更清晰"),
+        ("排班协调", "高峰时段人手安排更均衡"),
+    ],
+    "title_pt": 14.0,
+    "title_color": "0F5963",
+    "body_pt": 11.2,
+    "body_color": "203942",
+}
+
+REVIEW_SPEC = {
+    "tri": (16.2, 7.6, 1.4, 1.4),
+    "cards": [2.3, 18.9],
+    "card_top": 3.7,
+    "card_size": (12.6, 10.3),
+    "bottom": ("把一次问题变成一套流程", 11.0, 15.2, 28.0, "0F5963"),
+    "left_title": ("风险表现", 2.9, 4.2, 32.0, "A85E1C"),
+    "left_body_pos": (2.9, 5.3),
+    "left_body": ["直播话术中出现表达边界不够清晰的情况",
+                  "部分用户问题未能在第一时间形成标准回复",
+                  "活动节奏变化时，信息同步偶有滞后"],
+    "opt_lines": ["建立开播前话术检查表", "将敏感表达改为场景化、说明式表达",
+                  "每日收场后进行小结并同步给运营"],
+    "opt_dup": "将敏感表达改为场景化、说明式表达",
+}
+
+PLAN_SPEC = {
+    "card_size": (8.5, 6.5),
+    "card_top": 5.3,
+    "near_title": "近期",
+    "near_body": ["完善话术卡片", "稳定开播前检查", "提升互动响应质量"],
+    "long_title": "长期",
+    "long_body": ["搭建标准化复盘范式", "强化岗位协同配合效能", "赋能团队稳步长效发展"],
+    "long_body_size": (7.2, 4.5),
+    "mid_title": "中期",
+    "mid_body": ["沉淀品类知识库", "参与活动直播策划", "协助新人熟悉流程"],
+    "removed_line": "稳住基本盘，再把经验变成流程。",
+    "bg_pic": (0.0, 2.2, 33.9, 15.2),
+}
+
+# 封面、协作关系、核心品类、团队协作、感谢聆听 5 页各 1 张图片（页索引, x, y, w, h）
+PIC_SPEC = [
+    (0, 16.1, 0.0, 17.7, 19.05),
+    (2, 22.0, 3.0, 9.5, 7.9),
+    (3, 1.8, 3.4, 13.8, 11.0),
+    (7, 1.8, 3.2, 13.0, 10.8),
+    (9, 17.7, 0.0, 16.2, 19.05),
+]
+
+# 封面页既有的空文本框（正常，不计入空对象）
+COVER_EMPTY_BOX = (1.8, 17.9, 14.0, 0.5)
+
+# 临时批注类文字
+TEMP_TEXT_KEYS = ("已改", "待确认", "待修改", "待核对", "待补充", "待定", "修改说明",
+                  "请审核", "已完成修改", "TODO", "todo", "批注")
+
+# 新增说明性文字 / 水印 / 页码 / Logo 类文字
+EXTRA_TEXT_KEYS = ("数据来源", "资料来源", "来源：", "注：", "说明：", "备注：", "制表",
+                   "制图", "水印", "已按要求", "本页由", "logo", "LOGO", "Logo")
+
+# 常见标注类几何图形（原文件只用 rect/roundRect/line/chevron/triangle/ellipse）
+ANNOT_GEOMS = ("wedgeRectCallout", "wedgeEllipseCallout", "wedgeRoundRectCallout",
+               "cloudCallout", "borderCallout1", "borderCallout2", "borderCallout3",
+               "accentCallout1", "accentCallout2", "accentCallout3",
+               "rightArrow", "leftArrow", "upArrow", "downArrow", "leftRightArrow",
+               "bentArrow", "curvedRightArrow", "curvedLeftArrow", "notchedRightArrow",
+               "stripedRightArrow", "quadArrow", "circularArrow")
+
+
+def _cm(value):
+    """EMU → 厘米。1 cm = 360000 EMU。"""
+    return None if value is None else float(value) / EMU_PER_CM
+
+
+def _decimals(tol):
+    """取容差写出的有效位数：0.3 → 1 位，0.1 → 1 位，1 → 0 位。"""
+    text = ("%f" % float(tol)).rstrip("0")
+    return len(text.split(".")[1]) if "." in text and text.split(".")[1] else 0
+
+
+def _le(diff, tol):
+    """容差按写出的有效位比较：量测值先四舍五入到该精度再判，避免刀锋判定。"""
+    return round(abs(float(diff)), _decimals(tol)) <= float(tol) + 1e-9
+
+
+def _near(value, target, tol=TOL):
+    return False if value is None else _le(value - target, tol)
+
+
+def _pos_ok(shape, x, y, tol=TOL):
+    """(X, Y) 指对象左上角，即 a:off；旋转不改变 a:off。"""
+    if shape is None:
+        return False
+    return _near(_cm(shape.left), x, tol) and _near(_cm(shape.top), y, tol)
+
+
+def _size_ok(shape, w, h, tol=TOL):
+    """尺寸即 a:ext（cx, cy）。"""
+    if shape is None:
+        return False
+    ok = True
+    if w is not None:
+        ok = ok and _near(_cm(shape.width), w, tol)
+    if h is not None:
+        ok = ok and _near(_cm(shape.height), h, tol)
+    return ok
+
+
+def _geom_ok(shape, x, y, w, h, tol=TOL):
+    return _pos_ok(shape, x, y, tol) and _size_ok(shape, w, h, tol)
+
+
+def _iter_shapes(container):
+    """展开组合，便于文字/字体一类的全篇扫描；对象计数仍按顶层形状。"""
+    out = []
+    for shape in container:
+        out.append(shape)
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            out.extend(_iter_shapes(shape.shapes))
+    return out
+
+
+def _text_of(shape):
+    try:
+        return shape.text_frame.text if shape.has_text_frame else ""
+    except Exception:
+        return ""
+
+
+def _norm(text):
+    """比文字只比字形：去掉所有空白（行尾多余空格不扣）。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def _plain(text):
+    """再去掉项目符号前缀，用于比较正文逐字内容。"""
+    return _norm(text).replace("•", "").replace("·", "")
+
+
+def _find_exact(shapes, text):
+    key = _norm(text)
+    for shape in shapes:
+        if _norm(_text_of(shape)) == key:
+            return shape
+    return None
+
+
+def _find_contains(shapes, text):
+    key = _norm(text)
+    if not key:
+        return None
+    for shape in shapes:
+        if key in _norm(_text_of(shape)):
+            return shape
+    return None
+
+
+def _find_all_contains(shapes, text):
+    key = _norm(text)
+    return [s for s in shapes if key and key in _norm(_text_of(s))]
+
+
+def _find_geom(shapes, x=None, y=None, w=None, h=None, tol=TOL, exclude=()):
+    """按几何定位对象：不同办公软件写出的形状名不一致，只认 a:off / a:ext。"""
+    for shape in shapes:
+        if any(shape is e for e in exclude):
+            continue
+        if shape.left is None or shape.top is None:
+            continue
+        if x is not None and not _near(_cm(shape.left), x, tol):
+            continue
+        if y is not None and not _near(_cm(shape.top), y, tol):
+            continue
+        if w is not None and not _near(_cm(shape.width), w, tol):
+            continue
+        if h is not None and not _near(_cm(shape.height), h, tol):
+            continue
+        return shape
+    return None
+
+
+def _pictures(slide):
+    return [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+
+
+def _rot(shape):
+    try:
+        return float(shape.rotation) % 360.0
+    except Exception:
+        return 0.0
+
+
+def _sp_pr(shape):
+    return shape._element.find(qn("p:spPr"))
+
+
+def _fill_srgb(shape):
+    """形状自身填充色：只认 spPr 下直挂的 a:solidFill/a:srgbClr。"""
+    sp_pr = _sp_pr(shape)
+    if sp_pr is None:
+        return None
+    fill = sp_pr.find(qn("a:solidFill"))
+    if fill is None:
+        return None
+    clr = fill.find(qn("a:srgbClr"))
+    return clr.get("val").upper() if clr is not None and clr.get("val") else None
+
+
+def _is_no_fill(shape):
+    sp_pr = _sp_pr(shape)
+    return sp_pr is not None and sp_pr.find(qn("a:noFill")) is not None
+
+
+def _line_srgb(shape):
+    """线条色：a:ln/a:solidFill/a:srgbClr。"""
+    sp_pr = _sp_pr(shape)
+    if sp_pr is None:
+        return None
+    ln = sp_pr.find(qn("a:ln"))
+    if ln is None:
+        return None
+    fill = ln.find(qn("a:solidFill"))
+    if fill is None:
+        return None
+    clr = fill.find(qn("a:srgbClr"))
+    return clr.get("val").upper() if clr is not None and clr.get("val") else None
+
+
+def _has_visible_line(shape):
+    sp_pr = _sp_pr(shape)
+    if sp_pr is None:
+        return False
+    ln = sp_pr.find(qn("a:ln"))
+    if ln is None:
+        return False
+    return ln.find(qn("a:noFill")) is None
+
+
+def _has_shadow(shape):
+    return "outerShdw" in shape._element.xml
+
+
+def _prst_geom(shape):
+    sp_pr = _sp_pr(shape)
+    if sp_pr is None:
+        return None
+    geom = sp_pr.find(qn("a:prstGeom"))
+    return geom.get("prst") if geom is not None else None
+
+
+def _slide_bg(slide):
+    """页面背景：p:cSld/p:bg。返回 ('srgb', 'EAF8F9') / ('scheme', 'accent4') / ('other', None) / (None, None)。"""
+    c_sld = slide._element.find(qn("p:cSld"))
+    bg = c_sld.find(qn("p:bg")) if c_sld is not None else None
+    if bg is None:
+        return (None, None)
+    xml = bg.xml
+    m = re.search(r"<a:srgbClr val=\"([0-9A-Fa-f]{6})\"", xml)
+    if m and "<a:gradFill" not in xml and "<a:blipFill" not in xml:
+        return ("srgb", m.group(1).upper())
+    m = re.search(r"<a:schemeClr val=\"([^\"]+)\"", xml)
+    if m and "<a:gradFill" not in xml and "<a:blipFill" not in xml:
+        return ("scheme", m.group(1))
+    return ("other", None)
+
+
+def _hex_in_range(value, lo, hi):
+    if not value or len(value) != 6:
+        return False
+    try:
+        rgb = (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+    except ValueError:
+        return False
+    return all(lo[i] <= rgb[i] <= hi[i] for i in range(3))
+
+
+def _paragraphs(shape):
+    if shape is None or not shape.has_text_frame:
+        return []
+    return list(shape.text_frame.paragraphs)
+
+
+def _nonempty_lines(shape, plain=True):
+    conv = _plain if plain else _norm
+    return [conv(p.text) for p in _paragraphs(shape) if _norm(p.text)]
+
+
+def _r_pr(run):
+    return run._r.find(qn("a:rPr")) if run is not None else None
+
+
+def _first_run(paragraph):
+    runs = paragraph.runs
+    return runs[0] if runs else None
+
+
+def _run_size_pt(run):
+    r_pr = _r_pr(run)
+    if r_pr is None or not r_pr.get("sz"):
+        return None
+    return int(r_pr.get("sz")) / 100.0
+
+
+def _run_bold(run):
+    r_pr = _r_pr(run)
+    return r_pr is not None and r_pr.get("b") in ("1", "true", "on")
+
+
+def _run_color(run):
+    r_pr = _r_pr(run)
+    if r_pr is None:
+        return None
+    fill = r_pr.find(qn("a:solidFill"))
+    if fill is None:
+        return None
+    clr = fill.find(qn("a:srgbClr"))
+    return clr.get("val").upper() if clr is not None and clr.get("val") else None
+
+
+def _def_r_pr_chain(shape, paragraph):
+    """字体继承链的中间两级：段落 a:pPr/a:defRPr → 形状 a:lstStyle/a:lvl1pPr/a:defRPr。"""
+    chain = []
+    p_pr = paragraph._pPr
+    if p_pr is not None:
+        node = p_pr.find(qn("a:defRPr"))
+        if node is not None:
+            chain.append(node)
+    if shape is not None and shape.has_text_frame:
+        tx_body = shape.text_frame._txBody
+        lst = tx_body.find(qn("a:lstStyle"))
+        if lst is not None:
+            lvl1 = lst.find(qn("a:lvl1pPr"))
+            if lvl1 is not None:
+                node = lvl1.find(qn("a:defRPr"))
+                if node is not None:
+                    chain.append(node)
+    return chain
+
+
+def _typeface(node, tag):
+    if node is None:
+        return None
+    child = node.find(qn("a:" + tag))
+    if child is None:
+        return None
+    name = child.get("typeface")
+    return name if name else None
+
+
+def _resolve_effective_eastasia(shape, paragraph, run, theme_ea):
+    """中文字体：run 的 a:ea → 段落 defRPr → 形状 lstStyle → 主题 minorFont 的 a:ea。
+    主题 a:ea 为空时中文会回落到系统字体，此处返回 None，视为未设置。"""
+    for node in [_r_pr(run)] + _def_r_pr_chain(shape, paragraph):
+        name = _typeface(node, "ea")
+        if name:
+            return name
+    return theme_ea or None
+
+
+def _resolve_effective_ascii(shape, paragraph, run, theme_latin):
+    """西文字体：run 的 a:latin → 段落 defRPr → 形状 lstStyle → 主题 minorFont 的 a:latin。"""
+    for node in [_r_pr(run)] + _def_r_pr_chain(shape, paragraph):
+        name = _typeface(node, "latin")
+        if name:
+            return name
+    return theme_latin or None
+
+
+def _is_yahei(name):
+    """“微软雅黑”与“Microsoft YaHei”是同一字体的中英文名称，两种写法均可。"""
+    return (name or "").strip() in YAHEI_NAMES
+
+
+def _line_spacing_pct(shape, paragraph):
+    """段落行距：a:pPr/a:lnSpc/a:spcPct（200000 = 200%）；段落未写时回落形状 lstStyle。"""
+    for holder in ([paragraph._pPr] if paragraph._pPr is not None else []):
+        node = holder.find(qn("a:lnSpc"))
+        if node is not None:
+            pct = node.find(qn("a:spcPct"))
+            return int(pct.get("val")) / 1000.0 if pct is not None else None
+    if shape is not None and shape.has_text_frame:
+        lst = shape.text_frame._txBody.find(qn("a:lstStyle"))
+        lvl1 = lst.find(qn("a:lvl1pPr")) if lst is not None else None
+        node = lvl1.find(qn("a:lnSpc")) if lvl1 is not None else None
+        if node is not None:
+            pct = node.find(qn("a:spcPct"))
+            return int(pct.get("val")) / 1000.0 if pct is not None else None
+    return None
+
+
+def _theme_fonts(parts):
+    """主题 majorFont / minorFont 的 latin 与 ea。"""
+    xml = parts.get("ppt/theme/theme1.xml", "")
+    out = {}
+    for tag in ("majorFont", "minorFont"):
+        m = re.search(r"<a:%s>(.*?)</a:%s>" % (tag, tag), xml, re.S)
+        block = m.group(1) if m else ""
+        latin = re.search(r"<a:latin typeface=\"([^\"]*)\"", block)
+        ea = re.search(r"<a:ea typeface=\"([^\"]*)\"", block)
+        out[tag] = (latin.group(1) if latin else None, ea.group(1) if ea else None)
+    return out
+
+
+def _rect(shape):
+    left = _cm(shape.left) or 0.0
+    top = _cm(shape.top) or 0.0
+    return (left, top, left + (_cm(shape.width) or 0.0), top + (_cm(shape.height) or 0.0))
+
+
+def _overlap(a, b, slack=0.05):
+    """两矩形是否重叠（留 0.05 cm 贴边余量）。"""
+    return (a[0] < b[2] - slack and b[0] < a[2] - slack
+            and a[1] < b[3] - slack and b[1] < a[3] - slack)
+
+
+def _inside_page(shape, slack=0.05):
+    left, top, right, bottom = _rect(shape)
+    return (left >= -slack and top >= -slack
+            and right <= PAGE_W_CM + slack and bottom <= PAGE_H_CM + slack)
+
+
+def _find_chart_shape(prs):
+    """原生图表对象：p:graphicFrame 内挂 c:chart 关系（python-pptx 的 has_chart）。
+    静态图片/截图贴图没有图表部件，此处一律取不到。"""
+    for idx, slide in enumerate(prs.slides):
+        for shape in _iter_shapes(slide.shapes):
+            if getattr(shape, "has_chart", False):
+                return (idx, shape)
+    return (-1, None)
+
+
+def _chart_xml(shape):
+    try:
+        return shape.chart.part.blob.decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def _chart_sers(xml):
+    """返回 [(系列名, [数值...]), ...]。"""
+    out = []
+    for block in re.findall(r"<c:ser>(.*?)</c:ser>", xml, re.S):
+        name = ""
+        m = re.search(r"<c:tx>.*?<c:v>(.*?)</c:v>", block, re.S)
+        if m:
+            name = _norm(m.group(1))
+        vals = []
+        m = re.search(r"<c:val>(.*?)</c:val>", block, re.S)
+        if m:
+            for raw in re.findall(r"<c:v>([^<]*)</c:v>", m.group(1)):
+                try:
+                    vals.append(float(raw))
+                except ValueError:
+                    pass
+        out.append((name, vals))
+    return out
+
+
+def _chart_cats(xml):
+    m = re.search(r"<c:cat>(.*?)</c:cat>", xml, re.S)
+    if not m:
+        return []
+    return [_norm(v) for v in re.findall(r"<c:v>([^<]*)</c:v>", m.group(1))]
+
+
+def _chart_smooth(xml):
+    """线条是否为平滑曲线：每个系列的 c:smooth 必须为 1（普通折线为 0 或缺失）。"""
+    blocks = re.findall(r"<c:ser>(.*?)</c:ser>", xml, re.S)
+    if not blocks:
+        return False
+    for block in blocks:
+        m = re.search(r"<c:smooth val=\"([^\"]+)\"", block)
+        if m is None or m.group(1) not in ("1", "true"):
+            return False
+    return True
+
+
+def _chart_has_secondary_axis(xml):
+    """次坐标轴：plotArea 内出现 4 个不同 c:axId（两组坐标轴）。"""
+    return len(set(re.findall(r"<c:axId val=\"(\d+)\"", xml))) >= 4
+
+
+def _values_match(vals, expect, rel=0.005):
+    if len(vals) != len(expect):
+        return False
+    for got, want in zip(vals, expect):
+        if abs(got - want) > max(abs(want) * rel, 1e-6):
+            return False
+    return True
+
+
+def _pic_distortion(pic):
+    """宽高比失真：显示框宽高比 ÷ 原图宽高比 − 1。整体等比缩放为 0。"""
+    try:
+        px, py = pic.image.size
+        dpi_x, dpi_y = pic.image.dpi
+        native = (px / float(dpi_x or 72)) / (py / float(dpi_y or 72))
+        box = float(pic.width) / float(pic.height)
+        return abs(box / native - 1.0)
+    except Exception:
+        return None
+
+
+def _pic_cropped(pic):
+    try:
+        return max(abs(pic.crop_left), abs(pic.crop_right),
+                   abs(pic.crop_top), abs(pic.crop_bottom)) > 0.001
+    except Exception:
+        return False
+
+
+def _open_presentation(file_path):
+    """打开 .pptx；加密只读、结构损坏、实际为 .ppt/.pdf/图片改名的，这里就会抛异常。"""
+    return Presentation(file_path)
+
+
+def _read_parts(file_path):
+    """读出包内所有 xml / rels 文本，供主题、母版、动画、切换、批注等整包检查使用。"""
+    parts = {}
+    with zipfile.ZipFile(file_path) as zf:
+        for name in zf.namelist():
+            if name.endswith(".xml") or name.endswith(".rels"):
+                parts[name] = zf.read(name).decode("utf-8", "ignore")
+            else:
+                parts[name] = ""
+    return parts
+
+
+def _find_lines(shapes, lines):
+    want = [_plain(x) for x in lines]
+    for shape in shapes:
+        if _nonempty_lines(shape) == want:
+            return shape
+    return None
+
+
+def _check_cover(slide):
+    shapes = list(slide.shapes)
+    if len(shapes) != COVER_SPEC["count"]:
+        return False
+    for text, x, y in COVER_SPEC["texts"]:
+        shape = _find_exact(shapes, text)
+        if not _pos_ok(shape, x, y):
+            return False
+    pics = _pictures(slide)
+    x, y, w, h = COVER_SPEC["pic"]
+    return len(pics) == 1 and _geom_ok(pics[0], x, y, w, h)
+
+
+def _check_collab(slide):
+    shapes = list(slide.shapes)
+    if len(shapes) != COLLAB_SPEC["count"]:
+        return False
+    names = [t for t, _, _ in COLLAB_SPEC["bars"]]
+    for text, x, y in COLLAB_SPEC["bars"]:
+        if _find_geom(shapes, x=x, y=y, h=1.2) is None:
+            return False
+    labels = [s for s in shapes if _norm(_text_of(s)) in [_norm(n) for n in names]]
+    if len(labels) != len(names):
+        return False
+    order = [_norm(_text_of(s)) for s in sorted(labels, key=lambda s: s.top)]
+    if order != [_norm(n) for n in names]:
+        return False
+    text, x, y = COLLAB_SPEC["note"]
+    if not _pos_ok(_find_exact(shapes, text), x, y):
+        return False
+    pics = _pictures(slide)
+    x, y, w, h = COLLAB_SPEC["pic"]
+    return len(pics) == 1 and _geom_ok(pics[0], x, y, w, h)
+
+
+def _check_category(slide):
+    shapes = list(slide.shapes)
+    if len(shapes) != CATEGORY_SPEC["count"]:
+        return False
+    text, x, y = CATEGORY_SPEC["sub"]
+    if not _pos_ok(_find_exact(shapes, text), x, y):
+        return False
+    w, h = CATEGORY_SPEC["card_size"]
+    for top in CATEGORY_SPEC["cards"]:
+        if _find_geom(shapes, x=CATEGORY_SPEC["card_left"], y=top, w=w, h=h) is None:
+            return False
+    titles = []
+    for name in CATEGORY_SPEC["titles"]:
+        shape = _find_exact(shapes, name)
+        if shape is None:
+            return False
+        titles.append(shape)
+    if [t for t in sorted(titles, key=lambda s: s.top)] != titles:
+        return False
+    for lines in CATEGORY_SPEC["bodies"]:
+        if _find_lines(shapes, lines) is None:
+            return False
+    text, x, y = CATEGORY_SPEC["bottom"]
+    if not _pos_ok(_find_exact(shapes, text), x, y):
+        return False
+    pics = _pictures(slide)
+    x, y, w, h = CATEGORY_SPEC["pic"]
+    return len(pics) == 1 and _geom_ok(pics[0], x, y, w, h)
+
+
+def _check_growth(slide):
+    shapes = list(slide.shapes)
+    if len(shapes) != GROWTH_SPEC["count"]:
+        return False
+    x, y, length = GROWTH_SPEC["axis"]
+    if _find_geom(shapes, x=x, y=y, w=length) is None:
+        return False
+    dw, dh = GROWTH_SPEC["dot_size"]
+    for x, y in GROWTH_SPEC["dots"]:
+        if _find_geom(shapes, x=x, y=y, w=dw, h=dh) is None:
+            return False
+    cw, ch = GROWTH_SPEC["card_size"]
+    for x in GROWTH_SPEC["cards"]:
+        if _find_geom(shapes, x=x, y=GROWTH_SPEC["card_top"], w=cw, h=ch) is None:
+            return False
+    for name in GROWTH_SPEC["titles"]:
+        if _find_exact(shapes, name) is None:
+            return False
+    for lines in GROWTH_SPEC["bodies"]:
+        if _find_lines(shapes, lines) is None:
+            return False
+    text, x, y = GROWTH_SPEC["bottom"]
+    return _pos_ok(_find_exact(shapes, text), x, y)
+
+
+def _check_team(slide):
+    shapes = list(slide.shapes)
+    if len(shapes) != TEAM_SPEC["count"]:
+        return False
+    w, h = TEAM_SPEC["card_size"]
+    for x, y in TEAM_SPEC["cards"]:
+        if _find_geom(shapes, x=x, y=y, w=w, h=h) is None:
+            return False
+    for name in TEAM_SPEC["titles"]:
+        if _find_exact(shapes, name) is None:
+            return False
+    for body in TEAM_SPEC["bodies"]:
+        if _find_exact(shapes, body) is None:
+            return False
+    x, y, w, h = TEAM_SPEC["keep_card"]
+    if _find_geom(shapes, x=x, y=y, w=w, h=h) is None:
+        return False
+    x, y, w, h = TEAM_SPEC["bar"]
+    if _find_geom(shapes, x=x, y=y, w=w, h=h) is None:
+        return False
+    if not _find_exact(shapes, TEAM_SPEC["bar_text"]):
+        return False
+    pics = _pictures(slide)
+    x, y, w, h = TEAM_SPEC["pic"]
+    return len(pics) == 1 and _geom_ok(pics[0], x, y, w, h)
+
+
+def _check_team_keep_body(slide):
+    """“重复沉淀”卡内那两句重复写法属正常内容，须原样保留。"""
+    shapes = list(slide.shapes)
+    body = _find_lines(shapes, TEAM_SPEC["keep_lines"])
+    if body is None:
+        return False
+    x, y, w, h = TEAM_SPEC["keep_body"]
+    if not _geom_ok(body, x, y, w, h):
+        return False
+    return len([p for p in _paragraphs(body) if _norm(p.text)]) == 2
+
+
+def _bansu_shapes(slide):
+    """岗位职责页新增的“排班岗”标题对象（可能被写成文本框或形状）。"""
+    return [s for s in slide.shapes if _norm(_text_of(s)) == "排班岗"]
+
+
+def _check_duty(slide):
+    bansu = [s._element for s in _bansu_shapes(slide)]
+    shapes = [s for s in slide.shapes if s._element not in bansu]
+    if len(shapes) != DUTY_SPEC["count"]:
+        return False
+    w, h = DUTY_SPEC["card_size"]
+    for x in DUTY_SPEC["cards"]:
+        if _find_geom(shapes, x=x, y=DUTY_SPEC["card_top"], w=w, h=h) is None:
+            return False
+    aw, ah = DUTY_SPEC["arrow_size"]
+    for x, y in DUTY_SPEC["arrows"]:
+        if _find_geom(shapes, x=x, y=y, w=aw, h=ah) is None:
+            return False
+    for key in ("sub", "bottom", "t1", "t2"):
+        text, x, y = DUTY_SPEC[key]
+        if not _pos_ok(_find_exact(shapes, text), x, y):
+            return False
+    for key in ("b1", "b2"):
+        lines, x, y = DUTY_SPEC[key]
+        body = _find_lines(shapes, lines)
+        if body is None or not _pos_ok(body, x, y):
+            return False
+    # 第三卡正文的 Y 坐标允许上下微调以容纳标题，只查文字逐字一致与左边缘。
+    body3 = _find_lines(shapes, DUTY_SPEC["b3"])
+    return body3 is not None
+
+
+def _duty_title_baseline(slide):
+    """返回 (前两卡标题顶端列表, 前两卡“标题左边缘相对卡底左边缘”偏移均值)。
+    前两卡该偏移本身有 0.2 cm 上下，故按均值比，避免刀锋判定。"""
+    shapes = list(slide.shapes)
+    tops, offsets = [], []
+    for key, card_x in (("t1", DUTY_SPEC["cards"][0]), ("t2", DUTY_SPEC["cards"][1])):
+        text = DUTY_SPEC[key][0]
+        title = _find_exact(shapes, text)
+        card = _find_geom(shapes, x=card_x, y=DUTY_SPEC["card_top"],
+                          w=DUTY_SPEC["card_size"][0], h=DUTY_SPEC["card_size"][1])
+        if title is None or card is None:
+            return (None, None)
+        tops.append(_cm(title.top))
+        offsets.append(_cm(title.left) - _cm(card.left))
+    return (tops, sum(offsets) / len(offsets))
+
+
+def _work_cards(slide):
+    """工作成效页 4 张卡底：按圆角矩形 + 7.0×3.4 尺寸认（原文件 2 张 F9FEFE、2 张 FFFFFF）。"""
+    w, h = WORK_SPEC["card_size"]
+    return [s for s in slide.shapes
+            if _prst_geom(s) == "roundRect" and _size_ok(s, w, h)]
+
+
+def _work_triples(slide):
+    """把 4 组“卡底 + 小标题 + 正文”配起来；标题/正文按文字内容认，归属按最近卡底。"""
+    cards = _work_cards(slide)
+    shapes = list(slide.shapes)
+    triples = []
+    for title_text, body_text in WORK_SPEC["groups"]:
+        title = _find_exact(shapes, title_text)
+        body = _find_exact(shapes, body_text)
+        if title is None or body is None or not cards:
+            return []
+        card = min(cards, key=lambda c: (abs(_cm(c.left) - _cm(title.left))
+                                         + abs(_cm(c.top) - _cm(title.top))))
+        triples.append((card, title, body))
+    if len({id(c) for c, _, _ in triples}) != 4:
+        return []
+    return triples
+
+
+def _check_work_cards(slide):
+    cards = _work_cards(slide)
+    if len(cards) != 4:
+        return False
+    for card in cards:
+        if _prst_geom(card) != "roundRect" or not _has_shadow(card):
+            return False
+        if _fill_srgb(card) not in WORK_SPEC["card_fills"]:
+            return False
+    triples = _work_triples(slide)
+    if len(triples) != 4:
+        return False
+    for _, title, body in triples:
+        t_run = _first_run(_paragraphs(title)[0])
+        b_run = _first_run(_paragraphs(body)[0])
+        if not _near(_run_size_pt(t_run) or 0, WORK_SPEC["title_pt"], 0.1):
+            return False
+        if _run_color(t_run) != WORK_SPEC["title_color"]:
+            return False
+        if not _near(_run_size_pt(b_run) or 0, WORK_SPEC["body_pt"], 0.1):
+            return False
+        if _run_color(b_run) != WORK_SPEC["body_color"]:
+            return False
+    for getter in (lambda c, s: _cm(s.left) - _cm(c.left), lambda c, s: _cm(s.top) - _cm(c.top)):
+        for pick in (1, 2):
+            spread = [getter(t[0], t[pick]) for t in triples]
+            if not _le(max(spread) - min(spread), 0.3):
+                return False
+    return True
+
+
+def _check_review_layout(slide):
+    shapes = list(slide.shapes)
+    tris = [s for s in shapes if _prst_geom(s) == "triangle"]
+    if len(tris) != 1:
+        return False
+    x, y, w, h = REVIEW_SPEC["tri"]
+    if not _geom_ok(tris[0], x, y, w, h) or not _le(_rot(tris[0]) - 90.0, 1.0):
+        return False
+    w, h = REVIEW_SPEC["card_size"]
+    for x in REVIEW_SPEC["cards"]:
+        if _find_geom(shapes, x=x, y=REVIEW_SPEC["card_top"], w=w, h=h) is None:
+            return False
+    text, x, y, pt, color = REVIEW_SPEC["bottom"]
+    shape = _find_exact(shapes, text)
+    if not _pos_ok(shape, x, y):
+        return False
+    run = _first_run(_paragraphs(shape)[0])
+    return _near(_run_size_pt(run) or 0, pt, 0.1) and _run_color(run) == color
+
+
+def _check_review_left(slide):
+    shapes = list(slide.shapes)
+    text, x, y, pt, color = REVIEW_SPEC["left_title"]
+    title = _find_exact(shapes, text)
+    if not _pos_ok(title, x, y):
+        return False
+    run = _first_run(_paragraphs(title)[0])
+    if not _near(_run_size_pt(run) or 0, pt, 0.1) or _run_color(run) != color:
+        return False
+    body = _find_lines(shapes, REVIEW_SPEC["left_body"])
+    if body is None or not _pos_ok(body, *REVIEW_SPEC["left_body_pos"]):
+        return False
+    paras = [p for p in _paragraphs(body) if _norm(p.text)]
+    if len(paras) != 3:
+        return False
+    for para in paras:
+        run = _first_run(para)
+        if not _near(_line_spacing_pct(body, para) or 0, 200.0, 1.0):
+            return False
+        if not _near(_run_size_pt(run) or 0, 16.0, 0.1):
+            return False
+        if _run_color(run) != "203942" or not para.text.strip().startswith("•"):
+            return False
+    return True
+
+
+def _plan_cards(slide):
+    """后续规划页的卡底：8.5×6.5、顶端 5.3；左右位置不查（删卡后重新居中属允许）。"""
+    w, h = PLAN_SPEC["card_size"]
+    return [s for s in slide.shapes
+            if _size_ok(s, w, h) and _near(_cm(s.top), PLAN_SPEC["card_top"])]
+
+
+def _card_of(cards, shape):
+    for card in cards:
+        left, right = _cm(card.left), _cm(card.left) + _cm(card.width)
+        if left - 0.3 <= _cm(shape.left) and _cm(shape.left) + _cm(shape.width) <= right + 0.3:
+            return card
+    return None
+
+
+def _check_plan_cards(slide):
+    shapes = list(slide.shapes)
+    cards = _plan_cards(slide)
+    if len(cards) < 2:
+        return False
+    near_title = _find_exact(shapes, PLAN_SPEC["near_title"])
+    long_title = _find_exact(shapes, PLAN_SPEC["long_title"])
+    if near_title is None or long_title is None:
+        return False
+    near_card = _card_of(cards, near_title)
+    long_card = _card_of(cards, long_title)
+    if near_card is None or long_card is None or near_card is long_card:
+        return False
+    if not _inside_page(near_card) or not _inside_page(long_card):
+        return False
+    body = _find_lines(shapes, PLAN_SPEC["near_body"])
+    if body is None:
+        return False
+    paras = [p for p in _paragraphs(body) if _norm(p.text)]
+    if len(paras) != 3:
+        return False
+    for para in paras:
+        run = _first_run(para)
+        if not _near(_run_size_pt(run) or 0, 16.0, 0.1):
+            return False
+        if not _near(_line_spacing_pct(body, para) or 0, 150.0, 1.0):
+            return False
+        if _run_color(run) != "203942":
+            return False
+    return True
+
+
+def _check_plan_bg(slide):
+    x, y, w, h = PLAN_SPEC["bg_pic"]
+    for pic in _pictures(slide):
+        if _geom_ok(pic, x, y, w, h, tol=0.1) and not _pic_cropped(pic):
+            return True
+    return False
+
+
+def _plan_residual_boxes(slide):
+    """后续规划页上除卡底之外的空白框（残留的空卡底 / 空文本框）。"""
+    keep = [c._element for c in _plan_cards(slide)]
+    out = []
+    for shape in _iter_shapes(slide.shapes):
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE or shape._element in keep:
+            continue
+        if _norm(_text_of(shape)):
+            continue
+        if _cm(shape.height) >= 0.3 and _cm(shape.width) >= 2.0:
+            out.append(shape)
+    return out
+
+
+def _check_plan_mid_removed(slide):
+    """+3：只剩近期／长期 2 张卡，"中期"标题与其 3 行正文均不存在，无残留空卡底。"""
+    shapes = list(slide.shapes)
+    if _find_exact(shapes, PLAN_SPEC["mid_title"]) is not None:
+        return False
+    for line in PLAN_SPEC["mid_body"]:
+        if _find_contains(shapes, line) is not None:
+            return False
+    if len(_plan_cards(slide)) != 2:
+        return False
+    return not _plan_residual_boxes(slide)
+
+
+def _check_plan_line_removed(slide):
+    """+1：句子"稳住基本盘…"不存在，也没留下对应的空文本框。"""
+    shapes = list(slide.shapes)
+    if _find_contains(shapes, PLAN_SPEC["removed_line"]) is not None:
+        return False
+    if _find_contains(shapes, "稳住基本盘") is not None:
+        return False
+    return not _plan_residual_boxes(slide)
+
+
+def _plan_long_body(slide):
+    return _find_lines(list(slide.shapes), PLAN_SPEC["long_body"])
+
+
+def _align_of(shape):
+    """段落对齐；未写 algn 时按 PowerPoint 默认左对齐处理（显式 l 与缺省视为一致）。"""
+    algn = []
+    for para in _paragraphs(shape):
+        p_pr = para._pPr
+        algn.append((None if p_pr is None else p_pr.get("algn")) or "l")
+    return algn
+
+
+def _check_plan_long_format(slide, theme_latin, theme_ea):
+    """+3：长期卡正文 16pt / 行距 150% / 203942 / 中英文微软雅黑 / 7.2×4.5，对齐与近期卡一致。"""
+    body = _plan_long_body(slide)
+    if body is None:
+        return False
+    w, h = PLAN_SPEC["long_body_size"]
+    if not _size_ok(body, w, h):
+        return False
+    near = _find_lines(list(slide.shapes), PLAN_SPEC["near_body"])
+    if near is not None and set(_align_of(body)) != set(_align_of(near)):
+        return False
+    for para in _paragraphs(body):
+        if not _norm(para.text):
+            continue
+        if not _near(_line_spacing_pct(body, para) or 0, 150.0, 1.0):
+            return False
+        for run in para.runs:
+            if not _near(_run_size_pt(run) or 0, 16.0, 0.1):
+                return False
+            if _run_color(run) != "203942":
+                return False
+            latin = _resolve_effective_ascii(body, para, run, theme_latin)
+            ea = _resolve_effective_eastasia(body, para, run, theme_ea)
+            if not _is_yahei(latin) or not _is_yahei(ea):
+                return False
+    return True
+
+
+def _check_thanks(slide):
+    """−3：感谢聆听页原有 7 个对象齐全且在位（新增图表及承载对象不计入个数）。"""
+    shapes = list(slide.shapes)
+    for text, x, y in THANKS_TEXTS:
+        if not _pos_ok(_find_exact(shapes, text), x, y):
+            return False
+    pics = _pictures(slide)
+    if not any(_geom_ok(p, 17.7, 0.0, 16.2, PAGE_H_CM) for p in pics):
+        return False
+    if _find_geom(shapes, x=0.0, y=0.0, w=17.7, h=PAGE_H_CM) is None:
+        return False
+    if _find_geom(shapes, x=2.5, y=11.3, w=3.2) is None:
+        return False
+    return True
+
+
+def _check_chart_on_thanks(prs, chart_shape):
+    """+1：图表落在感谢聆听页（不是单独占一页、也不在其他页）。"""
+    for slide in prs.slides:
+        for shape in _iter_shapes(slide.shapes):
+            if shape._element is chart_shape._element:
+                return _slide_key_ok(slide, PAGE_KEYS[9])
+    return False
+
+
+def _slide_key_ok(slide, key):
+    text = _norm("".join(_text_of(s) for s in _iter_shapes(slide.shapes)))
+    return _plain(key) in _plain(text)
+
+
+def _page_by_key(prs, key):
+    """按页内关键字定位页面：页数/页序出问题时元素级检查仍能落到正确的页上。"""
+    for slide in prs.slides:
+        if _slide_key_ok(slide, key):
+            return slide
+    return None
+
+
+def _check_chart_geometry(prs, chart_shape):
+    """+1：图表完整落在页面内、宽高比正常无拉伸，且不遮挡感谢聆听页的四处文字。"""
+    if not _inside_page(chart_shape):
+        return False
+    w, h = _cm(chart_shape.width), _cm(chart_shape.height)
+    if not w or not h or not (0.7 <= w / h <= 3.0):
+        return False
+    slide = _page_by_key(prs, PAGE_KEYS[9])
+    if slide is None:
+        return False
+    for text, _x, _y in THANKS_TEXTS:
+        shape = _find_exact(list(slide.shapes), text)
+        if shape is not None and _overlap(_rect(shape), _rect(chart_shape)):
+            return False
+    return True
+
+
+def _check_titles_and_lines(prs):
+    """−3：岗位职责～后续规划每页有页面标题与青色短线；封面～后续规划每页有右下角横线。"""
+    for key in PAGE_KEYS[1:9]:
+        slide = _page_by_key(prs, key)
+        if slide is None:
+            return False
+        shapes = list(slide.shapes)
+        title = _find_geom(shapes, x=1.8, y=1.1, w=21.3, h=1.1)
+        if title is None or _plain(_text_of(title)) != _plain(key):
+            return False
+        run = _first_run(_paragraphs(title)[0]) if _paragraphs(title) else None
+        if not _near(_run_size_pt(run) or 0, 24.0, 0.1):
+            return False
+        if _find_geom(shapes, x=1.8, y=2.6, w=2.9) is None:
+            return False
+    for key in PAGE_KEYS[0:9]:
+        slide = _page_by_key(prs, key)
+        if slide is None or _find_geom(list(slide.shapes), x=27.1, y=18.1, w=4.8) is None:
+            return False
+    return True
+
+
+def _check_page_order(prs):
+    """−5：10 页，且页序为 封面／岗位职责／…／感谢聆听页。"""
+    slides = list(prs.slides)
+    if len(slides) != 10:
+        return False
+    for idx, key in enumerate(PAGE_KEYS):
+        if not _slide_key_ok(slides[idx], key):
+            return False
+    return True
+
+
+def _check_backgrounds(prs):
+    """−3：各页背景纯色色值，页面标题色 17323A、青色短线 29A7A5、右下横线 B9E1E4。"""
+    for key, expect in zip(PAGE_KEYS, BG_COLORS):
+        if expect is None:          # 工作成效页背景由加分项单独评
+            continue
+        slide = _page_by_key(prs, key)
+        if slide is None:
+            return False
+        kind, value = _slide_bg(slide)
+        if kind != "srgb" or (value or "").upper() != expect:
+            return False
+    for key in PAGE_KEYS[1:9]:
+        shapes = list(_page_by_key(prs, key).shapes)
+        title = _find_geom(shapes, x=1.8, y=1.1, w=21.3, h=1.1)
+        if title is not None and _paragraphs(title):
+            if _run_color(_first_run(_paragraphs(title)[0])) != TITLE_COLOR:
+                return False
+        line = _find_geom(shapes, x=1.8, y=2.6, w=2.9)
+        if line is not None and _line_srgb(line) != LINE_TEAL:
+            return False
+    for key in PAGE_KEYS[0:9]:
+        line = _find_geom(list(_page_by_key(prs, key).shapes), x=27.1, y=18.1, w=4.8)
+        if line is not None and _line_srgb(line) != LINE_LIGHT:
+            return False
+    return True
+
+
+def _check_pictures(prs):
+    """−3：封面、协作关系、核心品类、团队协作、感谢聆听 5 页各 1 张图片且位置尺寸不变。"""
+    for idx, x, y, w, h in PIC_SPEC:
+        slide = _page_by_key(prs, PAGE_KEYS[idx])
+        if slide is None:
+            return False
+        pics = _pictures(slide)
+        # 新增的图表/贴图不计入张数，只认原图是否仍在原位（与感谢聆听页口径一致）
+        if not any(_geom_ok(p, x, y, w, h) for p in pics):
+            return False
+    return True
+
+
+def _check_theme_and_fonts(prs, parts):
+    """−5：主题 majorFont/minorFont 的 latin 为微软雅黑、ea 为空；单 master 单 layout；全篇正文微软雅黑。"""
+    fonts = _theme_fonts(parts)
+    if not fonts:
+        return False
+    for tag in ("majorFont", "minorFont"):
+        latin, ea = fonts.get(tag, (None, None))
+        if not _is_yahei(latin) or (ea or "").strip():
+            return False
+    masters = [n for n in parts if re.match(r"ppt/slideMasters/slideMaster\d+\.xml$", n)]
+    layouts = [n for n in parts if re.match(r"ppt/slideLayouts/slideLayout\d+\.xml$", n)]
+    if len(masters) != 1 or len(layouts) != 1:
+        return False
+    for slide in prs.slides:
+        for shape in _iter_shapes(slide.shapes):
+            for para in _paragraphs(shape):
+                for run in para.runs:
+                    r_pr = _r_pr(run)
+                    for tag in ("latin", "ea"):
+                        name = _typeface(r_pr, tag)
+                        if name and not _is_yahei(name):
+                            return False
+    return True
+
+
+def _check_no_animation(parts):
+    """−1：全篇无动画、无页面切换效果。"""
+    for name, xml in parts.items():
+        if not re.match(r"ppt/slides/slide\d+\.xml$", name):
+            continue
+        if "<p:transition" in xml or "<mc:AlternateContent" in xml and "transition" in xml:
+            return False
+        if "<p:childTnLst" in xml:
+            return False
+    return True
+
+
+def _check_no_annotations(prs, parts):
+    """−3：无标注图形／批注／荧光笔标记，也无"已改""待确认"等临时文字。"""
+    for name in parts:
+        low = name.lower()
+        if "comment" in low or "ink" in low.replace("linked", ""):
+            return False
+    for slide in prs.slides:
+        if "<a:highlight" in slide._element.xml:
+            return False
+        for shape in _iter_shapes(slide.shapes):
+            text = _norm(_text_of(shape))
+            if any(key in text for key in TEMP_TEXT_KEYS):
+                return False
+            geom = _prst_geom(shape)
+            if geom in ANNOT_GEOMS:
+                return False
+            if geom == "ellipse" and _is_no_fill(shape) and _has_visible_line(shape):
+                return False
+    return True
+
+
+def _check_no_empty_objects(prs):
+    """−1：除封面页既有的空文本框外，无空占位符、空文本框及无填充无线条的多余对象。"""
+    for idx, slide in enumerate(prs.slides):
+        for shape in _iter_shapes(slide.shapes):
+            if shape.shape_type in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.CHART,
+                                    MSO_SHAPE_TYPE.TABLE, MSO_SHAPE_TYPE.GROUP):
+                continue
+            text = _text_of(shape)
+            if "单击此处" in text or "click to add" in text.lower():
+                return False
+            if _norm(text):
+                continue
+            if shape.is_placeholder:
+                return False
+            if idx == 0 and _geom_ok(shape, *COVER_EMPTY_BOX):
+                continue
+            # 空对象：面积可见（长宽均成形）且无填充、无线条、无阴影 → 多余对象
+            if _cm(shape.height) < 0.3 or _cm(shape.width) < 0.3:
+                continue        # 装饰短线（高度为 0）等，起装饰作用
+            if _is_no_fill(shape) and not _has_visible_line(shape) and not _has_shadow(shape):
+                return False
+    return True
+
+
+def _check_no_extra_text(prs):
+    """−1：无新增说明性文字、水印、页码、Logo。"""
+    for slide in prs.slides:
+        if 'type="slidenum"' in slide._element.xml:
+            return False
+        for shape in _iter_shapes(slide.shapes):
+            text = _text_of(shape)
+            if any(key in text for key in EXTRA_TEXT_KEYS):
+                return False
+    return True
+
+
+def _work_objects(slide):
+    """工作成效页 4 张卡片的 12 个对象：4 个卡底 + 4 个小标题 + 4 段正文（按文字认）。"""
+    shapes = list(slide.shapes)
+    out = _work_cards(slide)
+    if len(out) != 4:
+        return []
+    for title_text, body_text in WORK_SPEC["groups"]:
+        for text in (title_text, body_text):
+            shape = _find_exact(shapes, text)
+            if shape is None:
+                return []
+            out.append(shape)
+    return out
+
+
+def _check_work_rotation(slide):
+    """+3：4 张卡片的卡底、小标题、正文共 12 个对象旋转角全部为 0°。"""
+    objects = _work_objects(slide)
+    if len(objects) != 12:
+        return False
+    return all(_le(_rot(shape), 0.01) for shape in objects)
+
+
+def _check_work_pic_rotation(slide):
+    """+1：右侧图片旋转角为 0°。"""
+    pics = _pictures(slide)
+    return len(pics) == 1 and _le(_rot(pics[0]), 0.01)
+
+
+def _check_work_align(slide):
+    """+3：左右两列卡底左边缘对齐、上下两行卡底顶端对齐，同列/同行偏差 ≤0.1 cm。"""
+    cards = _work_cards(slide)
+    if len(cards) != 4:
+        return False
+    lefts = sorted(_cm(c.left) for c in cards)
+    tops = sorted(_cm(c.top) for c in cards)
+    for pairs in (lefts, tops):
+        if not _le(pairs[1] - pairs[0], 0.1) or not _le(pairs[3] - pairs[2], 0.1):
+            return False
+    if _le(lefts[2] - lefts[1], 0.1) or _le(tops[2] - tops[1], 0.1):
+        return False        # 两列/两行须真正分开，避免 4 张挤成一列被判"对齐"
+    return True
+
+
+def _check_work_bg_range(slide):
+    """+3：背景为浅青白，色值落在 EAF8F9–F6FBFC 区间。"""
+    kind, value = _slide_bg(slide)
+    return kind == "srgb" and _hex_in_range(value, BG_WORK_LO, BG_WORK_HI)
+
+
+def _check_work_bg_pure(slide):
+    """+1：背景为 srgbClr 纯色填充（非渐变、非图片、非主题色变体）。"""
+    kind, _value = _slide_bg(slide)
+    return kind == "srgb"
+
+
+def _check_work_picture(slide):
+    """−3：本页 1 张图片，画面完整、未被裁剪或替换，宽高比失真 ≤2%。"""
+    pics = _pictures(slide)
+    if len(pics) != 1:
+        return False
+    pic = pics[0]
+    if _pic_cropped(pic):
+        return False
+    dist = _pic_distortion(pic)
+    return dist is None or dist <= 0.02
+
+
+def _check_work_no_overlap(slide):
+    """−1：所有对象完整落在页面内，卡片之间、图片与卡片之间无重叠。"""
+    cards = _work_cards(slide)
+    pics = _pictures(slide)
+    for shape in _iter_shapes(slide.shapes):
+        if not _inside_page(shape):
+            return False
+    boxes = [_rect(s) for s in cards + pics]
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if _overlap(boxes[i], boxes[j]):
+                return False
+    return True
+
+
+def _opt_body(slide):
+    """问题复盘页右卡"优化动作"下方的正文文本框：按含"检查表"一句定位。"""
+    shapes = list(slide.shapes)
+    header = _find_exact(shapes, "优化动作")
+    cands = _find_all_contains(shapes, REVIEW_SPEC["opt_lines"][0])
+    if not cands:
+        return None
+    if header is not None:
+        cands = [c for c in cands if _cm(c.top) >= _cm(header.top) - 0.5] or cands
+    return cands[0]
+
+
+def _check_opt_dup(slide):
+    """+3："将敏感表达改为场景化、说明式表达"只出现 1 次（整页统计）。"""
+    key = _plain(REVIEW_SPEC["opt_dup"])
+    hits = 0
+    for shape in _iter_shapes(slide.shapes):
+        for para in _paragraphs(shape):
+            hits += _plain(para.text).count(key)
+    return hits == 1
+
+
+def _check_opt_paras(slide):
+    """+1：优化动作正文无空段落，共 3 段且顺序正确。"""
+    body = _opt_body(slide)
+    if body is None:
+        return False
+    paras = _paragraphs(body)
+    if any(not _norm(p.text) for p in paras):
+        return False
+    return [_plain(p.text) for p in paras] == [_plain(x) for x in REVIEW_SPEC["opt_lines"]]
+
+
+def _check_opt_format(slide, theme_latin, theme_ea):
+    """+1：优化动作 3 段格式一致：行距 200%、16pt、203942、中英文微软雅黑、前缀"• "。"""
+    body = _opt_body(slide)
+    if body is None:
+        return False
+    paras = [p for p in _paragraphs(body) if _norm(p.text)]
+    if len(paras) != 3:
+        return False
+    for para in paras:
+        if not _norm(para.text).startswith("•"):
+            return False
+        if not _near(_line_spacing_pct(body, para) or 0, 200.0, 1.0):
+            return False
+        for run in para.runs:
+            if not _near(_run_size_pt(run) or 0, 16.0, 0.1):
+                return False
+            if _run_color(run) != "203942":
+                return False
+            latin = _resolve_effective_ascii(body, para, run, theme_latin)
+            ea = _resolve_effective_eastasia(body, para, run, theme_ea)
+            if not _is_yahei(latin) or not _is_yahei(ea):
+                return False
+    return True
+
+
+def _bansu_title(slide):
+    """第三卡（卡底左边缘 21.4、宽 8.3）内的"排班岗"标题；不在卡内则不算。"""
+    shapes = list(slide.shapes)
+    card = _find_geom(shapes, x=DUTY_SPEC["cards"][2], y=DUTY_SPEC["card_top"],
+                      w=DUTY_SPEC["card_size"][0], h=DUTY_SPEC["card_size"][1])
+    if card is None:
+        return None
+    cx1, cx2 = _cm(card.left), _cm(card.left) + _cm(card.width)
+    cy1, cy2 = _cm(card.top), _cm(card.top) + _cm(card.height)
+    for shape in _bansu_shapes(slide):
+        x1, y1 = _cm(shape.left), _cm(shape.top)
+        if cx1 - TOL <= x1 <= cx2 + TOL and cy1 - TOL <= y1 <= cy2 + TOL:
+            return shape
+    return None
+
+
+def _check_bansu_title(slide):
+    """+3：第三张卡片内有标题"排班岗"，文字准确、无错字、无多余字符。"""
+    title = _bansu_title(slide)
+    if title is None:
+        return False
+    return [_norm(p.text) for p in _paragraphs(title) if _norm(p.text)] == ["排班岗"]
+
+
+def _check_bansu_format(slide, theme_latin, theme_ea):
+    """+1：24pt、加粗、0F5963、中英文均为微软雅黑（只设 latin 不得分）。"""
+    title = _bansu_title(slide)
+    if title is None:
+        return False
+    paras = [p for p in _paragraphs(title) if _norm(p.text)]
+    if not paras:
+        return False
+    for para in paras:
+        for run in para.runs:
+            if not _near(_run_size_pt(run) or 0, 24.0, 0.1) or not _run_bold(run):
+                return False
+            if _run_color(run) != "0F5963":
+                return False
+            latin = _resolve_effective_ascii(title, para, run, theme_latin)
+            ea = _resolve_effective_eastasia(title, para, run, theme_ea)
+            if not _is_yahei(latin) or not _is_yahei(ea):
+                return False
+    return True
+
+
+def _check_bansu_baseline(slide):
+    """+1：与前两卡标题同一基准：顶端偏差 ≤0.3 cm、卡内左偏移与前两卡均值差 ≤0.3 cm、未超卡片边界。"""
+    title = _bansu_title(slide)
+    if title is None:
+        return False
+    tops, offset_avg = _duty_title_baseline(slide)
+    if not tops or offset_avg is None:
+        return False
+    if not all(_le(_cm(title.top) - t, TOL) for t in tops):
+        return False
+    card = _find_geom(list(slide.shapes), x=DUTY_SPEC["cards"][2], y=DUTY_SPEC["card_top"],
+                      w=DUTY_SPEC["card_size"][0], h=DUTY_SPEC["card_size"][1])
+    if card is None:
+        return False
+    if not _le((_cm(title.left) - _cm(card.left)) - offset_avg, TOL):
+        return False
+    right = _cm(title.left) + _cm(title.width)
+    return right <= _cm(card.left) + _cm(card.width) + TOL
+
+
+def _check_bansu_box(slide):
+    """−1："排班岗"文本框无边框、无填充、无阴影，单行不折行，且不与第三卡正文重叠、不溢出卡片。"""
+    title = _bansu_title(slide)
+    if title is None:
+        return True             # 标题不存在属加分项 0 分，本条不重复扣
+    if not _is_no_fill(title) or _has_visible_line(title) or _has_shadow(title):
+        return False
+    if len([p for p in _paragraphs(title) if _norm(p.text)]) != 1:
+        return False
+    body3 = _find_lines(list(slide.shapes), DUTY_SPEC["b3"])
+    if body3 is not None and _overlap(_rect(title), _rect(body3)):
+        return False
+    card = _find_geom(list(slide.shapes), x=DUTY_SPEC["cards"][2], y=DUTY_SPEC["card_top"],
+                      w=DUTY_SPEC["card_size"][0], h=DUTY_SPEC["card_size"][1])
+    if card is None:
+        return False
+    x1, y1 = _cm(title.left), _cm(title.top)
+    x2, y2 = x1 + _cm(title.width), y1 + _cm(title.height)
+    cx1, cy1 = _cm(card.left), _cm(card.top)
+    cx2, cy2 = cx1 + _cm(card.width), cy1 + _cm(card.height)
+    return (x1 >= cx1 - TOL and y1 >= cy1 - TOL
+            and x2 <= cx2 + TOL and y2 <= cy2 + TOL)
+
+
+# ============================================================
+# 维度一：可用性 / 可修改性（门槛项，不计分）
+#   点1：交付物是可正常打开的 .pptx（非 .ppt/.pdf/图片/压缩包，未加密只读，包结构完整）
+#   点2：无“PowerPoint 已修复”迹象；若含图表对象，图表部件与关系完整、可正常显示
+#   点3：页面尺寸为 33.87×19.05 cm（16:9）
+#   任一条不满足 → 完成度直接判 0 分
+# ============================================================
+
+
+def check_dimension_one(prs, pptx_path):
+    issues = []
+
+    # 点1：扩展名与包结构
+    if not pptx_path.lower().endswith(".pptx"):
+        issues.append("交付物不是 .pptx 文件: %s" % os.path.basename(pptx_path))
+    try:
+        with zipfile.ZipFile(pptx_path) as z:
+            names = z.namelist()
+            if "ppt/presentation.xml" not in names:
+                issues.append("包内缺少 ppt/presentation.xml，文件可能已损坏")
+            bad = z.testzip()
+            if bad:
+                issues.append("包内文件损坏: %s" % bad)
+            if not [n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)]:
+                issues.append("包内没有任何幻灯片，无法评估")
+    except Exception as e:
+        issues.append("文件无法作为 .pptx 包读取（可能损坏或加密）: %s" % e)
+
+    # 点1：文件系统只读属性
+    try:
+        if os.path.exists(pptx_path) and not os.access(pptx_path, os.W_OK):
+            issues.append("文件为只读，无法修改")
+    except Exception:
+        pass
+
+    # 点2：图表对象完整可显示（图表部件存在、关系可解析、XML 可读）
+    try:
+        for slide in prs.slides:
+            for shape in _iter_shapes(slide.shapes):
+                if not getattr(shape, "has_chart", False):
+                    continue
+                if not _chart_xml(shape):
+                    issues.append("存在无法读取的图表对象（可能链接已断开）")
+    except Exception as e:
+        issues.append("幻灯片内容无法解析（文件可能需要修复）: %s" % e)
+
+    # 点3：页面尺寸 33.87×19.05 cm
+    try:
+        w, h = _cm(prs.slide_width), _cm(prs.slide_height)
+        if not _near(w, PAGE_W_CM) or not _near(h, PAGE_H_CM):
+            issues.append("页面尺寸为 %.2f×%.2f cm，不是 33.87×19.05 cm" % (w, h))
+    except Exception:
+        issues.append("无法读取页面尺寸")
+
+    return (len(issues) == 0), issues
+
+
+# ============================================================
+# 维度二：完成度
+# ============================================================
+
+
+class Evaluator(object):
+    """逐条比对评分细则；加分项满足记满分，减分项不满足记扣分。"""
+
+    def __init__(self, prs, pptx_path):
+        self.prs = prs
+        self.path = pptx_path
+        self.parts = _read_parts(pptx_path)
+        theme = _theme_fonts(self.parts)
+        self.theme_latin, self.theme_ea = theme.get("minorFont", (None, None))
+        self.chart_idx, self.chart = _find_chart_shape(prs)
+        self.chart_xml = _chart_xml(self.chart) if self.chart is not None else ""
+        self.chart_sers = _chart_sers(self.chart_xml) if self.chart_xml else []
+        # 原生平滑曲线图：既是真正的 PPT 图表对象，线条又是平滑曲线。
+        # 该项不成立 → 图表相关的 7 条一律 0 分（质量项挂在核心项之下）。
+        self.chart_native = (bool(self.chart_sers) and "<c:lineChart" in self.chart_xml
+                             and _chart_smooth(self.chart_xml))
+        self.hits = []
+        self.details = {}
+
+    # --------------------------------------------------------
+    # 通用工具
+    # --------------------------------------------------------
+    def page(self, idx):
+        """按页内关键字取页；取不到返回 None（页数/页序问题由对应减分项单独扣）。"""
+        return _page_by_key(self.prs, PAGE_KEYS[idx])
+
+    def rep(self, label, max_delta, ok, detail=""):
+        """记录一条检查项：加分项达标记满分；减分项不达标记扣分（负值）"""
+        if max_delta >= 0:
+            self.hits.append((label, max_delta if ok else 0))
+        else:
+            self.hits.append((label, 0 if ok else max_delta))
+        self.details[label] = detail
+
+    def guard(self, label, max_delta, precondition, ok, detail=""):
+        """质量项：核心项不成立则整项记 0，不做二次判定。"""
+        self.rep(label, max_delta, bool(precondition) and bool(ok),
+                 detail if precondition else "前置核心项不成立，本项记 0")
+
+    # --------------------------------------------------------
+    # 逐条检查（顺序与评分细则一致：先 22 条加分项，再 21 条减分项）
+    # --------------------------------------------------------
+    def check_all(self):
+        self.eval_chart_native()
+        self.eval_chart_two_series()
+        self.eval_chart_values()
+        self.eval_chart_categories()
+        self.eval_chart_legend()
+        self.eval_chart_on_thanks()
+        self.eval_chart_placement()
+        self.eval_bansu_title()
+        self.eval_bansu_format()
+        self.eval_bansu_baseline()
+        self.eval_work_rotation()
+        self.eval_work_pic_rotation()
+        self.eval_work_align()
+        self.eval_work_bg_range()
+        self.eval_work_bg_pure()
+        self.eval_opt_dup()
+        self.eval_opt_paras()
+        self.eval_opt_format()
+        self.eval_plan_mid_removed()
+        self.eval_plan_line_removed()
+        self.eval_plan_long_body()
+        self.eval_plan_long_format()
+        self.eval_page_order()
+        self.eval_five_pages_intact()
+        self.eval_team_keep_body()
+        self.eval_theme_master()
+        self.eval_backgrounds()
+        self.eval_no_annotations()
+        self.eval_duty_page()
+        self.eval_bansu_box()
+        self.eval_work_cards()
+        self.eval_work_picture()
+        self.eval_work_no_overlap()
+        self.eval_review_layout()
+        self.eval_review_left()
+        self.eval_plan_cards()
+        self.eval_plan_bg()
+        self.eval_thanks_page()
+        self.eval_titles_and_lines()
+        self.eval_pictures()
+        self.eval_no_empty_objects()
+        self.eval_no_animation()
+        self.eval_no_extra_text()
+
+    # --------------------------------------------------------
+    # 分值：+5
+    # 规则原文：文件末尾有原生可编辑的平滑曲线图（真正的 PPT 图表对象 + 平滑曲线）
+    # 定位口径：全篇的 p:graphicFrame/c:chart 图表部件
+    # 两个条件都满足 → +5；缺任何一个 → 图表相关 7 条一律 0 分
+    # --------------------------------------------------------
+    def eval_chart_native(self):
+        LABEL = "文件末尾有原生可编辑的平滑曲线图"
+        self.rep(LABEL, 5, self.chart_native,
+                 "图表对象 %s，平滑曲线 %s"
+                 % ("有" if self.chart is not None else "无",
+                    "是" if self.chart_native else "否"))
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：图表含"营收数值"与"盈利比值"两个系列，两条线都清晰可见
+    # 定位口径：c:ser 的系列名与数值；次坐标轴看 c:axId 是否分两组
+    # 全部满足 → +3；被压成贴底直线 → 0
+    # --------------------------------------------------------
+    def eval_chart_two_series(self):
+        LABEL = "图表含营收数值与盈利比值两个系列且两条线都清晰可见"
+        ok, detail = False, "图表非原生平滑曲线图"
+        if self.chart_native:
+            sers = self.chart_sers
+            names = [n for n, _v in sers]
+            named = all(any(k in n for k in CHART_SER_NAMES) for n in names)
+            peaks = [max([abs(x) for x in v] or [0.0]) for _n, v in sers]
+            visible = (_chart_has_secondary_axis(self.chart_xml)
+                       or (min(peaks) > 0 and max(peaks) / min(peaks) <= 10.0))
+            ok = len(sers) == 2 and named and visible
+            detail = "系列 %s，次坐标轴 %s" % (names, "有" if
+                                              _chart_has_secondary_axis(self.chart_xml) else "无")
+        self.guard(LABEL, 3, self.chart_native, ok, detail)
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：营收 68000/352000/486000/423000/579000（或等值 6.8/35.2/48.6/42.3/57.9 万），
+    #          盈利比值 1.42/1.56/1.71/1.63/1.85，无错值、无漏点、无多余点
+    # 定位口径：按系列名取 c:val 数值
+    # 全部满足 → +3；否则 0
+    # --------------------------------------------------------
+    def eval_chart_values(self):
+        LABEL = "图表数据为指定的营收数值与盈利比值，无错值漏点多余点"
+        ok, detail = False, "图表非原生平滑曲线图"
+        if self.chart_native:
+            got = {}
+            for name, vals in self.chart_sers:
+                key = "rev" if CHART_SER_NAMES[0] in name else (
+                    "ratio" if CHART_SER_NAMES[1] in name else name)
+                got[key] = vals
+            rev, ratio = got.get("rev", []), got.get("ratio", [])
+            ok = ((_values_match(rev, CHART_REVENUE) or _values_match(rev, CHART_REVENUE_ALT))
+                  and _values_match(ratio, CHART_RATIO))
+            detail = "营收 %s，盈利比值 %s" % (rev, ratio)
+        self.guard(LABEL, 3, self.chart_native, ok, detail)
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：横轴为 1月–5月共 5 个类别且顺序正确
+    # 定位口径：c:cat 内的类别文字
+    # --------------------------------------------------------
+    def eval_chart_categories(self):
+        LABEL = "图表横轴为1月至5月共5个类别且顺序正确"
+        cats = _chart_cats(self.chart_xml) if self.chart_native else []
+        ok = cats == CHART_CATS
+        self.guard(LABEL, 1, self.chart_native, ok,
+                   "类别 %s" % (cats or "无"))
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：有图例或系列标识可区分两条线；双轴时两侧刻度能对应到各自系列
+    # 定位口径：c:legend 与 c:ser/c:tx；双轴看 c:valAx 是否两个
+    # --------------------------------------------------------
+    def eval_chart_legend(self):
+        LABEL = "图表有图例或系列标识可区分两条线且双轴刻度对应各自系列"
+        ok, detail = False, "图表非原生平滑曲线图"
+        if self.chart_native:
+            legend = "<c:legend>" in self.chart_xml
+            named = all(n for n, _v in self.chart_sers)
+            val_ax = len(re.findall(r"<c:valAx>", self.chart_xml))
+            dual = _chart_has_secondary_axis(self.chart_xml)
+            ok = (legend or named) and (not dual or val_ax >= 2)
+            detail = "图例 %s，系列名 %s，valAx %d" % ("有" if legend else "无",
+                                                     "全有" if named else "缺", val_ax)
+        self.guard(LABEL, 1, self.chart_native, ok, detail)
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：图表落在"感谢聆听"页上（单独占一页或落在其他页面 → 0 分）
+    # 定位口径：图表所在页是否含"感谢聆听"
+    # --------------------------------------------------------
+    def eval_chart_on_thanks(self):
+        LABEL = "图表落在感谢聆听页上"
+        ok = self.chart_native and _check_chart_on_thanks(self.prs, self.chart)
+        self.guard(LABEL, 1, self.chart_native, ok,
+                   "图表所在页索引 %d" % self.chart_idx)
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：图表完整落在页面内，宽高比正常无拉伸变形，且不遮挡该页四处文字
+    # 定位口径：图表外框与该页文字框的相交判定
+    # --------------------------------------------------------
+    def eval_chart_placement(self):
+        LABEL = "图表完整落在页面内且不遮挡感谢聆听页文字"
+        ok = self.chart_native and _check_chart_geometry(self.prs, self.chart)
+        self.guard(LABEL, 1, self.chart_native, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：岗位职责页第三张卡片（卡底左边缘 21.4 cm、宽 8.3 cm）内有标题"排班岗"
+    # 定位口径：第三张卡底范围内、文字为"排班岗"的对象
+    # --------------------------------------------------------
+    def eval_bansu_title(self):
+        LABEL = "岗位职责页第三张卡片内有标题排班岗且文字准确"
+        slide = self.page(1)
+        ok = slide is not None and _check_bansu_title(slide)
+        self.rep(LABEL, 3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文："排班岗"标题 24pt、加粗、0F5963、中英文字体均为微软雅黑
+    # 定位口径：run 级 sz/b/solidFill 与 latin/ea 字体（只设 latin 不得分）
+    # 仅在标题存在时评分
+    # --------------------------------------------------------
+    def eval_bansu_format(self):
+        LABEL = "排班岗标题格式与同页前两卡标题一致"
+        slide = self.page(1)
+        exists = slide is not None and _bansu_title(slide) is not None
+        ok = exists and _check_bansu_format(slide, self.theme_latin, self.theme_ea)
+        self.guard(LABEL, 1, exists, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文："排班岗"标题与前两卡标题同一基准（顶端 ≤0.3 cm、卡内左偏移与均值差 ≤0.3 cm）
+    # 定位口径：标题顶端与"标题左边缘−卡底左边缘"偏移
+    # 仅在标题存在时评分
+    # --------------------------------------------------------
+    def eval_bansu_baseline(self):
+        LABEL = "排班岗标题与前两卡标题同一基准且未超出卡片"
+        slide = self.page(1)
+        exists = slide is not None and _bansu_title(slide) is not None
+        ok = exists and _check_bansu_baseline(slide)
+        self.guard(LABEL, 1, exists, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：工作成效页 4 张卡片的卡底、小标题、正文共 12 个对象旋转角全部为 0°
+    # 定位口径：a:xfrm@rot（任意一个带旋转即不得分）
+    # --------------------------------------------------------
+    def eval_work_rotation(self):
+        LABEL = "工作成效页4张卡片12个对象旋转角全部为0度"
+        slide = self.page(4)
+        ok = slide is not None and _check_work_rotation(slide)
+        self.rep(LABEL, 3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：工作成效页右侧图片旋转角为 0°
+    # --------------------------------------------------------
+    def eval_work_pic_rotation(self):
+        LABEL = "工作成效页右侧图片旋转角为0度"
+        slide = self.page(4)
+        ok = slide is not None and _check_work_pic_rotation(slide)
+        self.rep(LABEL, 1, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：4 张卡片排列整齐，左右两列卡底左边缘对齐、上下两行卡底顶端对齐，偏差 ≤0.1 cm
+    # 定位口径：旋转已归零的前提下量 a:off（旋转不改变坐标）
+    # 仅在 12 个对象旋转已归零时评分
+    # --------------------------------------------------------
+    def eval_work_align(self):
+        LABEL = "工作成效页4张卡片两列两行对齐偏差不超过0.1厘米"
+        slide = self.page(4)
+        zeroed = slide is not None and _check_work_rotation(slide)
+        ok = zeroed and _check_work_align(slide)
+        self.guard(LABEL, 3, zeroed, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：工作成效页背景为浅青白，色值落在 EAF8F9–F6FBFC 区间
+    # 定位口径：p:cSld/p:bg 的纯色色值
+    # --------------------------------------------------------
+    def eval_work_bg_range(self):
+        LABEL = "工作成效页背景为浅青白且色值在EAF8F9至F6FBFC区间"
+        slide = self.page(4)
+        ok = slide is not None and _check_work_bg_range(slide)
+        kind, value = _slide_bg(slide) if slide is not None else (None, None)
+        self.rep(LABEL, 3, ok, "背景 %s %s" % (kind, value))
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：工作成效页背景为 srgbClr 纯色填充（非渐变、非图片、非主题色变体）
+    # 仅在背景为浅青白时评分
+    # --------------------------------------------------------
+    def eval_work_bg_pure(self):
+        LABEL = "工作成效页背景为srgbClr纯色填充"
+        slide = self.page(4)
+        in_range = slide is not None and _check_work_bg_range(slide)
+        ok = in_range and _check_work_bg_pure(slide)
+        self.guard(LABEL, 1, in_range, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：问题复盘页右卡"优化动作"下方正文中，
+    #          "将敏感表达改为场景化、说明式表达"只出现 1 次
+    # 定位口径：整页段落文字中该句出现次数
+    # --------------------------------------------------------
+    def eval_opt_dup(self):
+        LABEL = "优化动作正文中重复句只出现1次"
+        slide = self.page(5)
+        ok = slide is not None and _check_opt_dup(slide)
+        self.rep(LABEL, 3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文："优化动作"正文无空段落/空行，共 3 段且顺序为检查表／场景化表达／小结同步
+    # 仅在该句只出现 1 次时评分
+    # --------------------------------------------------------
+    def eval_opt_paras(self):
+        LABEL = "优化动作正文无空段落且3段顺序正确"
+        slide = self.page(5)
+        dedup = slide is not None and _check_opt_dup(slide)
+        ok = dedup and _check_opt_paras(slide)
+        self.guard(LABEL, 1, dedup, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文："优化动作"3 段格式一致：行距 200%、16pt、203942、中英文微软雅黑、前缀"• "
+    # 仅在该句只出现 1 次时评分
+    # --------------------------------------------------------
+    def eval_opt_format(self):
+        LABEL = "优化动作3段格式一致行距200%且16pt微软雅黑"
+        slide = self.page(5)
+        dedup = slide is not None and _check_opt_dup(slide)
+        ok = dedup and _check_opt_format(slide, self.theme_latin, self.theme_ea)
+        self.guard(LABEL, 1, dedup, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文：后续规划页只剩 2 张卡（近期、长期）：无"中期"标题与其 3 行正文，无残留空卡底
+    # --------------------------------------------------------
+    def eval_plan_mid_removed(self):
+        LABEL = "后续规划页只剩近期长期2张卡且无残留空卡底"
+        slide = self.page(8)
+        ok = slide is not None and _check_plan_mid_removed(slide)
+        self.rep(LABEL, 3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+1
+    # 规则原文：后续规划页不存在句子"稳住基本盘，再把经验变成流程。"，也没留下空文本框
+    # --------------------------------------------------------
+    def eval_plan_line_removed(self):
+        LABEL = "后续规划页不存在稳住基本盘一句且无空文本框残留"
+        slide = self.page(8)
+        ok = slide is not None and _check_plan_line_removed(slide)
+        self.rep(LABEL, 1, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文："长期"卡正文为 3 个独立段落：搭建标准化复盘范式／强化岗位协同配合效能／
+    #          赋能团队稳步长效发展；文字准确无错字、无漏行（行尾多余空格不扣）
+    # --------------------------------------------------------
+    def eval_plan_long_body(self):
+        LABEL = "长期卡正文为3个独立段落且文字准确"
+        slide = self.page(8)
+        ok = slide is not None and _plan_long_body(slide) is not None
+        self.rep(LABEL, 3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：+3
+    # 规则原文："长期"卡正文 16pt、行距 150%、203942、中英文微软雅黑、文本框 7.2×4.5 cm，
+    #          对齐方式与"近期"卡正文一致（左右位置不查）
+    # 仅在"长期"三行已为上述新内容时评分
+    # --------------------------------------------------------
+    def eval_plan_long_format(self):
+        LABEL = "长期卡正文格式为16pt行距150%且文本框7.2乘4.5厘米"
+        slide = self.page(8)
+        renewed = slide is not None and _plan_long_body(slide) is not None
+        ok = renewed and _check_plan_long_format(slide, self.theme_latin, self.theme_ea)
+        self.guard(LABEL, 3, renewed, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−5
+    # 规则原文：文件为 10 页，页面顺序为封面／岗位职责／协作关系／核心品类／工作成效／
+    #          问题复盘／能力成长／团队协作／后续规划／感谢聆听页
+    # 页数不是 10 页（含为放图表另起一页）或页序不符 → −5
+    # --------------------------------------------------------
+    def eval_page_order(self):
+        LABEL = "文件为10页且页面顺序正确"
+        ok = _check_page_order(self.prs)
+        self.rep(LABEL, -5, ok, "共 %d 页" % len(list(self.prs.slides)))
+
+    # --------------------------------------------------------
+    # 分值：−5
+    # 规则原文：封面、协作关系、核心品类、能力成长、团队协作 5 页须为原状（对象个数、
+    #          文字内容、位置尺寸），任一项不符即 −5
+    # --------------------------------------------------------
+    def eval_five_pages_intact(self):
+        LABEL = "封面协作关系核心品类能力成长团队协作5页保持原状"
+        pairs = ((0, _check_cover), (2, _check_collab), (3, _check_category),
+                 (6, _check_growth), (7, _check_team))
+        bad = []
+        for idx, fn in pairs:
+            slide = self.page(idx)
+            if slide is None or not fn(slide):
+                bad.append(PAGE_KEYS[idx])
+        self.rep(LABEL, -5, not bad, "不符页：%s" % (bad or "无"))
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：团队协作页"重复沉淀"卡内正文在 (16.5, 9.4)、14.1×1.6，为 2 段，
+    #          逐字为两句"…；…"重复写法（须原样保留）
+    # --------------------------------------------------------
+    def eval_team_keep_body(self):
+        LABEL = "团队协作页重复沉淀卡内两句重复写法原样保留"
+        slide = self.page(7)
+        ok = slide is not None and _check_team_keep_body(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−5
+    # 规则原文：主题 majorFont/minorFont 的 latin 均为 Microsoft YaHei、ea 均为空；
+    #          只有 1 个 slideMaster、1 个 slideLayout；全篇正文字体为微软雅黑
+    # --------------------------------------------------------
+    def eval_theme_master(self):
+        LABEL = "主题字体与母版版式保持原状且全篇正文为微软雅黑"
+        ok = _check_theme_and_fonts(self.prs, self.parts)
+        self.rep(LABEL, -5, ok, "主题 %s" % (_theme_fonts(self.parts) or "无"))
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：各页背景为纯色且色值依次为规定值；页面标题色 17323A、
+    #          标题下装饰短线色 29A7A5、右下角装饰横线色 B9E1E4
+    # --------------------------------------------------------
+    def eval_backgrounds(self):
+        LABEL = "各页背景色与标题装饰线色值保持原状"
+        ok = _check_backgrounds(self.prs)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：文件中不存在红圈/黄圈/箭头等标注图形、批注、荧光笔标记，
+    #          以及"已改""待确认"等临时文字
+    # --------------------------------------------------------
+    def eval_no_annotations(self):
+        LABEL = "无标注图形批注荧光笔标记及临时文字"
+        ok = _check_no_annotations(self.prs, self.parts)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：岗位职责页除"排班岗"标题外为 15 个对象，三张卡底、两个箭头、副标题、
+    #          底部标语、卡 1/卡 2 标题与正文、第三卡正文逐字均须在位
+    # --------------------------------------------------------
+    def eval_duty_page(self):
+        LABEL = "岗位职责页除排班岗外15个对象及其位置尺寸不变"
+        slide = self.page(1)
+        ok = slide is not None and _check_duty(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−1
+    # 规则原文："排班岗"文本框无边框、无填充、无阴影，文字单行不折行，
+    #          且与第三卡正文不重叠、不遮挡正文、不溢出卡片边界
+    # --------------------------------------------------------
+    def eval_bansu_box(self):
+        LABEL = "排班岗文本框无边框填充阴影且不折行不重叠不溢出"
+        slide = self.page(1)
+        ok = slide is None or _check_bansu_box(slide)
+        self.rep(LABEL, -1, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：工作成效页 4 张卡片各由卡底 7.0×3.4 + 小标题（14pt、0F5963）+
+    #          正文（11.2pt、203942）三件组成，四组文字不变；卡底圆角、F9FEFE、带阴影；
+    #          4 张卡"标题相对卡底""正文相对卡底"的偏移量彼此偏差 ≤0.3 cm
+    # --------------------------------------------------------
+    def eval_work_cards(self):
+        LABEL = "工作成效页4张卡片三件套构成文字与卡内偏移不变"
+        slide = self.page(4)
+        ok = slide is not None and _check_work_cards(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：工作成效页有 1 张图片，画面完整、未被裁剪或替换，宽高比失真不超过 2%
+    # --------------------------------------------------------
+    def eval_work_picture(self):
+        LABEL = "工作成效页图片完整未裁剪替换且宽高比失真不超过2%"
+        slide = self.page(4)
+        ok = slide is not None and _check_work_picture(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−1
+    # 规则原文：工作成效页所有对象完整落在页面内，卡片之间、图片与卡片之间无重叠
+    # 仅在该页已摆正的情况下适用
+    # --------------------------------------------------------
+    def eval_work_no_overlap(self):
+        LABEL = "工作成效页对象不越界且卡片与图片互不重叠"
+        slide = self.page(4)
+        zeroed = slide is not None and _check_work_rotation(slide)
+        ok = (not zeroed) or _check_work_no_overlap(slide)
+        self.rep(LABEL, -1, ok, "" if zeroed else "该页未摆正，本条不适用")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：问题复盘页有青色三角形 1 个、1.4×1.4、在 (16.2, 7.6)、旋转 90°；
+    #          两张卡底各 12.6×10.3、顶端 3.7、左边缘 2.3/18.9；
+    #          底部标语"把一次问题变成一套流程"（28pt、0F5963）在 (11.0, 15.2)
+    # --------------------------------------------------------
+    def eval_review_layout(self):
+        LABEL = "问题复盘页三角形两张卡底与底部标语在位"
+        slide = self.page(5)
+        ok = slide is not None and _check_review_layout(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：问题复盘页左卡标题"风险表现"（32pt、A85E1C）在 (2.9, 4.2)，
+    #          其下方正文在 (2.9, 5.3)、共 3 段、行距 200%、16pt、203942、前缀"• "
+    # --------------------------------------------------------
+    def eval_review_left(self):
+        LABEL = "问题复盘页左卡风险表现标题与3段正文不变"
+        slide = self.page(5)
+        ok = slide is not None and _check_review_left(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：后续规划页"近期"卡完整（卡底 8.5×6.5、顶端 5.3，标题"近期"，正文 3 段
+    #          16pt、行距 150%、203942）；"长期"卡卡底 8.5×6.5、顶端 5.3、标题"长期"；
+    #          两卡均完整落在页面内（左右位置不查）
+    # --------------------------------------------------------
+    def eval_plan_cards(self):
+        LABEL = "后续规划页近期卡完整且长期卡卡底与标题在位"
+        slide = self.page(8)
+        ok = slide is not None and _check_plan_cards(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：后续规划页通栏背景图在 (0, 2.2)、尺寸 33.9×15.2（允差 ±0.1 cm），画面完整
+    # --------------------------------------------------------
+    def eval_plan_bg(self):
+        LABEL = "后续规划页通栏背景图位置尺寸不变且画面完整"
+        slide = self.page(8)
+        ok = slide is not None and _check_plan_bg(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：感谢聆听页原有 7 个对象齐全且在位（右侧图片、左侧底板、主标题、
+    #          组名、姓名、装饰短线、寄语）；新增的图表及承载对象不计入对象个数
+    # --------------------------------------------------------
+    def eval_thanks_page(self):
+        LABEL = "感谢聆听页原有7个对象齐全且在位"
+        slide = self.page(9)
+        ok = slide is not None and _check_thanks(slide)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：岗位职责页至后续规划页每页有页面标题（24pt、17323A）在 (1.8, 1.1)、21.3×1.1
+    #          及标题下青色短线在 (1.8, 2.6)、长 2.9；封面至后续规划页每页有右下角
+    #          浅色装饰横线在 (27.1, 18.1)、长 4.8
+    # --------------------------------------------------------
+    def eval_titles_and_lines(self):
+        LABEL = "各页页面标题与装饰短线横线齐全且位置不变"
+        ok = _check_titles_and_lines(self.prs)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−3
+    # 规则原文：封面、协作关系、核心品类、团队协作、感谢聆听 5 页各有 1 张图片，
+    #          位置尺寸分别为规定值，任一张缺失或不符即扣分
+    # --------------------------------------------------------
+    def eval_pictures(self):
+        LABEL = "5页配图各1张且位置尺寸不变"
+        ok = _check_pictures(self.prs)
+        self.rep(LABEL, -3, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−1
+    # 规则原文：除封面页 (1.8, 17.9)、14.0×0.5 处的空文本框外，不存在空占位符、
+    #          空文本框，以及无填充、无线条、无文字且不起装饰作用的多余对象
+    # --------------------------------------------------------
+    def eval_no_empty_objects(self):
+        LABEL = "无空占位符空文本框及多余空对象"
+        ok = _check_no_empty_objects(self.prs)
+        self.rep(LABEL, -1, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−1
+    # 规则原文：全篇无动画、无页面切换效果
+    # --------------------------------------------------------
+    def eval_no_animation(self):
+        LABEL = "全篇无动画无页面切换效果"
+        ok = _check_no_animation(self.parts)
+        self.rep(LABEL, -1, ok, "")
+
+    # --------------------------------------------------------
+    # 分值：−1
+    # 规则原文：不存在新增的说明性文字（如"数据来源：…"），也无水印、页码、Logo
+    # --------------------------------------------------------
+    def eval_no_extra_text(self):
+        LABEL = "无新增说明性文字水印页码Logo"
+        ok = _check_no_extra_text(self.prs)
+        self.rep(LABEL, -1, ok, "")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 各检查项满分（加分项 22 条 / 46 分；减分项 21 条 / 最多 −59 分）
+#   加分项：达标记满分，hit = (delta == max_delta)
+#   减分项：达标记 0、不达标记负值，hit = (delta == 0)
+#   实得分 = Σ加分项 + Σ减分项，下限 0，上限 46；完成度 = 实得分 ÷ 46
+# ============================================================
+
+RULE_MAX_DELTA = {
+    "文件末尾有原生可编辑的平滑曲线图": 5,
+    "图表含营收数值与盈利比值两个系列且两条线都清晰可见": 3,
+    "图表数据为指定的营收数值与盈利比值，无错值漏点多余点": 3,
+    "图表横轴为1月至5月共5个类别且顺序正确": 1,
+    "图表有图例或系列标识可区分两条线且双轴刻度对应各自系列": 1,
+    "图表落在感谢聆听页上": 1,
+    "图表完整落在页面内且不遮挡感谢聆听页文字": 1,
+    "岗位职责页第三张卡片内有标题排班岗且文字准确": 3,
+    "排班岗标题格式与同页前两卡标题一致": 1,
+    "排班岗标题与前两卡标题同一基准且未超出卡片": 1,
+    "工作成效页4张卡片12个对象旋转角全部为0度": 3,
+    "工作成效页右侧图片旋转角为0度": 1,
+    "工作成效页4张卡片两列两行对齐偏差不超过0.1厘米": 3,
+    "工作成效页背景为浅青白且色值在EAF8F9至F6FBFC区间": 3,
+    "工作成效页背景为srgbClr纯色填充": 1,
+    "优化动作正文中重复句只出现1次": 3,
+    "优化动作正文无空段落且3段顺序正确": 1,
+    "优化动作3段格式一致行距200%且16pt微软雅黑": 1,
+    "后续规划页只剩近期长期2张卡且无残留空卡底": 3,
+    "后续规划页不存在稳住基本盘一句且无空文本框残留": 1,
+    "长期卡正文为3个独立段落且文字准确": 3,
+    "长期卡正文格式为16pt行距150%且文本框7.2乘4.5厘米": 3,
+    "文件为10页且页面顺序正确": -5,
+    "封面协作关系核心品类能力成长团队协作5页保持原状": -5,
+    "团队协作页重复沉淀卡内两句重复写法原样保留": -3,
+    "主题字体与母版版式保持原状且全篇正文为微软雅黑": -5,
+    "各页背景色与标题装饰线色值保持原状": -3,
+    "无标注图形批注荧光笔标记及临时文字": -3,
+    "岗位职责页除排班岗外15个对象及其位置尺寸不变": -3,
+    "排班岗文本框无边框填充阴影且不折行不重叠不溢出": -1,
+    "工作成效页4张卡片三件套构成文字与卡内偏移不变": -3,
+    "工作成效页图片完整未裁剪替换且宽高比失真不超过2%": -3,
+    "工作成效页对象不越界且卡片与图片互不重叠": -1,
+    "问题复盘页三角形两张卡底与底部标语在位": -3,
+    "问题复盘页左卡风险表现标题与3段正文不变": -3,
+    "后续规划页近期卡完整且长期卡卡底与标题在位": -3,
+    "后续规划页通栏背景图位置尺寸不变且画面完整": -3,
+    "感谢聆听页原有7个对象齐全且在位": -3,
+    "各页页面标题与装饰短线横线齐全且位置不变": -3,
+    "5页配图各1张且位置尺寸不变": -3,
+    "无空占位符空文本框及多余空对象": -1,
+    "全篇无动画无页面切换效果": -1,
+    "无新增说明性文字水印页码Logo": -1,
+}
+
+assert sum(v for v in RULE_MAX_DELTA.values() if v > 0) == MAX_SCORE_TOTAL
+assert sum(v for v in RULE_MAX_DELTA.values() if v < 0) == MAX_PENALTY_TOTAL
 
 def _find_pptx_in_dir(dir_path):
-    """在指定目录内定位待评估的 .pptx 文件，返回绝对路径。"""
-    if not os.path.isdir(dir_path):
-        raise FileNotFoundError(f"目录不存在或不是目录：{dir_path}")
-    candidates = [
-        name for name in os.listdir(dir_path)
-        if name.lower().endswith(".pptx")
-        and not name.startswith("~$")  # 排除 Office 临时锁文件
-    ]
-    if not candidates:
-        raise FileNotFoundError(f"目录 {dir_path} 下未找到 .pptx 文件")
-    # 若有多份，优先选择非临时文件中最新修改的一份，避免误挑
-    candidates.sort(
-        key=lambda n: os.path.getmtime(os.path.join(dir_path, n)),
-        reverse=True,
-    )
-    return os.path.join(dir_path, candidates[0])
+    """在目录下查找待评估的 .pptx（跳过 PowerPoint 临时文件）"""
+    try:
+        names = os.listdir(dir_path)
+    except Exception:
+        return None
+    cands = [n for n in names
+             if n.lower().endswith(".pptx") and not n.startswith("~$")]
+    cands.sort()
+    for n in cands:
+        full = os.path.join(dir_path, n)
+        if os.path.isfile(full):
+            return full
+    return None
 
 
 def evaluate(dir_path: str) -> dict:
-    """脚本对外唯一入口。
-
-    参数：
-        dir_path: 脚本所在目录路径；脚本自行在该目录内定位 .pptx 文档。
-
-    返回：
-        结构化 dict，字段含义详见 §2.2 统一约定。
-    """
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
@@ -1473,98 +2327,96 @@ def evaluate(dir_path: str) -> dict:
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": MAX_SCORE,
+        "max_score": sum(v for v in RULE_MAX_DELTA.values() if v > 0),
     }
 
     try:
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError("目录不存在：%s" % dir_path)
         pptx_path = _find_pptx_in_dir(dir_path)
+        if not pptx_path:
+            raise FileNotFoundError("目录内未找到 .pptx 文件：%s" % dir_path)
         result["file_name"] = os.path.basename(pptx_path)
 
-        ok, fails = check_dim1(pptx_path)
+        prs = _open_presentation(pptx_path)
+
+        ok, issues = check_dimension_one(prs, pptx_path)
+        result["dim1_pass"] = ok
+        # dim1_reason 仅在维度一未通过时给出原因摘要；通过则为空
+        result["dim1_reason"] = "" if ok else "; ".join(issues)
         if not ok:
-            result["dim1_pass"] = False
-            result["dim1_reason"] = "；".join(fails)
-            result["total_score"] = 0
+            # 维度一未通过：完成度直接判 0，不再检查维度二
             return result
 
-        result["dim1_pass"] = True
-
-        prs = Presentation(pptx_path)
-
-        # 评分细则原文（来自打分细则）
-        rules = [
-            ("第10页曲线图对象：在结束页右侧或中部空白区域，插入可编辑的折线图或平滑曲线图，"
-             "包含\"营收数值\"和\"盈利比值\"两个纵轴数据系列，两条曲线颜色不同。"
-             "横轴从左至右依次显示\"1月、2月、3月、4月、5月\"，月份顺序正确。"
-             "营收数值系列：五个月数据依次为68000、352000、486000、423000、579000。"
-             "盈利比值系列：五个月数据依次为1.42、1.56、1.71、1.63、1.85。"
-             "准确显示\"营收数值\"\"盈利比值\"，图例颜色与两条曲线一一对应。", 5, rule_10_chart),
-            ("第2页右侧第3个岗位卡片：空白处有标题\"排班岗\"字体为深绿色微软雅黑24磅加粗",
-             1, rule_2_paiban),
-            ("第5页全部卡片和右侧图片：旋转角度调整为0度或接近0度，"
-             "卡片边线、文字基线和图片上下边缘保持水平。", 3, rule_5_rotation),
-            ("第5页背景更换为与第2、3页一致或高度接近的浅蓝色背景，不再使用米黄色背景。",
-             3, rule_5_background),
-            ("第6页\"优化动作\"区域：\"将敏感表达改为场景化、说明式表达\"内容出现次数不能超过1",
-             1, rule_6_optimize),
-            ("第9页PPT除标题和背景外只出现两个板块：\"近期\"板块和\"长期\"板块，"
-             "两个板块居中放置，板块下方无其余内容", 5, rule_9_two_blocks),
-            ("第9页右侧\"长期\"板块：三行内容为\"搭建标准化复盘范式\"\"强化岗位协同配合效能\""
-             "\"赋能团队稳步长效发展\"，每句独立一行。", 1, rule_9_long_term),
-            ("第10页曲线图标题：使用\"月度营收与盈利比值趋势\"或语义一致的标题。",
-             1, rule_10_chart_title),
-            ("第10页曲线图版式：宽度约13至17厘米、高度约7至10厘米，"
-             "与结束页其他元素之间保留合理间距。", 1, rule_10_chart_size),
-        ]
-
-        deductions = []
+        ev = Evaluator(prs, pptx_path)
+        ev.check_all()
 
         total = 0
-        items = []
-
-        for content, score, fn in rules:
-            try:
-                ok_r, _ = fn(prs)
-            except Exception:
-                ok_r = False
-            delta = score if ok_r else 0
+        for label, delta in ev.hits:
+            max_delta = RULE_MAX_DELTA.get(label, 0)
             total += delta
-            items.append({
-                "rule": content,
-                "max_delta": score,
+            result["dim2_items"].append({
+                "rule": label,
+                "max_delta": max_delta,
                 "delta": delta,
-                "hit": bool(ok_r),
-                "detail": "",
+                # 加分项达标为命中；减分项未被扣分为命中
+                "hit": (delta == max_delta) if max_delta > 0 else (delta == 0),
             })
-
-        for content, score, fn in deductions:
-            try:
-                ok_r, _ = fn(prs)
-            except Exception:
-                ok_r = False
-            delta = score if ok_r else 0
-            total += delta
-            items.append({
-                "rule": content,
-                "max_delta": score,
-                "delta": delta,
-                "hit": bool(ok_r),
-                "detail": "",
-            })
-
-        result["dim2_items"] = items
-        result["total_score"] = total
-        return result
-
-    except Exception as e:
+        # 实得分下限 0、上限 46
+        result["total_score"] = max(0, min(total, MAX_SCORE_TOTAL))
+    except Exception as exc:
+        # status 为 error 时未能完成判定，dim1_pass 留空，dim1_reason 也为空
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
         result["total_score"] = 0
         return result
 
+    return result
+
 
 if __name__ == "__main__":
-    # 本地调试入口：默认使用脚本所在目录，也可通过命令行覆盖
-    default_dir = os.path.dirname(os.path.abspath(__file__))
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else default_dir
-    print(json.dumps(evaluate(target_dir), ensure_ascii=True, indent=2))
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    _payload = json.dumps(evaluate(_dir), ensure_ascii=False, indent=2)
+    try:
+        sys.stdout.buffer.write((_payload + "\n").encode("utf-8"))
+    except AttributeError:
+        print(_payload)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

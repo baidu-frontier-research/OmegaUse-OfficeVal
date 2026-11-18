@@ -1,1918 +1,1651 @@
-#!/usr/bin/env python3
-"""Automatically evaluate website_outage_editable_flow.pptx against the rubric."""
+# -*- coding: utf-8 -*-
+"""officeval_055_verifier —— “网站故障处理流程图（可编辑 PPT）”交付件完成度评测。
+
+评测对象：单页 .pptx，横向 16:9，自左至右 5 个流程步骤组（编号 / 浅蓝圆形图标底 /
+深色圆角矩形阶段标签 / 说明文本框），左上角图例框，下部橙色虚线情绪折线与情绪标签，
+底部主题文本。
+
+实现要点：
+1) 直接解析 ppt/slides/slide1.xml，不依赖 python-pptx；填充/线条颜色均读取 a:alpha，
+   alpha=0 的白色不计为“白色填充”。
+2) 组合（p:grpSp）内的子形状按 a:xfrm 的 off/ext/chOff/chExt 做坐标变换，换算为幻灯片
+   绝对坐标，因此组合内的图标零件同样可被量测。
+3) 细则允许 5 个步骤图标“由形状组合或小尺寸图片实现”。因此图标造型类条目先按形状
+   组合逐件核验；若图标区域内存在具备图标尺寸的位图（p:pic），则该造型条目按“图片
+   实现”记为达成——位图内部构造无法静态拆解，这是细则允许范围内的必然放宽；徽标、
+   对勾等叠放件若本身为位图，其内部（白色感叹号 / 对勾连续性）同样不再拆解，但位置、
+   尺寸、叠放关系仍照常量测。
+4) “文字完整显示未被裁切”一项仅做结构性核验（文本框尺寸为正、位于页内、未被其后
+   绘制的不透明形状整体覆盖），不模拟字体排版换行。
+
+返回 evaluate(dir_path) -> dict，格式与 officeval_008_verifier 一致。
+"""
 
 from __future__ import annotations
 
 import json
-
-SCRIPT_ID = "055"
 import math
 import os
-import re
 import sys
 import zipfile
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable, Iterable, Optional
 from xml.etree import ElementTree as ET
 
-try:
-    from pptx import Presentation
-    from pptx.enum.shapes import MSO_SHAPE_TYPE
-except ImportError:  # pragma: no cover - handled at runtime
-    Presentation = None
-    MSO_SHAPE_TYPE = None
+SCRIPT_ID = "055"
+# 维度二所有"加分项"max_delta 之和；也是维度一未通过时回填的 max_score
+# （脚本没评上、即 status 为 error 时 max_score 为 0）。
+MAX_SCORE_TOTAL = 90
+SUPPORTED_EXTS = (".pptx",)
 
-EMU_PER_CM = 360000
-EMU_PER_INCH = 914400
-EMU_PER_PT = 12700
-CM_TOL = 0.18
-SPEC_CM_TOL = 0.03
-PT_TOL = 1.1
-# PowerPoint's default outline width when a shape/line does not set <a:ln w="…">.
-# The rubric measures the *rendered* stroke, so an unset width should be judged
-# as if it were the default (1.0pt) rather than silently passing or failing.
-DEFAULT_LINE_WIDTH_PT = 1.0
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
-NS = {
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-}
+EMU_CM = 360000.0
+EMU_PT = 12700.0
 
-FINISH_BODY = (
-    "The site was back up and stable within 10 minutes, order submissions resumed, "
-    "and a post-incident review has been scheduled for 4:00 PM this afternoon."
+SIZE_TOL = 0.06          # cm，尺寸区间容差
+COLOR_TOL = 6            # 每通道容差
+POS_TOL = 0.4            # 百分比位置容差（个别条目单独指定）
+
+STAGE_LABELS = ("start", "check", "problem peak", "solution point", "finish")
+
+BODY_TEXTS = (
+    "at 8:40 a.m., the team noticed that the online store was no longer loading "
+    "for customers.",
+    "the support lead checked alerts, confirmed the outage, and opened an incident "
+    "channel for developers and operations.",
+    "orders failed repeatedly because the database connection pool was exhausted "
+    "during the launch traffic surge.",
+    "the team rolled back the latest configuration and switched traffic to a "
+    "healthy backup instance.",
+    "the site was back up and stable within 10 minutes, order submissions resumed, "
+    "and a post-incident review has been scheduled for 4:00 pm this afternoon.",
 )
 
-STAGE_SPECS = [
-    {
-        "num": "1",
-        "title": "start",
-        "body": "At 8:40 a.m., the team noticed that the online store was no longer loading for customers.",
-        "top_range": (3.4, 4.0),
-        "icon_hint": ["warning", "computer", "monitor"],
-        # +5 细则逐点核验（strict）；细则未提及的不额外约束。
-        "strict": True,
-        "body_fill": "white",       # 说明框白色填充
-        # 尺寸区间（rubric 修订版）
-        "num_size":   (0.8, 1.5),   # 编号圆宽高 0.8-1.5cm
-        "title_size": (3.5, 4.6, 0.7, 1.3),  # 标题条 宽 3.5-4.6cm 高 0.7-1.3cm
-        "body_size":  (4.5, 5.7, 4.0, 5.0),  # 说明框 宽 4.5-5.7cm 高 4-5cm
-        "icon_size":  (2.9, 3.6),   # 浅蓝色圆形宽高 2.9-3.6cm
-    },
-    {
-        "num": "2",
-        "title": "check",
-        "body": "The support lead checked alerts, confirmed the outage, and opened an incident channel for developers and operations.",
-        "top_range": None,
-        "icon_hint": ["magnifier", "search", "exclamation", "alert"],
-        # +5 细则逐点核验（strict）；细则未提及的不额外约束。
-        "strict": True,
-        "body_fill": "light_blue",  # 说明框浅蓝色填充
-        "right_of_title": "start",  # 位于第 1 阶段右侧
-        "icon_orange_badge": True,  # 圆形内含橙色感叹号小圆标
-        # 尺寸区间（rubric 修订版）
-        "num_size":   (0.5, 1.5),   # 编号圆宽高 0.5-1.5cm
-        "title_size": (3.5, 4.7, 0.5, 1.5),  # 标题条 宽 3.5-4.7cm 高 0.5-1.5cm
-        "body_size":  (4.5, 5.7, 3.8, 5.0),  # 说明框 宽 4.5-5.7cm 高 3.8-5cm
-        "icon_size":  (2.9, 4.0),   # 浅蓝色圆形宽高 2.9-4cm
-    },
-    {
-        "num": "3",
-        "title": "problem peak",
-        "body": "Orders failed repeatedly because the database connection pool was exhausted during the launch traffic surge.",
-        "top_range": None,
-        "icon_hint": ["server", "warning", "alert"],
-        # +5 细则逐点核验（strict）；细则未提及的不额外约束。
-        "strict": True,
-        "body_fill": "light_blue",  # 说明框浅蓝色填充
-        "center_of_page": True,     # 位于页面中部
-        # 尺寸区间（rubric 修订版）
-        "num_size":   (0.8, 1.5),   # 编号圆宽高 0.8-1.5cm
-        "title_size": (3.5, 4.7, 0.5, 1.5),  # 标题条 宽 3.5-4.7cm 高 0.5-1.5cm
-        "body_size":  (4.5, 5.7, 3.8, 4.8),  # 说明框 宽 4.5-5.7cm 高 3.8-4.8cm
-        "icon_size":  (2.8, 3.8),   # 浅蓝色圆形宽高 2.8-3.8cm
-    },
-    {
-        "num": "4",
-        "title": "solution point",
-        "body": "The team rolled back the latest configuration and switched traffic to a healthy backup instance.",
-        "top_range": None,
-        "icon_hint": ["cloud", "check"],
-        # +5 细则逐点核验（strict）；细则未提及的不额外约束。
-        "strict": True,
-        "body_fill": "light_blue",   # 说明框浅蓝色填充
-        "right_of_title": "problem peak",  # 位于第 3 阶段右侧
-        # 尺寸区间（rubric 修订版）
-        "num_size":   (0.8, 1.5),   # 编号圆宽高 0.8-1.5cm
-        "title_size": (3.5, 4.5, 0.5, 1.5),  # 标题条 宽 3.5-4.5cm 高 0.5-1.5cm
-        "body_size":  (4.5, 5.7, 4.0, 5.0),  # 说明框 宽 4.5-5.7cm 高 4-5cm
-        "icon_size":  (2.8, 3.8),   # 浅蓝色圆形宽高 2.8-3.8cm
-    },
-    {
-        "num": "5",
-        "title": "finish",
-        "body": FINISH_BODY,
-        "top_range": None,
-        "icon_hint": ["monitor", "display", "check"],
-        # +5 细则逐点核验（strict）；细则未提及的不额外约束。
-        "strict": True,
-        "body_fill": "light_blue",   # 说明框浅蓝色填充
-        "right_side_of_page": True,  # 位于页面右侧
-        "num_white": False,          # 细则仅要求深绿色编号圆，未提"白色编号"
-        # 尺寸区间（rubric 修订版）
-        "num_size":   (0.8, 1.5),   # 编号圆宽高 0.8-1.5cm
-        "title_size": (3.5, 4.7, 0.5, 1.5),  # 标题条 宽 3.5-4.7cm 高 0.5-1.5cm
-        "body_size":  (5.5, 5.7, 4.0, 5.0),  # 说明框 宽 5.5-5.7cm 高 4-5cm
-        "icon_size":  (2.8, 3.8),   # 浅蓝色圆形宽高 2.8-3.8cm
-    },
-]
-
-EMOTION_WORDS = ["concerned", "tense and focused", "hopeful", "relieved"]
+EMOTION_WORDS = ("concerned", "tense and focused", "hopeful", "relieved")
 THEME_TEXT = "theme: managing a website outage before a product launch"
+LEGEND_WORDS = ("action", "emotion")
 
+# 编号可写作阿拉伯数字，或带圈数字符号
+NUM_GLYPHS = {}
+for _i, _chars in enumerate(("1➊❶①⑴𝟏", "2➋❷②⑵", "3➌❸③⑶", "4➍❹④⑷", "5➎❺⑤⑸"), start=1):
+    for _c in _chars:
+        NUM_GLYPHS[_c] = _i
 
-@dataclass
-class RunInfo:
-    text: str = ""
-    font_name: Optional[str] = None
-    size_pt: Optional[float] = None
-    color: Optional[str] = None
-    bold: Optional[bool] = None
-    italic: Optional[bool] = None
+# 颜色区间（细则给出的“近似”区间，逐通道取上下界）
+C_CIRCLE = ("DCEEF5", "E3EEF3")      # 浅蓝灰圆形底
+C_PILL = ("003341", "003E50")        # 深青蓝阶段标签
+C_BOX_LINE = ("86B9DD", "8FBBDC")    # 说明框边线
+C_BOX_FILL = ("EDF3F8", "F5F8FB")    # 说明框极浅蓝灰填充
+C_BODY_TEXT = ("151B2A", "0B2F45")   # 说明文字深色
+C_WARN_TRI = ("F2551A", "FF6B2C")    # 屏幕内橙色三角
+C_CURVE = ("FC5E13", "FF4B10")       # 情绪折线橙色
+C_GREEN = ("18934E", "20A45B")       # 对勾底绿色
+C_THEME = ("0A2E90", "1E5AB4")       # 主题文字蓝色
 
+# 5 个步骤组水平中心所在的页面百分比区间
+GROUP_BANDS = ((6.0, 13.0), (26.0, 33.0), (46.0, 53.0), (67.0, 74.0), (86.0, 93.0))
+# 4 个情绪标签左端所在的页面百分比区间
+EMOTION_BANDS = ((3.0, 13.0), (26.0, 36.0), (64.0, 74.0), (84.0, 95.0))
 
-@dataclass
-class ShapeInfo:
-    name: str
-    shape_type: str
-    text: str
-    left_cm: float
-    top_cm: float
-    width_cm: float
-    height_cm: float
-    fill_color: Optional[str] = None
-    line_color: Optional[str] = None
-    line_width_pt: Optional[float] = None
-    font_names: set[str] = field(default_factory=set)
-    font_sizes: list[float] = field(default_factory=list)
-    font_colors: set[str] = field(default_factory=set)
-    bold_values: list[bool] = field(default_factory=list)
-    italic_values: list[bool] = field(default_factory=list)
-    alignments: list[str] = field(default_factory=list)
-    runs: list[RunInfo] = field(default_factory=list)
-    is_group_child: bool = False
-    is_picture: bool = False
-    is_connector: bool = False
-    is_auto_shape: bool = False
+_MAX_DELTAS_ORDER = [
+    5, 1, 3, 3, 3, 1, 3, 1, 3,          # 版面骨架与文本
+    5, 3, 5, 3, 5, 3, 3, 3, 5, 3,       # 5 个图标造型与叠放件
+    3, 3, 3,                            # 图例框与两行图例
+    5, 3, 3, 3,                         # 情绪折线、折线实现、情绪标签、主题文字
+    1, 1, 1, 1, 1, 1,                   # 版式与规范性
+]
+assert sum(_MAX_DELTAS_ORDER) == MAX_SCORE_TOTAL
 
-    @property
-    def right_cm(self) -> float:
-        return self.left_cm + self.width_cm
-
-    @property
-    def bottom_cm(self) -> float:
-        return self.top_cm + self.height_cm
-
-    @property
-    def center_x_cm(self) -> float:
-        return self.left_cm + self.width_cm / 2
-
-    @property
-    def center_y_cm(self) -> float:
-        return self.top_cm + self.height_cm / 2
-
-    @property
-    def area_cm2(self) -> float:
-        return max(0.0, self.width_cm) * max(0.0, self.height_cm)
-
-
-@dataclass
-class XmlShapeInfo:
-    tag: str
-    name: str
-    text: str
-    left_cm: float
-    top_cm: float
-    width_cm: float
-    height_cm: float
-    geom: Optional[str] = None
-    fill_color: Optional[str] = None
-    line_color: Optional[str] = None
-    line_width_pt: Optional[float] = None
-    dashed: bool = False
-    arrow_head: bool = False
-    arrow_tail: bool = False
-    flip_h: bool = False
-    flip_v: bool = False
-    group_depth: int = 0
-
-    @property
-    def right_cm(self) -> float:
-        return self.left_cm + self.width_cm
-
-    @property
-    def bottom_cm(self) -> float:
-        return self.top_cm + self.height_cm
-
-    @property
-    def center_x_cm(self) -> float:
-        return self.left_cm + self.width_cm / 2
-
-    @property
-    def center_y_cm(self) -> float:
-        return self.top_cm + self.height_cm / 2
-
-    @property
-    def length_cm(self) -> float:
-        return math.hypot(self.width_cm, self.height_cm)
-
-    @property
-    def area_cm2(self) -> float:
-        return max(0.0, self.width_cm) * max(0.0, self.height_cm)
-
-
-@dataclass
-class PptModel:
-    path: Path
-    valid_pptx: bool
-    load_error: Optional[str]
-    slide_count: int = 0
-    slide_width_cm: float = 0.0
-    slide_height_cm: float = 0.0
-    shapes: list[ShapeInfo] = field(default_factory=list)
-    xml_shapes: list[XmlShapeInfo] = field(default_factory=list)
-    media_files: list[str] = field(default_factory=list)
-    zip_entries: list[str] = field(default_factory=list)
-    xml_counts: dict[str, int] = field(default_factory=dict)
-    background_color: Optional[str] = None
-    theme_colors: dict[str, str] = field(default_factory=dict)
-
-    @property
-    def all_text(self) -> str:
-        texts = [shape.text for shape in self.shapes if shape.text.strip()]
-        texts.extend(xml_shape.text for xml_shape in self.xml_shapes if xml_shape.text.strip())
-        return normalize_space(" ".join(texts))
-
-    @property
-    def aspect_ratio(self) -> float:
-        if self.slide_height_cm == 0:
-            return 0.0
-        return self.slide_width_cm / self.slide_height_cm
-
-
-# Module-level cache of the currently-inspected theme's scheme->RGB map.
-# color_is() consults this to resolve SCHEME:/THEME: references to real RGB
-# so families are judged by the actual color, not by the theme role.
-_ACTIVE_THEME_COLORS: dict[str, str] = {}
-
-
-@dataclass
-class CheckResult:
-    rule_id: str
-    label: str
-    score: int
-    passed: bool
-    evidence: str
-
-
-@dataclass
-class Rule:
-    rule_id: str
-    label: str
-    score: int
-    check: Callable[[PptModel], CheckResult]
-
-
-def normalize_space(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
-
-
-def normalize_for_match(value: str) -> str:
-    return normalize_space(value).lower()
-
-
-def cm_from_emu(value: int | float | None) -> float:
-    return float(value or 0) / EMU_PER_CM
-
-
-def pt_from_emu(value: int | float | None) -> Optional[float]:
-    if value is None:
-        return None
-    return float(value) / EMU_PER_PT
-
-
-def close(value: float, low: float, high: float, tol: float = CM_TOL) -> bool:
-    return low - tol <= value <= high + tol
-
-
-def in_spec_cm(value: float, low: float, high: float, tol: float = SPEC_CM_TOL) -> bool:
-    """Return True when a measured dimension is inside the rubric range.
-
-    Use this for explicit size/position ranges from the scoring rubric.  The
-    tolerance is intentionally small and only absorbs EMU/cm conversion noise;
-    the wider close() helper is for approximate layout proximity checks.
-    """
-    return low - tol <= value <= high + tol
-
-
-def near(value: float, target: float, tol: float = CM_TOL) -> bool:
-    return abs(value - target) <= tol
-
-
-def safe_rgb(color_obj) -> Optional[str]:
-    if color_obj is None:
+def _hex2rgb(h):
+    h = (h or "").strip().lstrip("#")
+    if len(h) != 6:
         return None
     try:
-        rgb = color_obj.rgb
-        if rgb is not None:
-            return str(rgb).upper()
-    except Exception:
-        pass
-    try:
-        theme = color_obj.theme_color
-        if theme is not None:
-            return f"THEME:{theme}"
-    except Exception:
-        pass
-    return None
-
-
-def shape_fill_color(shape) -> Optional[str]:
-    try:
-        return safe_rgb(shape.fill.fore_color)
-    except Exception:
-        return None
-
-
-def shape_line_color(shape) -> Optional[str]:
-    try:
-        return safe_rgb(shape.line.color)
-    except Exception:
-        return None
-
-
-def shape_line_width_pt(shape) -> Optional[float]:
-    try:
-        if shape.line.width is None:
-            return None
-        return pt_from_emu(shape.line.width)
-    except Exception:
-        return None
-
-
-def effective_line_width_pt(width_pt: Optional[float]) -> float:
-    """Return the rendered stroke width, substituting PowerPoint's default.
-
-    OOXML omits <a:ln w="…"> for shapes that use the theme/master default
-    outline, which PowerPoint draws at 1.0pt.  Rubric checks care about the
-    visible stroke, so an unset width should be evaluated as 1.0pt rather
-    than skipped or treated as "unknown".
-    """
-    return DEFAULT_LINE_WIDTH_PT if width_pt is None else width_pt
-
-
-def local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
-
-
-def find_first(element: ET.Element, path: str) -> Optional[ET.Element]:
-    return element.find(path, NS)
-
-
-def find_all(element: ET.Element, path: str) -> list[ET.Element]:
-    return list(element.findall(path, NS))
-
-
-def xml_attr_int(element: Optional[ET.Element], attr: str) -> int:
-    if element is None:
-        return 0
-    try:
-        return int(element.attrib.get(attr, "0"))
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
     except ValueError:
-        return 0
-
-
-def xml_text(element: ET.Element) -> str:
-    return normalize_space("".join(t.text or "" for t in element.findall(".//a:t", NS)))
-
-
-def xml_name(element: ET.Element) -> str:
-    c_nv_pr = find_first(element, ".//p:cNvPr")
-    return c_nv_pr.attrib.get("name", "") if c_nv_pr is not None else ""
-
-
-def xml_geom(element: ET.Element) -> Optional[str]:
-    geom = find_first(element, ".//a:prstGeom")
-    return geom.attrib.get("prst") if geom is not None else None
-
-
-def xml_color_from_parent(element: Optional[ET.Element]) -> Optional[str]:
-    if element is None:
         return None
-    srgb = find_first(element, ".//a:srgbClr")
-    if srgb is not None and srgb.attrib.get("val"):
-        return srgb.attrib["val"].upper()
-    scheme = find_first(element, ".//a:schemeClr")
-    if scheme is not None and scheme.attrib.get("val"):
-        return f"SCHEME:{scheme.attrib['val']}"
-    return None
 
 
-def xml_fill_color(element: ET.Element) -> Optional[str]:
-    sp_pr = find_first(element, ".//p:spPr")
-    if sp_pr is None:
-        sp_pr = find_first(element, ".//p:cxnSpPr")
-    solid = find_first(sp_pr, ".//a:solidFill") if sp_pr is not None else None
-    return xml_color_from_parent(solid)
-
-
-def xml_background_color(root: ET.Element) -> Optional[str]:
-    """Read the slide background fill color from <p:cSld>/<p:bg>.
-
-    Returns the srgb/scheme color if the slide sets an explicit background,
-    or None when the slide inherits its background (layout/master default),
-    which PowerPoint renders as the default (white) background.
-    """
-    bg = find_first(root, ".//p:cSld/p:bg")
-    if bg is None:
-        return None
-    return xml_color_from_parent(bg)
-
-
-def xml_line_data(element: ET.Element) -> tuple[Optional[str], Optional[float], bool, bool, bool]:
-    line = find_first(element, ".//a:ln")
-    if line is None:
-        return None, None, False, False, False
-    color = xml_color_from_parent(line)
-    width_pt = pt_from_emu(xml_attr_int(line, "w")) if "w" in line.attrib else None
-    dash = find_first(line, "a:prstDash")
-    dashed = dash is not None and dash.attrib.get("val", "solid") != "solid"
-    head = find_first(line, "a:headEnd")
-    tail = find_first(line, "a:tailEnd")
-    arrow_head = head is not None and head.attrib.get("type", "none") != "none"
-    arrow_tail = tail is not None and tail.attrib.get("type", "none") != "none"
-    return color, width_pt, dashed, arrow_head, arrow_tail
-
-
-def xml_position(element: ET.Element) -> tuple[float, float, float, float]:
-    xfrm = find_first(element, ".//a:xfrm")
-    off = find_first(xfrm, "a:off") if xfrm is not None else None
-    ext = find_first(xfrm, "a:ext") if xfrm is not None else None
-    return (
-        cm_from_emu(xml_attr_int(off, "x")),
-        cm_from_emu(xml_attr_int(off, "y")),
-        cm_from_emu(xml_attr_int(ext, "cx")),
-        cm_from_emu(xml_attr_int(ext, "cy")),
-    )
-
-
-def xml_flip(element: ET.Element) -> tuple[bool, bool]:
-    """Return (flipH, flipV) of a shape's <a:xfrm>.
-
-    PowerPoint draws a line from its bounding-box top-left to bottom-right by
-    default.  flipV mirrors it vertically, which flips the visual slope: a box
-    with height>0 that is flipV'd actually slants up-right instead of down-right.
-    We need this to judge the rubric's up/down zig-zag directions correctly.
-    """
-    xfrm = find_first(element, ".//a:xfrm")
-    if xfrm is None:
-        return False, False
-    return (
-        xfrm.attrib.get("flipH", "0") in ("1", "true"),
-        xfrm.attrib.get("flipV", "0") in ("1", "true"),
-    )
-
-
-def iter_xml_drawings(element: ET.Element, depth: int = 0) -> Iterable[tuple[ET.Element, int]]:
-    for child in list(element):
-        name = local_name(child.tag)
-        if name in {"sp", "cxnSp", "pic", "grpSp"}:
-            yield child, depth
-            if name == "grpSp":
-                yield from iter_xml_drawings(child, depth + 1)
-        else:
-            yield from iter_xml_drawings(child, depth)
-
-
-def parse_theme_colors(theme_xml: bytes) -> dict[str, str]:
-    """Parse ppt/theme/themeN.xml into a {scheme_name: 'RRGGBB'} map.
-
-    We resolve srgbClr and sysClr@lastClr entries.  The resulting map lets
-    color_is() judge scheme-colored fills by their actual RGB rather than by
-    hardcoded scheme-role assumptions — a gray shape reported as accent3
-    (A5A5A5) is judged gray because it is gray, not because "accent3" is on a
-    hardcoded list.
-    """
-    result: dict[str, str] = {}
-    try:
-        root = ET.fromstring(theme_xml)
-    except ET.ParseError:
-        return result
-    scheme = root.find(".//a:clrScheme", NS)
-    if scheme is None:
-        return result
-    for child in list(scheme):
-        name = local_name(child.tag)
-        srgb = child.find(".//a:srgbClr", NS)
-        if srgb is not None and srgb.attrib.get("val"):
-            result[name.lower()] = srgb.attrib["val"].upper()
-            continue
-        sysc = child.find(".//a:sysClr", NS)
-        if sysc is not None and sysc.attrib.get("lastClr"):
-            result[name.lower()] = sysc.attrib["lastClr"].upper()
-    return result
-
-
-def parse_openxml(path: Path) -> tuple[list[str], list[str], list[XmlShapeInfo], dict[str, int], Optional[str], dict[str, str], Optional[str]]:
-    if not zipfile.is_zipfile(path):
-        return [], [], [], {}, None, {}, "not a valid pptx zip package"
-    try:
-        with zipfile.ZipFile(path) as archive:
-            entries = archive.namelist()
-            media_files = [name for name in entries if name.startswith("ppt/media/") and not name.endswith("/")]
-            slide_xmls = sorted(
-                name for name in entries if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
-            )
-            if not slide_xmls:
-                return entries, media_files, [], {}, None, {}, "no slide XML found"
-            slide_xml = archive.read(slide_xmls[0])
-            theme_colors: dict[str, str] = {}
-            theme_names = sorted(
-                name for name in entries if re.fullmatch(r"ppt/theme/theme\d+\.xml", name)
-            )
-            if theme_names:
-                try:
-                    theme_colors = parse_theme_colors(archive.read(theme_names[0]))
-                except Exception:
-                    theme_colors = {}
-    except Exception as exc:
-        return [], [], [], {}, None, {}, str(exc)
-
-    try:
-        root = ET.fromstring(slide_xml)
-    except ET.ParseError as exc:
-        return entries, media_files, [], {}, None, {}, f"invalid slide XML: {exc}"
-
-    background_color = xml_background_color(root)
-    xml_shapes: list[XmlShapeInfo] = []
-    counts = {"sp": 0, "cxnSp": 0, "pic": 0, "grpSp": 0}
-    for element, depth in iter_xml_drawings(root):
-        tag = local_name(element.tag)
-        if tag in counts:
-            counts[tag] += 1
-        left, top, width, height = xml_position(element)
-        line_color, line_width, dashed, arrow_head, arrow_tail = xml_line_data(element)
-        flip_h, flip_v = xml_flip(element)
-        xml_shapes.append(
-            XmlShapeInfo(
-                tag=tag,
-                name=xml_name(element),
-                text=xml_text(element),
-                left_cm=left,
-                top_cm=top,
-                width_cm=width,
-                height_cm=height,
-                geom=xml_geom(element),
-                fill_color=xml_fill_color(element),
-                line_color=line_color,
-                line_width_pt=line_width,
-                dashed=dashed,
-                arrow_head=arrow_head,
-                arrow_tail=arrow_tail,
-                flip_h=flip_h,
-                flip_v=flip_v,
-                group_depth=depth,
-            )
-        )
-    return entries, media_files, xml_shapes, counts, background_color, theme_colors, None
-
-
-def paragraph_alignment_name(paragraph) -> str:
-    try:
-        alignment = paragraph.alignment
-        return str(alignment).lower() if alignment is not None else ""
-    except Exception:
-        return ""
-
-
-def collect_text_style(shape) -> tuple[set[str], list[float], set[str], list[bool], list[bool], list[str], list[RunInfo]]:
-    font_names: set[str] = set()
-    font_sizes: list[float] = []
-    font_colors: set[str] = set()
-    bold_values: list[bool] = []
-    italic_values: list[bool] = []
-    alignments: list[str] = []
-    runs: list[RunInfo] = []
-    if not getattr(shape, "has_text_frame", False):
-        return font_names, font_sizes, font_colors, bold_values, italic_values, alignments, runs
-    for paragraph in shape.text_frame.paragraphs:
-        alignments.append(paragraph_alignment_name(paragraph))
-        # 段落级 defRPr（继承源）：当 run 属性缺失时回退取用，避免默认放行。
-        para_font_name: Optional[str] = None
-        para_size_pt: Optional[float] = None
-        para_color: Optional[str] = None
-        para_bold: Optional[bool] = None
-        para_italic: Optional[bool] = None
-        try:
-            pf = paragraph.font
-            try:
-                if pf.name:
-                    para_font_name = pf.name
-            except Exception:
-                pass
-            try:
-                if pf.size is not None:
-                    para_size_pt = pt_from_emu(pf.size)
-            except Exception:
-                pass
-            try:
-                pc = safe_rgb(pf.color)
-                if pc:
-                    para_color = pc
-            except Exception:
-                pass
-            try:
-                if pf.bold is not None:
-                    para_bold = bool(pf.bold)
-            except Exception:
-                pass
-            try:
-                if pf.italic is not None:
-                    para_italic = bool(pf.italic)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        for run in paragraph.runs:
-            font = run.font
-            font_name = None
-            size_pt = None
-            color = None
-            bold = None
-            italic = None
-            try:
-                font_name = font.name
-                if font_name:
-                    font_names.add(font_name)
-                elif para_font_name:
-                    font_name = para_font_name
-                    font_names.add(para_font_name)
-            except Exception:
-                pass
-            try:
-                if font.size is not None:
-                    size_pt = pt_from_emu(font.size)
-                    if size_pt is not None:
-                        font_sizes.append(size_pt)
-                elif para_size_pt is not None:
-                    size_pt = para_size_pt
-                    font_sizes.append(para_size_pt)
-            except Exception:
-                pass
-            try:
-                color = safe_rgb(font.color)
-                if color:
-                    font_colors.add(color)
-                elif para_color:
-                    color = para_color
-                    font_colors.add(para_color)
-            except Exception:
-                pass
-            try:
-                bold = font.bold
-                if bold is not None:
-                    bold_values.append(bool(bold))
-                elif para_bold is not None:
-                    bold = para_bold
-                    bold_values.append(para_bold)
-            except Exception:
-                pass
-            try:
-                italic = font.italic
-                if italic is not None:
-                    italic_values.append(bool(italic))
-                elif para_italic is not None:
-                    italic = para_italic
-                    italic_values.append(para_italic)
-            except Exception:
-                pass
-            runs.append(RunInfo(run.text, font_name, size_pt, color, bold, italic))
-    return font_names, font_sizes, font_colors, bold_values, italic_values, alignments, runs
-
-
-def shape_type_name(shape) -> str:
-    try:
-        return str(shape.shape_type).lower()
-    except Exception:
-        return type(shape).__name__
-
-
-def extract_shape_info(shape, is_group_child: bool = False) -> list[ShapeInfo]:
-    records: list[ShapeInfo] = []
-    if hasattr(shape, "shapes"):
-        for child in shape.shapes:
-            records.extend(extract_shape_info(child, True))
-    text = normalize_space(getattr(shape, "text", "") or "")
-    font_names, font_sizes, font_colors, bold_values, italic_values, alignments, runs = collect_text_style(shape)
-    shape_type = shape_type_name(shape)
-    is_picture = False
-    is_connector = False
-    is_auto_shape = False
-    try:
-        if MSO_SHAPE_TYPE is not None:
-            is_picture = shape.shape_type == MSO_SHAPE_TYPE.PICTURE
-            is_connector = shape.shape_type in {MSO_SHAPE_TYPE.LINE, MSO_SHAPE_TYPE.FREEFORM}
-            is_auto_shape = shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
-    except Exception:
-        pass
-    records.append(
-        ShapeInfo(
-            name=getattr(shape, "name", ""),
-            shape_type=shape_type,
-            text=text,
-            left_cm=cm_from_emu(getattr(shape, "left", 0)),
-            top_cm=cm_from_emu(getattr(shape, "top", 0)),
-            width_cm=cm_from_emu(getattr(shape, "width", 0)),
-            height_cm=cm_from_emu(getattr(shape, "height", 0)),
-            fill_color=shape_fill_color(shape),
-            line_color=shape_line_color(shape),
-            line_width_pt=shape_line_width_pt(shape),
-            font_names=font_names,
-            font_sizes=font_sizes,
-            font_colors=font_colors,
-            bold_values=bold_values,
-            italic_values=italic_values,
-            alignments=alignments,
-            runs=runs,
-            is_group_child=is_group_child,
-            is_picture=is_picture,
-            is_connector=is_connector,
-            is_auto_shape=is_auto_shape,
-        )
-    )
-    return records
-
-
-def inspect_ppt(path: Path) -> PptModel:
-    suffix = path.suffix.lower()
-    if suffix != ".pptx":
-        return PptModel(path, False, f"file extension {suffix or '(none)'} is not .pptx")
-    if Presentation is None:
-        return PptModel(path, False, "missing dependency: python-pptx; run python -m pip install -r requirements.txt")
-    if not path.exists():
-        return PptModel(path, False, "file does not exist")
-    entries, media_files, xml_shapes, xml_counts, background_color, theme_colors, xml_error = parse_openxml(path)
-    if xml_error:
-        return PptModel(path, False, xml_error, media_files=media_files, zip_entries=entries, xml_shapes=xml_shapes, xml_counts=xml_counts, theme_colors=theme_colors)
-    try:
-        prs = Presentation(str(path))
-    except Exception as exc:
-        return PptModel(path, False, f"python-pptx could not open file: {exc}", media_files=media_files, zip_entries=entries, xml_shapes=xml_shapes, xml_counts=xml_counts, theme_colors=theme_colors)
-
-    shapes: list[ShapeInfo] = []
-    if len(prs.slides) >= 1:
-        for shape in prs.slides[0].shapes:
-            shapes.extend(extract_shape_info(shape))
-    _ACTIVE_THEME_COLORS.clear()
-    _ACTIVE_THEME_COLORS.update(theme_colors)
-    return PptModel(
-        path=path,
-        valid_pptx=True,
-        load_error=None,
-        slide_count=len(prs.slides),
-        slide_width_cm=cm_from_emu(prs.slide_width),
-        slide_height_cm=cm_from_emu(prs.slide_height),
-        shapes=shapes,
-        xml_shapes=xml_shapes,
-        media_files=media_files,
-        zip_entries=entries,
-        xml_counts=xml_counts,
-        background_color=background_color,
-        theme_colors=theme_colors,
-    )
-
-
-def color_tuple(value: Optional[str]) -> Optional[tuple[int, int, int]]:
-    if not value or not re.fullmatch(r"[0-9A-Fa-f]{6}", value):
-        return None
-    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
-
-
-def color_distance(value: Optional[str], target: str) -> float:
-    rgb = color_tuple(value)
-    target_rgb = color_tuple(target)
-    if rgb is None or target_rgb is None:
-        return 999.0
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(rgb, target_rgb)))
-
-
-def _resolve_color(value: Optional[str]) -> Optional[str]:
-    """Resolve a possibly scheme/theme-qualified color to a 6-hex RGB string.
-
-    Returns None if value is None or unresolvable.  Direct RGB values pass
-    through unchanged (uppercased).  SCHEME:xxx / THEME:xxx values are looked
-    up in the active theme's color scheme so downstream family checks judge
-    the actual pixel color, not the theme role.
-    """
-    if not value:
-        return None
-    value = value.upper()
-    if value.startswith("SCHEME:") or value.startswith("THEME:"):
-        key = value.split(":", 1)[1].lower()
-        # PowerPoint's dk1/lt1/dk2/lt2 aliases show up as bg1/tx1/bg2/tx2 in
-        # some documents; try both spellings.
-        alias = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}.get(key, key)
-        rgb = _ACTIVE_THEME_COLORS.get(key) or _ACTIVE_THEME_COLORS.get(alias)
-        return rgb.upper() if rgb else None
-    if re.fullmatch(r"[0-9A-F]{6}", value):
-        return value
-    return None
-
-
-def color_is(value: Optional[str], family: str) -> bool:
-    """Return True when `value` visually belongs to the named color family.
-
-    Theme/scheme colors are resolved to their real RGB via the active theme
-    before matching — the rubric only cares that a fill "is gray" (or blue,
-    orange, etc.), not that it comes from a particular theme slot.  Only
-    unresolved scheme references fall back to name-based heuristics.
-    """
-    if value is None:
+def _in_band(rgb, lo_hex, hi_hex, tol=COLOR_TOL):
+    """逐通道判断 rgb 是否落在两个端点色构成的区间内（含容差）。"""
+    if not rgb:
         return False
-    rgb_hex = _resolve_color(value)
-    if rgb_hex is None:
-        # Unresolvable scheme/theme reference — fall back to a coarse name
-        # heuristic so we don't reject something we simply can't inspect.
-        upper = value.upper()
-        if upper.startswith("SCHEME:") or upper.startswith("THEME:"):
-            scheme = upper.split(":", 1)[1].lower()
-            if family == "white":
-                return "lt1" in scheme or "bg1" in scheme or "lt2" in scheme
-            if family == "black":
-                return "dk1" in scheme or "tx1" in scheme
-            return False
-        return False
-    rgb = color_tuple(rgb_hex)
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    max_min = max(rgb) - min(rgb)
-    if family == "white":
-        return r >= 235 and g >= 235 and b >= 235
-    if family == "black":
-        return r <= 45 and g <= 45 and b <= 45
-    if family == "gray":
-        # Any neutral gray: channels close together, not near pure white/black.
-        return max_min <= 25 and 40 <= (r + g + b) / 3 <= 220
-    if family == "light_gray":
-        return r >= 225 and g >= 225 and b >= 225 and max_min <= 18
-    if family == "green":
-        return g > r + 20 and g > b + 10 and g >= 85
-    if family == "dark_green":
-        return color_is(rgb_hex, "green") and sum(rgb) < 360
-    if family == "blue":
-        return b >= r and b >= g - 20 and b >= 90
-    if family == "light_blue":
-        return b >= 140 and g >= 130 and r >= 120 and b >= g >= r and max_min >= 12
-    if family == "dark_teal":
-        return g >= 45 and b >= 60 and r <= 85 and sum(rgb) < 380
-    if family == "orange":
-        return r >= 180 and 70 <= g <= 180 and b <= 90
-    if family == "red":
-        return r >= 170 and g <= 100 and b <= 100 and not color_is(rgb_hex, "orange")
-    return False
-
-
-def any_color_is(colors: Iterable[Optional[str]], family: str) -> bool:
-    return any(color_is(color, family) for color in colors if color)
-
-
-def text_shapes(model: PptModel, text: str, exact: bool = False) -> list[ShapeInfo]:
-    needle = normalize_for_match(text)
-    matches = []
-    for shape in model.shapes:
-        hay = normalize_for_match(shape.text)
-        if exact and hay == needle:
-            matches.append(shape)
-        elif not exact and needle in hay:
-            matches.append(shape)
-    return matches
-
-
-def xml_text_shapes(model: PptModel, text: str, exact: bool = False) -> list[XmlShapeInfo]:
-    needle = normalize_for_match(text)
-    matches = []
-    for shape in model.xml_shapes:
-        hay = normalize_for_match(shape.text)
-        if exact and hay == needle:
-            matches.append(shape)
-        elif not exact and needle in hay:
-            matches.append(shape)
-    return matches
-
-
-def all_text_contains(model: PptModel, text: str) -> bool:
-    return normalize_for_match(text) in normalize_for_match(model.all_text)
-
-
-def token_absent(model: PptModel, token: str) -> bool:
-    return re.search(rf"\b{re.escape(token.lower())}\b", normalize_for_match(model.all_text)) is None
-
-
-def average(values: list[float]) -> Optional[float]:
-    return sum(values) / len(values) if values else None
-
-
-def main_bbox(model: PptModel, include_small: bool = False) -> Optional[tuple[float, float, float, float]]:
-    candidates = []
-    for shape in model.shapes:
-        if shape.width_cm <= 0 or shape.height_cm <= 0:
-            continue
-        if shape.is_picture:
-            continue
-        if not include_small and shape.area_cm2 < 0.08 and not shape.text:
-            continue
-        candidates.append((shape.left_cm, shape.top_cm, shape.right_cm, shape.bottom_cm))
-    for shape in model.xml_shapes:
-        if shape.tag == "pic" or shape.width_cm <= 0 or shape.height_cm <= 0:
-            continue
-        if not include_small and shape.area_cm2 < 0.08 and not shape.text:
-            continue
-        candidates.append((shape.left_cm, shape.top_cm, shape.right_cm, shape.bottom_cm))
-    if not candidates:
-        return None
-    left = min(item[0] for item in candidates)
-    top = min(item[1] for item in candidates)
-    right = max(item[2] for item in candidates)
-    bottom = max(item[3] for item in candidates)
-    return left, top, right, bottom
-
-
-def shapes_inside_slide(model: PptModel) -> bool:
-    for shape in model.shapes:
-        if shape.width_cm <= 0 or shape.height_cm <= 0:
-            continue
-        if shape.left_cm < -0.1 or shape.top_cm < -0.1:
-            return False
-        if shape.right_cm > model.slide_width_cm + 0.1 or shape.bottom_cm > model.slide_height_cm + 0.1:
+    lo, hi = _hex2rgb(lo_hex), _hex2rgb(hi_hex)
+    for v, a, b in zip(rgb, lo, hi):
+        if not (min(a, b) - tol <= v <= max(a, b) + tol):
             return False
     return True
 
 
-def pass_result(rule_id: str, label: str, score: int, evidence: str) -> CheckResult:
-    return CheckResult(rule_id, label, score, True, evidence)
+def _lum(rgb):
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2] if rgb else 0.0
 
 
-def fail_result(rule_id: str, label: str, score: int, evidence: str) -> CheckResult:
-    return CheckResult(rule_id, label, score, False, evidence)
+def _is_dark(rgb):
+    return bool(rgb) and _lum(rgb) <= 110
 
 
-def gate_valid_file(model: PptModel) -> CheckResult:
-    if model.valid_pptx:
-        return pass_result("D1-1", "交付文件为 .pptx 格式，文件可正常打开", 0, f"loaded successfully; zip entries={len(model.zip_entries)}")
-    return fail_result("D1-1", "交付文件为 .pptx 格式，文件可正常打开", 0, model.load_error or "unknown load error")
+def _is_white(rgb, tol=18):
+    return bool(rgb) and min(rgb) >= 255 - tol
 
 
-def gate_not_single_image(model: PptModel) -> CheckResult:
-    sp = model.xml_counts.get("sp", 0)
-    connectors = model.xml_counts.get("cxnSp", 0)
-    editable_lines = len(line_candidates(model))
-    pics = model.xml_counts.get("pic", 0)
-    text_count = sum(1 for shape in model.shapes if shape.text.strip())
-    picture_area = sum(shape.area_cm2 for shape in model.xml_shapes if shape.tag == "pic")
-    slide_area = max(model.slide_width_cm * model.slide_height_cm, 1)
-    picture_ratio = picture_area / slide_area
-    has_full_slide_picture = any(
-        shape.tag == "pic"
-        and shape.width_cm >= model.slide_width_cm * 0.90
-        and shape.height_cm >= model.slide_height_cm * 0.90
-        for shape in model.xml_shapes
-    )
-    has_editable_content = (sp + connectors + editable_lines) >= 5 or text_count >= 3
-    ok = not has_full_slide_picture and picture_ratio < 0.85 and has_editable_content
-    evidence = f"pics={pics}, picture_area={picture_ratio:.1%}, full_slide_picture={has_full_slide_picture}, editable_shapes={sp}, editable_lines={editable_lines}, text_shapes={text_count}"
-    if ok:
-        return pass_result("D1-3", "该幻灯片不是一整张图片", 0, evidence)
-    return fail_result("D1-3", "该幻灯片不是一整张图片", 0, evidence)
+def _is_light(rgb):
+    return bool(rgb) and _lum(rgb) >= 190
 
 
-def gate_check_replacement(model: PptModel) -> CheckResult:
-    has_check = bool(text_shapes(model, "check")) or bool(xml_text_shapes(model, "check"))
-    assessment_absent = token_absent(model, "assessment")
-    if has_check and assessment_absent:
-        return pass_result("D1-4", "第二部分标题为 check 且无 assessment", 0, "found title/text 'check'; no standalone 'assessment' token")
-    return fail_result("D1-4", "第二部分标题为 check 且无 assessment", 0, f"has_check={has_check}, assessment_absent={assessment_absent}")
+def _is_orange(rgb):
+    if not rgb:
+        return False
+    r, g, b = rgb
+    return r >= 180 and 30 <= g <= 165 and b <= 110 and (r - g) >= 55 and (r - b) >= 90
 
 
-def gate_finish_body(model: PptModel) -> CheckResult:
-    found = all_text_contains(model, FINISH_BODY)
-    if found:
-        return pass_result("D1-5", "finish 正文已替换为指定文本", 0, "exact normalized finish body found")
-    return fail_result("D1-5", "finish 正文已替换为指定文本", 0, "specified finish body was not found after whitespace normalization")
+def _is_green(rgb):
+    if not rgb:
+        return False
+    r, g, b = rgb
+    return g >= 110 and (g - r) >= 35 and (g - b) >= 25
 
 
-def gate_filled_centered(model: PptModel) -> CheckResult:
-    bbox = main_bbox(model)
-    if bbox is None:
-        return fail_result("D1-6", "整体构图铺满且居中无遮挡", 0, "no editable content bounding box")
-    left, top, right, bottom = bbox
-    width_ratio = (right - left) / model.slide_width_cm
-    height_ratio = (bottom - top) / model.slide_height_cm
-    center_dx = abs(((left + right) / 2) - model.slide_width_cm / 2) / model.slide_width_cm
-    center_dy = abs(((top + bottom) / 2) - model.slide_height_cm / 2) / model.slide_height_cm
-    ok = width_ratio >= 0.78 and height_ratio >= 0.68 and center_dx <= 0.08 and center_dy <= 0.10 and shapes_inside_slide(model)
-    evidence = f"bbox={width_ratio:.1%}w x {height_ratio:.1%}h, center_dx={center_dx:.1%}, center_dy={center_dy:.1%}"
-    if ok:
-        return pass_result("D1-6", "整体构图铺满且居中无遮挡", 0, evidence)
-    return fail_result("D1-6", "整体构图铺满且居中无遮挡", 0, evidence)
+def _is_lightblue(rgb):
+    if not rgb:
+        return False
+    r, g, b = rgb
+    return b >= 170 and b >= r and g >= r and (b - r) >= 15
 
 
-def stage_title_shape(model: PptModel, title: str) -> Optional[ShapeInfo]:
-    matches = text_shapes(model, title, exact=True)
-    if matches:
-        return sorted(matches, key=lambda s: s.area_cm2, reverse=True)[0]
-    matches = text_shapes(model, title)
-    return sorted(matches, key=lambda s: s.area_cm2, reverse=True)[0] if matches else None
+def _between(v, lo, hi, tol=SIZE_TOL):
+    return (lo - tol) <= v <= (hi + tol)
 
 
-def stage_body_shape(model: PptModel, body: str) -> Optional[ShapeInfo]:
-    matches = text_shapes(model, body)
-    return sorted(matches, key=lambda s: len(s.text), reverse=True)[0] if matches else None
+def _norm_text(s):
+    if not s:
+        return ""
+    out = []
+    for ch in s:
+        if ch in "    \t\r\n":
+            out.append(" ")
+        elif ch in "‘’ʼ":
+            out.append("'")
+        elif ch in "“”":
+            out.append('"')
+        elif ch in "‐‑‒–—−":
+            out.append("-")
+        else:
+            out.append(ch)
+    return " ".join("".join(out).split()).strip()
 
 
-def number_shape(model: PptModel, number: str) -> Optional[ShapeInfo]:
-    candidates = [shape for shape in model.shapes if normalize_space(shape.text) == number]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda s: (abs(s.width_cm - s.height_cm), -s.area_cm2))[0]
+def _key(s):
+    return _norm_text(s).lower()
 
 
-def nearby_shapes(model: PptModel, center_x: float, center_y: float, radius_cm: float) -> list[ShapeInfo]:
-    found = []
-    for shape in model.shapes:
-        distance = math.hypot(shape.center_x_cm - center_x, shape.center_y_cm - center_y)
-        if distance <= radius_cm:
-            found.append(shape)
-    return found
+class El(object):
+    """幻灯片上的一个绘图对象（已换算为幻灯片绝对坐标，单位 cm）。"""
+
+    __slots__ = ("tag", "prst", "x", "y", "w", "h", "rw", "rh", "flip_h", "flip_v",
+                 "rot", "fill_kind", "fill_rgb", "fill_alpha", "ln_none", "ln_w",
+                 "ln_rgb", "ln_alpha", "ln_dash", "ln_head", "ln_tail", "text",
+                 "runs", "align", "anchor", "autofit", "depth", "order", "geom_ok")
+
+    def __init__(self):
+        self.tag = ""
+        self.prst = ""
+        self.x = self.y = self.w = self.h = 0.0
+        self.rw = self.rh = 0.0
+        self.flip_h = self.flip_v = False
+        self.rot = 0.0
+        self.fill_kind = "inherit"
+        self.fill_rgb = None
+        self.fill_alpha = 100.0
+        self.ln_none = False
+        self.ln_w = None
+        self.ln_rgb = None
+        self.ln_alpha = 100.0
+        self.ln_dash = ""
+        self.ln_head = ""
+        self.ln_tail = ""
+        self.text = ""
+        self.runs = []
+        self.align = ""
+        self.anchor = ""
+        self.autofit = ""
+        self.depth = 0
+        self.order = 0
+        self.geom_ok = False
+
+    # --- 便捷属性 ---
+    @property
+    def x2(self):
+        return self.x + self.w
+
+    @property
+    def y2(self):
+        return self.y + self.h
+
+    @property
+    def cx(self):
+        return self.x + self.w / 2.0
+
+    @property
+    def cy(self):
+        return self.y + self.h / 2.0
+
+    @property
+    def area(self):
+        return self.w * self.h
+
+    @property
+    def is_leaf(self):
+        return self.tag in ("sp", "pic", "cxnSp", "graphicFrame")
+
+    @property
+    def filled(self):
+        return self.fill_kind in ("solid", "grad", "blip") and self.fill_alpha > 8.0
+
+    def bbox(self):
+        return (self.x, self.y, self.x2, self.y2)
+
+    def contains_point(self, px, py, pad=0.0):
+        return (self.x - pad <= px <= self.x2 + pad) and (self.y - pad <= py <= self.y2 + pad)
+
+    def contains(self, other, pad=0.0):
+        return (self.x - pad <= other.x and other.x2 <= self.x2 + pad and
+                self.y - pad <= other.y and other.y2 <= self.y2 + pad)
+
+    def overlaps(self, other, pad=0.0):
+        return not (other.x > self.x2 + pad or other.x2 < self.x - pad or
+                    other.y > self.y2 + pad or other.y2 < self.y - pad)
+
+    def endpoints(self):
+        """线条类对象的起点/终点（考虑翻转，并容忍非法的负尺寸）。"""
+        ascending = (self.rh < 0) != bool(self.flip_v)
+        if ascending:
+            p1, p2 = (self.x, self.y2), (self.x2, self.y)
+        else:
+            p1, p2 = (self.x, self.y), (self.x2, self.y2)
+        if self.flip_h:
+            p1, p2 = p2, p1
+        return p1, p2
+
+    @property
+    def seg_len(self):
+        (x1, y1), (x2, y2) = self.endpoints()
+        return math.hypot(x2 - x1, y2 - y1)
+
+    @property
+    def arrow_right(self):
+        """箭头（线端属性）是否位于线段右端。"""
+        (x1, _), (x2, _) = self.endpoints()
+        tail_at_right = x2 >= x1
+        if self.ln_tail and self.ln_tail != "none":
+            return tail_at_right
+        if self.ln_head and self.ln_head != "none":
+            return not tail_at_right
+        return False
+
+    @property
+    def has_arrow(self):
+        return bool((self.ln_tail and self.ln_tail != "none") or
+                    (self.ln_head and self.ln_head != "none"))
 
 
-def nearby_xml_shapes(model: PptModel, center_x: float, center_y: float, radius_cm: float) -> list[XmlShapeInfo]:
-    found = []
-    for shape in model.xml_shapes:
-        distance = math.hypot(shape.center_x_cm - center_x, shape.center_y_cm - center_y)
-        if distance <= radius_cm:
-            found.append(shape)
-    return found
+def _theme_colors(zf):
+    """读取主题配色，并按常规 clrMap 映射 bg1/tx1 等别名。"""
+    table = {}
+    try:
+        root = ET.fromstring(zf.read("ppt/theme/theme1.xml"))
+    except Exception:
+        root = None
+    if root is not None:
+        scheme = root.find(".//" + A + "clrScheme")
+        for node in (scheme if scheme is not None else []):
+            name = node.tag.split("}")[-1]
+            srgb = node.find(A + "srgbClr")
+            sysc = node.find(A + "sysClr")
+            val = srgb.get("val") if srgb is not None else (
+                sysc.get("lastClr") if sysc is not None else None)
+            if val:
+                table[name] = val.upper()
+    table.setdefault("dk1", "000000")
+    table.setdefault("lt1", "FFFFFF")
+    table.setdefault("dk2", "000000")
+    table.setdefault("lt2", "FFFFFF")
+    for alias, target in (("tx1", "dk1"), ("bg1", "lt1"), ("tx2", "dk2"), ("bg2", "lt2")):
+        table[alias] = table.get(target, "000000")
+    return table
 
 
-def shape_font_family_ok(shape: ShapeInfo, accepted: tuple[str, ...] = ("arial", "times", "liberation serif")) -> bool:
-    if not shape.font_names:
-        return True
-    return any(any(accepted_name in name.lower() for accepted_name in accepted) for name in shape.font_names)
+def _color_of(container, theme):
+    """从 solidFill 容器读出 (rgb, alpha%)；无 solidFill 返回 (None, None)。"""
+    if container is None:
+        return None, None
+    sf = container.find(A + "solidFill")
+    if sf is None:
+        return None, None
+    rgb, alpha = None, 100.0
+    node = sf.find(A + "srgbClr")
+    if node is None:
+        node = sf.find(A + "schemeClr")
+        if node is not None:
+            rgb = _hex2rgb(theme.get(node.get("val") or "", ""))
+    else:
+        rgb = _hex2rgb(node.get("val"))
+    if node is not None:
+        al = node.find(A + "alpha")
+        if al is not None:
+            try:
+                alpha = int(al.get("val")) / 1000.0
+            except (TypeError, ValueError):
+                alpha = 100.0
+        lm = node.find(A + "lumMod")
+        lo = node.find(A + "lumOff")
+        if rgb and (lm is not None or lo is not None):
+            f = int(lm.get("val")) / 100000.0 if lm is not None else 1.0
+            off = int(lo.get("val")) / 100000.0 if lo is not None else 0.0
+            rgb = tuple(int(max(0, min(255, v * f + 255 * off))) for v in rgb)
+    return rgb, alpha
 
 
-def font_size_in(shape: ShapeInfo, low: float, high: float) -> bool:
-    sizes = [size for size in shape.font_sizes if size > 0]
-    if not sizes:
-        return True
-    avg = average(sizes)
-    return avg is not None and low - PT_TOL <= avg <= high + PT_TOL
-
-
-def font_size_in_spec(shape: ShapeInfo, low: float, high: float, tol: float = 0.2) -> bool:
-    """Check explicit rubric font-size ranges with only conversion tolerance."""
-    sizes = [size for size in shape.font_sizes if size > 0]
-    if not sizes:
-        return True
-    avg = average(sizes)
-    return avg is not None and low - tol <= avg <= high + tol
-
-
-def shape_has_text_color(shape: ShapeInfo, family: str) -> bool:
-    if not shape.font_colors:
-        return True
-    return any_color_is(shape.font_colors, family)
-
-
-def shape_bold_ok(shape: ShapeInfo, required: bool) -> bool:
-    if not shape.bold_values:
-        return True
-    return any(shape.bold_values) if required else True
-
-
-def shape_italic_ok(shape: ShapeInfo, required: bool) -> bool:
-    if not shape.italic_values:
-        return True
-    return any(shape.italic_values) if required else True
-
-
-def shape_centered_ok(shape: ShapeInfo) -> bool:
-    if not shape.alignments:
-        return True
-    joined = " ".join(shape.alignments)
-    return "center" in joined or "2" in joined or joined.strip() == ""
-
-
-def find_title_bar(model: PptModel, title: str) -> Optional[ShapeInfo]:
-    shape = stage_title_shape(model, title)
-    if shape:
-        return shape
+def _shape_props(node):
+    for tag in (P + "spPr", A + "spPr", P + "grpSpPr", A + "grpSpPr"):
+        found = node.find(tag)
+        if found is not None:
+            return found
     return None
 
 
-def find_icon_candidates(model: PptModel, title_shape: Optional[ShapeInfo], number: str) -> list[ShapeInfo]:
-    number_record = number_shape(model, number)
-    anchor_x = title_shape.center_x_cm if title_shape else (number_record.center_x_cm if number_record else model.slide_width_cm / 2)
-    anchor_y = (title_shape.top_cm - 1.8) if title_shape else (number_record.center_y_cm if number_record else model.slide_height_cm / 2)
-    candidates = []
-    for shape in model.shapes:
-        if shape.text.strip():
-            continue
-        if 2.6 <= shape.width_cm <= 3.8 and 2.6 <= shape.height_cm <= 3.8:
-            if abs(shape.center_x_cm - anchor_x) <= 1.2 and abs(shape.center_y_cm - anchor_y) <= 1.5:
-                candidates.append(shape)
-    if candidates:
-        return candidates
-    # Fallback to XML because PowerPoint often stores icon circles as background
-    # shapes and the text/icon strokes as separate selectable objects.
-    for shape in model.xml_shapes:
-        if shape.tag == "sp" and shape.geom == "ellipse" and 2.6 <= shape.width_cm <= 3.8 and 2.6 <= shape.height_cm <= 3.8:
-            if abs(shape.center_x_cm - anchor_x) <= 1.2 and abs(shape.center_y_cm - anchor_y) <= 1.5:
-                candidates.append(
-                    ShapeInfo(
-                        name=shape.name,
-                        shape_type="xml:sp",
-                        text="",
-                        left_cm=shape.left_cm,
-                        top_cm=shape.top_cm,
-                        width_cm=shape.width_cm,
-                        height_cm=shape.height_cm,
-                        fill_color=shape.fill_color,
-                        line_color=shape.line_color,
-                        line_width_pt=shape.line_width_pt,
-                    )
-                )
-    return candidates
-
-
-def xml_backing_shape(
-    model: PptModel,
-    text_shape: Optional[ShapeInfo],
-    width_range: tuple[float, float],
-    height_range: tuple[float, float],
-    geoms: set[str],
-    max_center_delta_cm: float = 0.45,
-) -> Optional[XmlShapeInfo]:
-    if text_shape is None:
-        return None
-    candidates = []
-    for shape in model.xml_shapes:
-        if shape.tag != "sp" or shape.text.strip():
-            continue
-        if shape.geom not in geoms:
-            continue
-        if not (close(shape.width_cm, width_range[0], width_range[1]) and close(shape.height_cm, height_range[0], height_range[1])):
-            continue
-        delta = math.hypot(shape.center_x_cm - text_shape.center_x_cm, shape.center_y_cm - text_shape.center_y_cm)
-        if delta <= max_center_delta_cm:
-            candidates.append((delta, shape))
-    return sorted(candidates, key=lambda item: item[0])[0][1] if candidates else None
-
-
-def text_effective_fill(model: PptModel, text_shape: Optional[ShapeInfo], width_range: tuple[float, float], height_range: tuple[float, float], geoms: set[str]) -> Optional[str]:
-    if text_shape is None:
-        return None
-    return text_shape.fill_color or (xml_backing_shape(model, text_shape, width_range, height_range, geoms).fill_color if xml_backing_shape(model, text_shape, width_range, height_range, geoms) else None)
-
-
-def number_backing_shape(model: PptModel, text_shape: Optional[ShapeInfo]) -> Optional[XmlShapeInfo]:
-    return xml_backing_shape(model, text_shape, (0.9, 1.2), (0.9, 1.2), {"ellipse"}, 0.35)
-
-
-def title_backing_shape(model: PptModel, text_shape: Optional[ShapeInfo]) -> Optional[XmlShapeInfo]:
-    return xml_backing_shape(model, text_shape, (3.9, 4.5), (0.85, 1.15), {"roundRect"}, 0.45)
-
-
-def body_backing_shape(model: PptModel, text_shape: Optional[ShapeInfo]) -> Optional[XmlShapeInfo]:
-    return xml_backing_shape(model, text_shape, (5.1, 5.3), (4.3, 4.7), {"roundRect"}, 0.60)
-
-
-def check_stage(model: PptModel, spec: dict) -> CheckResult:
-    rule_id = f"D2-STAGE-{spec['num']}"
-    label = f"第 {spec['num']} 阶段节点：{spec['title']}"
-    score = 5
-    # 标记为 strict 的阶段按 +5 细则逐点严格核验（细则未提及的不额外约束）。
-    strict = bool(spec.get("strict"))
-    failures = []
-    num = number_shape(model, spec["num"])
-    title = find_title_bar(model, spec["title"])
-    body = stage_body_shape(model, spec["body"])
-    if num is None:
-        failures.append("missing number circle")
-    else:
-        num_bg = number_backing_shape(model, num)
-        num_w = num_bg.width_cm if num_bg is not None else num.width_cm
-        num_h = num_bg.height_cm if num_bg is not None else num.height_cm
-        num_fill = num_bg.fill_color if num_bg is not None else num.fill_color
-        # 细则：编号圆 宽高（spec['num_size'] 指定；未指定则沿用原默认 1-1.2cm）
-        _ns = spec.get("num_size", (1.0, 1.2))
-        num_lo = float(_ns[0]); num_hi = float(_ns[1])  # type: ignore[index,arg-type]
-        if not (in_spec_cm(num_w, num_lo, num_hi) and in_spec_cm(num_h, num_lo, num_hi)):
-            failures.append(f"number size={num_w:.2f}x{num_h:.2f}cm not in {num_lo}-{num_hi}cm")
-        # 细则：深绿色填充
-        if strict:
-            if not color_is(num_fill, "dark_green"):
-                failures.append(f"number fill not dark green: {num_fill}")
-        elif not (color_is(num_fill, "dark_green") or color_is(num_fill, "green") or color_is(num_fill, "dark_teal")):
-            failures.append(f"number fill={num_fill}")
-        # 细则：白色编号（stage 1-4 要求；stage 5 细则未提"白色编号"，故不约束）
-        if spec.get("num_white", True) and not shape_has_text_color(num, "white"):
-            failures.append("number text is not white")
-    if title is None:
-        failures.append("missing title")
-    else:
-        title_bg = title_backing_shape(model, title)
-        title_w = title_bg.width_cm if title_bg is not None else title.width_cm
-        title_h = title_bg.height_cm if title_bg is not None else title.height_cm
-        title_fill = title_bg.fill_color if title_bg is not None else title.fill_color
-        # 细则：标题条 宽/高（spec['title_size'] 指定；未指定则沿用原默认 4-4.2cm × 0.9-1.1cm）
-        t_w_lo, t_w_hi, t_h_lo, t_h_hi = spec.get("title_size", (4.0, 4.2, 0.9, 1.1))  # type: ignore[misc]
-        t_w_lo = float(t_w_lo); t_w_hi = float(t_w_hi); t_h_lo = float(t_h_lo); t_h_hi = float(t_h_hi)
-        if not (in_spec_cm(title_w, t_w_lo, t_w_hi) and in_spec_cm(title_h, t_h_lo, t_h_hi)):
-            failures.append(f"title size={title_w:.2f}x{title_h:.2f}cm not in {t_w_lo}-{t_w_hi} x {t_h_lo}-{t_h_hi}cm")
-        # 细则：深青色圆角标题条
-        if strict:
-            if not color_is(title_fill, "dark_teal"):
-                failures.append(f"title fill not dark teal: {title_fill}")
-            if title_bg is not None and title_bg.geom != "roundRect":
-                failures.append(f"title not roundRect: {title_bg.geom}")
-        elif not (color_is(title_fill, "dark_teal") or color_is(title_fill, "blue")):
-            failures.append(f"title fill={title_fill}")
-        # 细则：文本白色 Arial 或 新罗马(Times New Roman) 14-18磅 加粗
-        if strict:
-            if not shape_font_family_ok(title, ("arial", "times")):
-                failures.append(f"title font not Arial/Times: {sorted(title.font_names)}")
-            if not font_size_in_spec(title, 14, 18):
-                failures.append(f"title font size not 14-18pt: {title.font_sizes}")
-        else:
-            if not shape_font_family_ok(title):
-                failures.append(f"title font={sorted(title.font_names)}")
-            if not font_size_in(title, 14, 18):
-                failures.append(f"title font size={title.font_sizes}")
-        if not shape_has_text_color(title, "white"):
-            failures.append("title text not white")
-        if not shape_bold_ok(title, True):
-            failures.append("title not bold")
+def _read_text(node, el, theme):
+    body = node.find(P + "txBody")
     if body is None:
-        failures.append("missing body text")
-    else:
-        body_bg = body_backing_shape(model, body)
-        body_w = body_bg.width_cm if body_bg is not None else body.width_cm
-        body_h = body_bg.height_cm if body_bg is not None else body.height_cm
-        body_fill = body_bg.fill_color if body_bg is not None else body.fill_color
-        # 细则：说明框 宽/高（spec['body_size'] 指定；未指定则沿用原默认 5.1-5.3cm × 4.3-4.6cm）
-        _bs = spec.get("body_size", (5.1, 5.3, 4.3, 4.6))
-        b_w_lo = float(_bs[0]); b_w_hi = float(_bs[1]); b_h_lo = float(_bs[2]); b_h_hi = float(_bs[3])  # type: ignore[index,arg-type]
-        if not (in_spec_cm(body_w, b_w_lo, b_w_hi) and in_spec_cm(body_h, b_h_lo, b_h_hi)):
-            failures.append(f"body size={body_w:.2f}x{body_h:.2f}cm not in {b_w_lo}-{b_w_hi} x {b_h_lo}-{b_h_hi}cm")
-        # 细则：圆角矩形说明框（strict 阶段要求 roundRect）
-        if strict and body_bg is not None and body_bg.geom != "roundRect":
-            failures.append(f"body not roundRect: {body_bg.geom}")
-        # 细则：说明框填充色（stage 1 白色 / stage 2 浅蓝色，由 spec['body_fill'] 指定）
-        if strict:
-            want_fill = spec.get("body_fill")
-            if want_fill and not color_is(body_fill, want_fill):
-                failures.append(f"body fill not {want_fill}: {body_fill}")
+        body = node.find(A + "txBody")
+    if body is None:
+        return
+    bpr = body.find(A + "bodyPr")
+    if bpr is not None:
+        el.anchor = bpr.get("anchor") or ""
+        if bpr.find(A + "normAutofit") is not None:
+            el.autofit = "normAutofit"
+        elif bpr.find(A + "spAutoFit") is not None:
+            el.autofit = "spAutoFit"
         else:
-            if not (color_is(body_fill, "light_blue") or color_is(body_fill, "white")):
-                failures.append(f"body fill={body_fill}")
-        # 细则：文本 Arial 或 新罗马 10-14磅（说明框正文内容由 stage_body_shape 匹配保证）
-        if strict:
-            if not shape_font_family_ok(body, ("arial", "times")):
-                failures.append(f"body font not Arial/Times: {sorted(body.font_names)}")
-            if not font_size_in_spec(body, 10, 14):
-                failures.append(f"body font size not 10-14pt: {body.font_sizes}")
-        else:
-            if not shape_font_family_ok(body):
-                failures.append(f"body font={sorted(body.font_names)}")
-            if not font_size_in(body, 10, 14):
-                failures.append(f"body font size={body.font_sizes}")
-    icon_candidates = find_icon_candidates(model, title, spec["num"])
-    if not icon_candidates:
-        failures.append("missing editable icon circle near title")
-    else:
-        # 细则：浅蓝色圆形 宽高（spec['icon_size'] 指定；未指定则沿用原默认 3.1-3.4cm）
-        _is = spec.get("icon_size", (3.1, 3.4))
-        ic_lo = float(_is[0]); ic_hi = float(_is[1])  # type: ignore[index,arg-type]
-        ic_mid = (ic_lo + ic_hi) / 2
-        icon = sorted(icon_candidates, key=lambda s: abs(s.width_cm - ic_mid) + abs(s.height_cm - ic_mid))[0]
-        if not (in_spec_cm(icon.width_cm, ic_lo, ic_hi) and in_spec_cm(icon.height_cm, ic_lo, ic_hi)):
-            failures.append(f"icon size={icon.width_cm:.2f}x{icon.height_cm:.2f}cm not in {ic_lo}-{ic_hi}cm")
-        if not color_is(icon.fill_color, "light_blue"):
-            failures.append(f"icon fill={icon.fill_color}")
-        # 细则：圆形内含图标 → 圆内存在可编辑图形部件
-        local_xml = nearby_xml_shapes(model, icon.center_x_cm, icon.center_y_cm, 2.2)
-        editable_inside = [x for x in local_xml if x.tag in {"sp", "cxnSp"} and x.area_cm2 < 8.0]
-        if len(editable_inside) < 2:
-            failures.append(f"icon editable parts={len(editable_inside)}")
-        # 细则：圆形内含橙色感叹号小圆标（仅 stage 2）
-        if spec.get("icon_orange_badge"):
-            orange_badge = [
-                x for x in local_xml
-                if x.tag == "sp" and x.geom == "ellipse"
-                and color_is(x.fill_color, "orange")
-                and x.width_cm <= 1.2 and x.height_cm <= 1.2
-            ]
-            if not orange_badge:
-                failures.append("orange exclamation badge circle not found in icon")
-    # 细则：距上边线 3.5-3.8cm（仅 stage 1，spec['top_range'] 指定）
-    if spec.get("top_range") and (title is not None or num is not None):
-        top_low, top_high = spec["top_range"]
-        num_bg = number_backing_shape(model, num) if num is not None else None
-        stage_top = num_bg.top_cm if num_bg is not None else (num.top_cm if num is not None else title.top_cm)
-        if strict:
-            if not in_spec_cm(stage_top, top_low, top_high):
-                failures.append(f"stage top={stage_top:.2f}cm not in {top_low}-{top_high}cm")
-        elif not close(stage_top, top_low, top_high, 0.15):
-            failures.append(f"stage top={stage_top:.2f}cm, expected near {top_low}-{top_high}cm")
-    # 细则：位于指定阶段右侧（stage 2 位于第 1 阶段 start 右侧）
-    right_of = spec.get("right_of_title")
-    if right_of and title is not None:
-        left_stage = stage_title_shape(model, right_of)
-        if left_stage is not None and not (title.center_x_cm > left_stage.center_x_cm):
-            failures.append(f"stage not to the right of '{right_of}' (cx={title.center_x_cm:.2f} <= {left_stage.center_x_cm:.2f})")
-    # 细则：位于页面中部（stage 3）——节点水平中心接近页面水平中线
-    if spec.get("center_of_page") and title is not None:
-        page_center_x = model.slide_width_cm / 2
-        if not near(title.center_x_cm, page_center_x, 1.0):
-            failures.append(f"stage not at page center (cx={title.center_x_cm:.2f} vs {page_center_x:.2f})")
-    # 细则：位于页面右侧（stage 5）——节点水平中心位于页面右半区
-    if spec.get("right_side_of_page") and title is not None:
-        if not (title.center_x_cm > model.slide_width_cm * 0.6):
-            failures.append(f"stage not on right side of page (cx={title.center_x_cm:.2f}, page_w={model.slide_width_cm:.2f})")
-    if failures:
-        return fail_result(rule_id, label, score, "; ".join(failures))
-    return pass_result(rule_id, label, score, f"found number {spec['num']}, title '{spec['title']}', body, icon and styles")
+            el.autofit = "none"
+    paras = []
+    for para in body.findall(A + "p"):
+        ppr = para.find(A + "pPr")
+        if ppr is not None and not el.align:
+            el.align = ppr.get("algn") or ""
+        chunks = []
+        for child in para:
+            name = child.tag.split("}")[-1]
+            if name == "r":
+                t = child.find(A + "t")
+                chunks.append(t.text or "" if t is not None else "")
+                el.runs.append(_read_run(child, theme))
+            elif name == "br":
+                chunks.append(" ")
+            elif name == "fld":
+                t = child.find(A + "t")
+                chunks.append(t.text or "" if t is not None else "")
+        paras.append("".join(chunks))
+    el.text = "\n".join(paras)
 
 
-def line_candidates(model: PptModel) -> list[XmlShapeInfo]:
-    return [shape for shape in model.xml_shapes if shape.tag == "cxnSp" or (shape.line_width_pt is not None and shape.width_cm + shape.height_cm > 0.2)]
+def _read_run(run_node, theme):
+    pr = run_node.find(A + "rPr")
+    info = {"size": None, "bold": False, "italic": False, "rgb": None, "alpha": 100.0}
+    if pr is None:
+        return info
+    sz = pr.get("sz")
+    if sz:
+        try:
+            info["size"] = int(sz) / 100.0
+        except ValueError:
+            pass
+    info["bold"] = pr.get("b") == "1"
+    info["italic"] = pr.get("i") == "1"
+    rgb, alpha = _color_of(pr, theme)
+    info["rgb"] = rgb
+    if alpha is not None:
+        info["alpha"] = alpha
+    return info
 
 
-def is_straight_line_geom(shape: XmlShapeInfo) -> bool:
-    """Return True when a shape is a single-stroke straight line/arrow.
+def _read_geom(node, el, theme):
+    pr = _shape_props(node)
+    if pr is None:
+        return None
+    geom = pr.find(A + "prstGeom")
+    if geom is not None:
+        el.prst = geom.get("prst") or ""
+    elif pr.find(A + "custGeom") is not None:
+        el.prst = "custGeom"
+    if pr.find(A + "noFill") is not None:
+        el.fill_kind = "none"
+    elif pr.find(A + "solidFill") is not None:
+        el.fill_kind = "solid"
+        el.fill_rgb, alpha = _color_of(pr, theme)
+        el.fill_alpha = 100.0 if alpha is None else alpha
+    elif pr.find(A + "gradFill") is not None:
+        el.fill_kind = "grad"
+    elif pr.find(A + "blipFill") is not None:
+        el.fill_kind = "blip"
+    if el.tag == "pic":
+        el.fill_kind = "blip"
+    ln = pr.find(A + "ln")
+    if ln is not None:
+        if ln.get("w"):
+            try:
+                el.ln_w = int(ln.get("w")) / EMU_PT
+            except ValueError:
+                el.ln_w = None
+        el.ln_none = ln.find(A + "noFill") is not None
+        el.ln_rgb, alpha = _color_of(ln, theme)
+        el.ln_alpha = 100.0 if alpha is None else alpha
+        dash = ln.find(A + "prstDash")
+        el.ln_dash = (dash.get("val") or "") if dash is not None else "solid"
+        head = ln.find(A + "headEnd")
+        tail = ln.find(A + "tailEnd")
+        el.ln_head = (head.get("type") or "") if head is not None else ""
+        el.ln_tail = (tail.get("type") or "") if tail is not None else ""
+    return pr
 
-    Accepts both routes PowerPoint uses for "一体箭头":
-      • autoshape ``line`` (``<p:sp>`` with ``prstGeom prst="line"``);
-      • the straight-connector family (``<p:cxnSp>`` with ``straightConnector1``
-        or plain ``line`` geometry).
-    Either can carry ``headEnd``/``tailEnd`` arrowheads as one integrated
-    object, so both should be eligible everywhere an "arrow" is checked.
-    """
-    if shape.geom == "line" or shape.geom == "straightConnector1":
+
+def _xfrm_of(pr):
+    if pr is None:
+        return None
+    xf = pr.find(A + "xfrm")
+    return xf
+
+
+def _walk(container, tf, depth, out, theme, counter):
+    """遍历形状树；tf = (ox, oy, sx, sy, cox, coy)，把子空间坐标换算到绝对坐标。"""
+    ox, oy, sx, sy, cox, coy = tf
+    for node in container:
+        tag = node.tag.split("}")[-1]
+        if tag not in ("sp", "pic", "cxnSp", "grpSp", "graphicFrame"):
+            continue
+        el = El()
+        el.tag = tag
+        el.depth = depth
+        el.order = counter[0]
+        counter[0] += 1
+        pr = _read_geom(node, el, theme)
+        xf = _xfrm_of(pr)
+        if xf is None and tag == "graphicFrame":
+            xf = node.find(P + "xfrm")
+        lx = ly = lw = lh = 0.0
+        if xf is not None:
+            off = xf.find(A + "off")
+            ext = xf.find(A + "ext")
+            if off is not None:
+                lx = float(off.get("x") or 0) / EMU_CM
+                ly = float(off.get("y") or 0) / EMU_CM
+            if ext is not None:
+                lw = float(ext.get("cx") or 0) / EMU_CM
+                lh = float(ext.get("cy") or 0) / EMU_CM
+            el.flip_h = xf.get("flipH") == "1"
+            el.flip_v = xf.get("flipV") == "1"
+            try:
+                el.rot = float(xf.get("rot") or 0) / 60000.0
+            except ValueError:
+                el.rot = 0.0
+            el.geom_ok = True
+        el.rw, el.rh = lw * sx, lh * sy
+        el.w, el.h = abs(el.rw), abs(el.rh)
+        el.x = ox + (lx - cox) * sx
+        el.y = oy + (ly - coy) * sy
+        if el.rw < 0:
+            el.x += el.rw
+        if el.rh < 0:
+            el.y += el.rh
+        _read_text(node, el, theme)
+        out.append(el)
+        if tag == "grpSp":
+            chx = chy = 0.0
+            nsx, nsy = sx, sy
+            if xf is not None:
+                choff = xf.find(A + "chOff")
+                chext = xf.find(A + "chExt")
+                if choff is not None:
+                    chx = float(choff.get("x") or 0) / EMU_CM
+                    chy = float(choff.get("y") or 0) / EMU_CM
+                if chext is not None:
+                    ccx = float(chext.get("cx") or 0) / EMU_CM
+                    ccy = float(chext.get("cy") or 0) / EMU_CM
+                    nsx = (el.rw / ccx) if ccx else sx
+                    nsy = (el.rh / ccy) if ccy else sy
+            _walk(node, (el.x, el.y, nsx, nsy, chx, chy), depth + 1, out, theme, counter)
+
+
+class Deck(object):
+    """一份 pptx 的解析结果。"""
+
+    def __init__(self):
+        self.page_w = 0.0
+        self.page_h = 0.0
+        self.slide_count = 0
+        self.els = []
+        self.leaves = []
+        self.tops = []
+        self.texts = []
+        self.theme = {}
+        self.bg_fill = None
+        self.has_shadow = False
+
+
+def _load(path):
+    deck = Deck()
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        pres = ET.fromstring(zf.read("ppt/presentation.xml"))
+        sz = pres.find(P + "sldSz")
+        if sz is not None:
+            deck.page_w = float(sz.get("cx") or 0) / EMU_CM
+            deck.page_h = float(sz.get("cy") or 0) / EMU_CM
+        slides = sorted(n for n in names
+                        if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
+        deck.slide_count = len(slides)
+        if not slides:
+            return deck
+        deck.theme = _theme_colors(zf)
+        raw = zf.read(slides[0])
+        text = raw.decode("utf-8", "ignore")
+        deck.has_shadow = ("outerShdw" in text or "innerShdw" in text
+                           or "prstShdw" in text)
+        root = ET.fromstring(raw)
+        csld = root.find(P + "cSld")
+        if csld is not None:
+            bg = csld.find(P + "bg")
+            if bg is not None:
+                bgpr = bg.find(P + "bgPr")
+                rgb, alpha = _color_of(bgpr, deck.theme)
+                if rgb and (alpha or 100.0) > 8.0:
+                    deck.bg_fill = rgb
+            tree = csld.find(P + "spTree")
+            if tree is not None:
+                _walk(tree, (0.0, 0.0, 1.0, 1.0, 0.0, 0.0), 0, deck.els,
+                      deck.theme, [0])
+    deck.leaves = [e for e in deck.els if e.is_leaf]
+    deck.tops = [e for e in deck.els if e.depth == 0]
+    deck.texts = [e for e in deck.els if _norm_text(e.text)]
+    return deck
+
+
+class Ctx(object):
+    """把幻灯片上的对象归类为版面语义部件。"""
+
+    def __init__(self, deck):
+        self.deck = deck
+        self.pw = deck.page_w or 33.87
+        self.ph = deck.page_h or 19.05
+        self.leaves = deck.leaves
+        self.circles = self._find_circles()
+        self.legend = self._find_legend()
+        self.numbers = self._find_numbers()
+        self.num_circles = self._find_num_circles()
+        self.pills = self._find_pills()
+        self.labels = self._match_labels()
+        self.desc_round = False
+        self.descs = self._find_descs()
+        self.bodies = self._match_bodies()
+        self.arrows = self._find_step_arrows()
+        self.curve = self._find_curve()
+        self.emotions = self._find_emotions()
+        self.theme_el = self._find_theme()
+        self.icons = [self._icon_set(c) for c in self.circles]
+
+    def px(self, v):
+        return v / self.pw * 100.0
+
+    def py(self, v):
+        return v / self.ph * 100.0
+
+    def _find_circles(self):
+        cand = [e for e in self.leaves
+                if e.prst == "ellipse" and e.filled and 2.4 <= e.w <= 3.8
+                and abs(e.w - e.h) <= 0.3 and _is_light(e.fill_rgb)
+                and 20.0 <= self.py(e.cy) <= 50.0]
+        cand.sort(key=lambda e: e.x)
+        return cand
+
+    def _find_legend(self):
+        cand = [e for e in self.leaves
+                if e.prst in ("roundRect", "rect") and 4.5 <= e.w <= 7.5
+                and 1.5 <= e.h <= 3.0 and self.px(e.x) <= 10.0
+                and self.py(e.y) <= 10.0]
+        cand.sort(key=lambda e: (e.y, e.x))
+        return cand[0] if cand else None
+
+    def _find_numbers(self):
+        out = []
+        for e in self.deck.texts:
+            t = _norm_text(e.text)
+            if len(t) == 1 and t in NUM_GLYPHS:
+                out.append((NUM_GLYPHS[t], e))
+        out.sort(key=lambda pair: pair[1].x)
+        return out
+
+
+    def _find_num_circles(self):
+        res = []
+        for _digit, ne in self.numbers:
+            best = None
+            for e in self.leaves:
+                if e.prst != "ellipse" or not e.filled or not _is_dark(e.fill_rgb):
+                    continue
+                if not (0.4 <= e.w <= 1.8) or abs(e.w - e.h) > 0.25:
+                    continue
+                if not e.contains_point(ne.cx, ne.cy, 0.15):
+                    continue
+                if best is None or e.area < best.area:
+                    best = e
+            res.append(best)
+        return res
+
+    def _find_pills(self):
+        cand = [e for e in self.leaves
+                if e.prst in ("roundRect", "rect") and e.filled and _is_dark(e.fill_rgb)
+                and 3.0 <= e.w <= 5.6 and 0.6 <= e.h <= 1.5
+                and 30.0 <= self.py(e.cy) <= 52.0]
+        cand.sort(key=lambda e: e.x)
+        return cand
+
+    def _match_labels(self):
+        out = []
+        for p in self.pills:
+            found = None
+            for e in self.deck.texts:
+                if _key(e.text) not in STAGE_LABELS:
+                    continue
+                if abs(e.cy - p.cy) <= 0.7 and abs(e.cx - p.cx) <= 0.9:
+                    found = e
+                    break
+            out.append(found)
+        return out
+
+    def _find_descs(self):
+        def cand(prsts):
+            got = [e for e in self.leaves
+                   if e.prst in prsts and 4.2 <= e.w <= 6.0 and 3.8 <= e.h <= 5.6
+                   and 40.0 <= self.py(e.y) <= 56.0]
+            got.sort(key=lambda e: e.x)
+            return got
+        rounded = cand(("roundRect",))
+        self.desc_round = len(rounded) >= 5
+        if len(rounded) >= 5:
+            return rounded
+        extra = [e for e in cand(("rect",)) if e not in rounded]
+        return sorted(rounded + extra, key=lambda e: e.x)
+
+
+    def _match_bodies(self):
+        out = []
+        for d in self.descs[:5]:
+            if len(_norm_text(d.text)) > 30:
+                out.append(d)
+                continue
+            best = None
+            for e in self.deck.texts:
+                if e is d or len(_norm_text(e.text)) <= 30:
+                    continue
+                if not d.contains_point(e.cx, e.cy, 0.25):
+                    continue
+                if best is None or e.area > best.area:
+                    best = e
+            out.append(best)
+        return out
+
+    def _find_step_arrows(self):
+        out = []
+        for e in self.leaves:
+            if e.prst not in ("line", "straightConnector1", "bentConnector3"):
+                continue
+            if e.ln_none or not e.has_arrow or not _is_dark(e.ln_rgb):
+                continue
+            if e.h > 0.25 or not (1.5 <= e.w <= 3.4):
+                continue
+            if not (26.0 <= self.py(e.cy) <= 42.0):
+                continue
+            out.append(e)
+        out.sort(key=lambda e: e.x)
+        return out
+
+    def _find_curve(self):
+        out = []
+        for e in self.leaves:
+            if e.prst not in ("line", "straightConnector1", "bentConnector3",
+                              "curvedConnector3", "curvedConnector4", "custGeom",
+                              "freeform"):
+                continue
+            if e.ln_none or e.ln_alpha <= 8 or not _is_orange(e.ln_rgb):
+                continue
+            if self.py(e.cy) < 62.0:
+                continue
+            out.append(e)
+        out.sort(key=lambda e: e.x)
+        return out
+
+    def _find_emotions(self):
+        out = [e for e in self.deck.texts if _key(e.text) in EMOTION_WORDS]
+        out.sort(key=lambda e: e.x)
+        return out
+
+
+    def _find_theme(self):
+        for e in self.deck.texts:
+            if _key(e.text).startswith("theme:"):
+                return e
+        return None
+
+    def _icon_set(self, circle):
+        skip = set([id(circle)])
+        for group in (self.pills, self.descs, self.arrows, self.curve,
+                      self.emotions, self.labels, self.bodies, self.num_circles):
+            for e in group:
+                if e is not None:
+                    skip.add(id(e))
+        for _digit, e in self.numbers:
+            skip.add(id(e))
+        if self.legend is not None:
+            skip.add(id(self.legend))
+        if self.theme_el is not None:
+            skip.add(id(self.theme_el))
+        out = []
+        for e in self.leaves:
+            if id(e) in skip:
+                continue
+            if not circle.contains_point(e.cx, e.cy, 0.12):
+                continue
+            if e.w > circle.w * 1.2 or e.h > circle.h * 1.3:
+                continue
+            out.append(e)
+        return out
+
+
+def _pic_impl(els, lo=1.3, hi=3.6):
+    """图标区域内具备图标尺寸的位图（细则允许图标由小尺寸图片实现）。"""
+    return [e for e in els if e.tag == "pic" and min(e.w, e.h) >= lo
+            and max(e.w, e.h) <= hi]
+
+
+def _white_bits(els, host):
+    """host 内部的白色零件（填充为白或线条为白）。"""
+    out = []
+    for e in els:
+        if e is host or not host.contains_point(e.cx, e.cy, 0.05):
+            continue
+        if e.filled and _is_white(e.fill_rgb):
+            out.append(e)
+        elif not e.ln_none and e.ln_alpha > 8 and _is_white(e.ln_rgb):
+            out.append(e)
+    return out
+
+
+def _has_exclaim(els, host):
+    """host 内是否有白色感叹号（位图内部不再拆解，直接认定）。"""
+    if host.tag == "pic":
         return True
-    # Straight connectors sometimes drop geom in the XML tree; treat any
-    # cxnSp with near-zero thickness (a rendered straight stroke) as one too.
-    if shape.tag == "cxnSp" and (shape.geom is None or "straight" in (shape.geom or "").lower()):
+    for e in els:
+        t = _norm_text(e.text)
+        if t and t.strip("!！i") == "" and host.contains_point(e.cx, e.cy, 0.1):
+            return True
+    for e in _white_bits(els, host):
+        if e.h >= 0.12 and e.w <= 0.22:
+            return True
+    return False
+
+
+def _check_mark_ok(els, host):
+    """host（绿色圆）内白色对勾是否为两笔相接、连续完整。"""
+    if host.tag == "pic":
+        return True
+    strokes = [e for e in _white_bits(els, host)
+               if (e.w + e.h) > 0.12 and min(e.w, e.h) <= 0.5]
+    if not strokes:
+        return False
+    for e in strokes:
+        if e.rw < 0 or e.rh < 0:
+            return False              # 负尺寸为非法几何，渲染为断裂笔画
+    if len(strokes) == 1:
+        return strokes[0].prst in ("custGeom", "freeform")
+    for i, a in enumerate(strokes):
+        near = None
+        for j, b in enumerate(strokes):
+            if i == j:
+                continue
+            for pa in a.endpoints():
+                for pb in b.endpoints():
+                    d = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+                    if near is None or d < near:
+                        near = d
+        if near is None or near > 0.12:
+            return False
+    return True
+
+
+def _union_box(els):
+    box = El()
+    box.tag = "sp"
+    box.x = min(e.x for e in els)
+    box.y = min(e.y for e in els)
+    box.w = max(e.x2 for e in els) - box.x
+    box.h = max(e.y2 for e in els) - box.y
+    return box
+
+
+def _laptop(els):
+    """返回 (是否为笔记本造型, 屏幕外框元素)。"""
+    frames = [e for e in els
+              if e.prst in ("rect", "roundRect", "custGeom") and e.tag == "sp"
+              and 1.2 <= e.w <= 3.2 and 0.8 <= e.h <= 2.6 and e.w >= e.h
+              and (_is_dark(e.fill_rgb)
+                   or (not e.ln_none and e.ln_alpha > 8 and _is_dark(e.ln_rgb)))]
+    frames.sort(key=lambda e: -e.area)
+    screen = frames[0] if frames else None
+    pics = _pic_impl(els)
+    if pics:
+        return True, (screen or max(pics, key=lambda e: e.area))
+    if screen is None:
+        return False, None
+    bases = [e for e in els
+             if e is not screen and e.h <= 0.3 and e.w >= 0.5
+             and screen.y2 - 0.15 <= e.cy <= screen.y2 + 0.8
+             and abs(e.cx - screen.cx) <= screen.w * 0.6]
+    if not bases:
+        return False, screen
+    base = max(bases, key=lambda e: e.w)
+    stems = [e for e in els
+             if e.w <= 0.2 and 0.08 <= e.h <= 0.9
+             and screen.y2 - 0.15 <= e.cy <= base.cy + 0.15
+             and abs(e.cx - screen.cx) <= 0.5]
+    if stems:
+        return False, screen              # 立柱→台式支架造型，非笔记本
+    if base.w < screen.w * 0.85:
+        return False, screen
+    top, bot = min(screen.y, base.y), max(screen.y2, base.y2)
+    if not (_between(max(screen.w, base.w), 2.0, 3.2)
+            and _between(bot - top, 1.6, 3.2)):
+        return False, screen
+    return True, screen
+
+
+def _screen_triangle(els, screen):
+    tris = []
+    for e in els:
+        if e.prst == "triangle" and e.filled and (_is_orange(e.fill_rgb)
+                                                  or _in_band(e.fill_rgb, *C_WARN_TRI)):
+            tris.append(e)
+        elif (e.tag == "pic" and abs(e.w - e.h) <= 0.35 and 0.9 <= e.w <= 1.9
+              and screen is not None and screen.contains_point(e.cx, e.cy, 0.25)):
+            tris.append(e)
+    for t in tris:
+        if not (_between(t.w, 1.0, 1.8) and _between(t.h, 1.0, 1.8)):
+            continue
+        if not _has_exclaim(els, t):
+            continue
+        if screen is not None and not screen.contains(t, 0.05):
+            continue
         return True
     return False
 
 
-def action_arrow_candidates(model: PptModel) -> list[XmlShapeInfo]:
-    candidates = []
-    for shape in line_candidates(model):
-        horizontal = shape.width_cm >= 2.0 and abs(shape.height_cm) <= 0.6
-        dark_line = color_is(shape.line_color, "black") or color_is(shape.line_color, "dark_teal") or shape.line_color is None
-        # Unset line widths render at the default 1.0pt; judge that instead of skipping.
-        width = effective_line_width_pt(shape.line_width_pt)
-        width_ok = 0.8 <= width <= 1.8
-        arrow = shape.arrow_head or shape.arrow_tail
-        upper_flow = 4.0 <= shape.center_y_cm <= 8.0
-        if horizontal and dark_line and width_ok and arrow and not shape.dashed and upper_flow:
-            candidates.append(shape)
-    return sorted(candidates, key=lambda s: (s.top_cm, s.left_cm))
+def _magnifier(els):
+    """返回 (是否为放大镜造型, 镜片元素)。"""
+    lens, handle_ok = None, False
+    for e in els:
+        if (e.prst == "ellipse" and abs(e.w - e.h) <= 0.3 and _between(e.w, 1.2, 2.0)
+                and not e.ln_none and e.ln_alpha > 8 and _is_dark(e.ln_rgb)):
+            lens = e
+            break
+    if lens is not None:
+        handle_ok = any(e is not lens and 0.25 <= e.w <= 1.3 and 0.25 <= e.h <= 1.3
+                        and e.cx > lens.cx and e.cy > lens.cy for e in els)
+    if lens is None or not handle_ok:
+        for e in _pic_impl(els, 1.15, 2.1):
+            if abs(e.w - e.h) <= 0.3 and _between(e.w, 1.2, 2.0):
+                lens, handle_ok = e, True
+                break
+    bars = [e for e in els
+            if e.filled and _is_lightblue(e.fill_rgb) and e.h > e.w
+            and 0.05 <= e.w <= 0.45 and e.h >= 0.15]
+    heights = sorted(set(round(e.h, 2) for e in bars))
+    panel = [e for e in els
+             if e is not lens and max(e.w, e.h) >= 0.8
+             and ((not e.ln_none and e.ln_alpha > 8 and _is_lightblue(e.ln_rgb))
+                  or (e.filled and _is_lightblue(e.fill_rgb)))]
+    ok = bool(lens) and handle_ok and len(bars) >= 3 and len(heights) >= 2 and bool(panel)
+    return ok, lens
 
 
-def emotion_line_candidates(model: PptModel) -> list[XmlShapeInfo]:
-    candidates = []
-    for shape in line_candidates(model):
-        orange = color_is(shape.line_color, "orange")
-        width = effective_line_width_pt(shape.line_width_pt)
-        width_ok = 0.8 <= width <= 2.3
-        lower = shape.center_y_cm >= model.slide_height_cm * 0.45
-        short_dash_piece = is_straight_line_geom(shape) and 0.05 <= shape.length_cm <= 0.45
-        if orange and lower and width_ok and (shape.dashed or short_dash_piece):
-            candidates.append(shape)
-    return sorted(candidates, key=lambda s: s.left_cm)
-
-
-def score_legend(model: PptModel) -> CheckResult:
-    # 细则 (+3)：第1页左上图例框
-    #   ① 位于页面左上角
-    #   ② 距上边线 0.2-1cm
-    #   ③ 距左边线 0.4-1cm
-    #   ④ 宽度 5-6.5cm
-    #   ⑤ 高度 2-2.6cm
-    #   ⑥ 白色填充
-    #   ⑦ 深蓝色圆角矩形边框
-    #   ⑧ 长度 2-2.6cm 黑色实线箭头
-    #   ⑨ 文本 "action"
-    #   ⑩ 长度 2-2.6cm 橙色虚线箭头
-    #   ⑪ 文本 "emotion"
-    #   ⑫ 文本字体 Arial 或 Times New Roman(新罗马)，14-18 磅
-    # 仅检查细则列出的点，不额外约束；判定基于 PowerPoint 实际存储的形状与线条。
-    failures: list[str] = []
-
-    action = text_shapes(model, "action")
-    emotion = text_shapes(model, "emotion")
-
-    def in_box_spec(shape: XmlShapeInfo) -> bool:
-        # ②③④⑤ 位置与尺寸区间（左上角由左/上边距区间共同保证 → ①）
-        return (
-            in_spec_cm(shape.top_cm, 0.2, 1.0)
-            and in_spec_cm(shape.left_cm, 0.4, 1.0)
-            and in_spec_cm(shape.width_cm, 5.0, 6.5)
-            and in_spec_cm(shape.height_cm, 2.0, 2.6)
-        )
-
-    # ⑦ 图例框必须是圆角矩形（roundRect）。取底层 XML 形状（含 geom / 填充 / 边框）。
-    legend_boxes = [
-        shape for shape in model.xml_shapes
-        if shape.tag == "sp" and shape.geom == "roundRect" and in_box_spec(shape)
-    ]
-    box = legend_boxes[0] if legend_boxes else None
-    if box is None:
-        failures.append("legend roundRect box (pos/size) not found")
-
-    if box is not None:
-        # ⑥ 白色填充
-        if not color_is(box.fill_color, "white"):
-            failures.append(f"box fill not white: {box.fill_color}")
-        # ⑦ 深蓝色边框
-        def is_dark_blue(color: Optional[str]) -> bool:
-            rgb = color_tuple(color)
-            if rgb is None:
-                return color_is(color, "blue")
-            r, g, b = rgb
-            return b >= r and b >= g and b > 40 and sum(rgb) < 420
-        if not is_dark_blue(box.line_color):
-            failures.append(f"box border not dark blue: {box.line_color}")
-
-    # 箭头必须位于图例框范围内（细则：图例框"包含"两种箭头）。
-    def inside_legend(line: XmlShapeInfo) -> bool:
-        if box is None:
-            return False
-        return (
-            box.left_cm - 0.2 <= line.center_x_cm <= box.right_cm + 0.2
-            and box.top_cm - 0.2 <= line.center_y_cm <= box.bottom_cm + 0.2
-        )
-
-    legend_lines = [line for line in line_candidates(model) if is_straight_line_geom(line) and inside_legend(line)]
-
-    # ⑧ 长度 2-2.6cm 黑色实线箭头
-    black_arrows = [
-        line for line in legend_lines
-        if (line.arrow_head or line.arrow_tail)
-        and not line.dashed
-        and color_is(line.line_color, "black")
-        and in_spec_cm(line.length_cm, 2.0, 2.6)
-    ]
-    if not black_arrows:
-        failures.append("black solid arrow (len 2-2.6cm) not found")
-
-    # ⑩ 长度 2-2.6cm 橙色虚线箭头
-    orange_arrows = [
-        line for line in legend_lines
-        if (line.arrow_head or line.arrow_tail)
-        and line.dashed
-        and color_is(line.line_color, "orange")
-        and in_spec_cm(line.length_cm, 2.0, 2.6)
-    ]
-    if not orange_arrows:
-        failures.append("orange dashed arrow (len 2-2.6cm) not found")
-
-    # ⑨⑪ 文本 action / emotion
-    if not action:
-        failures.append("text 'action' not found")
-    if not emotion:
-        failures.append("text 'emotion' not found")
-
-    # ⑫ 文本字体 Arial 或 Times New Roman，14-18 磅
-    for shape in action + emotion:
-        if not shape_font_family_ok(shape, ("arial", "times")):
-            failures.append(f"legend text font not Arial/Times: {sorted(shape.font_names)}")
-        if not font_size_in_spec(shape, 14, 18):
-            failures.append(f"legend text size not 14-18pt: {shape.font_sizes}")
-
-    evidence = (
-        f"box={box is not None}, "
-        f"fill={box.fill_color if box else None}, border={box.line_color if box else None}, "
-        f"black_arrows={len(black_arrows)}, orange_dashed_arrows={len(orange_arrows)}, "
-        f"action_text={len(action)}, emotion_text={len(emotion)}"
-    )
-    if failures:
-        return fail_result("D2-02", "左上图例框", 3, "; ".join(failures) + f" | {evidence}")
-    return pass_result("D2-02", "左上图例框", 3, evidence)
-
-
-def score_number_style(model: PptModel) -> CheckResult:
-    # 细则 (+1)：编号 "1""2""3""4""5" 为 Arial 或 新罗马(Times New Roman)
-    #   18-22磅、白色、加粗。仅检查这些点，不额外约束。
-    # 说明：样式解析（collect_text_style）已支持段落级 defRPr 继承——run 属性
-    #   缺失时会自动回退到段落 font 的对应属性并写入统一字段。仍无可读证据
-    #   时不再强制判失败，交由 helper 保持"未显式设置 → 继承默认"的宽容判定。
-    failures = []
-    for number in ["1", "2", "3", "4", "5"]:
-        shape = number_shape(model, number)
-        if shape is None:
-            failures.append(f"missing {number}")
+def _badge(els, lens):
+    cands = []
+    for e in els:
+        if e is lens:
             continue
-        # 字体：Arial 或 新罗马（未读取到字体信息时视为继承母版默认，宽容通过）
-        if not shape_font_family_ok(shape, ("arial", "times")):
-            failures.append(f"{number} font not Arial/Times: {sorted(shape.font_names)}")
-        # 字号：18-22磅（未读取到字号时视为继承母版默认，宽容通过）
-        if not font_size_in_spec(shape, 18, 22):
-            failures.append(f"{number} size not 18-22pt: {shape.font_sizes}")
-        # 颜色：白色（未读取到字体颜色时视为继承母版默认，宽容通过）
-        if not shape_has_text_color(shape, "white"):
-            failures.append(f"{number} not white: {sorted(shape.font_colors)}")
-        # 加粗（未读取到加粗设置时视为继承母版默认，宽容通过）
-        if not shape_bold_ok(shape, True):
-            failures.append(f"{number} not bold")
-    if failures:
-        return fail_result("D2-08", "编号样式", 1, "; ".join(failures))
-    return pass_result("D2-08", "编号样式", 1, "numbers 1-5 are Arial/Times, 18-22pt, white, bold")
+        if e.prst == "ellipse" and e.filled and (_is_orange(e.fill_rgb)
+                                                 or _in_band(e.fill_rgb, *C_WARN_TRI)):
+            cands.append(e)
+        elif e.tag == "pic" and abs(e.w - e.h) <= 0.2 and _between(e.w, 0.6, 1.2):
+            cands.append(e)
+    for b in cands:
+        if not (_between(b.w, 0.6, 1.2) and _between(b.h, 0.6, 1.2)):
+            continue
+        if not (b.cx > lens.cx and b.cy > lens.cy):
+            continue
+        if not _has_exclaim(els, b):
+            continue
+        if math.hypot(b.cx - lens.cx, b.cy - lens.cy) > (lens.w + b.w) / 2.0 + 0.05:
+            continue                      # 与镜片边缘不相叠
+        return True
+    return False
 
 
-def score_action_arrows(model: PptModel) -> CheckResult:
-    # 细则 (+1)：第1至第5阶段之间设置 4 条黑色水平单箭头，方向均从左向右，
-    #   线宽 1.0-3磅，长度 2-3cm，箭头连接相邻阶段图标区域。
-    #   仅检查细则列出的点，不额外约束；判定基于 PowerPoint 实际存储的线条。
-    # 视觉方向计算：
-    #   OOXML 中线段起点位于形状 bbox 左上 (left, top)、终点位于右下 (right, bottom)。
-    #   flipH 会左右翻转：起点变到右上、终点变到左下（视觉方向水平反向）。
-    #   flipV 会上下翻转：不影响水平方向。
-    #   arrow_head 附着于形状起点，arrow_tail 附着于形状终点。
-    #   由此，箭头视觉终点的 x 坐标计算方式：
-    #     ┌ 无 flipH：起点在左、终点在右 → tail 在右、head 在左
-    #     └ 有 flipH：起点在右、终点在左 → tail 在左、head 在右
-    #   视觉"从左向右"即"箭头尖端位于右端"，等价条件：
-    #     (arrow_tail 且 !flipH) 或 (arrow_head 且 flipH)
+def _server(els):
+    """返回 (是否为服务器造型, 机架整体外接框)。"""
+    racks = [e for e in els
+             if e.prst in ("rect", "roundRect") and e.filled and _is_dark(e.fill_rgb)
+             and 1.2 <= e.w <= 2.6 and 0.25 <= e.h <= 0.65]
+    racks.sort(key=lambda e: e.y)
+    box = _union_box(racks) if racks else None
+    if len(racks) < 3:
+        pics = _pic_impl(els, 1.4)
+        if pics:
+            return True, (box or max(pics, key=lambda e: e.area))
+        return False, box
+    ok = True
+    widths = [r.w for r in racks[:3]]
+    if max(widths) - min(widths) > 0.2 or not _between(max(widths), 1.5, 2.5):
+        ok = False
+    for r in racks[:3]:
+        bits = _white_bits(els, r)
+        lamps = [e for e in bits if e.cx < r.cx and max(e.w, e.h) <= 0.4
+                 and abs(e.w - e.h) <= 0.12]
+        lines = [e for e in bits if e.cx > r.cx and e.w >= 0.2 and e.h <= 0.15]
+        if not lamps or not lines:
+            ok = False
+    return ok, box
 
-    # 各阶段图标圆心（按从左到右排序），用于校验"连接相邻阶段图标区域"。
-    icon_centers: list[tuple[float, float]] = []
-    for spec in STAGE_SPECS:
-        title = stage_title_shape(model, str(spec["title"]))
-        icons = find_icon_candidates(model, title, str(spec["num"]))
-        if icons:
-            icon = sorted(icons, key=lambda s: abs(s.width_cm - 3.2) + abs(s.height_cm - 3.2))[0]
-            icon_centers.append((icon.center_x_cm, icon.center_y_cm))
-    icon_centers.sort(key=lambda c: c[0])
 
-    # 逐条筛选满足全部细则要求的黑色水平单箭头。
-    valid_arrows: list[XmlShapeInfo] = []
-    for shape in line_candidates(model):
-        # 一体箭头：autoshape line 或直线连接符 straightConnector1 均视为等价
-        if not is_straight_line_geom(shape):
+def _corner_triangle(els, box):
+    """box 右下方的橙色三角警示标志。"""
+    tris = []
+    for e in els:
+        if e.prst == "triangle" and e.filled and (_is_orange(e.fill_rgb)
+                                                  or _in_band(e.fill_rgb, *C_WARN_TRI)):
+            tris.append(e)
+        elif e.tag == "pic" and abs(e.w - e.h) <= 0.3 and _between(e.w, 1.0, 1.8):
+            tris.append(e)
+    for t in tris:
+        if not (_between(t.w, 1.0, 1.8) and _between(t.h, 1.0, 1.8)):
             continue
-        # 水平
-        if abs(shape.height_cm) > 0.15:
+        if box is not None and not (t.cx > box.cx and t.cy > box.cy):
             continue
-        # 黑色
-        if not color_is(shape.line_color, "black"):
+        if not _has_exclaim(els, t):
             continue
-        # 单箭头（只有一端有箭头）
-        single_arrow = shape.arrow_head != shape.arrow_tail
-        if not single_arrow:
-            continue
-        # 方向从左向右（视觉）：基于起点/终点/flipH 与箭头端综合判定，避免仅凭
-        # tailEnd 导致的反向误判（形状被水平翻转时 tailEnd 反而指向左侧）。
-        if shape.flip_h:
-            # flipH：起点在右、终点在左 → arrow_head(起点端) 指向右侧
-            visual_left_to_right = shape.arrow_head and not shape.arrow_tail
-        else:
-            # 无 flipH：起点在左、终点在右 → arrow_tail(终点端) 指向右侧
-            visual_left_to_right = shape.arrow_tail and not shape.arrow_head
-        if not visual_left_to_right:
-            continue
-        # 线宽 1.0-3磅（未显式设置线宽时按 PowerPoint 默认 1.0pt 判定）
-        width = effective_line_width_pt(shape.line_width_pt)
-        if not (1.0 - PT_TOL <= width <= 3.0 + PT_TOL):
-            continue
-        # 长度 2-3cm
-        if not in_spec_cm(shape.length_cm, 2.0, 3.0):
-            continue
-        valid_arrows.append(shape)
+        return True
+    return False
 
-    # 箭头连接相邻阶段图标区域：箭头位于相邻两图标之间（水平夹在两圆心间、
-    # 纵向与图标同高），且 4 个相邻间隔各有一条。
-    connected_gaps = 0
-    if len(icon_centers) == 5:
+
+def _cloud(els):
+    """返回 (云朵造型是否达标, 云朵元素)。"""
+    for e in els:
+        if e.prst in ("cloud", "cloudCallout"):
+            ok = (_between(e.w, 1.6, 2.6) and _between(e.h, 1.0, 1.8)
+                  and not e.ln_none and e.ln_alpha > 8 and _is_dark(e.ln_rgb)
+                  and e.filled and e.fill_alpha > 50.0 and _is_white(e.fill_rgb))
+            return ok, e
+    pics = [e for e in els if e.tag == "pic" and min(e.w, e.h) >= 0.9
+            and max(e.w, e.h) <= 3.4]
+    if pics:
+        return True, max(pics, key=lambda e: e.area)
+    frees = [e for e in els if e.prst in ("custGeom", "freeform") and e.w >= 1.4]
+    if frees:
+        e = max(frees, key=lambda x: x.area)
+        ok = (_between(e.w, 1.6, 2.6) and _between(e.h, 1.0, 1.8)
+              and not e.ln_none and e.ln_alpha > 8 and _is_dark(e.ln_rgb)
+              and e.filled and e.fill_alpha > 50.0 and _is_white(e.fill_rgb))
+        return ok, e
+    return False, None
+
+
+def _monitor(els):
+    """返回 (是否为显示器造型, 屏幕外框元素)。"""
+    frames = [e for e in els
+              if e.prst in ("rect", "roundRect", "custGeom") and e.tag == "sp"
+              and 1.2 <= e.w <= 2.8 and 0.8 <= e.h <= 2.2 and e.w >= e.h * 0.9
+              and (_is_dark(e.fill_rgb)
+                   or (not e.ln_none and e.ln_alpha > 8 and _is_dark(e.ln_rgb)))]
+    frames.sort(key=lambda e: -e.area)
+    screen = frames[0] if frames else None
+    pics = _pic_impl(els, 1.3)
+    if pics:
+        return True, (screen or max(pics, key=lambda e: e.area))
+    if screen is None:
+        return False, None
+    stems = [e for e in els if e.w <= 0.25 and 0.08 <= e.h <= 0.9
+             and screen.y2 - 0.2 <= e.cy <= screen.y2 + 1.0
+             and abs(e.cx - screen.cx) <= 0.6]
+    bases = [e for e in els if e.h <= 0.3 and e.w >= 0.4
+             and screen.y2 <= e.cy <= screen.y2 + 1.2
+             and abs(e.cx - screen.cx) <= screen.w * 0.6]
+    if not stems or not bases:
+        return False, screen
+    bot = max(max(b.y2 for b in bases), screen.y2)
+    ok = _between(screen.w, 1.6, 2.6) and _between(bot - screen.y, 1.2, 2.2)
+    return ok, screen
+
+
+def _green_badge(els, host, mode):
+    """host 右下方（corner）或中央（center）的绿色对勾圆。"""
+    cands = []
+    for e in els:
+        if e is host:
+            continue
+        if e.prst == "ellipse" and e.filled and (_is_green(e.fill_rgb)
+                                                 or _in_band(e.fill_rgb, *C_GREEN)):
+            cands.append(e)
+        elif e.tag == "pic" and abs(e.w - e.h) <= 0.2 and _between(e.w, 0.7, 1.7):
+            cands.append(e)
+    for g in cands:
+        if not (_between(g.w, 0.8, 1.6) and _between(g.h, 0.8, 1.6)):
+            continue
+        if mode == "corner":
+            if not (g.cx > host.cx and g.cy > host.cy):
+                continue
+        elif abs(g.cx - host.cx) > 0.45 or abs(g.cy - host.cy) > 0.45:
+            continue
+        if not _check_mark_ok(els, g):
+            continue
+        return True
+    return False
+
+
+def _covered(el, leaves):
+    """el 是否被其后绘制的不透明形状整体覆盖。"""
+    for other in leaves:
+        if other is el or other.order <= el.order:
+            continue
+        if not (other.filled and other.fill_alpha > 85.0):
+            continue
+        if other.contains(el):
+            return True
+    return False
+
+
+def _sizes_of(el):
+    return [r["size"] for r in el.runs if r.get("size")]
+
+
+def _colors_of(el):
+    return [r["rgb"] for r in el.runs if r.get("rgb")]
+
+
+def _check_layout(ctx):
+    """细则第 1–9 条：版面骨架与文本。"""
+    f = [False] * 9
+    circles, pills, descs = ctx.circles, ctx.pills, ctx.descs
+    nums, labels, bodies = ctx.numbers, ctx.labels, ctx.bodies
+    full = (len(circles) == 5 and len(pills) >= 5 and len(descs) >= 5
+            and len(nums) == 5)
+    if full:
+        ok = True
+        for i in range(5):
+            ne, c, p, d = nums[i][1], circles[i], pills[i], descs[i]
+            cs = [ne.cx, c.cx, p.cx, d.cx]
+            if max(cs) - min(cs) > 1.0:
+                ok = False
+            if not (ne.cy < c.cy < p.cy < d.cy):
+                ok = False
+            if ne.cy > c.y + 0.6 or p.y < c.y2 - 0.6 or d.y < p.y2 - 0.6:
+                ok = False
+            lo, hi = GROUP_BANDS[i]
+            if not (lo - POS_TOL <= ctx.px(sum(cs) / 4.0) <= hi + POS_TOL):
+                ok = False
+        f[0] = ok
+    if len(nums) == 5:
+        ok = [d for d, _e in nums] == [1, 2, 3, 4, 5]
+        for idx, (_dg, e) in enumerate(nums):
+            top = e.y
+            nc = ctx.num_circles[idx] if idx < len(ctx.num_circles) else None
+            if nc is not None:
+                top = min(top, nc.y)
+            if not (14.0 - POS_TOL <= ctx.py(top) <= 26.0 + POS_TOL):
+                ok = False
+            sizes = _sizes_of(e)
+            if not sizes or not all(14.0 <= s <= 24.0 for s in sizes):
+                ok = False
+            cols = _colors_of(e)
+            if _norm_text(e.text) in "12345":
+                if nc is None or not cols or not all(_is_white(c) for c in cols):
+                    ok = False
+            elif not cols or not all(_is_dark(c) for c in cols):
+                ok = False
+        f[1] = ok
+    if len(circles) == 5:
+        f[2] = all(_in_band(c.fill_rgb, *C_CIRCLE) and _between(c.w, 2.6, 3.5)
+                   and _between(c.h, 2.6, 3.5)
+                   and 22.0 - POS_TOL <= ctx.py(c.y) <= 28.0 + POS_TOL
+                   for c in circles)
+    if len(pills) >= 5:
+        f[3] = all(_in_band(p.fill_rgb, *C_PILL) and _between(p.h, 0.8, 1.3)
+                   and _between(p.w, 3.5, 5.0)
+                   and 36.0 - POS_TOL <= ctx.py(p.y) <= 43.0 + POS_TOL
+                   for p in pills[:5])
+    if len(pills) >= 5 and all(labels[:5]):
+        ok = True
+        for i, e in enumerate(labels[:5]):
+            if _key(e.text) != STAGE_LABELS[i]:
+                ok = False
+            sizes = _sizes_of(e)
+            if not sizes or not all(13.0 <= s <= 18.0 for s in sizes):
+                ok = False
+            if not e.runs or not all(r["bold"] for r in e.runs):
+                ok = False
+            cols = _colors_of(e)
+            if not cols or not all(_is_white(c) for c in cols):
+                ok = False
+            if abs(e.cx - pills[i].cx) > 0.4 and e.align != "ctr":
+                ok = False
+        f[4] = ok
+    if len(circles) == 5:
+        hit = 0
         for i in range(4):
-            lx, ly = icon_centers[i]
-            rx, _ = icon_centers[i + 1]
-            for arrow in valid_arrows:
-                if lx < arrow.center_x_cm < rx and abs(arrow.center_y_cm - ly) <= 1.5:
-                    connected_gaps += 1
-                    break
-
-    ok = len(valid_arrows) == 4 and connected_gaps == 4
-    evidence = (
-        f"valid_arrows={len(valid_arrows)} (need 4 black horizontal single arrows, "
-        f"L->R, 1.0-3pt, 2-3cm), connected_adjacent_icon_gaps={connected_gaps}/4"
-    )
-    return pass_result("D2-09", "action 主箭头", 1, evidence) if ok else fail_result("D2-09", "action 主箭头", 1, evidence)
-
-
-def score_emotion_line(model: PptModel) -> CheckResult:
-    # 细则 (+3)：页面下方橙色虚线折线箭头（可编辑一体折线）
-    #   6 段斜线从左到右依次为：
-    #     ① 2.5-3.5cm 斜向右下方
-    #     ② 8-9.5cm  斜向右上方
-    #     ③ 6-7cm    斜向右下方
-    #     ④ 4.5-6cm  斜向右上方
-    #     ⑤ 2-3cm    斜向右下方
-    #     ⑥ 6-7cm    斜向右上方（箭头结束）
-    #   线宽 1.0-3磅，虚线样式清晰。仅检查细则列出的点，不额外约束。
-    lines = emotion_line_candidates(model)
-    if not lines:
-        return fail_result("D2-10", "emotion 橙色虚线折线", 3, "no orange dashed lower-page line found")
-
-    # The rubric describes one editable dashed zig-zag made of six diagonal
-    # segments with explicit lengths and line width.  Do not accept many tiny
-    # solid line pieces that only visually imitate a dashed line.
-    long_segments = [
-        line for line in lines
-        if is_straight_line_geom(line) and line.length_cm > 1.0
-    ]
-    sorted_lines = sorted(long_segments, key=lambda s: s.left_cm)[:6]
-    expected_ranges = [(2.5, 3.5), (8.0, 9.5), (6.0, 7.0), (4.5, 6.0), (2.0, 3.0), (6.0, 7.0)]
-    lengths = [line.length_cm for line in sorted_lines]
-    length_ok = len(sorted_lines) == 6 and all(
-        in_spec_cm(length, low, high, 0.05)
-        for length, (low, high) in zip(lengths, expected_ranges)
-    )
-    directions = [1 if line.height_cm > 0 else -1 for line in sorted_lines]
-    direction_ok = directions == [1, -1, 1, -1, 1, -1]
-    width_ok = len(sorted_lines) == 6 and all(
-        1.0 <= effective_line_width_pt(line.line_width_pt) <= 3.0
-        for line in sorted_lines
-    )
-    dashed_ok = len(sorted_lines) == 6 and all(line.dashed for line in sorted_lines)
-    arrow_end = bool(sorted_lines) and (sorted_lines[-1].arrow_head or sorted_lines[-1].arrow_tail)
-    ok = length_ok and direction_ok and width_ok and dashed_ok and arrow_end
-    short_piece_count = sum(1 for line in lines if line.length_cm <= 0.45)
-    evidence = (
-        f"segments={len(long_segments)}, lengths={[round(v, 2) for v in lengths]} "
-        f"(need 2.5-3.5/8-9.5/6-7/4.5-6/2-3/6-7cm), "
-        f"length_ok={length_ok}, directions={directions}, direction_ok={direction_ok}, "
-        f"width_ok={width_ok} (need 1.0-3pt), dashed_ok={dashed_ok}, arrow_end={arrow_end}, "
-        f"short_pieces={short_piece_count}"
-    )
-    return pass_result("D2-10", "emotion 橙色虚线折线", 3, evidence) if ok else fail_result("D2-10", "emotion 橙色虚线折线", 3, evidence)
+            left, right = circles[i], circles[i + 1]
+            for a in ctx.arrows:
+                if not (left.x2 - 0.6 <= a.x and a.x2 <= right.x + 0.6):
+                    continue
+                if not _between(a.w, 1.8, 3.0, 0.1) or not a.arrow_right:
+                    continue
+                if not (31.0 - POS_TOL <= ctx.py(a.cy) <= 38.0 + POS_TOL):
+                    continue
+                hit += 1
+                break
+        f[5] = hit == 4
+    if len(descs) >= 5:
+        ok = ctx.desc_round
+        for d in descs[:5]:
+            if not (_between(d.w, 4.6, 5.6) and _between(d.h, 4.2, 5.2)):
+                ok = False
+            if not (44.0 - POS_TOL <= ctx.py(d.y) <= 50.0 + POS_TOL):
+                ok = False
+            if d.ln_none or d.ln_alpha <= 8 or not _in_band(d.ln_rgb, *C_BOX_LINE):
+                ok = False
+            if d.ln_dash not in ("", "solid"):
+                ok = False
+            if not (d.filled and _in_band(d.fill_rgb, *C_BOX_FILL)):
+                ok = False
+            if d.fill_rgb and min(d.fill_rgb) >= 250:
+                ok = False                # 纯白填充
+        f[6] = ok
+    if len(bodies) >= 5 and all(bodies[:5]):
+        ok = True
+        for b in bodies[:5]:
+            sizes = _sizes_of(b)
+            if not sizes or not all(10.0 <= s <= 14.0 for s in sizes):
+                ok = False
+            if b.align != "ctr" or b.anchor != "ctr":
+                ok = False
+            for c in _colors_of(b):
+                if not (_is_dark(c) or _in_band(c, *C_BODY_TEXT)):
+                    ok = False
+        f[7] = ok
+        f[8] = all(_key(bodies[i].text) == BODY_TEXTS[i] for i in range(5))
+    return f
 
 
-def score_emotion_labels(model: PptModel) -> CheckResult:
-    # 细则 (+1)：第1页情绪标签
-    #   ① 底部依次出现 "concerned" "tense and focused" "hopeful" "relieved"（从左到右顺序）
-    #   ② 字体为 Times New Roman 或等效西文字体
-    #   ③ 字号 12-15 磅
-    #   ④ 橙色
-    #   ⑤ 倾斜（italic）
-    # 仅检查细则列出的点，不额外约束；判定基于 PowerPoint 实际存储的文本样式与位置。
-    failures: list[str] = []
-    label_shapes: list[ShapeInfo] = []
-    for word in EMOTION_WORDS:
-        matches = text_shapes(model, word)
-        if not matches:
-            failures.append(f"missing {word}")
+def _check_icons(ctx):
+    """细则第 10–19 条：5 个步骤图标造型与其叠放件。"""
+    f = [False] * 10
+    if len(ctx.circles) != 5:
+        return f
+    ic = ctx.icons
+    laptop_ok, screen = _laptop(ic[0])
+    f[0] = laptop_ok
+    if laptop_ok:
+        f[1] = _screen_triangle(ic[0], screen)
+    mag_ok, lens = _magnifier(ic[1])
+    f[2] = mag_ok
+    if lens is not None:
+        f[3] = _badge(ic[1], lens)
+    srv_ok, srv_box = _server(ic[2])
+    f[4] = srv_ok
+    if srv_box is not None:
+        f[5] = _corner_triangle(ic[2], srv_box)
+    cloud_ok, cloud = _cloud(ic[3])
+    f[6] = cloud_ok
+    if cloud is not None:
+        f[7] = _green_badge(ic[3], cloud, "corner")
+    mon_ok, mon_screen = _monitor(ic[4])
+    f[8] = mon_ok
+    if mon_screen is not None:
+        f[9] = _green_badge(ic[4], mon_screen, "center")
+    return f
+
+
+def _check_legend(ctx):
+    """细则第 20–22 条：图例框与两行图例。"""
+    f = [False] * 3
+    box = ctx.legend
+    if box is None:
+        return f
+    fill_ok = (not box.filled) or box.fill_alpha <= 8 or _is_white(box.fill_rgb)
+    line_ok = (not box.ln_none and box.ln_alpha > 8 and _is_dark(box.ln_rgb)
+               and box.ln_dash in ("", "solid")
+               and (box.ln_w is None or 0.85 <= box.ln_w <= 3.15))
+    f[0] = (box.prst == "roundRect" and fill_ok and line_ok
+            and _between(box.w, 5.0, 7.0) and _between(box.h, 1.8, 2.8)
+            and ctx.px(box.x) <= 8.0 + POS_TOL and ctx.py(box.y) <= 8.0 + POS_TOL)
+    inner = [e for e in ctx.leaves if e is not box and box.contains_point(e.cx, e.cy, 0.35)]
+    lines = [e for e in inner
+             if e.prst in ("line", "straightConnector1", "bentConnector3")
+             and not e.ln_none and e.ln_alpha > 8]
+    dark = [e for e in lines if _is_dark(e.ln_rgb)]
+    orange = [e for e in lines if _is_orange(e.ln_rgb)]
+    texts = dict((_key(e.text), e) for e in inner if _key(e.text) in LEGEND_WORDS)
+    ae = texts.get("action")
+    if ae is not None and dark:
+        arrow = None
+        for e in dark:
+            if (_between(e.seg_len, 2.0, 3.0, 0.1) and e.arrow_right
+                    and e.ln_dash in ("", "solid")):
+                arrow = e
+                break
+        sizes = _sizes_of(ae)
+        f[1] = (arrow is not None and ae.cx > arrow.cx and bool(sizes)
+                and all(12.0 <= s <= 18.0 for s in sizes)
+                and bool(ae.runs) and all(r["bold"] for r in ae.runs)
+                and all(_is_dark(c) for c in _colors_of(ae)))
+    ee = texts.get("emotion")
+    segs = [e for e in orange if e.seg_len > 0.05]
+    if ee is not None and segs:
+        main = [e for e in segs
+                if _between(e.seg_len, 2.0, 3.0, 0.1) and e.arrow_right
+                and e.ln_dash not in ("", "solid")]
+        sizes = _sizes_of(ee)
+        f[2] = (len(segs) <= 2 and bool(main)
+                and ee.cx > max(e.cx for e in segs) and bool(sizes)
+                and all(12.0 <= s <= 18.0 for s in sizes)
+                and bool(ee.runs) and all(r["bold"] for r in ee.runs)
+                and all(_is_orange(c) or _in_band(c, *C_CURVE)
+                        for c in _colors_of(ee)))
+    return f
+
+
+def _trend_ok(ctx, pts):
+    """折线走势：先下降后上升、再下降、再上升，波峰/波谷位置在指定区间内。"""
+    if len(pts) < 4:
+        return False
+
+    def window(lo, hi):
+        return [p for p in pts if lo <= ctx.px(p[0]) <= hi]
+
+    left, mid = window(18.0, 50.0), window(44.0, 70.0)
+    if not left or not mid:
+        return False
+    peak = min(left, key=lambda p: p[1])
+    valley = max(mid, key=lambda p: p[1])
+    if not (32.0 - POS_TOL <= ctx.px(peak[0]) <= 42.0 + POS_TOL):
+        return False
+    if not (52.0 - POS_TOL <= ctx.px(valley[0]) <= 62.0 + POS_TOL):
+        return False
+    before = [p for p in pts if p[0] < peak[0]]
+    if not before or max(p[1] for p in before) <= pts[0][1] + 0.08:
+        return False                      # 起始段未先下降
+    if pts[-1][1] >= valley[1] - 0.08:
+        return False                      # 末段未再上升
+    return peak[1] < valley[1] - 0.3
+
+
+def _check_curve(ctx):
+    """细则第 23–26 条：情绪折线、折线实现方式、情绪标签与主题文字。"""
+    f = [False] * 4
+    segs = ctx.curve
+    if segs:
+        pts = []
+        for e in segs:
+            p1, p2 = e.endpoints()
+            pts.append(p1)
+            pts.append(p2)
+        pts.sort(key=lambda p: p[0])
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        span_ok = (ctx.px(min(xs)) <= 6.0 + POS_TOL
+                   and ctx.px(max(xs)) >= 92.0 - POS_TOL)
+        band_ok = (ctx.py(min(ys)) >= 72.0 - POS_TOL
+                   and ctx.py(max(ys)) <= 90.0 + POS_TOL)
+        arrow_ok = any(e.has_arrow for e in segs if e.x2 >= max(xs) - 0.6)
+        f[0] = span_ok and band_ok and arrow_ok and _trend_ok(ctx, pts)
+        f[1] = (len(segs) <= 30 and all(e.seg_len >= 2.0 - 0.05 for e in segs)
+                and all(e.ln_dash not in ("", "solid") for e in segs)
+                and any(e.has_arrow for e in segs))
+    ems = ctx.emotions
+    if len(ems) == 4:
+        ok = True
+        for i, e in enumerate(ems):
+            if _key(e.text) != EMOTION_WORDS[i]:
+                ok = False
+            sizes = _sizes_of(e)
+            if not sizes or not all(12.0 <= s <= 18.0 for s in sizes):
+                ok = False
+            if not e.runs or not all(r["italic"] for r in e.runs):
+                ok = False
+            for c in _colors_of(e):
+                if not (_is_orange(c) or _in_band(c, *C_CURVE)):
+                    ok = False
+            if not (78.0 - POS_TOL <= ctx.py(e.cy) <= 95.0 + POS_TOL):
+                ok = False
+            lo, hi = EMOTION_BANDS[i]
+            if not (lo - POS_TOL <= ctx.px(e.x) <= hi + POS_TOL):
+                ok = False
+        f[2] = ok
+    te = ctx.theme_el
+    if te is not None:
+        sizes = _sizes_of(te)
+        f[3] = (_key(te.text) == THEME_TEXT and bool(sizes)
+                and all(13.0 <= s <= 18.0 for s in sizes)
+                and bool(te.runs) and all(r["italic"] for r in te.runs)
+                and all(_in_band(c, *C_THEME) for c in _colors_of(te))
+                and 90.0 - POS_TOL <= ctx.py(te.y) <= 97.0 + POS_TOL
+                and 45.0 - POS_TOL <= ctx.px(te.cx) <= 55.0 + POS_TOL)
+    return f
+
+
+def _check_norms(ctx):
+    """细则第 27–32 条：版式与规范性。"""
+    f = [False] * 6
+    deck = ctx.deck
+    page_ok = (32.9 <= ctx.pw <= 34.1 and 18.4 <= ctx.ph <= 19.6)
+    inside = True
+    for e in ctx.leaves:
+        if e.w <= 0.0 and e.h <= 0.0:
             continue
-        shape = matches[0]
-        label_shapes.append(shape)
-        # ② 字体 Times New Roman 或等效西文字体
-        if not shape_font_family_ok(shape, ("times", "liberation serif", "cambria", "georgia")):
-            failures.append(f"{word} font={sorted(shape.font_names)}")
-        # ③ 字号 12-15 磅
-        if not font_size_in_spec(shape, 12, 15):
-            failures.append(f"{word} size not 12-15pt: {shape.font_sizes}")
-        # ④ 橙色
-        if not shape_has_text_color(shape, "orange"):
-            failures.append(f"{word} not orange")
-        # ⑤ 倾斜
-        if not shape_italic_ok(shape, True):
-            failures.append(f"{word} not italic")
-        # ① 底部
-        if shape.center_y_cm < model.slide_height_cm * 0.45:
-            failures.append(f"{word} not at bottom y={shape.center_y_cm:.2f}cm")
-    # ① 依次出现（从左到右顺序）
-    if len(label_shapes) == len(EMOTION_WORDS):
-        centers = [shape.center_x_cm for shape in label_shapes]
-        if centers != sorted(centers):
-            failures.append(f"labels not left-to-right order={centers}")
-    if failures:
-        return fail_result("D2-11", "情绪标签", 1, "; ".join(failures))
-    return pass_result("D2-11", "情绪标签", 1, "all four emotion labels found at bottom with Times/西文 12-15pt, orange, italic")
+        if (e.x < -0.2 or e.y < -0.2 or e.x2 > ctx.pw + 0.2
+                or e.y2 > ctx.ph + 0.2):
+            inside = False
+            break
+    f[0] = page_ok and inside
+    if (len(ctx.circles) == 5 and len(ctx.pills) >= 5 and len(ctx.descs) >= 5
+            and len(ctx.numbers) == 5):
+        ok = True
+        for i in range(5):
+            cs = [ctx.numbers[i][1].cx, ctx.circles[i].cx, ctx.pills[i].cx,
+                  ctx.descs[i].cx]
+            if max(cs) - min(cs) > 0.5:
+                ok = False
+        f[1] = ok
+    bodies = [b for b in ctx.bodies[:5] if b is not None]
+    if len(bodies) == 5:
+        sizes = []
+        for b in bodies:
+            sizes.extend(_sizes_of(b))
+        f[2] = bool(sizes) and (max(sizes) - min(sizes) <= 0.2)
+    ok = True
+    for idx, nc in enumerate(ctx.num_circles):
+        if nc is None:
+            continue
+        digit = ctx.numbers[idx][1]
+        for e in ctx.leaves:
+            if e is nc or e is digit or not e.filled:
+                continue
+            if not nc.contains_point(e.cx, e.cy, 0.02):
+                continue
+            if max(e.w, e.h) > nc.w * 0.9:
+                continue
+            if _is_white(e.fill_rgb) or _is_light(e.fill_rgb):
+                ok = False                # 编号圆内多余的白色/浅色小圆点
+    if len(ctx.icons) >= 2:
+        _mag_ok, lens = _magnifier(ctx.icons[1])
+        if (lens is not None and lens.tag != "pic" and lens.filled
+                and lens.fill_alpha > 20.0):
+            ok = False                    # 镜片为不透明填充，遮挡其后柱条
+    f[3] = ok
+    allowed = set(BODY_TEXTS) | set(STAGE_LABELS) | set(EMOTION_WORDS) \
+        | set(LEGEND_WORDS) | set([THEME_TEXT])
+    ok = True
+    for e in deck.texts:
+        t = _norm_text(e.text)
+        if e.w <= 0.05 or e.h <= 0.05:
+            ok = False
+        if (e.x < -0.2 or e.y < -0.2 or e.x2 > ctx.pw + 0.2
+                or e.y2 > ctx.ph + 0.2):
+            ok = False
+        if _covered(e, ctx.leaves):
+            ok = False
+        if _key(t) in allowed:
+            continue
+        if len(t) == 1 and t in NUM_GLYPHS:
+            continue
+        if all(not ch.isalnum() for ch in t):
+            continue                      # 图标内的感叹号、对勾等符号
+        ok = False
+    f[4] = ok
+    ok = True
+    if deck.bg_fill is not None and not _is_white(deck.bg_fill, 12):
+        ok = False
+    if deck.has_shadow:
+        ok = False
+    for e in ctx.leaves:
+        if e.w >= ctx.pw * 0.9 and e.h >= ctx.ph * 0.9:
+            if e.filled or (not e.ln_none and e.ln_alpha > 8):
+                ok = False
+    f[5] = ok
+    return f
 
 
-def score_theme_text(model: PptModel) -> CheckResult:
-    # 细则 (+1)：第1页底部主题文字
-    #   ① 页面底部中央出现文本 "theme: managing a website outage before a product launch"
-    #   ② 字体 Times New Roman 或等效西文字体
-    #   ③ 字号 15-19 磅
-    #   ④ 蓝色
-    #   ⑤ 倾斜（italic）
-    # 仅检查细则列出的点，不额外约束；判定基于 PowerPoint 实际存储的文本、样式与位置。
-    matches = text_shapes(model, THEME_TEXT)
-    if not matches:
-        return fail_result("D2-12", "底部主题文字", 1, "theme text not found")
-    shape = matches[0]
-    failures = []
-    # ① 页面底部
-    if shape.center_y_cm < model.slide_height_cm * 0.84:
-        failures.append(f"not at bottom y={shape.center_y_cm:.2f}cm")
-    # ① 页面中央（水平方向文本框居中于页面）
-    if abs(shape.center_x_cm - model.slide_width_cm / 2) > 1.5:
-        failures.append(f"not centered x={shape.center_x_cm:.2f}cm")
-    # ② 字体 Times New Roman 或等效西文字体
-    if not shape_font_family_ok(shape, ("times", "liberation serif", "cambria", "georgia")):
-        failures.append(f"font={sorted(shape.font_names)}")
-    # ③ 字号 15-19 磅
-    if not font_size_in_spec(shape, 15, 19):
-        failures.append(f"size not 15-19pt: {shape.font_sizes}")
-    # ④ 蓝色
-    if not shape_has_text_color(shape, "blue"):
-        failures.append("not blue")
-    # ⑤ 倾斜
-    if not shape_italic_ok(shape, True):
-        failures.append("not italic")
-    if failures:
-        return fail_result("D2-12", "底部主题文字", 1, "; ".join(failures))
-    return pass_result("D2-12", "底部主题文字", 1, "theme text at bottom center with Times/西文 15-19pt, blue, italic")
+def _check_dim1(deck, path):
+    reasons = []
+    if not path.lower().endswith(SUPPORTED_EXTS):
+        reasons.append("交付文件格式不是.pptx")
+    if deck.slide_count != 1:
+        reasons.append("幻灯片页数为%d页，不等于1页" % deck.slide_count)
+    for e in deck.leaves:
+        if (e.tag == "pic" and deck.page_w and e.w >= deck.page_w * 0.85
+                and e.h >= deck.page_h * 0.85):
+            reasons.append("版面由整张位图充当，图形与文字均不可编辑")
+            break
+    if len(deck.texts) < 18:
+        reasons.append("可单独选中修改的文本对象仅%d个，编号/阶段标签/说明文字/"
+                       "图例文字/情绪标签/主题文字未全部以文本实现" % len(deck.texts))
+    if len(deck.leaves) < 30:
+        reasons.append("可单独点选、单独编辑的对象仅%d个，少于30个" % len(deck.leaves))
+    if reasons:
+        return False, "；".join(reasons)
+    # 约定：维度一通过时 dim1_reason 保持空串，只有未通过才写错误摘要。
+    return True, ""
 
 
-def score_background(model: PptModel) -> CheckResult:
-    # 细则 (+1)：第1页背景
-    #   ① 页面背景为白色或极浅灰白色
-    # 仅检查细则列出的点，不额外约束；判定基于 PowerPoint 实际存储的背景填充。
-    failures: list[str] = []
-
-    # ① 背景为白色或极浅灰白色。未显式设置背景时继承母版默认（PowerPoint 渲染为白色），视为通过。
-    bg = model.background_color
-    if bg is not None and not (color_is(bg, "white") or color_is(bg, "light_gray")):
-        failures.append(f"background not white/near-white ({bg})")
-
-    evidence = f"background={bg or 'inherited(default white)'}"
-    if failures:
-        return fail_result("D2-14", "背景干净", 1, "; ".join(failures))
-    return pass_result("D2-14", "背景干净", 1, evidence)
-
-
-def build_gate_rules() -> list[Rule]:
-    return [
-        Rule("D1-1", "交付文件为 .pptx 格式，文件可正常打开", 0, gate_valid_file),
-        Rule("D1-3", "该幻灯片不是一整张图片", 0, gate_not_single_image),
-    ]
-
-
-def make_stage_rule(spec: dict) -> Rule:
-    return Rule(f"D2-STAGE-{spec['num']}", f"第 {spec['num']} 阶段节点：{spec['title']}", 5, lambda model, spec=spec: check_stage(model, spec))
-
-
-def build_scoring_rules() -> list[Rule]:
-    rules = [
-        Rule("D2-02", "左上图例框", 3, score_legend),
-    ]
-    rules.extend(make_stage_rule(spec) for spec in STAGE_SPECS)
-    rules.extend(
-        [
-            Rule("D2-08", "编号样式", 1, score_number_style),
-            Rule("D2-09", "action 主箭头", 1, score_action_arrows),
-            Rule("D2-10", "emotion 橙色虚线折线", 3, score_emotion_line),
-            Rule("D2-11", "情绪标签", 1, score_emotion_labels),
-            Rule("D2-12", "底部主题文字", 1, score_theme_text),
-            Rule("D2-14", "背景干净", 1, score_background),
-        ]
-    )
-    return rules
-
-
-def run_rules(model: PptModel, rules: list[Rule]) -> list[CheckResult]:
-    results = []
-    for rule in rules:
-        try:
-            results.append(rule.check(model))
-        except Exception as exc:
-            results.append(fail_result(rule.rule_id, rule.label, rule.score, f"check raised {type(exc).__name__}: {exc}"))
-    return results
-
-
-def _run_evaluation(path: Path) -> tuple[PptModel, list[CheckResult], list[CheckResult], int, bool]:
-    model = inspect_ppt(path)
-    gate_results = run_rules(model, build_gate_rules())
-    passed_gate = all(result.passed for result in gate_results)
-    if not passed_gate:
-        return model, gate_results, [], 0, False
-    scoring_results = run_rules(model, build_scoring_rules())
-    total = sum(result.score for result in scoring_results if result.passed)
-    return model, gate_results, scoring_results, total, True
-
-
-def _locate_pptx(dir_path: Path) -> Optional[Path]:
-    """Locate the PPTX document to evaluate inside `dir_path`.
-
-    Prefers the well-known filename shipped alongside the script; falls back
-    to a single .pptx in the directory when the well-known name is absent,
-    so the script keeps working if the document is renamed.
-    """
-    preferred = dir_path / "website_outage_editable_flow.pptx"
-    if preferred.is_file():
-        return preferred
-    candidates = sorted(
-        p for p in dir_path.iterdir()
-        if p.is_file() and p.suffix.lower() == ".pptx"
-    )
-    return candidates[0] if candidates else None
-
-
-# 维度二评分项定义：与 build_scoring_rules() 顺序一致，用于统一输出结构中的 dim2_items。
-_DIM2_ITEMS: list[tuple[str, str, int]] = [
-    ("D2-02", "左上图例框", 3),
-    *((f"D2-STAGE-{spec['num']}", f"第 {spec['num']} 阶段节点：{spec['title']}", 5) for spec in STAGE_SPECS),
-    ("D2-08", "编号样式", 1),
-    ("D2-09", "action 主箭头", 1),
-    ("D2-10", "emotion 橙色虚线折线", 3),
-    ("D2-11", "情绪标签", 1),
-    ("D2-12", "底部主题文字", 1),
-    ("D2-14", "背景干净", 1),
+RULE_TEXTS = [
+    "页面自左至右并列出现5个流程步骤组，每组自上而下依次为“编号—浅蓝色圆形图标底—深色圆角矩形阶段标签—说明文本框”四层结构；5组的水平中心分别位于页面从左至右6%–13%、26%–33%、46%–53%、67%–74%、86%–93%",
+    "5个编号自左至右依次为1、2、3、4、5，位于页面从上至下14%–26%，表现为深色实心圆形内白色数字或深色圆形数字符号，字号14–24磅",
+    "5个浅蓝色圆形填充为浅蓝灰色（近似#DCEEF5–#E3EEF3），直径均为2.6–3.5cm，顶端位于页面从上至下22%–28%",
+    "5个深色圆角矩形阶段标签填充为深青蓝色（近似#003341–#003E50），高0.8–1.3cm、宽3.5–5.0cm，顶端位于页面从上至下36%–43%",
+    "5个阶段标签内自左至右依次出现白色加粗文本“start”“check”“problem peak”“solution point”“finish”，字号13–18磅，水平居中显示于所在标签之内",
+    "相邻两个浅蓝色圆形之间各出现1条水平深色实线箭头，共4条，位于页面从上至下31%–38%，长度1.8–3.0cm，箭头指向右侧",
+    "5个说明文本框为圆角矩形，宽4.6–5.6cm、高4.2–5.2cm，顶端位于页面从上至下44%–50%，边线为浅蓝色实线（近似#86B9DD–#8FBBDC），填充为极浅蓝灰色（近似#EDF3F8–#F5F8FB），非纯白",
+    "5个说明文本框内文字均为10–14磅、水平居中、垂直居中，颜色为黑色或深色（近似#151B2A–#0B2F45）",
+    "5个说明文本框内自左至右依次为“At 8:40 a.m., the team noticed that the online store was no longer loading for customers.”“The support lead checked alerts, confirmed the outage, and opened an incident channel for developers and operations.”“Orders failed repeatedly because the database connection pool was exhausted during the launch traffic surge.”“The team rolled back the latest configuration and switched traffic to a healthy backup instance.”“The site was back up and stable within 10 minutes, order submissions resumed, and a post-incident review has been scheduled for 4:00 PM this afternoon.”，文字完整无缺字、无错拼",
+    "第1个浅蓝色圆形内出现深色笔记本电脑造型（由形状组合或图片实现）：由屏幕外框矩形与其正下方的横向宽底座条构成，非立柱加圆盘的台式支架造型，整体宽2.0–3.2cm、高1.6–3.2cm",
+    "第1个浅蓝色圆形内的笔记本电脑屏幕区域内叠放橙色实心三角形警示标志（近似#F2551A–#FF6B2C，由形状或图片实现）：宽高均为1.0–1.8cm，三角形内有白色感叹号，且三角形完整位于屏幕外框的边线之内、未越出下边线或右边线",
+    "第2个浅蓝色圆形内出现深色放大镜造型（由形状组合或图片实现）：圆环镜片加右下斜向手柄，镜片外径1.2–2.0cm；镜片右后方有浅蓝色柱状图面板，面板内有3根及以上高度不等的竖直柱条",
+    "第2个浅蓝色圆形内放大镜镜片的右下方出现橙色实心圆形（由形状或图片实现）：直径0.6–1.2cm，圆内为白色感叹号，且该圆与镜片边缘相叠",
+    "第3个浅蓝色圆形内出现深色服务器造型（由形状组合或图片实现）：自上而下3个等宽横向机架（矩形或圆角矩形，单个高0.3–0.6cm），每个机架内左侧有白色小圆形指示灯、右侧有白色横线条，整体宽1.5–2.5cm",
+    "第3个浅蓝色圆形内服务器的右下方叠放橙色实心三角形警示标志（由形状或图片实现）：宽高均为1.0–1.8cm，三角形内有白色感叹号",
+    "第4个浅蓝色圆形内出现云朵造型（由形状或图片实现）：深色描边、白色填充，宽1.6–2.6cm、高1.0–1.8cm",
+    "第4个浅蓝色圆形内云朵的右下方叠放绿色实心圆形（近似#18934E–#20A45B，由形状或图片实现）：直径0.8–1.6cm，圆内为一个两笔相接、连续完整的白色对勾（✓），不呈两段互不相接的斜线",
+    "第5个浅蓝色圆形内出现深色显示器造型（由形状组合或图片实现）：由屏幕外框矩形与其下方的立柱及横向底座构成，整体宽1.6–2.6cm、高1.2–2.2cm",
+    "第5个浅蓝色圆形内屏幕区域中央叠放绿色实心圆形（由形状或图片实现）：直径0.8–1.6cm，圆内为一个两笔相接、连续完整的白色对勾（✓），不呈两段互不相接的斜线",
+    "页面左上角出现图例框：圆角矩形，无填充或白色填充、深色实线边线（线宽1–3磅），宽5.0–7.0cm、高1.8–2.8cm，左边线位于页面从左至右0%–8%、上边线位于从上至下0%–8%",
+    "图例框内上行为深色实线箭头（长2.0–3.0cm、右端带箭头），其右侧为深色加粗文本“action”，字号12–18磅",
+    "图例框内下行为1条橙色虚线箭头（单条线长2.0–3.0cm、右端带箭头、线型为虚线或点线，非由多段短线段拼接），其右侧为橙色加粗文本“emotion”，字号12–18磅",
+    "页面下部出现1条橙色（近似#FC5E13–#FF4B10）虚线折线：自页面从左至右0%–6%横向贯通至92%–100%，整体位于页面从上至下72%–90%，右端带箭头；走势为先下降后上升、再下降、再上升，波峰位于页面从左至右32%–42%、波谷位于52%–62%",
+    "页面下部的橙色虚线折线由连续的线条或连接符以虚线线型实现，单条线段长度均不小于2cm，不存在由30段以上互不相连的独立短线段拼接充当虚线效果的情况，末端箭头由线条端点箭头属性实现",
+    "页面下部出现4个橙色倾斜文本，自左至右依次为“concerned”“tense and focused”“hopeful”“relieved”，字号12–18磅，均位于页面从上至下78%–95%，水平位置分别位于页面从左至右3%–13%、26%–36%、64%–74%、84%–95%",
+    "页面底部出现倾斜蓝色文本“theme: managing a website outage before a product launch”（近似#0A2E90–#1E5AB4）：字号13–18磅，顶端位于页面从上至下90%–97%，整体水平中心位于页面从左至右45%–55%",
+    "页面为16:9横向版式（宽33–34cm、高18.5–19.5cm），全部元素完整位于页面之内，无越出页面边界的元素",
+    "同一步骤组内的编号、浅蓝色圆形、阶段标签、说明文本框上下居中对齐，各元素水平中心的相互偏差不超过0.5cm",
+    "5个说明文本框的正文字号完全一致，不存在其中某一框字号被单独调小或调大的情况",
+    "5个编号圆形内除白色数字外无多余的白色或浅色小圆点、小圆形等形状；放大镜镜片为无填充或透明，其后方柱状图面板的柱条完整可见未被遮挡",
+    "页面内所有文字均完整显示在所属形状的可视区域之内，未被相邻形状遮挡、未被裁切；页面内除编号1–5、5个阶段标签文本、5段英文说明文字、图例文字“action”“emotion”、4个情绪标签文本与底部主题文本外，未出现其他文字（如标题、页码、日期、水印、生成说明等）",
+    "页面内无覆盖整页的背景色块与整页外边框，所有形状与文本均未设置阴影效果",
 ]
 
-_MAX_SCORE = sum(max_delta for _, _, max_delta in _DIM2_ITEMS)
+assert len(RULE_TEXTS) == len(_MAX_DELTAS_ORDER)
 
 
-def evaluate(dir_path: str) -> dict:
-    """Evaluate the PPT located in `dir_path` and return a structured report.
+# 可能被当作交付件提交的格式。.pptx 之外的这几种也认作交付件，以便维度一按
+# "格式不为 .pptx"记 0 分；除此以外的文件（脚本自身、说明文本等）不是交付件。
+DELIVERABLE_EXTS = (".pptx", ".ppt", ".pptm", ".ppsx", ".odp", ".pdf",
+                    ".png", ".jpg", ".jpeg")
 
-    `dir_path` is the directory where this script resides; the script locates
-    and opens the target document inside that directory itself.  Returns a
-    dict following the batch-runner contract (see §2.2 of the interface spec).
+
+def _locate_document(dir_path):
+    """在 dir_path 内定位被评估的交付文件；目录内没有交付件时返回 None。
+
+    优先 .pptx；若目录内只有其他演示或图片格式（.ppt/.pdf/.png 等），也返回该文件，
+    以便维度一按"格式不为 .pptx"记 0 分而不是报"没评上"。目录内只有脚本、说明
+    文档一类非交付件时返回 None，由 evaluate 按"没评上"处理。
     """
-    result: dict = {
-        "id": "055",
+    names = sorted(f for f in os.listdir(dir_path)
+                   if not f.startswith("~$") and not f.startswith(".")
+                   and os.path.isfile(os.path.join(dir_path, f)))
+    pptx = [f for f in names if f.lower().endswith(".pptx")]
+    if pptx:
+        return os.path.join(dir_path, pptx[0])
+    other = [f for f in names
+             if os.path.splitext(f)[1].lower() in DELIVERABLE_EXTS]
+    if other:
+        return os.path.join(dir_path, other[0])
+    return None
+
+
+def evaluate(dir_path):
+    """按接口约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+
+    入参 dir_path 为"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估的
+    .pptx。
+
+    返回信息约定：
+      status="error"（目录不存在、目录中没有交付文件、脚本自身异常）表示这份作业
+      根本没评上，此时 dim1_pass 为空串（未判定）、dim1_reason 为空串、
+      dim2_items 为 []、total_score 与 max_score 均为 0；
+      维度一未通过时 status 仍为 "ok"，dim1_pass 为 False、dim1_reason 写错误摘要、
+      dim2_items 为 []（未真正逐条评过）、total_score 为 0、max_score 为满分；
+      维度一通过时 dim1_pass 为 True、dim1_reason 保持空串。
+      dim2_items 每条只含 rule / max_delta / delta / hit 四个键。
+    """
+    result = {
+        "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": "",
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": _MAX_SCORE,
+        "max_score": 0,
     }
     try:
-        directory = Path(dir_path)
-        if not directory.is_dir():
-            result["status"] = "error"
-            result["error"] = f"dir_path is not a directory: {dir_path}"
-            return result
-        target = _locate_pptx(directory)
-        if target is None:
-            result["status"] = "error"
-            result["error"] = f"no .pptx file found in {dir_path}"
-            return result
-        result["file_name"] = target.name
-
-        model, gate_results, scoring_results, total, passed_gate = _run_evaluation(target)
-        result["dim1_pass"] = passed_gate
-        if not passed_gate:
-            reasons = [
-                f"{r.rule_id} {r.label}: {r.evidence}"
-                for r in gate_results if not r.passed
-            ]
-            result["dim1_reason"] = "; ".join(reasons)
-            return result
-
-        scoring_by_id = {r.rule_id: r for r in scoring_results}
-        items = []
-        for rule_id, label, max_delta in _DIM2_ITEMS:
-            check = scoring_by_id.get(rule_id)
-            hit = bool(check and check.passed)
-            items.append({
-                "rule": label,
-                "max_delta": max_delta,
-                "delta": max_delta if hit else 0,
-                "hit": hit,
-                "detail": "",
-            })
-        result["dim2_items"] = items
-        result["total_score"] = total
-        return result
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError("目录不存在：%s" % dir_path)
+        file_path = _locate_document(dir_path)
+        if file_path is None:
+            # 目录里一个交付物都没有：这份作业没评上，而不是维度一判不通过。
+            raise FileNotFoundError("目录内未找到 .pptx 文件：%s" % dir_path)
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
     except Exception as exc:
+        # status 为 error 时未能完成判定，dim1_pass 留空，dim1_reason 也为空，
+        # 两项分数一并归零。
         result["status"] = "error"
-        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
+
+
+def _dim1_fail(result, reason):
+    """维度一未通过：完成度总分记 0，不再逐条罗列（未真正逐条评过）。"""
+    result["dim1_pass"] = False
+    result["dim1_reason"] = reason or "维度一未通过（未给出具体原因）"
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def _build_dim2_items(results):
+    """把 "+N：说明" 逐条反解为结构化 dim2_items（顺序对齐 _MAX_DELTAS_ORDER）。
+
+    返回的每条只含 rule / max_delta / delta / hit 四个键。"""
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    items = []
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta > 0
+        items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+    return items
+
+
+def _evaluate_impl(file_path, result):
+    """维度一门禁 + 维度二 32 条加分项的评估主体。"""
+    if not file_path.lower().endswith(SUPPORTED_EXTS):
+        return _dim1_fail(result, "交付文件格式不是.pptx（实际为%s）"
+                                  % (os.path.splitext(file_path)[1] or "无扩展名"))
+    try:
+        deck = _load(file_path)
+    except Exception as exc:
+        return _dim1_fail(result, "交付文件无法正常打开（损坏或需修复）：%s: %s"
+                                  % (type(exc).__name__, exc))
+    dim1_ok, dim1_reason = _check_dim1(deck, file_path)
+    if not dim1_ok:
+        return _dim1_fail(result, dim1_reason)
+    result["dim1_pass"] = True
+    # 约定：维度一通过时 dim1_reason 保持空串，只有未通过才写错误摘要。
+    result["dim1_reason"] = ""
+
+    ctx = Ctx(deck)
+    flags = []
+    flags.extend(_check_layout(ctx))
+    flags.extend(_check_icons(ctx))
+    flags.extend(_check_legend(ctx))
+    flags.extend(_check_curve(ctx))
+    flags.extend(_check_norms(ctx))
+    if len(flags) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("检查项数不一致：flags=%d vs order=%d"
+                           % (len(flags), len(_MAX_DELTAS_ORDER)))
+
+    results = []
+    for hit, delta, text in zip(flags, _MAX_DELTAS_ORDER, RULE_TEXTS):
+        results.append("+%d：%s" % (delta if hit else 0, text))
+
+    items = _build_dim2_items(results)
+    result["dim2_items"] = items
+    result["total_score"] = sum(it["delta"] for it in items)
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    _arg = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent)
-    print(json.dumps(evaluate(_arg), ensure_ascii=False, indent=2))
+    # 本地调试入口：evaluate 只接收"脚本所在目录的路径"，由脚本自己在该目录里
+    # 定位并打开被评估的 .pptx。命令行第 1 个参数可覆盖目录路径。
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

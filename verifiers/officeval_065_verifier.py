@@ -1,2276 +1,1468 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-对 "口算教学课件_第10页双转盘动画版.pptx" 的自动评估脚本
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingImports=false, reportOptionalMemberAccess=false, reportGeneralTypeIssues=false, reportAttributeAccessIssue=false, reportIndexIssue=false, reportArgumentType=false, reportOptionalSubscript=false, reportOptionalIterable=false
 
-评分逻辑
-========
-维度 1（可用与可修改性）：
-    - 文件为 .pptx
-    - 能正常被解析（即能被打开的代理）
-    - 第 10 页存在，且页面上至少存在可编辑的"转盘动画"承载对象
-  若维度 1 不满足 -> 直接 0 分
+# =============================================================================
+# 接口约定（与 officeval_008_verifier.py 完全一致）：
+#   1. 本脚本不修改全局 sys.stdout，不打印主结果；
+#   2. 主结果由 evaluate(dir_path) -> dict 返回；
+#   3. 入参为“脚本所在目录的路径”，由脚本自行在该目录下定位并打开被测文件；
+#   4. __main__ 仅作为本地调试入口。
+#
+# 评分对象：口算教学课件（.pptx），第 10 页“乘号 + 双转盘 + 控制按钮”交互页。
+# 评分逻辑：维度1（可用或可修改性）为闸门；维度2（完成度）= 25 条加分（满分 63）
+#           与 20 条减分（扣分上限 42），完成度 = max(0, 加分合计 - 扣分合计) / 63。
+# 所有判定常量均已内联，脚本不依赖原始文件与客户指令。
+# =============================================================================
 
-维度 2（完成度评分）：
-    - 由若干 +x 加分细则和若干 -x 扣分细则组成
-    - 加分细则：必须满足该细则下的全部要点才计入加分
-    - 扣分细则：满足该细则下任意一点即计入扣分
-    - 最终得分 = 各细则得分之和（允许为负数 -> 这里向下截断到 0，
-      因为题目只说"累计"，未明确允许负总分；为安全起见仍打印原始累计）
-
-说明
-====
-PPT 是一个静态描述格式，"动画行为"（旋转、按钮多次点击）无法在不实际播放
-的情况下做严格自动判断。本脚本采用如下"灵活变通"策略：
-    * 旋转/启停一致性：检查是否存在 PowerPoint 动画时间线（a:timing/p:timing
-      或形状级动画属性），或是否使用了视频/媒体作为动画载体；若整页是单段
-      视频，则按"视频动画"判断启停一致性（视频内部天然同步），并据此命中
-      扣分项"整页被视频/动画覆盖，转盘和按钮无法单独编辑"。
-    * "按钮再次点击/继续"：检测是否存在带触发器（trigger by click）的动画
-      序列，且序列至少包含 start/pause/resume 三个语义状态（通过形状文字
-      含"开始/暂停/继续"或同义词识别）。
-"""
-
-from __future__ import annotations
-
-import json
 import os
 import re
 import sys
+import json
+import math
+import shutil
+import hashlib
 import zipfile
+import tempfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
 
-from pptx import Presentation
-from pptx.util import Emu
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
 
-# ----------------------------- 工具 ----------------------------- #
+SCRIPT_ID = "065"
+MAX_SCORE_TOTAL = 63
+MAX_DEDUCT_TOTAL = 42
+
+_MAX_DELTAS_ORDER = [
+    # ---------------- 加分项 25 条，合计 63 分 ----------------
+    1,   # 01 乘号存在且是可单独选中的对象
+    3,   # 02 乘号中心落在 (17.03, 9.71) cm ±0.3
+    1,   # 03 乘号高 2.4—4.8cm、亮色、未被遮挡超 20%
+    3,   # 04 两个转盘左右分列、离中线≥2.5cm、中心 y 在 3—16cm、直径≥4cm
+    3,   # 05 每盘扇形≥6 块、颜色≥4 种、相邻两块不同色
+    3,   # 06 每盘纯数字≥6 个、与扇形块数一致、盘内不重复
+    1,   # 07 一盘 1—9 一位数，另一盘 10—90 整十数
+    3,   # 08 每盘各 1 个指针共 2 个、中心 x 差≤0.3cm、面积≤15%、不随盘转
+    1,   # 09 底板包住转盘、面积 1.05—2.5 倍、数字≥12 磅
+    3,   # 10 两盘宽差、高差均≤0.1cm
+    3,   # 11 两盘中心 y 差≤0.1cm
+    3,   # 12 两盘中心 x 的中点与 17.03cm 差≤0.3cm
+    1,   # 13 新增对象不出界且两个转盘单元互不重叠
+    3,   # 14 有 1 个带文字的按钮并由它触发转盘旋转
+    1,   # 15 按钮中心 x 与 17.03cm 差≤0.5cm 且位于转盘中心之下
+    1,   # 16 按钮为带填色的圆角矩形类形状、字号≥14 磅、明暗差明显
+    5,   # 17 单击按钮两盘同时启动、无延迟
+    5,   # 18 无限重复、单圈整 360 度
+    5,   # 19 再次单击两盘同时停下、可反复切换
+    3,   # 20 暂停停在当前角度（相对量 by）且保持结束状态
+    3,   # 21 只由按钮控制，非任意处单击、非自动播放
+    3,   # 22 只有两个转盘在动（按钮占位动画≤0.1 秒且 100% 不算）
+    3,   # 23 绕圆心旋转：宽高比 0.95—1.05 且圆心偏差≤0.2cm
+    1,   # 24 单圈耗时 0.3—1 秒
+    1,   # 25 每盘 1 个组合、嵌套≤4 层、非图片或视频承担
+    # ---------------- 减分项 20 条，合计 -42 分 ----------------
+    -3,  # 26 背景图被删除、移动、改尺寸或不在最底层
+    -3,  # 27 多出覆盖页面≥60% 的图片或视频对象
+    -1,  # 28 4 个小图标任一被删除、移动或改尺寸
+    -3,  # 29 椭圆区域被单个新增对象盖住过半
+    -1,  # 30 残留“同步/双转盘/示例/demo/水印/模板/参考图”或 >15% 无文字纯色块
+    -5,  # 31 页数≠11 或页面尺寸≠33.87×19.05cm
+    -5,  # 32 其余 10 页文字指纹不符
+    -3,  # 33 任意页出现自动缩小字号或压缩行距
+    -1,  # 34 存在隐藏页或切换效果
+    -1,  # 35 母版≠2 或版式≠3 或主题字体≠Microsoft YaHei
+    -1,  # 36 备注缺少以“课堂备注：”开头且长度 40—90 字的段落
+    -3,  # 37 含宏代码
+    -3,  # 38 存在外部链接的媒体
+    -1,  # 39 体积 >18MB 或存在冗余未引用素材
+    -1,  # 40 文件名≠口算教学课件.pptx
+    -1,  # 41 第 10 页存在空形状、页外对象或重复对象
+    -3,  # 42 第 1—9、11 页被加了动画
+    -1,  # 43 第 10 页存在音频或视频对象
+    -1,  # 44 第 10 页存在单击跳转超链接
+    -1,  # 45 文档属性被清空或改错
+]
+
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+assert -sum(d for d in _MAX_DELTAS_ORDER if d < 0) == MAX_DEDUCT_TOTAL
+assert len(_MAX_DELTAS_ORDER) == 45
+
+# --------------------------------------------------------------------------
+# 内联常量（全部为绝对值，不依赖原始文件）
+# --------------------------------------------------------------------------
+EMU_PER_CM = 360000.0
+PAGE_W_CM = 33.87                 # 页宽（p:sldSz cx=12192000 EMU）
+PAGE_H_CM = 19.05                 # 页高（p:sldSz cy=6858000 EMU）
+SLIDE_COUNT = 11                  # 应有页数
+TARGET_INDEX = 10                 # 交互页页码（1 基）
+CENTER_X_CM = 17.03               # 页面竖向中线（乘号 / 按钮的对齐基准）
+CROSS_CENTER_CM = (17.03, 9.71)   # 乘号应在的中心点
+ELLIPSE_RECT_CM = (11.54, 3.73, 22.52, 15.68)   # 原页粉色椭圆区域 left/top/right/bottom
+FILE_NAME_EXPECT = "口算教学课件.pptx"
+SIZE_LIMIT_BYTES = 18 * 1024 * 1024
+THEME_FONT_EXPECT = "Microsoft YaHei"
+MASTER_COUNT = 2
+LAYOUT_COUNT = 3
+DOC_TITLE_EXPECT = "10乘两位数、整十数乘整十数的口算教学课件"
+DOC_SUBJECT_EXPECT = "小学数学口算教学课件"
+NOTE_PREFIX = "课堂备注："
+NOTE_LEN_RANGE = (40, 90)
+BANNED_WORDS = ("同步", "双转盘", "示例", "demo", "水印", "模板", "参考图")
+
+# 第 10 页 4 个小图标基线：left/top/边长（cm），容差 ±0.30cm
+ICONS_CM = (
+    (6.70, 4.59, 1.13),
+    (25.75, 4.94, 0.85),
+    (25.40, 10.58, 0.99),
+    (7.06, 10.94, 0.71),
+)
+
+# 第 1—9、11 页文字指纹（SHA-1）。归一化方式：递归遍历 spTree（含组合内部），
+# 每个形状按段落用 \n 连接其 a:t 文本并顺序拼接全部形状，再删除所有空白
+# （含 　 与不换行空格），对 UTF-8 字节取 SHA-1。
+TEXT_SHA1 = {
+    1: "788f69604ac64fbb49743a67f324e680d5ec81fb",
+    2: "326d32698d9a69096344189cf608895f357aa386",
+    3: "5b49e6ac31ab3c98604ed295dfa08708b1c419f6",
+    4: "ac91cfec311feb0dfa7281b23539c7c343aa1be2",
+    5: "c7a818d582ffa7282d43b32062b47fed96b302b3",
+    6: "c7a8c99e5f86b2cbab01bd00f75da60686ac7453",
+    7: "81a10cae5ec1d05528b2831805bf84d01ad29d23",
+    8: "ff3f7c3b216e6d46a4d0fb220236e92ee69854cc",
+    9: "2575c3442dc9cb7c8442534c0e4ec8bf8fc567c1",
+    11: "2e53dec0ec7ad6f00a7a2a1cc7ee4d9cd6fa92a9",
+}
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    "dc": "http://purl.org/dc/elements/1.1/",
 }
+_A = NS["a"]
+_P = NS["p"]
 
-EMU_PER_CM = 360000.0
-
-
-def emu_to_cm(v: Optional[int]) -> float:
-    if v is None:
+# --------------------------------------------------------------------------
+# 基础工具
+# --------------------------------------------------------------------------
+def _cm(emu):
+    """EMU -> 厘米。"""
+    try:
+        return float(emu) / EMU_PER_CM
+    except (TypeError, ValueError):
         return 0.0
-    return v / EMU_PER_CM
 
 
-def shape_center_cm(shape) -> Tuple[float, float]:
-    left = emu_to_cm(shape.left or 0)
-    top = emu_to_cm(shape.top or 0)
-    w = emu_to_cm(shape.width or 0)
-    h = emu_to_cm(shape.height or 0)
-    return left + w / 2.0, top + h / 2.0
-
-
-def shape_size_cm(shape) -> Tuple[float, float]:
-    return emu_to_cm(shape.width or 0), emu_to_cm(shape.height or 0)
-
-
-def safe_text(shape) -> str:
+def _xml(z, name):
+    """读取包内 XML 部件，缺失或损坏时返回 None。"""
     try:
-        if shape.has_text_frame:
-            return shape.text_frame.text or ""
-    except Exception:
-        pass
-    return ""
-
-
-# --------------------------- 报告对象 --------------------------- #
-
-
-@dataclass
-class Rule:
-    code: str            # e.g. "+5-a", "-3-b"
-    score: int           # 正/负
-    title: str
-    matched: bool = False
-    notes: List[str] = field(default_factory=list)
-
-
-@dataclass
-class Report:
-    dim1_pass: bool = False
-    dim1_reasons: List[str] = field(default_factory=list)
-    rules: List[Rule] = field(default_factory=list)
-
-    def total(self) -> int:
-        return sum(r.score for r in self.rules if r.matched)
-
-
-# --------------------------- 主评估器 --------------------------- #
-
-
-class Evaluator:
-    TARGET_PAGE_INDEX = 9  # 第 10 页
-
-    def __init__(self, path: str):
-        self.path = path
-        self.report = Report()
-        self.prs: Optional[Presentation] = None
-        self.slide = None
-        self.slide_xml: Optional[ET.Element] = None
-        self.slide_xml_raw: str = ""
-        self.zf: Optional[zipfile.ZipFile] = None
-
-    # -------- 维度 1 -------- #
-
-    def check_dim1(self) -> bool:
-        """维度 1：交付文件为 .pptx 格式，能够正常打开。
-        严格按细则逐点：
-            (1) 交付文件为 .pptx 格式
-            (2) 能够正常打开
-        """
-        r = self.report
-
-        # ---- (1) 后缀为 .pptx ---- #
-        ext = os.path.splitext(self.path)[1].lower()
-        if ext != ".pptx":
-            r.dim1_reasons.append(f"(1)文件后缀 {ext} 非 .pptx")
-            return False
-        r.dim1_reasons.append(f"(1)文件后缀 {ext} 合法")
-
-        # ---- (2) 能正常打开 ---- #
-        # 代理判定：文件可被 python-pptx 完整加载，且包内 presentation.xml /
-        # slideN.xml 可解析为合法 XML。
-        try:
-            self.prs = Presentation(self.path)
-            self.zf = zipfile.ZipFile(self.path, "r")
-            # 包合法性
-            bad = self.zf.testzip()
-            if bad is not None:
-                r.dim1_reasons.append(f"(2)文件损坏，无法打开（坏文件：{bad}）")
-                return False
-        except Exception as e:
-            r.dim1_reasons.append(f"(2)文件无法正常打开：{e}")
-            return False
-        r.dim1_reasons.append("(2)文件可正常打开")
-
-        assert self.prs is not None
-        if len(self.prs.slides) > self.TARGET_PAGE_INDEX:
-            self.slide = self.prs.slides[self.TARGET_PAGE_INDEX]
-        if self.slide is not None:
-            self.slide_xml_raw = self.zf.read(
-                f"ppt/slides/slide{self.TARGET_PAGE_INDEX + 1}.xml"
-            ).decode("utf-8")
-            self.slide_xml = ET.fromstring(self.slide_xml_raw)
-
-        return True
-
-    def _has_editable_spinner_object(self) -> bool:
-        """第 10 页是否存在"可编辑的转盘动画对象"。
-        判定：
-          - 必须是 PPT 内可单独选中并编辑的 shape（OVAL/PICTURE/GROUP/FREEFORM 等），
-            排除整页 MEDIA（视频）和整页 PICTURE 这类"烘焙背景"——它们不
-            可被单独编辑为"转盘"，只是被整体播放/显示的烘焙内容。
-          - 该对象近似为圆形（宽高差 ≤ 0.2cm，作为"轮盘"的几何代理）。
-          - 该对象尺寸需要在合理的"转盘"量级：直径 ≥ 3cm（细则建议 6~7cm，
-            这里给出较宽容差，但要排除明显是图标/指针的小图）。
-          - 同时具有动画属性的代理：页面包含 p:timing 且时间轴中存在作用于
-            该 shape 的旋转/动作动画；若仅有页面级 timing 但目标是其它对象
-            （例如整页视频），则不视为"该对象本身的动画"。
-        """
-        if self.slide is None or self.slide_xml is None or self.prs is None:
-            return False
-        sw = emu_to_cm(self.prs.slide_width)
-        sh = emu_to_cm(self.prs.slide_height)
-
-        # 收集 timing 中所有动画目标 spid -> 用于"是否对该 shape 有动画"
-        anim_target_ids = set()
-        for spt in self.slide_xml.findall(".//p:spTgt", NS):
-            sid = spt.get("spid")
-            if sid:
-                anim_target_ids.add(sid)
-
-        def shape_id(sh):
-            for tag in ("p:nvSpPr/p:cNvPr", "p:nvPicPr/p:cNvPr",
-                        "p:nvGrpSpPr/p:cNvPr"):
-                el = sh._element.find(".//" + tag, NS)
-                if el is not None:
-                    return el.get("id")
-            return None
-
-        for shape in self.slide.shapes:
-            st = str(shape.shape_type)
-            w, h = shape_size_cm(shape)
-            # 排除整页媒体（视频）—— 这是"被烘焙的整页动画"，不是"可编辑转盘"
-            if "MEDIA" in st:
-                continue
-            # 排除整页图片背景
-            if "PICTURE" in st and w >= sw * 0.9 and h >= sh * 0.9:
-                continue
-            # 仅认可可作为转盘载体的 shape 类型
-            if not any(k in st for k in ("OVAL", "PICTURE", "GROUP", "FREEFORM")):
-                continue
-            # 圆形几何代理（宽高差 ≤ 0.2cm）
-            if w <= 0 or h <= 0 or abs(w - h) > 0.2:
-                continue
-            # 尺寸需达到"转盘"量级：直径 ≥ 3cm；过小则是图标/指针
-            d = (w + h) / 2.0
-            if d < 3.0:
-                continue
-            # 动画属性：要么页面 timing 有作用于该 shape 的动画，
-            # 要么至少 shape 上挂了 hyperlink/action（可用作触发器入口）。
-            # 若两者皆无：仍允许，但需要至少 timing 节点存在（页面已具备动画体系）。
-            sid = shape_id(shape)
-            has_anim_on_this = sid is not None and sid in anim_target_ids
-            page_has_timing = self.slide_xml.find(".//p:timing", NS) is not None
-            if not (has_anim_on_this or page_has_timing):
-                continue
-            return True
-
-        return False
-
-    # -------- 通用：抽取页面上的关键对象 -------- #
-
-    def _classify_shapes(self):
-        """把第 10 页 shape 分类，便于后续规则。"""
-        info = {
-            "all": [],
-            "ovals": [],          # 圆/椭圆形状
-            "pictures": [],
-            "media": [],          # 视频/音频
-            "groups": [],
-            "text_shapes": [],
-            "buttons": [],
-            "fullpage_media": [],  # 覆盖整页的媒体
-            "fullpage_picture": [],
-            "cross_x": [],         # 中央乘号 ×
-            "pointers": [],        # 指针（小三角/小图片）
-        }
-        sw_cm = emu_to_cm(self.prs.slide_width)
-        sh_cm = emu_to_cm(self.prs.slide_height)
-        for shape in self.slide.shapes:
-            info["all"].append(shape)
-            st = str(shape.shape_type)
-            w_cm, h_cm = shape_size_cm(shape)
-            txt = safe_text(shape).strip()
-            if "MEDIA" in st:
-                info["media"].append(shape)
-                if w_cm >= sw_cm * 0.9 and h_cm >= sh_cm * 0.9:
-                    info["fullpage_media"].append(shape)
-            elif "PICTURE" in st:
-                info["pictures"].append(shape)
-                if w_cm >= sw_cm * 0.9 and h_cm >= sh_cm * 0.9:
-                    info["fullpage_picture"].append(shape)
-            elif "GROUP" in st:
-                info["groups"].append(shape)
-            elif "OVAL" in st:
-                info["ovals"].append(shape)
-            if txt:
-                info["text_shapes"].append(shape)
-                if re.search(r"[×xX✕✖]", txt) and len(txt) <= 3:
-                    info["cross_x"].append(shape)
-                if re.search(r"(开始|暂停|继续|停止|播放|start|pause|resume|stop|play)",
-                             txt, re.I):
-                    info["buttons"].append(shape)
-            # 指针：尺寸较小且贴近"轮盘上方"的图片/三角；启发式留到具体规则里
-        return info, sw_cm, sh_cm
-
-    # -------- 维度 2 规则 -------- #
-
-    def check_dim2(self):
-        info, sw, sh = self._classify_shapes()
-
-        # --- +5 转盘数量与对称分布 ---
-        self._rule_two_spinners(info, sw, sh)
-        # --- +1 中央乘号 ---
-        self._rule_central_cross(info, sw, sh)
-        # --- +3 共同控制按钮 ---
-        self._rule_common_button(info, sw, sh)
-        # --- +5 动画行为（同步启停 + 持续旋转 + 仅绕圆心） ---
-        self._rule_anim_behavior(info)
-        # --- +1 固定指针 ---
-        self._rule_pointers(info, sw, sh)
-        # --- +1 中央乘号格式 ---
-        self._rule_cross_format(info)
-        # --- +1 按钮状态文字 ---
-        self._rule_button_states(info)
-
-        # --- 扣分 ---
-        self._rule_minus_fullpage_video(info)
-
-    # ---------- 加分项实现 ---------- #
-
-    def _rule_two_spinners(self, info, sw, sh):
-        """+5 严格按细则逐点：
-            (1) 左右各一个，共 2 个完整转盘（页面上"完整转盘"实际数量恰为 2）
-            (2) 左侧转盘：圆形轮盘 + 多个彩色扇区 + 可辨认数字/口算
-            (3) 右侧转盘：圆形轮盘 + 多个彩色扇区 + 可辨认数字/口算
-            (4) 两转盘直径一致（建议约 6~7cm）
-            (5) 每个转盘 宽高差 ≤ 0.2cm
-            (6) 左右对称分布在粉色椭圆两侧（以粉色椭圆中心为对称轴）
-            (7) 两个转盘中心点处于同一水平线上
-        """
-        rule = Rule("+5-spinners", 5, "页面左右各1个完整转盘(共2)，含扇区与数字，"
-                                       + "直径一致(约6~7cm)，宽高差≤0.2，左右对称"
-                                       + "(以粉色椭圆中心为对称轴)，中心同一水平线")
-
-        # 整页视频存在时无法核验转盘内容，跳过不计分
-        if info["fullpage_media"]:
-            rule.notes.append("存在整页视频，无法核验转盘细则，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        # 候选：第10页上"可作为整体转盘"的对象。
-        candidates = []
-        for s in (info["ovals"] + info["pictures"] + info["groups"]):
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            candidates.append(s)
-
-        # ---- (5) 每个转盘自身 宽高差 ≤ 0.2cm（圆形轮盘的代理判定） ---- #
-        def is_circular(s):
-            w, h = shape_size_cm(s)
-            return w > 0 and h > 0 and abs(w - h) <= 0.2
-
-        # ---- "完整转盘"筛选：圆形 + 尺寸达到转盘量级（直径 ≥3cm，
-        #      细则建议 6~7cm；上限 12cm 以排除装饰性大圆环/背景） ---- #
-        def is_complete_spinner(s):
-            if not is_circular(s):
-                return False
-            w, h = shape_size_cm(s)
-            d = (w + h) / 2.0
-            return 3.0 <= d <= 12.0
-
-        circular = [s for s in candidates if is_circular(s)]
-        complete = [s for s in candidates if is_complete_spinner(s)]
-        rule.notes.append(
-            f"候选(非整页){len(candidates)} 个，圆形(宽高差≤0.2){len(circular)} 个，"
-            + f"完整转盘(圆形且直径3~12cm){len(complete)} 个"
-        )
-
-        # ---- (1) 完整转盘数量"恰好"为 2 ---- #
-        # 与之前"从更多候选里挑最像的两个"不同：这里严格要求实际完整转盘数=2；
-        # 多余的完整转盘（>2）也判为不达标，避免"多余转盘"误得分。
-        ok_count = (len(complete) == 2)
-        picked = complete if ok_count else []
-        rule.notes.append(f"(1)完整转盘数量恰为2={ok_count}")
-
-        # ---- (4) 两转盘直径一致（宽高差≤0.2cm；6~7cm 为建议值，不强制） ---- #
-        ok_same_diameter = False
-        if ok_count:
-            w1, h1 = shape_size_cm(picked[0])
-            w2, h2 = shape_size_cm(picked[1])
-            d1 = (w1 + h1) / 2.0
-            d2 = (w2 + h2) / 2.0
-            ok_same_diameter = abs(d1 - d2) <= 0.2
-            rule.notes.append(
-                f"直径 D1={d1:.2f}cm D2={d2:.2f}cm；一致(|ΔD|≤0.2)={ok_same_diameter}（建议6~7cm）"
-            )
-
-        # ---- (6) 左右对称分布在"粉色椭圆两侧"（以椭圆中心为对称轴） ---- #
-        # 严格按 rubric：对称轴是粉色椭圆中心的 x 坐标，而非幻灯片中线。
-        # 找不到粉色椭圆时，本点判为不满足（不再退化到幻灯片中线）。
-        # ---- (7) 中心点处于同一水平线 ---- #
-        ok_symmetric = False
-        ok_same_y = False
-        left_shape = right_shape = None
-        pink_xy = self._find_pink_ellipse_center(info, sw, sh)
-        if ok_count:
-            a, b = picked
-            ca = shape_center_cm(a)
-            cb = shape_center_cm(b)
-            left_shape, right_shape = (a, b) if ca[0] < cb[0] else (b, a)
-            cl = shape_center_cm(left_shape)
-            cr = shape_center_cm(right_shape)
-            if pink_xy is not None:
-                axis_x = pink_xy[0]
-                on_two_sides = cl[0] < axis_x < cr[0]
-                sym_dist = abs((axis_x - cl[0]) - (cr[0] - axis_x)) <= 0.3
-                ok_symmetric = on_two_sides and sym_dist
-                rule.notes.append(
-                    f"粉色椭圆中心 x={axis_x:.2f}cm；左中心={cl}, 右中心={cr}；"
-                    f"分居两侧={on_two_sides}, 到椭圆中心距离对称(≤0.3cm)={sym_dist}"
-                )
-            else:
-                rule.notes.append("未定位到粉色椭圆 -> (6)左右对称无法核验，判为不满足")
-            # (7) 中心 y 在同一水平线，细则未给具体容差，按 0.3cm 工程容差判定
-            ok_same_y = abs(cl[1] - cr[1]) <= 0.3
-            rule.notes.append(
-                f"中心 y 差={abs(cl[1]-cr[1]):.3f}cm 同一水平线(≤0.3cm)={ok_same_y}"
-            )
-
-        # ---- (2)(3) 含彩色扇区 + 可辨认数字/口算 ---- #
-        # 检测策略：在 slide xml 中，对该 shape 子树内
-        #   · 矢量承载：≥3 种不同的 srgbClr 填充色（扇区）+ shape 内文本含数字或口算符号
-        #   · 图片承载：只有当图片的 alt 文本 / 图形名称 / 关系目标（media 文件名）
-        #     明确显示"转盘/扇区/数字/口算"等语义时，才视为"可辨认"。仅仅是
-        #     一张位图（无任何证据）不能被直接判为含扇区和含数字。
-        def _iter_alt_and_names(shape):
-            """收集 shape 上可用作图片语义证据的字符串："""
-            texts = []
-            # 图形名
-            if shape.name:
-                texts.append(shape.name)
-                # descr / title on cNvPr
-            for cnv_path in (".//p:nvSpPr/p:cNvPr",
-                             ".//p:nvPicPr/p:cNvPr",
-                             ".//p:nvGrpSpPr/p:cNvPr"):
-                el = shape._element.find(cnv_path, NS)
-                if el is not None:
-                    for a in ("descr", "title", "name"):
-                        v = el.get(a)
-                        if v:
-                            texts.append(v)
-            # 图片承载对应 media 文件名（若能取到）
-            try:
-                if hasattr(shape, "image") and shape.image is not None:
-                    fn = getattr(shape.image, "filename", "") or ""
-                    if fn:
-                        texts.append(fn)
-            except Exception:
-                pass
-            return " ".join(texts)
-
-        SECTOR_HINT = re.compile(
-            r"(转盘|轮盘|扇区|扇形|spinner|wheel|sector|pie)", re.I
-        )
-        DIGIT_HINT = re.compile(
-            r"(口算|算式|数字|number|digit|math|arith|equation|"
-            r"[0-9０-９]|[\+\-\×\÷])", re.I
-        )
-
-        def has_sectors_and_digits(shape):
-            xml = shape._element
-            xml_str = ET.tostring(xml, encoding="unicode")
-            # 矢量填充色种类（扇区代理）
-            colors = set(re.findall(r'srgbClr val="([0-9A-Fa-f]{6})"', xml_str))
-            many_colors = len(colors) >= 3
-            # 矢量文字：数字/口算
-            txt = safe_text(shape)
-            has_digit_text = bool(re.search(r"[0-9０-９]", txt)) or \
-                             bool(re.search(r"[\+\-\×\÷xX]", txt))
-            # 图片承载
-            is_image_carrier = re.search(r'r:embed="', xml_str) is not None or \
-                               "PICTURE" in str(shape.shape_type)
-            # 图片语义证据（alt / name / filename）
-            alt_txt = _iter_alt_and_names(shape) if is_image_carrier else ""
-            img_sector_evidence = bool(SECTOR_HINT.search(alt_txt))
-            img_digit_evidence = bool(DIGIT_HINT.search(alt_txt))
-
-            # 扇区：矢量多色 或 图片且有扇区语义证据
-            sectors_ok = many_colors or (is_image_carrier and img_sector_evidence)
-            # 数字：矢量文本含数字/口算 或 图片且有数字/口算语义证据
-            digits_ok = has_digit_text or (is_image_carrier and img_digit_evidence)
-            return sectors_ok, digits_ok, {
-                "colors": len(colors),
-                "is_image": is_image_carrier,
-                "alt": alt_txt[:60],
-                "text": txt[:30],
-            }
-
-        ok_left_content = ok_right_content = False
-        if ok_count:
-            s_ok_l, d_ok_l, info_l = has_sectors_and_digits(left_shape)
-            s_ok_r, d_ok_r, info_r = has_sectors_and_digits(right_shape)
-            ok_left_content = s_ok_l and d_ok_l
-            ok_right_content = s_ok_r and d_ok_r
-            rule.notes.append(
-                f"左转盘：扇区={s_ok_l} 数字/口算={d_ok_l} 详情={info_l}"
-            )
-            rule.notes.append(
-                f"右转盘：扇区={s_ok_r} 数字/口算={d_ok_r} 详情={info_r}"
-            )
-
-        # 圆形轮盘：(5) 已通过 is_circular 验证
-        ok_circular_two = ok_count and is_circular(picked[0]) and is_circular(picked[1])
-
-        rule.matched = (
-            ok_count           # (1) 完整转盘数=2
-            and ok_circular_two  # (2)(3) 圆形轮盘 + (5) 宽高差≤0.2cm
-            and ok_left_content  # (2) 左：扇区+数字
-            and ok_right_content # (3) 右：扇区+数字
-            and ok_same_diameter # (4) 直径一致
-            and ok_symmetric     # (6) 以粉色椭圆中心为对称轴左右对称
-            and ok_same_y        # (7) 中心同一水平线
-        )
-        rule.notes.append(
-            f"逐点：(1)完整转盘数=2 {ok_count} "
-            f"(2/3)圆形={ok_circular_two} "
-            f"左内容={ok_left_content} 右内容={ok_right_content} "
-            f"(4)同径={ok_same_diameter} "
-            f"(6)对称(粉椭圆轴)={ok_symmetric} (7)同水平={ok_same_y}"
-        )
-        self.report.rules.append(rule)
-
-    def _rule_central_cross(self, info, sw, sh):
-        """+1 严格按细则逐点：
-            (1) 第 10 页存在"中央粉色椭圆"
-            (2) 在该椭圆中心点放置"×"
-            (3) × 中心相对椭圆中心的偏离不超过 0.3 厘米
-        细则没有要求"× 是独立文本框"，因此只要页面上存在以
-        "×/✕/✖/x/X" 为内容的对象（文本/小图片），都参与判定。
-        """
-        rule = Rule("+1-cross", 1, "中央粉色椭圆中心放置 ×，偏离≤0.3cm")
-
-        # 整页视频存在时无法核验视频内部的粉色椭圆和 ×，跳过不计分
-        if info["fullpage_media"]:
-            rule.notes.append("存在整页视频，无法核验中央乘号细则，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        # ---- (1) 定位"中央粉色椭圆" ---- #
-        # 方式 A：页面上有 OVAL/freeform 形状且填充为粉色（H ≈ 320~360°，S≥0.1，L≥0.7）
-        # 方式 B：作为底图背景的一部分 -> 通过对背景图做像素级粉色连通域分析定位中心
-        pink_ellipse_center = self._find_pink_ellipse_center(info, sw, sh)
-        if pink_ellipse_center is None:
-            rule.notes.append("未在第10页定位到中央粉色椭圆")
-            self.report.rules.append(rule)
-            return
-        tx, ty = pink_ellipse_center
-        rule.notes.append(f"中央粉色椭圆中心定位于 ({tx:.2f}cm, {ty:.2f}cm)")
-
-        # ---- (2) 找 × 对象 ---- #
-        cross_shapes = []
-        for s in self.slide.shapes:
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            t = safe_text(s).strip()
-            if t and re.fullmatch(r"[×xX✕✖]+", t):
-                cross_shapes.append(s)
-        if not cross_shapes:
-            rule.notes.append("未发现 × 对象")
-            self.report.rules.append(rule)
-            return
-
-        # ---- (3) 偏离 ≤ 0.3cm ---- #
-        for s in cross_shapes:
-            cx, cy = shape_center_cm(s)
-            dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
-            rule.notes.append(
-                f"× '{safe_text(s).strip()}' 中心({cx:.2f},{cy:.2f})，"
-                f"距椭圆中心 {dist:.3f}cm"
-            )
-            if dist <= 0.3:
-                rule.matched = True
-                break
-        self.report.rules.append(rule)
-
-    def _find_pink_ellipse_center(self, info, sw, sh):
-        """返回中央粉色椭圆的中心 (x_cm, y_cm)；找不到返回 None。
-        优先：页面上"形状级"粉色椭圆 -> 取该 shape 中心。
-        其次：解析背景图（整页图片）中粉色连通域，取最居中的连通域几何中心，
-              再换算回幻灯片厘米坐标。
-        """
-        # ---- A) 形状级粉色椭圆 ---- #
-        for s in self.slide.shapes:
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            st = str(s.shape_type)
-            if "OVAL" not in st and "FREEFORM" not in st:
-                continue
-            xml_str = ET.tostring(s._element, encoding="unicode")
-            for hex6 in re.findall(r'srgbClr val="([0-9A-Fa-f]{6})"', xml_str):
-                if self._is_pink(hex6):
-                    cx, cy = shape_center_cm(s)
-                    return (cx, cy)
-
-        # ---- B) 背景图像素分析 ---- #
-        bg = None
-        for s in self.slide.shapes:
-            if s in info["fullpage_picture"]:
-                bg = s
-                break
-        if bg is None:
-            return None
-        try:
-            from PIL import Image
-            import io
-            blob = bg.image.blob
-            img = Image.open(io.BytesIO(blob)).convert("RGB")
-        except Exception:
-            return None
-
-        W, H = img.size
-        px = img.load()
-        # 在中央带状区域内搜索粉色像素，避免边角粉色装饰干扰
-        x0, x1 = int(W * 0.35), int(W * 0.65)
-        y0, y1 = int(H * 0.30), int(H * 0.70)
-        xs, ys, n = 0, 0, 0
-        for yy in range(y0, y1, 2):
-            for xx in range(x0, x1, 2):
-                r, g, b = px[xx, yy]
-                if self._is_pink_rgb(r, g, b):
-                    xs += xx
-                    ys += yy
-                    n += 1
-        if n < 50:
-            return None
-        cx_px = xs / n
-        cy_px = ys / n
-        # 像素 -> 幻灯片厘米
-        bg_left = emu_to_cm(bg.left or 0)
-        bg_top = emu_to_cm(bg.top or 0)
-        bg_w = emu_to_cm(bg.width or 0)
-        bg_h = emu_to_cm(bg.height or 0)
-        cx_cm = bg_left + bg_w * (cx_px / W)
-        cy_cm = bg_top + bg_h * (cy_px / H)
-        return (cx_cm, cy_cm)
-
-    @staticmethod
-    def _is_pink(hex6: str) -> bool:
-        try:
-            r = int(hex6[0:2], 16)
-            g = int(hex6[2:4], 16)
-            b = int(hex6[4:6], 16)
-        except Exception:
-            return False
-        return Evaluator._is_pink_rgb(r, g, b)
-
-    @staticmethod
-    def _is_pink_rgb(r: int, g: int, b: int) -> bool:
-        # 粉色：红明显高，蓝中高，绿略低；亮度较高
-        if r < 200:
-            return False
-        if not (b >= 150 and b <= 240):
-            return False
-        if not (g >= 130 and g <= 220):
-            return False
-        if not (r > g and r >= b - 10):
-            return False
-        # 排除纯白/灰
-        if abs(r - g) < 15 and abs(g - b) < 15:
-            return False
-        return True
-
-
-    def _rule_common_button(self, info, sw, sh):
-        """+3 严格按细则逐点：
-            (1) 页面中"仅"设置一个主要按钮
-            (2) 该按钮"同时控制"左、右两个转盘
-            (3) 位于"两个转盘之间" 或 "中央粉色椭圆下方"
-            (4) 宽约 3~5 厘米
-            (5) 高约 1~1.5 厘米
-        """
-        rule = Rule("+3-common-button", 3,
-                    "页面仅1个主要按钮，同控两转盘，位于两转盘之间或粉椭圆下方，"
-                    "宽3~5cm 高1~1.5cm")
-
-        # ---- 收集"按钮候选" ---- #
-        # 细则没有限定按钮的实现形式（可以是 shape/图片/文本框/group/媒体控件），
-        # 因此把页面上"主要可交互对象"都列为候选：
-        # 排除：整页媒体/整页背景图、纯装饰的转盘/指针/× 等。
-        # 主要按钮的可识别特征（任一即可作为候选）：
-        #   a) 形状文字命中"开始/暂停/继续/停止/播放/start/pause/resume/stop/play"
-        #   b) 在 slide xml 中绑定了 hyperlink/action(ppaction://) -> 可点击
-        #   c) shape 名称含 "button/btn/控制/按钮"
-
-        def is_button_like(sh):
-            # a) 文字
-            t = safe_text(sh)
-            if t and re.search(r"(开始|暂停|继续|停止|播放|start|pause|resume|stop|play)",
-                               t, re.I):
-                return True
-            # c) 名称
-            name = (sh.name or "")
-            if re.search(r"button|btn|控制|按钮", name, re.I):
-                return True
-            # b) 在该 shape 的子树 xml 中查找点击动作
-            try:
-                xml = ET.tostring(sh._element, encoding="unicode")
-                if "ppaction://" in xml or "hlinkClick" in xml:
-                    return True
-            except Exception:
-                pass
-            return False
-
-        buttons = []
-        for sh in self.slide.shapes:
-            if sh in info["fullpage_media"] or sh in info["fullpage_picture"]:
-                continue
-            if is_button_like(sh):
-                buttons.append(sh)
-        rule.notes.append(f"页面按钮候选数：{len(buttons)}")
-
-        # 整页视频存在且没有找到独立按钮，跳过不计分
-        if info["fullpage_media"] and not buttons:
-            rule.notes.append("存在整页视频且页面无独立按钮，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        # ---- (1) 仅 1 个主要按钮 ---- #
-        ok_only_one = len(buttons) == 1
-        if not ok_only_one:
-            rule.notes.append("不满足'仅1个主要按钮'")
-        if not buttons:
-            self.report.rules.append(rule)
-            return
-
-        btn = buttons[0]
-        w, h = shape_size_cm(btn)
-        cx, cy = shape_center_cm(btn)
-        rule.notes.append(
-            f"按钮：name={btn.name!r} 文字={safe_text(btn).strip()!r} "
-            f"尺寸 {w:.2f}x{h:.2f}cm 中心({cx:.2f},{cy:.2f})"
-        )
-
-        # ---- (4)(5) 尺寸 ---- #
-        ok_w = 3.0 <= w <= 5.0
-        ok_h = 1.0 <= h <= 1.5
-        rule.notes.append(f"(4)宽3~5cm={ok_w}  (5)高1~1.5cm={ok_h}")
-
-        # ---- 先定位两个转盘（与 +5-spinners 保持一致：圆形 + 直径3~12cm，
-        #      按接近 6.5cm 排序取前两个），供 (2) 目标一致性 与 (3) 位置判定共用 ---- #
-        sp_cands = []
-        for s in (info["ovals"] + info["pictures"] + info["groups"]):
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            ww, hh = shape_size_cm(s)
-            if ww <= 0 or hh <= 0 or abs(ww - hh) > 0.2:
-                continue
-            dd = (ww + hh) / 2.0
-            if not (3.0 <= dd <= 12.0):
-                continue
-            sp_cands.append(s)
-        sp_cands.sort(key=lambda s: abs((shape_size_cm(s)[0] +
-                                         shape_size_cm(s)[1]) / 2 - 6.5))
-        two_spinners = sp_cands[:2]
-
-        def _shape_id(sh):
-            for tag in ("p:nvSpPr/p:cNvPr", "p:nvPicPr/p:cNvPr",
-                        "p:nvGrpSpPr/p:cNvPr"):
-                el = sh._element.find(".//" + tag, NS)
-                if el is not None:
-                    return el.get("id")
-            return None
-
-        spinner_ids = {sid for sid in (_shape_id(s) for s in two_spinners) if sid}
-        rule.notes.append(f"两个转盘 spid={spinner_ids}")
-
-        # ---- (2) 同时控制左、右两个转盘 ---- #
-        # 严格化：按钮 click 触发的目标 spid 集合必须"包含"两个转盘 spid，
-        # 而不是仅"存在 ≥2 个不同的 target"。
-        if len(spinner_ids) == 2:
-            ok_control_both = self._button_controls_target_set(btn, spinner_ids)
-        else:
-            ok_control_both = False
-            rule.notes.append("未定位到两个转盘 spid，(2)同控两转盘判为不满足")
-        rule.notes.append(f"(2)按钮触发目标包含两个转盘 spid={ok_control_both}")
-
-        # ---- (3) 位置：两个转盘之间 或 中央粉色椭圆下方 ---- #
-        # 严格化：
-        #   "两转盘之间" 需同时约束 x/y：
-        #     · x 在两转盘 x 区间内
-        #     · y 与两转盘中心 y 均值的偏差 ≤ 转盘半径 + 1.0cm 的工程容差
-        #       （避免按钮位于页面很上方/很下方也被判为"之间"）
-        #   "中央粉色椭圆下方" 需要 y 在椭圆中心之下 且 x 与椭圆中心同列
-        pink_xy = self._find_pink_ellipse_center(info, sw, sh)
-        ok_pos_between = False
-        ok_pos_below_pink = False
-        if len(two_spinners) == 2:
-            cL = shape_center_cm(two_spinners[0])
-            cR = shape_center_cm(two_spinners[1])
-            xl, xr = min(cL[0], cR[0]), max(cL[0], cR[0])
-            avg_y = (cL[1] + cR[1]) / 2.0
-            # 转盘半径（用较大者，容差更宽容）
-            radii = [(shape_size_cm(s)[0] + shape_size_cm(s)[1]) / 4.0
-                     for s in two_spinners]
-            r_max = max(radii) if radii else 0.0
-            y_tol = r_max + 1.0
-            x_between = xl <= cx <= xr
-            y_between = abs(cy - avg_y) <= y_tol
-            ok_pos_between = x_between and y_between
-            rule.notes.append(
-                f"两转盘中心 L={cL} R={cR}，平均y={avg_y:.2f}, 半径≈{r_max:.2f}cm, "
-                + f"y容差={y_tol:.2f}cm；按钮中心=({cx:.2f},{cy:.2f}) "
-                + f"x在[{xl:.2f},{xr:.2f}]内={x_between}, |cy-avg_y|≤容差={y_between}"
-            )
-        else:
-            rule.notes.append("未找到两个转盘 -> 无法判定'两转盘之间'")
-        if pink_xy is not None:
-            px, py = pink_xy
-            # "中央粉色椭圆下方"：按钮中心 y > 椭圆中心 y；并且 x 大致与椭圆同列
-            ok_pos_below_pink = (cy > py) and (abs(cx - px) <= 3.0)
-            rule.notes.append(
-                f"粉椭圆中心=({px:.2f},{py:.2f})；按钮中心 y={cy:.2f} 在其下方且 x 同列={ok_pos_below_pink}"
-            )
-        else:
-            rule.notes.append("未定位到粉色椭圆 -> 无法判定'椭圆下方'")
-        ok_pos = ok_pos_between or ok_pos_below_pink
-        rule.notes.append(f"(3)位置 之间或下方={ok_pos}")
-
-        rule.matched = ok_only_one and ok_control_both and ok_pos and ok_w and ok_h
-        rule.notes.append(
-            f"逐点：(1)仅1个={ok_only_one} (2)同控两转盘={ok_control_both} "
-            f"(3)位置={ok_pos} (4)宽={ok_w} (5)高={ok_h}"
-        )
-        self.report.rules.append(rule)
-
-    def _button_controls_two_targets(self, btn) -> bool:
-        """在 slide xml 的 timing 节里，按钮的 spid 作为 click trigger 是否
-        驱动了 ≥2 个不同 spid 的目标。
-        """
-        targets = self._button_click_target_spids(btn)
-        return len(targets) >= 2
-
-    def _button_controls_target_set(self, btn, required_ids: "set[str]") -> bool:
-        """按钮 click 触发的目标 spid 集合是否"包含"给定 spid 集合。
-        与 _button_controls_two_targets 的差别：这里要求目标必须恰好覆盖
-        指定的两个转盘 spid，而不仅仅是"至少 2 个不同 target"。
-        """
-        if not required_ids:
-            return False
-        targets = self._button_click_target_spids(btn)
-        return required_ids.issubset(targets)
-
-    def _button_click_target_spids(self, btn) -> "set[str]":
-        """收集：以 btn 的 spid 为 onClick trigger 的所有 par 下动画 targetElement spid。"""
-        # 按钮 spid
-        try:
-            spid = btn._element.find(".//p:nvSpPr/p:cNvPr", NS)
-            if spid is None:
-                spid = btn._element.find(".//p:nvPicPr/p:cNvPr", NS)
-            if spid is None:
-                spid = btn._element.find(".//p:nvGrpSpPr/p:cNvPr", NS)
-            btn_id = spid.get("id") if spid is not None else None
-        except Exception:
-            btn_id = None
-        targets: "set[str]" = set()
-        if btn_id is None or self.slide_xml is None:
-            return targets
-
-        timing = self.slide_xml.find(".//p:timing", NS)
-        if timing is None:
-            return targets
-
-        for par in timing.iter("{%s}par" % NS["p"]):
-            ctn = par.find("p:cTn", NS)
-            if ctn is None:
-                continue
-            if ctn.get("nodeType") not in ("clickEffect", "withEffect",
-                                            "afterEffect", "interactiveSeq"):
-                continue
-            trigger_ok = False
-            for cond in par.findall(".//p:cond", NS):
-                if cond.get("evt") == "onClick":
-                    sptgt = cond.find(".//p:spTgt", NS)
-                    if sptgt is not None and sptgt.get("spid") == btn_id:
-                        trigger_ok = True
-                        break
-            if not trigger_ok:
-                seq = par.find(".//p:tgtEl/p:spTgt", NS)
-                if seq is not None and seq.get("spid") == btn_id:
-                    trigger_ok = True
-            if not trigger_ok:
-                continue
-            for spt in par.findall(".//p:spTgt", NS):
-                tid = spt.get("spid")
-                if tid and tid != btn_id:
-                    targets.add(tid)
-        return targets
-
-    def _rule_anim_behavior(self, info):
-        """+5 严格按细则逐点：
-            (1) 进入第 10 页后两个转盘保持静止，等待用户点击按钮
-            (2) 按钮首次点击 -> 左、右两个转盘同时开始旋转，启动时间差 ≤ 0.2s
-            (3) 两个转盘能够连续旋转，不会自动停止
-            (4) 按钮再次点击 -> 两个转盘同时暂停，暂停时间差 ≤ 0.2s
-            (5) 再次点击同一按钮 -> 两个转盘能够从暂停状态继续旋转
-            (6) 两个转盘的"开始/暂停/继续"时刻一致，不出现一动一静
-            (7) 旋转时仅轮盘绕各自圆心转动；转盘整体不发生位移、跳动、
-                缩放或明显偏心
-        所有点必须同时满足才计 +5。
-
-        重要原则：本项属于交互播放行为，无法完全静态确认。
-          · 若按钮绑定 VBA 宏 / 自定义 add-in / 未知 ppaction:// 目标 ->
-            无法静态确认其行为，(2)(3)(4)(5)(6) 均按"不确定"处理，
-            规则不命中（保守判定），并在 notes 中说明原因。
-          · 只有当 p:timing 中给出结构化的 onClick + animRot / cmd
-            证据，且证据同时覆盖两个转盘 spid，才能确认对应细则。
-        """
-        rule = Rule("+5-anim", 5,
-                    "进入静止/同步启动(≤0.2s)/持续旋转/同步暂停(≤0.2s)/可继续/"
-                    + "时刻一致/仅绕圆心（无法静态确认时保守不命中）")
-
-        if self.slide_xml is None:
-            rule.notes.append("无法读取第10页 XML")
-            self.report.rules.append(rule)
-            return
-        timing = self.slide_xml.find(".//p:timing", NS)
-
-        # ---- 找两个转盘（与 +5-spinners 一致：圆形 + 直径 3~12cm，
-        #      按接近 6.5cm 取前两个） ---- #
-        cands = []
-        for s in (info["ovals"] + info["pictures"] + info["groups"]):
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            w, h = shape_size_cm(s)
-            if w <= 0 or h <= 0 or abs(w - h) > 0.2:
-                continue
-            d = (w + h) / 2.0
-            if not (3.0 <= d <= 12.0):
-                continue
-            cands.append(s)
-        cands.sort(key=lambda s: abs((shape_size_cm(s)[0] +
-                                      shape_size_cm(s)[1]) / 2 - 6.5))
-        spinners = cands[:2]
-
-        if len(spinners) < 2:
-            rule.notes.append(f"页面找不到 2 个完整转盘 -> 无法核对动画(找到 {len(spinners)})")
-            self.report.rules.append(rule)
-            return
-
-        if timing is None:
-            rule.notes.append("不存在 p:timing 动画时间轴 -> 无法静态确认交互行为，判为不命中")
-            self.report.rules.append(rule)
-            return
-
-        def shape_id(sh):
-            for tag in ("p:nvSpPr/p:cNvPr", "p:nvPicPr/p:cNvPr",
-                        "p:nvGrpSpPr/p:cNvPr"):
-                el = sh._element.find(".//" + tag, NS)
-                if el is not None:
-                    return el.get("id")
-            return None
-
-        sp_ids = [shape_id(s) for s in spinners]
-        sp_id_set = {i for i in sp_ids if i}
-        rule.notes.append(f"两转盘 spid={sp_ids}")
-        if len(sp_id_set) < 2:
-            rule.notes.append("两个转盘的 spid 无法唯一定位 -> 判为不命中")
-            self.report.rules.append(rule)
-            return
-
-        # ---- 找"主要按钮"及其交互形式 ---- #
-        btn = None
-        for sh in self.slide.shapes:
-            if sh in info["fullpage_media"] or sh in info["fullpage_picture"]:
-                continue
-            t = safe_text(sh)
-            name = sh.name or ""
-            try:
-                xml = ET.tostring(sh._element, encoding="unicode")
-            except Exception:
-                xml = ""
-            if (t and re.search(r"(开始|暂停|继续|停止|播放|start|pause|resume|stop|play)", t, re.I)) \
-               or re.search(r"button|btn|控制|按钮", name, re.I) \
-               or "ppaction://" in xml or "hlinkClick" in xml:
-                btn = sh
-                break
-        btn_id = shape_id(btn) if btn is not None else None
-        rule.notes.append(f"主要按钮 spid={btn_id}")
-        if btn is None or btn_id is None:
-            rule.notes.append("找不到主要按钮 -> 判为不命中")
-            self.report.rules.append(rule)
-            return
-
-        # ---- 若按钮绑定 VBA 宏 / 自定义动作，则无法静态确认交互行为 ---- #
-        # 判据：按钮子树包含 <a:hlinkClick action="ppaction://macro?..."> 或
-        # 演示文稿中存在 ppt/vbaProject.bin 且按钮的 hlinkClick action 值不是
-        # 我们能静态识别的形式（如 program=... / hlinkshowjump=...）
-        try:
-            btn_xml = ET.tostring(btn._element, encoding="unicode")
-        except Exception:
-            btn_xml = ""
-        macro_action = re.search(r'action="ppaction://macro[^"]*"', btn_xml)
-        has_vba_project = False
-        try:
-            if self.zf is not None and "ppt/vbaProject.bin" in self.zf.namelist():
-                has_vba_project = True
-        except Exception:
-            pass
-        if macro_action or (has_vba_project and re.search(r'action="ppaction://program', btn_xml)):
-            rule.notes.append(
-                "按钮绑定 VBA 宏/自定义程序动作 -> 无法静态确认交互播放行为，"
-                + "(2)(3)(4)(5)(6) 均按不确定处理，规则保守判为不命中"
-            )
-            self.report.rules.append(rule)
-            return
-
-        # ---- 收集 timing 中由该按钮 onClick 触发的 par ---- #
-        click_pars = []
-        for par in timing.iter("{%s}par" % NS["p"]):
-            ctn = par.find("p:cTn", NS)
-            if ctn is None:
-                continue
-            trig_btn = False
-            for cond in par.findall(".//p:cond", NS):
-                if cond.get("evt") == "onClick":
-                    sptgt = cond.find(".//p:spTgt", NS)
-                    if sptgt is not None and sptgt.get("spid") == btn_id:
-                        trig_btn = True
-                        break
-            if not trig_btn:
-                continue
-            click_pars.append(par)
-        rule.notes.append(f"由按钮 onClick 触发的 par 数={len(click_pars)}")
-
-        # ---- 辅助：给定 par，统计其下 animRot 对两个转盘的作用 ---- #
-        def rot_info_for_par(par):
-            """返回 { spid: [(delay_ms, dur_ms, by_val, repeat)] }，只统计
-            作用于转盘 spid 的 animRot 记录。"""
-            m = {sid: [] for sid in sp_id_set}
-            for ar in par.findall(".//p:animRot", NS):
-                # 目标 spid
-                tgt_ids = [spt.get("spid") for spt in ar.findall(".//p:spTgt", NS)]
-                if not any(t in sp_id_set for t in tgt_ids):
-                    continue
-                ctn = ar.find(".//p:cTn", NS)
-                delay_ms = 0
-                dur_ms = 0
-                repeat = "1"
-                if ctn is not None:
-                    d = ctn.get("delay", "0")
-                    if d.isdigit():
-                        delay_ms = int(d)
-                    du = ctn.get("dur", "0")
-                    if du.isdigit():
-                        dur_ms = int(du)
-                    repeat = ctn.get("repeatCount", "1")
-                by_val = ar.get("by", "")  # animRot 的 by 单位为 1/60000 度
-                for t in tgt_ids:
-                    if t in sp_id_set:
-                        m[t].append((delay_ms, dur_ms, by_val, repeat))
-            return m
-
-        # ---- 辅助：给定 par，统计其下"暂停/继续"命令对两转盘的作用 ---- #
-        # 兼容 PowerPoint 常见编码：<p:cmd type="evt" cmd="togglePause"/>
-        # 以及 <p:cmd cmd="resume"/> <p:cmd cmd="pause"/>
-        def cmd_info_for_par(par):
-            pause_targets = set()
-            resume_targets = set()
-            toggle_targets = set()
-            for cmd in par.findall(".//p:cmd", NS):
-                cmd_val = (cmd.get("cmd", "") or (cmd.text or "")).strip()
-                lc = cmd_val.lower()
-                if not cmd_val:
-                    continue
-                spids = [spt.get("spid") for spt in cmd.findall(".//p:spTgt", NS)]
-                if "togglepause" in lc:
-                    for sid in spids:
-                        if sid:
-                            toggle_targets.add(sid)
-                elif "pause" in lc or "stop" in lc:
-                    for sid in spids:
-                        if sid:
-                            pause_targets.add(sid)
-                elif "resume" in lc or "play" in lc:
-                    for sid in spids:
-                        if sid:
-                            resume_targets.add(sid)
-            return pause_targets, resume_targets, toggle_targets
-
-        # ---- (2) 首次点击 -> 同步启动，delay 差 ≤ 200ms ---- #
-        ok_sync_start = False
-        first_par = None
-        first_rot_info = None
-        for par in click_pars:
-            rot_map = rot_info_for_par(par)
-            if not all(rot_map[sid] for sid in sp_id_set):
-                continue
-            # 每个转盘取首条 animRot 的 delay
-            first_delays = [rot_map[sid][0][0] for sid in sp_id_set]
-            diff_ms = max(first_delays) - min(first_delays)
-            if diff_ms <= 200:
-                ok_sync_start = True
-                first_par = par
-                first_rot_info = rot_map
-                rule.notes.append(
-                    f"(2)首次点击 par 同步启动两转盘 animRot, delays={first_delays}ms, 差={diff_ms}ms"
-                )
-                break
-        if not ok_sync_start:
-            rule.notes.append("(2)未找到 onClick+animRot 同时覆盖两转盘、delay 差≤200ms 的 par")
-
-        # ---- (3) 连续旋转：repeatCount=indefinite 且 by 表示至少一整圈 ---- #
-        # animRot by 单位为 1/60000 度；一整圈 = 360 * 60000 = 21600000
-        ok_continuous = False
-        if first_par is not None and first_rot_info is not None:
-            per_spinner_ok = []
-            details = []
-            for sid in sp_id_set:
-                recs = first_rot_info[sid]
-                any_ok = False
-                for (delay_ms, dur_ms, by_val, repeat) in recs:
-                    rep_ok = (repeat in ("indefinite", "-1", "INF")
-                              or (repeat.isdigit() and int(repeat) >= 100000))
-                    # by 若为空(默认或未指定)也视为可接受，只要 repeat 无限；
-                    # 若给出 by 数值，要求 |by| >= 一整圈（避免只旋转一点点）
-                    by_ok = True
-                    if by_val:
-                        try:
-                            by_ok = abs(int(by_val)) >= 21600000
-                        except Exception:
-                            # 非整数：可能是浮点度数；粗略判定 >= 360
-                            try:
-                                by_ok = abs(float(by_val)) >= 360.0
-                            except Exception:
-                                by_ok = True
-                    if rep_ok and by_ok:
-                        any_ok = True
-                        details.append(
-                            f"spid={sid} repeat={repeat} by={by_val or '(默认)'}"
-                        )
-                        break
-                per_spinner_ok.append(any_ok)
-            ok_continuous = all(per_spinner_ok) and len(per_spinner_ok) == 2
-            rule.notes.append(
-                f"(3)连续旋转={ok_continuous}  " + "; ".join(details)
-            )
-        else:
-            rule.notes.append("(3)无法判定(缺首点击 par)")
-
-        # ---- (4) 再次点击 -> 同步暂停，delay 差 ≤ 200ms ---- #
-        # 有效编码：另一个 onClick par 下含 pause 或 togglePause 命令，
-        # 且命令目标覆盖两个转盘 spid。
-        ok_sync_pause = False
-        pause_par = None
-        for par in click_pars:
-            if par is first_par:
-                continue
-            pause_t, _resume_t, toggle_t = cmd_info_for_par(par)
-            pause_like = pause_t | toggle_t
-            if not sp_id_set.issubset(pause_like):
-                continue
-            # 收集 pause/toggle 命令的 delay
-            delays = []
-            for cmd in par.findall(".//p:cmd", NS):
-                cmd_val = (cmd.get("cmd", "") or (cmd.text or "")).strip().lower()
-                if not ("pause" in cmd_val or "togglepause" in cmd_val or "stop" in cmd_val):
-                    continue
-                spids = [spt.get("spid") for spt in cmd.findall(".//p:spTgt", NS)]
-                if not any(sid in sp_id_set for sid in spids):
-                    continue
-                ctn = cmd.find(".//p:cTn", NS)
-                d = ctn.get("delay", "0") if ctn is not None else "0"
-                try:
-                    delays.append(int(d) if d.isdigit() else 0)
-                except Exception:
-                    delays.append(0)
-            diff_ms = (max(delays) - min(delays)) if delays else 0
-            if diff_ms <= 200:
-                ok_sync_pause = True
-                pause_par = par
-                rule.notes.append(f"(4)第二次点击 par 同步暂停两转盘, 差={diff_ms}ms")
-                break
-        if not ok_sync_pause:
-            rule.notes.append("(4)未找到 onClick + (pause/togglePause) 同时覆盖两转盘、差≤200ms 的 par")
-
-        # ---- (5) 再次点击 -> 继续旋转 ---- #
-        # 有效编码：
-        #   A. 存在另一个 onClick par，其 resume/play 命令目标覆盖两转盘；
-        #   B. 存在同一 togglePause 序列（暂停 par 的命令类型为 togglePause，
-        #      再次点击天然切换回旋转），此时视为"编码上支持继续"。
-        ok_resume = False
-        for par in click_pars:
-            if par is first_par or par is pause_par:
-                continue
-            _p_t, resume_t, toggle_t = cmd_info_for_par(par)
-            if sp_id_set.issubset(resume_t) or sp_id_set.issubset(toggle_t):
-                ok_resume = True
-                rule.notes.append("(5)发现独立的 resume/togglePause par 作用于两转盘")
-                break
-        if not ok_resume and pause_par is not None:
-            _p_t, _r_t, toggle_t = cmd_info_for_par(pause_par)
-            if sp_id_set.issubset(toggle_t):
-                ok_resume = True
-                rule.notes.append("(5)暂停 par 使用 togglePause 命令，天然支持暂停/继续切换")
-        if not ok_resume:
-            rule.notes.append("(5)未发现能静态确认的'从暂停继续'动画命令")
-
-        # ---- (1) 进入静止：不存在"进入即播"的 animRot 作用于转盘 ---- #
-        ok_idle_on_enter = True
-        for par in timing.iter("{%s}par" % NS["p"]):
-            ctn = par.find("p:cTn", NS)
-            if ctn is None:
-                continue
-            delay = ctn.get("delay", "")
-            node_type = ctn.get("nodeType", "")
-            has_click = any(
-                cond.get("evt") == "onClick"
-                for cond in par.findall(".//p:cond", NS)
-            )
-            has_rot_on_spinner = any(
-                spt.get("spid") in sp_id_set
-                for ar in par.findall(".//p:animRot", NS)
-                for spt in ar.findall(".//p:spTgt", NS)
-            )
-            if has_rot_on_spinner and not has_click and \
-               (delay in ("", "0") or node_type in ("mainSeq", "tmRoot")):
-                ok_idle_on_enter = False
-                break
-        rule.notes.append(f"(1)进入页面后转盘静止={ok_idle_on_enter}")
-
-        # ---- (6) 时刻一致：(2)(4) 都满足同步差 ≤200ms 视为一致 ---- #
-        ok_concurrent = ok_sync_start and ok_sync_pause
-        rule.notes.append(f"(6)开始/暂停/继续时刻一致={ok_concurrent}")
-
-        # ---- (7) 仅绕圆心、不位移/缩放/偏心 ---- #
-        # 正向证据：两个转盘的 animRot 存在（(2) 已确认）；bbox 宽高差 ≤0.2cm
-        #           （PowerPoint animRot 默认绕 bbox 中心旋转，因此圆形 bbox
-        #            即可保证绕圆心）；shape 上无 animMotion / animScale。
-        # 负向证据：不存在 animMotion / animScale 作用于转盘 spid；
-        #           不存在 <a:xfrm> 中 offset 与 ext 相对错位（PPT 中 shape
-        #            旋转对齐 bbox，无法通过静态 XML 显式表示"跳动/偏心"）。
-        no_motion = True
-        no_scale = True
-        for ar in self.slide_xml.findall(".//p:animMotion", NS):
-            for spt in ar.findall(".//p:spTgt", NS):
-                if spt.get("spid") in sp_id_set:
-                    no_motion = False
-                    break
-        for ar in self.slide_xml.findall(".//p:animScale", NS):
-            for spt in ar.findall(".//p:spTgt", NS):
-                if spt.get("spid") in sp_id_set:
-                    no_scale = False
-                    break
-        no_eccentric = True
-        for sh in spinners:
-            w, h = shape_size_cm(sh)
-            if abs(w - h) > 0.2:
-                no_eccentric = False
-                break
-        # 正向：两转盘都有 animRot 作为旋转载体
-        has_rot_both = ok_sync_start  # (2) 已经确认覆盖两个 spid
-        ok_rotate_only = no_motion and no_scale and no_eccentric and has_rot_both
-        rule.notes.append(
-            f"(7)有animRot覆盖两转盘={has_rot_both} 无位移={no_motion} "
-            + f"无缩放={no_scale} 无明显偏心={no_eccentric} -> 仅绕圆心={ok_rotate_only}"
-        )
-
-        rule.matched = (
-            ok_idle_on_enter and ok_sync_start and ok_continuous and
-            ok_sync_pause and ok_resume and ok_concurrent and ok_rotate_only
-        )
-        rule.notes.append(
-            f"逐点：(1)={ok_idle_on_enter} (2)={ok_sync_start} (3)={ok_continuous} "
-            + f"(4)={ok_sync_pause} (5)={ok_resume} (6)={ok_concurrent} (7)={ok_rotate_only}"
-        )
-        self.report.rules.append(rule)
-
-    def _rule_pointers(self, info, sw, sh):
-        """+1 两转盘上方各一个"指向轮盘边缘"的指针，大小和位置一致。
-
-        严格化判定（回应第一轮反馈"缺少指向轮盘边缘的实现"）：
-          - 指针形状线索：三角形/箭头/Freeform/自选图形中含
-            "Triangle/Arrow/pointer/箭头/指针/三角"；单纯装饰图片不算。
-          - 朝向：形状 bbox 宽/高比接近细长（长边:短边 ≥ 1.4），或旋转角度
-            指示"向下朝向轮盘"；对三角形/箭头预设几何来推出尖端。
-          - 尖端位置：估算尖端在页面上的坐标（cm），要求：
-              · 尖端 y 位于转盘顶边附近（|y_tip - (sy - r)| ≤ 半径 * 0.35）
-              · 尖端 x 与转盘中心 x 的偏差 ≤ 半径 * 0.35
-            两条同时满足视为"指向轮盘边缘"。
-          - 大小/位置一致仍要求两个指针宽高差 ≤0.2cm、相对各自转盘中心的
-            偏移量差 ≤0.3cm。
-        """
-        rule = Rule("+1-pointers", 1,
-                    "两转盘上方指针(形状/朝向/尖端在轮盘边缘)，大小位置一致")
-
-        if self.slide is None:
-            self.report.rules.append(rule)
-            return
-
-        # ---- 收集候选（排除整页媒体/图片） ---- #
-        pointer_cands = []
-        for s in self.slide.shapes:
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            w, h = shape_size_cm(s)
-            if w > 0 and h > 0:
-                pointer_cands.append(s)
-
-        if info["fullpage_media"] and not pointer_cands:
-            rule.notes.append("存在整页视频且页面无独立对象，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        # ---- 找两个转盘（与其他规则一致：圆形 + 直径3~12cm） ---- #
-        sp_cands = []
-        for s in (info["ovals"] + info["pictures"] + info["groups"]):
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            ww, hh = shape_size_cm(s)
-            if ww <= 0 or hh <= 0 or abs(ww - hh) > 0.2:
-                continue
-            dd = (ww + hh) / 2.0
-            if not (3.0 <= dd <= 12.0):
-                continue
-            sp_cands.append(s)
-        sp_cands.sort(key=lambda s: abs((shape_size_cm(s)[0] +
-                                         shape_size_cm(s)[1]) / 2 - 6.5))
-        spinners = sp_cands[:2]
-
-        if len(spinners) < 2:
-            rule.notes.append("找不到两个转盘，无法判定指针位置")
-            self.report.rules.append(rule)
-            return
-
-        spinners.sort(key=lambda s: shape_center_cm(s)[0])
-        left_sp, right_sp = spinners
-        cl_sp = shape_center_cm(left_sp)
-        cr_sp = shape_center_cm(right_sp)
-        l_rad = shape_size_cm(left_sp)[0] / 2.0
-        r_rad = shape_size_cm(right_sp)[0] / 2.0
-
-        # ---- 指针形状/朝向识别 ---- #
-        POINTER_SHAPE_HINT = re.compile(
-            r"(triangle|arrow|pointer|三角|箭头|指针)", re.I
-        )
-
-        def _shape_type_str(sh):
-            try:
-                return str(sh.shape_type)
-            except Exception:
-                return ""
-
-        def _rotation_deg(sh):
-            try:
-                rot = getattr(sh, "rotation", None)
-                if rot is None:
-                    return 0.0
-                return float(rot) % 360.0
-            except Exception:
-                return 0.0
-
-        def _preset_geom(sh):
-            """取 shape 的 a:prstGeom prst 值（若存在）。"""
-            try:
-                el = sh._element.find(".//a:prstGeom", NS)
-                if el is not None:
-                    return (el.get("prst") or "").lower()
-            except Exception:
-                pass
-            return ""
-
-        def _looks_like_pointer(sh):
-            """形状语义线索：三角/箭头/名称含关键词。"""
-            st = _shape_type_str(sh)
-            prst = _preset_geom(sh)
-            name = sh.name or ""
-            reasons = []
-            # PowerPoint 常见 prst：triangle / rtTriangle / downArrow / upArrow /
-            # leftArrow / rightArrow / arrowCallout* 等
-            if prst:
-                if "triangle" in prst or "arrow" in prst:
-                    reasons.append(f"prst={prst}")
-            if POINTER_SHAPE_HINT.search(name):
-                reasons.append(f"name={name!r}")
-            if "TRIANGLE" in st or "ARROW" in st or "FREEFORM" in st:
-                # freeform 不足以单独作为指针证据，但可与朝向证据组合
-                if "TRIANGLE" in st or "ARROW" in st:
-                    reasons.append(f"shape_type={st}")
-                else:
-                    reasons.append(f"shape_type={st}(需与朝向组合)")
-            return reasons
-
-        def _tip_xy(sh):
-            """估算指针尖端在幻灯片上的 (x_cm, y_cm)。
-            规则：
-              · 起始参考："默认尖端"在 bbox 顶边中点（即"未旋转的向上箭头"，
-                尖端朝上；因为指针位于转盘上方，尖端应朝下指向转盘顶边）。
-                因此我们改用"底边中点"作为向下箭头尖端的默认位置。
-              · 若形状 prst 明确了朝向（如 downArrow），则底边中点；如 upArrow
-                则顶边中点；其余根据 rotation 旋转 bbox 内的默认位置。
-              · rotation 用 shape 的 rotation 属性；正值为顺时针（度）。
-            返回 (tip_x_cm, tip_y_cm, orient_desc)。
-            """
-            left = emu_to_cm(sh.left or 0)
-            top = emu_to_cm(sh.top or 0)
-            w, h = shape_size_cm(sh)
-            cx = left + w / 2.0
-            cy = top + h / 2.0
-            prst = _preset_geom(sh)
-            rot = _rotation_deg(sh)
-            # 默认"尖端方向向量"（bbox 局部坐标系，向下 = (0, +h/2)）
-            # 之所以默认向下：转盘位于指针下方，正确的指针尖端应朝下。
-            local_dx, local_dy = 0.0, h / 2.0
-            orient = "default-down"
-            if "uparrow" in prst or "uptriangle" in prst or prst == "triangle":
-                # PPT 的 "triangle" prst 是尖端朝上的等腰三角形
-                local_dx, local_dy = 0.0, -h / 2.0
-                orient = f"prst={prst}(up)"
-            elif "downarrow" in prst or "downtriangle" in prst:
-                local_dx, local_dy = 0.0, h / 2.0
-                orient = f"prst={prst}(down)"
-            elif "leftarrow" in prst:
-                local_dx, local_dy = -w / 2.0, 0.0
-                orient = f"prst={prst}(left)"
-            elif "rightarrow" in prst:
-                local_dx, local_dy = w / 2.0, 0.0
-                orient = f"prst={prst}(right)"
-            # 应用旋转（顺时针为正）
-            import math
-            theta = math.radians(rot)
-            rx = local_dx * math.cos(theta) - local_dy * math.sin(theta)
-            ry = local_dx * math.sin(theta) + local_dy * math.cos(theta)
-            return cx + rx, cy + ry, f"{orient} rot={rot:.0f}°"
-
-        def _classify_pointer_for(spinner, radius, sp_center, all_cands):
-            """在候选中找一个既位于转盘上方，又"指向轮盘边缘"的指针。"""
-            sx, sy = sp_center
-            # 转盘顶边 y = sy - radius
-            top_edge_y = sy - radius
-            best = None
-            best_debug = ""
-            for s in all_cands:
-                if s in spinners:
-                    continue
-                cx, cy = shape_center_cm(s)
-                w, h = shape_size_cm(s)
-                # 粗筛：中心在转盘上方（cy 小于转盘中心）
-                if cy >= sy:
-                    continue
-                # 粗筛：x 大致在转盘 x 范围（±radius+1cm）
-                if abs(cx - sx) > radius + 1.0:
-                    continue
-                # 形状语义证据
-                reasons = _looks_like_pointer(s)
-                if not reasons:
-                    continue
-                # 朝向：bbox 细长比 或 明确 prst
-                aspect_ok = max(w, h) / max(min(w, h), 1e-6) >= 1.4
-                prst = _preset_geom(s)
-                has_prst_dir = any(k in prst for k in
-                                   ("uparrow", "downarrow", "leftarrow",
-                                    "rightarrow", "triangle"))
-                if not (aspect_ok or has_prst_dir):
-                    continue
-                # 尖端位置：需要落在转盘顶边附近
-                tip_x, tip_y, orient = _tip_xy(s)
-                y_tol = max(radius * 0.35, 0.5)
-                x_tol = max(radius * 0.35, 0.5)
-                y_ok = abs(tip_y - top_edge_y) <= y_tol
-                x_ok = abs(tip_x - sx) <= x_tol
-                dbg = (f"name={s.name!r} prst={prst!r} 中心=({cx:.2f},{cy:.2f}) "
-                       f"tip=({tip_x:.2f},{tip_y:.2f}) 转盘顶=({sx:.2f},{top_edge_y:.2f}) "
-                       f"orient={orient} 语义={reasons} y_ok={y_ok} x_ok={x_ok}")
-                if y_ok and x_ok:
-                    best = s
-                    best_debug = dbg
-                    break
-                else:
-                    if not best_debug:
-                        best_debug = "[未通过] " + dbg
-            return best, best_debug
-
-        left_ptr, left_dbg = _classify_pointer_for(left_sp, l_rad, cl_sp, pointer_cands)
-        right_ptr, right_dbg = _classify_pointer_for(right_sp, r_rad, cr_sp, pointer_cands)
-        rule.notes.append(f"左转盘指针：{left_dbg or '(无候选通过)'}")
-        rule.notes.append(f"右转盘指针：{right_dbg or '(无候选通过)'}")
-
-        if left_ptr is None or right_ptr is None:
-            rule.notes.append("未同时找到两个通过'形状/朝向/尖端在轮盘边缘'检验的指针")
-            self.report.rules.append(rule)
-            return
-
-        # ---- 大小一致（宽高差 ≤0.2cm） ---- #
-        wL, hL = shape_size_cm(left_ptr)
-        wR, hR = shape_size_cm(right_ptr)
-        size_ok = abs(wL - wR) <= 0.2 and abs(hL - hR) <= 0.2
-
-        # ---- 位置一致：相对各自转盘中心的偏移量接近（容差 0.3cm） ---- #
-        cL = shape_center_cm(left_ptr)
-        cR = shape_center_cm(right_ptr)
-        off_xL = cL[0] - cl_sp[0]
-        off_yL = cL[1] - cl_sp[1]
-        off_xR = cR[0] - cr_sp[0]
-        off_yR = cR[1] - cr_sp[1]
-        pos_ok = abs(off_xL - off_xR) <= 0.3 and abs(off_yL - off_yR) <= 0.3
-
-        rule.notes.append(
-            f"左指针 wh=({wL:.2f},{hL:.2f}) 偏移=({off_xL:.2f},{off_yL:.2f}); "
-            + f"右指针 wh=({wR:.2f},{hR:.2f}) 偏移=({off_xR:.2f},{off_yR:.2f}); "
-            + f"大小一致={size_ok} 位置一致={pos_ok}"
-        )
-        rule.matched = size_ok and pos_ok
-        self.report.rules.append(rule)
-
-    def _rule_cross_format(self, info):
-        """+1 可单独选中拖动的 × 对象，字号约80~90磅，加粗，字体颜色白/米/淡粉。
-
-        严格化（回应反馈）：
-          - 字号 / 加粗 / 颜色：从 run 属性开始，逐层回退到段落 defRPr、
-            txBody 的 lstStyle、占位符继承（layout/master）、以及 theme
-            的字体默认，直到取到有效值；颜色支持 srgbClr / schemeClr /
-            prstClr 三种，并可通过 lumMod/lumOff 亮度修正。
-          - 可单独选中拖动：显式检查 shape 上是否含 spLocks/grpSpLocks 的
-            noSelect / noMove / noGrp 等锁定属性；命中即视为不可单独拖动。
-        """
-        rule = Rule("+1-cross-format", 1,
-                    "× 可单独选中(未锁定)，字号80~90磅，加粗，"
-                    + "颜色白/米/淡粉（含 theme/继承颜色解析）")
-
-        if info["fullpage_media"] and not info["cross_x"]:
-            rule.notes.append("存在整页视频且页面无独立 × 对象，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        if not info["cross_x"]:
-            rule.notes.append("未发现 × 文本对象")
-            self.report.rules.append(rule)
-            return
-
-        for s in info["cross_x"]:
-            # ---- 锁定检查（可单独选中拖动） ---- #
-            try:
-                sp_xml = ET.tostring(s._element, encoding="unicode")
-            except Exception:
-                sp_xml = ""
-            lock_hit = None
-            for attr in ('noSelect="1"', 'noSelect="true"',
-                         'noMove="1"', 'noMove="true"',
-                         'noGrp="1"', 'noGrp="true"'):
-                if attr in sp_xml:
-                    lock_hit = attr
-                    break
-            if lock_hit:
-                rule.notes.append(
-                    f"× 对象 name={s.name!r} 存在锁定属性 {lock_hit}，不满足'可单独选中拖动'"
-                )
-                continue
-
-            # ---- 逐 run 解析有效字号/加粗/颜色（含继承与 theme） ---- #
-            try:
-                tf = s.text_frame
-            except Exception:
-                continue
-            hit_any = False
-            fail_details = []
-            for para in tf.paragraphs:
-                for run in para.runs:
-                    eff = self._resolve_run_effective_style(s, para, run)
-                    sz = eff["size_pt"]
-                    bold = eff["bold"]
-                    color_hex = eff["color_hex"]
-                    reason = eff["reason"]
-                    ok_sz = sz is not None and 80 <= sz <= 90
-                    ok_bold = bool(bold)
-                    ok_color = color_hex is not None and self._is_white_beige_pink(color_hex)
-                    if ok_sz and ok_bold and ok_color:
-                        rule.notes.append(
-                            f"× name={s.name!r} 命中：字号={sz}pt 粗体={bold} "
-                            + f"颜色=#{color_hex}  解析路径={reason}"
-                        )
-                        hit_any = True
-                        break
-                    fail_details.append(
-                        f"字号={sz} 粗体={bold} 颜色={color_hex} "
-                        + f"[sz_ok={ok_sz} bold_ok={ok_bold} color_ok={ok_color}] "
-                        + f"路径={reason}"
-                    )
-                if hit_any:
-                    break
-            if hit_any:
-                rule.matched = True
-                self.report.rules.append(rule)
-                return
-            rule.notes.append(f"× name={s.name!r} 未命中：" + " | ".join(fail_details))
-        self.report.rules.append(rule)
-
-    # ---------- 文本样式与主题解析 ---------- #
-
-    def _resolve_run_effective_style(self, shape, paragraph, run) -> dict:
-        """按 OOXML 继承链解析一个 run 的有效 字号 / 加粗 / 颜色。
-
-        继承顺序（前者优先）：
-          1. run 直接属性（a:rPr）
-          2. 段落 defRPr（a:pPr/a:defRPr）
-          3. shape 的 txBody/lstStyle 中对应级别（a:lvlNPpr/a:defRPr，
-             以及 a:defPPr/a:defRPr）
-          4. 占位符：slide layout 的对应占位符 -> master 的对应占位符
-          5. 主题默认（theme/fontScheme + clrScheme）
-
-        颜色支持：a:srgbClr / a:schemeClr（通过 theme 的 clrScheme 解析）/
-                   a:prstClr；带 a:lumMod / a:lumOff 亮度修正。
-
-        返回：{"size_pt": float|None, "bold": bool|None, "color_hex": str|None,
-                "reason": str（解析出处，便于 debug）}
-        """
-        reason_parts = []
-        # 快照：从 run 开始，逐级找 rPr
-        run_rpr = self._safe_find(getattr(run, "_r", None), "a:rPr")
-        para_el = getattr(paragraph, "_p", None)
-        para_pPr = self._safe_find(para_el, "a:pPr") if para_el is not None else None
-        para_defrpr = self._safe_find(para_pPr, "a:defRPr") if para_pPr is not None else None
-
-        size_pt = None
-        bold = None
-        color_hex = None
-
-        def _apply_rpr(rpr, tag):
-            nonlocal size_pt, bold, color_hex
-            if rpr is None:
-                return
-            # size
-            if size_pt is None:
-                sz_attr = rpr.get("sz")
-                if sz_attr and sz_attr.isdigit():
-                    size_pt = int(sz_attr) / 100.0
-                    reason_parts.append(f"size<-{tag}.sz={sz_attr}")
-            # bold
-            if bold is None:
-                b_attr = rpr.get("b")
-                if b_attr is not None:
-                    bold = b_attr in ("1", "true", "True")
-                    reason_parts.append(f"bold<-{tag}.b={b_attr}")
-            # color
-            if color_hex is None:
-                fill_hex = self._extract_solid_fill_hex(rpr)
-                if fill_hex:
-                    color_hex = fill_hex.upper()
-                    reason_parts.append(f"color<-{tag}.solidFill={color_hex}")
-
-        # 1) run
-        _apply_rpr(run_rpr, "run.rPr")
-        # 2) 段落 defRPr
-        _apply_rpr(para_defrpr, "para.defRPr")
-
-        # 3) shape txBody 的 lstStyle
-        try:
-            tx_body = shape._element.find(".//p:txBody", NS)
-        except Exception:
-            tx_body = None
-        if tx_body is not None:
-            lst_style = tx_body.find("a:lstStyle", NS)
-            if lst_style is not None:
-                # 取段落级：优先 lvl1pPr，其次 defPPr
-                for lvl_tag in ("a:lvl1pPr", "a:defPPr", "a:lvl2pPr",
-                                "a:lvl3pPr", "a:lvl4pPr", "a:lvl5pPr"):
-                    lvl = lst_style.find(lvl_tag, NS)
-                    if lvl is not None:
-                        _apply_rpr(lvl.find("a:defRPr", NS), f"lstStyle.{lvl_tag}.defRPr")
-
-        # 4) 占位符继承（layout/master）
-        if size_pt is None or bold is None or color_hex is None:
-            ph_rpr_list = self._collect_placeholder_defrpr(shape)
-            for src_tag, rpr in ph_rpr_list:
-                _apply_rpr(rpr, src_tag)
-                if size_pt is not None and bold is not None and color_hex is not None:
-                    break
-
-        # 5) 主题默认（bodyPr/majorFont/minorFont + clrScheme dk1）
-        if color_hex is None:
-            # 若颜色仍为 None，取 theme 的 dk1（正文默认色）
-            theme_color = self._theme_scheme_color("dk1")
-            if theme_color:
-                color_hex = theme_color.upper()
-                reason_parts.append("color<-theme.dk1")
-
-        return {
-            "size_pt": size_pt,
-            "bold": bold,
-            "color_hex": color_hex,
-            "reason": " > ".join(reason_parts) or "(默认)",
-        }
-
-    def _safe_find(self, el, tag):
-        try:
-            if el is None:
-                return None
-            return el.find(tag, NS)
-        except Exception:
-            return None
-
-    def _extract_solid_fill_hex(self, rpr) -> Optional[str]:
-        """从 rPr 里解析 a:solidFill 的颜色为 6 位 RGB hex（考虑 lumMod/lumOff）。"""
-        if rpr is None:
-            return None
-        sf = rpr.find("a:solidFill", NS)
-        if sf is None:
-            return None
-        # srgbClr
-        srgb = sf.find("a:srgbClr", NS)
-        if srgb is not None:
-            hexv = (srgb.get("val") or "").upper()
-            if len(hexv) == 6:
-                return self._apply_lum_mod_off(hexv, srgb)
-        # schemeClr
-        sc = sf.find("a:schemeClr", NS)
-        if sc is not None:
-            name = sc.get("val") or ""
-            resolved = self._theme_scheme_color(name)
-            if resolved:
-                return self._apply_lum_mod_off(resolved.upper(), sc)
-        # prstClr
-        pr = sf.find("a:prstClr", NS)
-        if pr is not None:
-            hexv = self._preset_color_hex(pr.get("val") or "")
-            if hexv:
-                return self._apply_lum_mod_off(hexv, pr)
+        return ET.fromstring(z.read(name))
+    except (KeyError, ET.ParseError):
         return None
 
-    @staticmethod
-    def _apply_lum_mod_off(hexv: str, color_el) -> str:
-        """对 hex 颜色套用 <a:lumMod val="..."/> 和 <a:lumOff val="..."/> 亮度修正。
-        PowerPoint OOXML 中 val 为千分数（60000 = 60%）。
-        """
-        try:
-            r = int(hexv[0:2], 16) / 255.0
-            g = int(hexv[2:4], 16) / 255.0
-            b = int(hexv[4:6], 16) / 255.0
-        except Exception:
-            return hexv
-        lum_mod = color_el.find("a:lumMod", NS)
-        lum_off = color_el.find("a:lumOff", NS)
-        # 用 HSL 亮度近似：L = (max+min)/2
-        mx = max(r, g, b)
-        mn = min(r, g, b)
-        L = (mx + mn) / 2.0
-        new_L = L
-        if lum_mod is not None:
-            try:
-                new_L = new_L * (int(lum_mod.get("val") or "100000") / 100000.0)
-            except Exception:
-                pass
-        if lum_off is not None:
-            try:
-                new_L = new_L + (int(lum_off.get("val") or "0") / 100000.0)
-            except Exception:
-                pass
-        new_L = max(0.0, min(1.0, new_L))
-        # 缩放 RGB：粗略保持色相 (r,g,b) 按新 L 与旧 L 比例调整
-        if L <= 0:
-            r2 = g2 = b2 = new_L
-        else:
-            scale = new_L / L if L > 0 else 1.0
-            r2 = min(1.0, r * scale)
-            g2 = min(1.0, g * scale)
-            b2 = min(1.0, b * scale)
-        return "{:02X}{:02X}{:02X}".format(int(r2 * 255), int(g2 * 255), int(b2 * 255))
 
-    def _collect_placeholder_defrpr(self, shape):
-        """若 shape 是占位符，从 slide layout / master 上找到对应占位符的
-        默认段落 defRPr，返回 [(source_tag, rpr_element), ...]。
-        """
-        out = []
-        try:
-            ph = shape._element.find(".//p:nvSpPr/p:nvPr/p:ph", NS)
-        except Exception:
-            ph = None
-        if ph is None:
-            return out
-        ph_type = ph.get("type") or ""
-        ph_idx = ph.get("idx") or ""
-
-        # slide layout
-        try:
-            layout = self.slide.slide_layout
-        except Exception:
-            layout = None
-        for src_name, src in (("layout", layout),
-                              ("master", layout.slide_master if layout is not None else None)):
-            if src is None:
-                continue
-            try:
-                spTree = src.element.find(".//p:cSld/p:spTree", NS)
-            except Exception:
-                spTree = None
-            if spTree is None:
-                continue
-            for sp in spTree.findall("p:sp", NS):
-                sp_ph = sp.find(".//p:nvSpPr/p:nvPr/p:ph", NS)
-                if sp_ph is None:
-                    continue
-                if ph_type and sp_ph.get("type") == ph_type:
-                    match = True
-                elif ph_idx and sp_ph.get("idx") == ph_idx:
-                    match = True
-                else:
-                    match = False
-                if not match:
-                    continue
-                lst = sp.find(".//p:txBody/a:lstStyle", NS)
-                if lst is not None:
-                    for lvl_tag in ("a:lvl1pPr", "a:defPPr"):
-                        lvl = lst.find(lvl_tag, NS)
-                        if lvl is not None:
-                            rpr = lvl.find("a:defRPr", NS)
-                            if rpr is not None:
-                                out.append((f"{src_name}.ph.{lvl_tag}.defRPr", rpr))
+def _rels(z, part_name):
+    """返回某部件的 rels 映射：rId -> (Target, TargetMode)。"""
+    d = os.path.dirname(part_name)
+    rel_name = "%s/_rels/%s.rels" % (d, os.path.basename(part_name))
+    root = _xml(z, rel_name)
+    out = {}
+    if root is None:
         return out
+    for rel in root:
+        out[rel.get("Id")] = (rel.get("Target") or "", rel.get("TargetMode") or "Internal")
+    return out
 
-    def _theme_scheme_color(self, name: str) -> Optional[str]:
-        """从演示文稿主题的 clrScheme 中解析 scheme color name（dk1/lt1/
-        accent1..6/hlink/folHlink）为 6 位 hex。缓存在 self 上。
-        """
-        if not name:
-            return None
-        cache = getattr(self, "_theme_cache", None)
-        if cache is None:
-            cache = self._load_theme_scheme()
-            self._theme_cache = cache
-        # 兼容 dk1/tx1、lt1/bg1 等别名
-        aliases = {
-            "tx1": "dk1", "bg1": "lt1",
-            "tx2": "dk2", "bg2": "lt2",
-        }
-        key = aliases.get(name, name)
-        return cache.get(key)
 
-    def _load_theme_scheme(self) -> dict:
-        """加载 ppt/theme/theme1.xml，返回 {schemeName: hex6}。"""
-        out = {}
-        if self.zf is None:
-            return out
-        theme_name = None
-        for n in self.zf.namelist():
-            if n.startswith("ppt/theme/") and n.endswith(".xml"):
-                theme_name = n
-                break
-        if theme_name is None:
-            return out
-        try:
-            root = ET.fromstring(self.zf.read(theme_name))
-        except Exception:
-            return out
-        scheme = root.find(".//a:themeElements/a:clrScheme", NS)
-        if scheme is None:
-            return out
-        for child in scheme:
-            tag = child.tag.split("}")[-1]  # dk1, lt1, accent1, ...
-            srgb = child.find("a:srgbClr", NS)
-            if srgb is not None:
-                v = (srgb.get("val") or "").upper()
-                if len(v) == 6:
-                    out[tag] = v
-                    continue
-            # 系统颜色（sysClr）：使用 lastClr 属性
-            sysc = child.find("a:sysClr", NS)
-            if sysc is not None:
-                v = (sysc.get("lastClr") or "").upper()
-                if len(v) == 6:
-                    out[tag] = v
+def _slide_parts(z):
+    """按 p:sldIdLst 的顺序返回幻灯片部件名列表（真实放映顺序）。"""
+    pres = _xml(z, "ppt/presentation.xml")
+    if pres is None:
+        return []
+    rels = _rels(z, "ppt/presentation.xml")
+    out = []
+    lst = pres.find("p:sldIdLst", NS)
+    if lst is None:
         return out
-
-    @staticmethod
-    def _preset_color_hex(name: str) -> Optional[str]:
-        """OOXML a:prstClr 的常见预设颜色到 hex 的映射（部分常用值）。"""
-        table = {
-            "white": "FFFFFF", "black": "000000",
-            "beige": "F5F5DC", "bisque": "FFE4C4",
-            "mistyRose": "FFE4E1", "lightPink": "FFB6C1",
-            "pink": "FFC0CB", "hotPink": "FF69B4",
-            "wheat": "F5DEB3", "cornsilk": "FFF8DC",
-            "ivory": "FFFFF0", "linen": "FAF0E6",
-            "seashell": "FFF5EE", "papayaWhip": "FFEFD5",
-            "peachPuff": "FFDAB9", "antiqueWhite": "FAEBD7",
-        }
-        return table.get(name)
-
-    @staticmethod
-    def _is_white_beige_pink(hexstr: str) -> bool:
-        try:
-            r = int(hexstr[0:2], 16)
-            g = int(hexstr[2:4], 16)
-            b = int(hexstr[4:6], 16)
-        except Exception:
-            return False
-        # 白色
-        if r >= 240 and g >= 240 and b >= 240:
-            return True
-        # 米色 (Beige ~ F5F5DC, 偏黄白)
-        if r >= 220 and g >= 210 and 180 <= b <= 230 and r >= b:
-            return True
-        # 淡粉
-        if r >= 230 and 180 <= g <= 230 and 200 <= b <= 240 and r >= g:
-            return True
-        return False
-
-    def _rule_button_states(self, info):
-        """+1 按钮根据状态显示 开始/暂停/继续 或语义一致提示。
-
-        严格化（回应反馈）：rubric 只要求"根据状态显示"三类语义，
-        单按钮初始只显示"开始"、点击后动态变更也是合格的。
-        因此判定顺序：
-          (A) 若存在多按钮/多状态文本，直接根据当前静态文本命中：
-                只要 {开始|暂停|继续} 三类语义中至少两类有静态可见证据，即命中。
-          (B) 单按钮或静态只见一类状态词时，尝试从动画/宏中证明状态序列：
-              · p:timing 中该按钮 onClick 触发的 par 数 ≥ 2（点击 → 停 → 继）
-              · 或 par 内有 pause/resume/togglePause 之一，且另一 par 有反向命令
-              · 或按钮绑定 VBA(ppaction://macro / vbaProject.bin) —— 无法静态
-                展开脚本，但至少能证明"点击后状态会变化"；给以中立命中。
-          (C) 无任何证据时保守判为不命中。
-        """
-        rule = Rule("+1-button-states", 1,
-                    "按钮状态文字显示开始/暂停/继续或语义一致提示"
-                    + "（含动态状态/序列证据）")
-
-        # 整页视频存在且无独立按钮，跳过不计分
-        if info["fullpage_media"] and not info["buttons"]:
-            rule.notes.append("存在整页视频且页面无独立按钮，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        if not info["buttons"]:
-            rule.notes.append("未发现按钮候选")
-            self.report.rules.append(rule)
-            return
-
-        start_words = ("开始", "播放", "启动", "start", "play", "begin", "go")
-        pause_words = ("暂停", "停止", "pause", "stop", "halt")
-        resume_words = ("继续", "恢复", "resume", "continue")
-
-        def _cls_of(text: str) -> "set[str]":
-            t = (text or "").lower()
-            cls = set()
-            if any(w.lower() in t for w in start_words):
-                cls.add("start")
-            if any(w.lower() in t for w in pause_words):
-                cls.add("pause")
-            if any(w.lower() in t for w in resume_words):
-                cls.add("resume")
-            return cls
-
-        # ---- (A) 静态文本命中 ---- #
-        classes_seen: "set[str]" = set()
-        per_button = []
-        for s in info["buttons"]:
-            text = safe_text(s)
-            cls = _cls_of(text)
-            classes_seen |= cls
-            per_button.append((s, text, cls))
-        rule.notes.append(
-            "按钮静态文本："
-            + " | ".join(f"{safe_text(s).strip()!r}->{sorted(c)}"
-                          for s, _t, c in per_button)
-        )
-
-        # 若已见 ≥2 类静态语义 -> 直接命中
-        if len(classes_seen) >= 2:
-            rule.notes.append(f"静态文本已覆盖状态语义 {sorted(classes_seen)}，命中")
-            rule.matched = True
-            self.report.rules.append(rule)
-            return
-
-        # ---- (B) 从动画/VBA 证明状态序列 ---- #
-        # 逐个可能是"控制型"的按钮尝试匹配
-        candidates = []
-        for s, text, cls in per_button:
-            # 只对像"控制按钮"的候选做动态分析：文本已含至少一类状态词，
-            # 或名称含 button/btn/控制/按钮
-            name = (s.name or "").lower()
-            if cls or re.search(r"(button|btn|控制|按钮)", name):
-                candidates.append(s)
-        if not candidates:
-            candidates = [s for s, _t, _c in per_button]
-
-        dynamic_hit = False
-        dynamic_reason = None
-        for btn in candidates:
-            # 静态无法解析 VBA 时给中立命中（有 vbaProject.bin + program 动作）
-            try:
-                btn_xml = ET.tostring(btn._element, encoding="unicode")
-            except Exception:
-                btn_xml = ""
-            macro_action = bool(re.search(r'action="ppaction://macro[^"]*"', btn_xml))
-            has_vba = False
-            try:
-                if self.zf is not None and "ppt/vbaProject.bin" in self.zf.namelist():
-                    has_vba = True
-            except Exception:
-                pass
-            program_action = bool(re.search(r'action="ppaction://program', btn_xml))
-            if macro_action or (has_vba and program_action):
-                dynamic_hit = True
-                dynamic_reason = (
-                    f"按钮 name={btn.name!r} 绑定 VBA/自定义程序动作 "
-                    + "-> 状态文本会由脚本动态更新（静态无法展开，判为合格）"
-                )
-                break
-
-            # 分析 timing：该按钮 onClick 触发的 par 数 ≥ 2 或含 pause/resume 命令
-            if self.slide_xml is None:
-                continue
-            timing = self.slide_xml.find(".//p:timing", NS)
-            if timing is None:
-                continue
-            btn_spid = None
-            for tag in ("p:nvSpPr/p:cNvPr", "p:nvPicPr/p:cNvPr", "p:nvGrpSpPr/p:cNvPr"):
-                el = btn._element.find(".//" + tag, NS)
-                if el is not None:
-                    btn_spid = el.get("id")
-                    break
-            if not btn_spid:
-                continue
-
-            click_pars = []
-            for par in timing.iter("{%s}par" % NS["p"]):
-                for cond in par.findall(".//p:cond", NS):
-                    if cond.get("evt") != "onClick":
-                        continue
-                    sptgt = cond.find(".//p:spTgt", NS)
-                    if sptgt is not None and sptgt.get("spid") == btn_spid:
-                        click_pars.append(par)
-                        break
-
-            has_pause_cmd = False
-            has_resume_cmd = False
-            for par in click_pars:
-                for cmd in par.findall(".//p:cmd", NS):
-                    ctype = (cmd.get("type") or "").lower()
-                    if ctype in ("stop", "pause"):
-                        has_pause_cmd = True
-                    if ctype in ("play", "resume", "togglepause"):
-                        has_resume_cmd = True
-                if par.find(".//p:cmd[@type='togglePause']", NS) is not None:
-                    has_pause_cmd = True
-                    has_resume_cmd = True
-
-            if len(click_pars) >= 2 or (has_pause_cmd and has_resume_cmd):
-                dynamic_hit = True
-                dynamic_reason = (
-                    f"按钮 name={btn.name!r} 有 {len(click_pars)} 个 onClick par "
-                    + f"(pause_cmd={has_pause_cmd}, resume_cmd={has_resume_cmd}) "
-                    + "-> 可证明按钮点击后状态会切换，视为动态状态文本"
-                )
-                break
-            if len(click_pars) >= 1 and classes_seen:
-                # 单 par 但静态已见 ≥1 类状态词：认为初始 UI 显示"开始"、
-                # 点击后由动画驱动的隐藏/显示切换成"暂停/继续"，也认合格。
-                dynamic_hit = True
-                dynamic_reason = (
-                    f"按钮 name={btn.name!r} 静态见 {sorted(classes_seen)}，"
-                    + f"且有 {len(click_pars)} 个 onClick par -> 判为动态状态切换"
-                )
-                break
-
-        if dynamic_hit:
-            rule.notes.append(dynamic_reason or "动态状态证据命中")
-            rule.matched = True
-            self.report.rules.append(rule)
-            return
-
-        # ---- (C) 全部证据缺失 ---- #
-        rule.notes.append(
-            "无静态多语义文本，也无动画/VBA 状态切换证据 -> 判为不命中"
-        )
-        self.report.rules.append(rule)
-
-    # ---------- 扣分项实现 ---------- #
-
-    def _rule_minus_occlusion(self, info, sw, sh):
-        """-3 新增对象遮挡粉色椭圆、乘号、按钮或页面主要装饰元素"""
-        rule = Rule("-3-occlusion", -3, "新增对象遮挡椭圆/乘号/按钮/装饰")
-
-        if self.slide is None:
-            self.report.rules.append(rule)
-            return
-
-        # 整页视频存在且没有其它可核验遮挡对象，跳过不计分
-        non_fullpage_shapes = [
-            s for s in self.slide.shapes
-            if s not in info["fullpage_media"] and s not in info["fullpage_picture"]
-        ]
-        if info["fullpage_media"] and not non_fullpage_shapes:
-            rule.notes.append("存在整页视频且无其它对象，跳过不计分")
-            self.report.rules.append(rule)
-            return
-
-        # 只针对细则：新增对象遮挡粉色椭圆、乘号、按钮或页面主要装饰元素。
-        # 自动化代理：顶层非目标对象若大面积覆盖页面中央区域，视为遮挡主要元素。
-        if non_fullpage_shapes:
-            last = non_fullpage_shapes[-1]
-            w, h = shape_size_cm(last)
-            cx, cy = shape_center_cm(last)
-            covers_center = (sw * 0.25 <= cx <= sw * 0.75) and (sh * 0.25 <= cy <= sh * 0.75)
-            large_object = w >= sw * 0.5 or h >= sh * 0.5
-            target_like = last in info["cross_x"] or last in info["buttons"]
-            if large_object and covers_center and not target_like:
-                rule.notes.append(f"顶层新增对象 '{last.name}' 覆盖页面主要区域")
-                rule.matched = True
-
-        if not rule.matched:
-            rule.notes.append("未发现新增对象遮挡指定元素")
-        self.report.rules.append(rule)
-
-    def _rule_minus_fullpage_video(self, info):
-        """-5 第10页被整页视频或动画覆盖，或转盘/按钮无法单独编辑"""
-        rule = Rule("-5-fullpage-video", -5, "整页视频/动画覆盖，无法单独编辑")
-
-        # 条件 1：出现整页视频或动画覆盖
-        if info["fullpage_media"]:
-            rule.notes.append(f"发现整页媒体：{info['fullpage_media'][0].name}")
-            rule.matched = True
-
-        # 条件 2：没有整页视频时，转盘或按钮对象被锁定，无法单独编辑
-        def is_locked(shape) -> bool:
-            xml = ET.tostring(shape._element, encoding="unicode")
-            lock_attrs = (
-                'noSelect="1"', 'noSelect="true"',
-                'noMove="1"', 'noMove="true"',
-                'noResize="1"', 'noResize="true"',
-                'noEditPoints="1"', 'noEditPoints="true"',
-                'noGrp="1"', 'noGrp="true"',
-                'noChangeAspect="1"', 'noChangeAspect="true"',
-            )
-            return any(attr in xml for attr in lock_attrs)
-
-        spinner_candidates = []
-        for s in (info["ovals"] + info["pictures"] + info["groups"]):
-            if s in info["fullpage_media"] or s in info["fullpage_picture"]:
-                continue
-            w, h = shape_size_cm(s)
-            if w > 0 and h > 0 and abs(w - h) <= 0.2:
-                spinner_candidates.append(s)
-
-        locked_spinner = any(is_locked(s) for s in spinner_candidates)
-        locked_button = any(is_locked(s) for s in info["buttons"])
-        if locked_spinner or locked_button:
-            rule.notes.append(
-                f"检测到无法单独编辑对象：转盘锁定={locked_spinner}，按钮锁定={locked_button}"
-            )
-            rule.matched = True
-
-        if not rule.matched:
-            rule.notes.append("未发现整页视频/动画，未发现转盘或按钮锁定")
-        self.report.rules.append(rule)
-
-    def _rule_minus_garbage(self, info):
-        """-1 文件中出现批注/临时说明/红色标记/截图边框/无关占位对象"""
-        rule = Rule("-1-garbage", -1, "批注/临时说明/红色标记/截图边框/无关占位")
-        # 1) 批注：演讲者备注（notesSlide10.xml）中是否含实质内容
-        notes_text = ""
-        try:
-            notes_xml = self.zf.read(
-                f"ppt/notesSlides/notesSlide{self.TARGET_PAGE_INDEX + 1}.xml"
-            ).decode("utf-8")
-            # 提取 <a:t> 文本
-            notes_text = " ".join(re.findall(r"<a:t>(.*?)</a:t>", notes_xml))
-        except KeyError:
-            pass
-        meaningful_notes = bool(notes_text.strip()) and len(notes_text.strip()) > 5
-        rule.notes.append(f"备注页文本长度={len(notes_text.strip())}: {notes_text[:80]!r}")
-        # 2) PPT 批注（comments）
-        has_comments = False
-        for n in self.zf.namelist():
-            if n.startswith("ppt/comments/"):
-                has_comments = True
-                break
-        rule.notes.append(f"含 PPT 批注：{has_comments}")
-        # 3) 红色标记：检测页面 shape 中是否存在显著红色填充/线条小图形（颜色 R>200, G<80, B<80）
-        red_found = False
-        red_pat = re.compile(r'srgbClr val="([0-9A-Fa-f]{6})"')
-        for m in red_pat.finditer(self.slide_xml_raw):
-            r = int(m.group(1)[0:2], 16)
-            g = int(m.group(1)[2:4], 16)
-            b = int(m.group(1)[4:6], 16)
-            if r > 200 and g < 80 and b < 80:
-                red_found = True
-                break
-        rule.notes.append(f"含纯红色 srgb 标记：{red_found}")
-        # 4) 截图边框：图片名 含 screenshot/截图，或图片是带白边的矩形（这里只判文件名）
-        screenshot_like = False
-        for s in info["pictures"]:
-            if re.search(r"screenshot|截图|snip", s.name or "", re.I):
-                screenshot_like = True
-                break
-        rule.notes.append(f"截图类图片：{screenshot_like}")
-        # 5) 无关占位：layout 占位符未删除（在 slide xml 中有 <p:ph>）
-        ph_count = len(re.findall(r"<p:ph\b", self.slide_xml_raw))
-        rule.notes.append(f"页面占位符数：{ph_count}")
-
-        rule.matched = (
-            meaningful_notes or has_comments or red_found or screenshot_like or ph_count > 0
-        )
-        self.report.rules.append(rule)
-
-    # -------- 入口 -------- #
-
-    def run(self) -> Report:
-        if not self.check_dim1():
-            return self.report
-        self.report.dim1_pass = True
-        self.check_dim2()
-        return self.report
-
-
-# ----------------------------- 统一入口 ----------------------------- #
-
-
-SCRIPT_ID = "065"
-
-
-def _locate_document(dir_path: str) -> Optional[str]:
-    """在给定目录中定位待评估的 .pptx 文档；找不到返回 None。
-    忽略 Office 打开时生成的临时锁文件（以 ~$ 开头）。
-    仅支持 .pptx；旧版 .ppt 不再识别（避免依赖 COM/LibreOffice 转换）。
-    """
-    try:
-        entries = os.listdir(dir_path)
-    except OSError:
-        return None
-    for name in entries:
-        if name.startswith("~$"):
+    for sld in lst.findall("p:sldId", NS):
+        rid = sld.get("{%s}id" % NS["r"])
+        target = rels.get(rid, ("", ""))[0]
+        if not target:
             continue
-        if name.lower().endswith(".pptx"):
-            return os.path.join(dir_path, name)
+        target = target.replace("../", "")
+        if not target.startswith("ppt/"):
+            target = "ppt/" + target
+        out.append(target)
+    return out
+
+
+def _shape_text(el):
+    """形状内文本：按段落用 \\n 连接（只取 a:t）。"""
+    body = el.find("p:txBody", NS)
+    if body is None:
+        return ""
+    paras = []
+    for para in body.findall("a:p", NS):
+        paras.append("".join(t.text or "" for t in para.iter("{%s}t" % _A)))
+    return "\n".join(paras)
+
+
+def _strip_ws(s):
+    """删除所有空白（含全角空格与不换行空格）。"""
+    return re.sub(r"[\s　 ﻿]", "", s or "")
+
+
+def _text_sha1(sp_tree):
+    """整页文字指纹：递归拼接所有形状文本后去空白取 SHA-1。"""
+    chunks = []
+
+    def walk(node):
+        for ch in list(node):
+            tag = _local(ch)
+            if tag == "grpSp":
+                walk(ch)
+            elif tag in ("sp", "pic", "graphicFrame", "cxnSp"):
+                chunks.append(_shape_text(ch))
+                for tbl_t in ch.iter("{%s}t" % _A):
+                    if ch.find("p:txBody", NS) is None:
+                        chunks.append(tbl_t.text or "")
+
+    if sp_tree is not None:
+        walk(sp_tree)
+    raw = _strip_ws("".join(chunks))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest(), len(raw)
+
+
+def _local(el):
+    """去掉命名空间的标签名。"""
+    tag = el.tag
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _cnv_pr(el):
+    """返回 (id, name)。"""
+    for path in ("p:nvSpPr/p:cNvPr", "p:nvGrpSpPr/p:cNvPr", "p:nvPicPr/p:cNvPr",
+                 "p:nvCxnSpPr/p:cNvPr", "p:nvGraphicFramePr/p:cNvPr"):
+        c = el.find(path, NS)
+        if c is not None:
+            return c.get("id") or "", c.get("name") or ""
+    return "", ""
+
+
+def _attr_num(el, name, default=0.0):
+    """读取 OOXML 数值属性。
+
+    部分生成工具会写出非法值（如 cy="D"），此时按 default 处理，
+    避免整脚本因单个坏属性而中断评估。
+    """
+    if el is None:
+        return default
+    raw = el.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _collect(sp_tree):
+    """
+    递归收集形状，返回记录列表。每条记录带页面绝对坐标（cm）：
+      tag/sid/name/x/y/w/h/depth/el/parent/z
+    组合内部子元素坐标按 a:off/a:ext 与 a:chOff/a:chExt 做线性映射还原到页面坐标，
+    这与办公软件里“组合内对象的实际显示位置”一致。
+    """
+    out = []
+    if sp_tree is None:
+        return out
+
+    def walk(node, tf, depth, parent, top_z):
+        ax, ay, sx, sy = tf
+        for ch in list(node):
+            tag = _local(ch)
+            if tag in ("nvGrpSpPr", "grpSpPr", "extLst"):
+                continue
+            if depth == 0:
+                top_z = len(out)
+            if tag == "grpSp":
+                xf = ch.find("p:grpSpPr/a:xfrm", NS)
+                if xf is None:
+                    continue
+                off, ext = xf.find("a:off", NS), xf.find("a:ext", NS)
+                choff, chext = xf.find("a:chOff", NS), xf.find("a:chExt", NS)
+                if off is None or ext is None:
+                    continue
+                ox, oy = _attr_num(off, "x"), _attr_num(off, "y")
+                cx, cy = _attr_num(ext, "cx"), _attr_num(ext, "cy")
+                gx = _attr_num(choff, "x") if choff is not None else 0.0
+                gy = _attr_num(choff, "y") if choff is not None else 0.0
+                gcx = _attr_num(chext, "cx", cx) if chext is not None else cx
+                gcy = _attr_num(chext, "cy", cy) if chext is not None else cy
+                bx, by = ax + ox * sx, ay + oy * sy
+                sid, name = _cnv_pr(ch)
+                out.append({"tag": tag, "sid": sid, "name": name, "el": ch,
+                            "x": _cm(bx), "y": _cm(by), "w": _cm(cx * sx), "h": _cm(cy * sy),
+                            "depth": depth, "parent": parent, "z": top_z})
+                nsx = (cx / gcx * sx) if gcx else sx
+                nsy = (cy / gcy * sy) if gcy else sy
+                walk(ch, (bx - gx * nsx, by - gy * nsy, nsx, nsy), depth + 1, sid, top_z)
+            elif tag in ("sp", "pic", "cxnSp", "graphicFrame"):
+                xf = ch.find(".//a:xfrm", NS) if tag != "graphicFrame" else ch.find("p:xfrm", NS)
+                if xf is None:
+                    continue
+                off, ext = xf.find("a:off", NS), xf.find("a:ext", NS)
+                if off is None or ext is None:
+                    continue
+                sid, name = _cnv_pr(ch)
+                out.append({"tag": tag, "sid": sid, "name": name, "el": ch,
+                            "x": _cm(ax + _attr_num(off, "x") * sx),
+                            "y": _cm(ay + _attr_num(off, "y") * sy),
+                            "w": _cm(_attr_num(ext, "cx") * sx),
+                            "h": _cm(_attr_num(ext, "cy") * sy),
+                            "depth": depth, "parent": parent, "z": top_z})
+
+    walk(sp_tree, (0.0, 0.0, 1.0, 1.0), 0, None, -1)
+    return out
+
+
+def _rect(s):
+    return (s["x"], s["y"], s["x"] + s["w"], s["y"] + s["h"])
+
+
+def _center(s):
+    return (s["x"] + s["w"] / 2.0, s["y"] + s["h"] / 2.0)
+
+
+def _area(s):
+    return max(0.0, s["w"]) * max(0.0, s["h"])
+
+
+def _inter_area(r1, r2):
+    dx = min(r1[2], r2[2]) - max(r1[0], r2[0])
+    dy = min(r1[3], r2[3]) - max(r1[1], r2[1])
+    return dx * dy if dx > 0 and dy > 0 else 0.0
+
+
+def _contains(outer, inner, tol=0.05):
+    return (outer[0] <= inner[0] + tol and outer[1] <= inner[1] + tol
+            and outer[2] >= inner[2] - tol and outer[3] >= inner[3] - tol)
+
+
+def _descendants(shapes, sid):
+    """某组合下的全部后代记录。"""
+    kids = [s for s in shapes if s["parent"] == sid]
+    out = list(kids)
+    for k in kids:
+        if k["tag"] == "grpSp":
+            out += _descendants(shapes, k["sid"])
+    return out
+
+
+def _max_depth(shapes, sid, base=1):
+    """组合嵌套层数：自身算 1 层。"""
+    depth = base
+    for k in [s for s in shapes if s["parent"] == sid and s["tag"] == "grpSp"]:
+        depth = max(depth, _max_depth(shapes, k["sid"], base + 1))
+    return depth
+
+
+def _theme_palette(z):
+    """主题 clrScheme + 母版 clrMap，用于把 schemeClr 解析成 srgb 十六进制。"""
+    palette, clrmap = {}, {}
+    theme = _xml(z, "ppt/theme/theme1.xml")
+    if theme is not None:
+        scheme = theme.find(".//a:clrScheme", NS)
+        for node in list(scheme) if scheme is not None else []:
+            key = _local(node)
+            srgb = node.find("a:srgbClr", NS)
+            sysc = node.find("a:sysClr", NS)
+            if srgb is not None:
+                palette[key] = (srgb.get("val") or "").upper()
+            elif sysc is not None:
+                palette[key] = (sysc.get("lastClr") or "").upper()
+    master = _xml(z, "ppt/slideMasters/slideMaster1.xml")
+    if master is not None:
+        cm = master.find("p:clrMap", NS)
+        if cm is not None:
+            clrmap = dict(cm.attrib)
+    return palette, clrmap
+
+
+def _hex_of(node, palette, clrmap):
+    """把 a:srgbClr / a:schemeClr / a:sysClr 解析为 RRGGBB。"""
+    if node is None:
+        return None
+    tag = _local(node)
+    if tag == "srgbClr":
+        return (node.get("val") or "").upper() or None
+    if tag == "sysClr":
+        return (node.get("lastClr") or "").upper() or None
+    if tag == "schemeClr":
+        val = node.get("val") or ""
+        val = clrmap.get(val, val)
+        if val in ("phClr",):
+            return None
+        return palette.get(val)
     return None
 
 
-def evaluate(dir_path: str) -> dict:
-    """统一入口：接收脚本所在目录的路径，脚本自行在该目录中定位并评估文档。
+def _first_color(parent, palette, clrmap):
+    for name in ("srgbClr", "schemeClr", "sysClr"):
+        node = parent.find("a:%s" % name, NS)
+        if node is not None:
+            return _hex_of(node, palette, clrmap)
+    return None
 
-    返回结构见《脚本接口差异与统一建议.md》§2.2。
-    命中和未命中的维度二细则都会返回，便于批量汇总。
+
+def _fill_hex(el, palette, clrmap):
     """
+    形状填充色：solidFill 直接取；gradFill 取各 gs 色的平均值；
+    noFill / 无 spPr 填充返回 None（与办公软件“无填充”一致）。
+    """
+    spPr = el.find("p:spPr", NS)
+    if spPr is None:
+        return None
+    if spPr.find("a:noFill", NS) is not None:
+        return None
+    solid = spPr.find("a:solidFill", NS)
+    if solid is not None:
+        return _first_color(solid, palette, clrmap)
+    grad = spPr.find("a:gradFill", NS)
+    if grad is not None:
+        cols = []
+        for gs in grad.findall("a:gsLst/a:gs", NS):
+            hx = _first_color(gs, palette, clrmap)
+            if hx:
+                cols.append(hx)
+        if cols:
+            r = sum(int(c[0:2], 16) for c in cols) // len(cols)
+            g = sum(int(c[2:4], 16) for c in cols) // len(cols)
+            b = sum(int(c[4:6], 16) for c in cols) // len(cols)
+            return "%02X%02X%02X" % (r, g, b)
+    return None
+
+
+def _lum(hx):
+    """相对亮度 0—1。"""
+    if not hx or len(hx) < 6:
+        return None
+    try:
+        r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+    except ValueError:
+        return None
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+
+
+def _font_pts(el, default=18.0):
+    """
+    形状内每个文本 run 的字号（磅）。rPr@sz 未写时取演示文稿默认正文 18 磅，
+    与办公软件“新建文本框默认 18 号”一致。
+    """
+    out = []
+    body = el.find("p:txBody", NS)
+    if body is None:
+        return out
+    for para in body.findall("a:p", NS):
+        p_sz = None
+        pPr = para.find("a:pPr", NS)
+        if pPr is not None:
+            d = pPr.find("a:defRPr", NS)
+            if d is not None and d.get("sz"):
+                p_sz = float(d.get("sz")) / 100.0
+        for run in para.findall("a:r", NS):
+            txt = "".join(t.text or "" for t in run.iter("{%s}t" % _A))
+            if not txt.strip():
+                continue
+            rPr = run.find("a:rPr", NS)
+            sz = None
+            if rPr is not None and rPr.get("sz"):
+                sz = float(rPr.get("sz")) / 100.0
+            out.append((txt, sz if sz else (p_sz if p_sz else default)))
+    return out
+
+
+def _text_hex(el, palette, clrmap):
+    """文字颜色：优先 run 的 solidFill，其次 p:style/a:fontRef 的主题色。"""
+    body = el.find("p:txBody", NS)
+    if body is not None:
+        for run in body.iter("{%s}r" % _A):
+            rPr = run.find("a:rPr", NS)
+            if rPr is None:
+                continue
+            solid = rPr.find("a:solidFill", NS)
+            if solid is not None:
+                hx = _first_color(solid, palette, clrmap)
+                if hx:
+                    return hx
+    ref = el.find("p:style/a:fontRef", NS)
+    if ref is not None:
+        hx = _first_color(ref, palette, clrmap)
+        if hx:
+            return hx
+    return "000000"
+
+
+def _prst(el):
+    g = el.find("p:spPr/a:prstGeom", NS)
+    return (g.get("prst") or "") if g is not None else ""
+
+
+def _has_custgeom(el):
+    return el.find("p:spPr/a:custGeom", NS) is not None
+
+
+_BEHAVIOR_TAGS = ("anim", "animClr", "animEffect", "animMotion", "animRot",
+                  "animScale", "set", "cmd", "audio", "video")
+
+
+def _parse_timing(root):
+    """
+    解析 p:timing。返回：
+      present / has_main_seq / seqs / behaviors / onclick_spids
+    behaviors 每项：kind, spid, dur, by, to, eff_nodeType, eff_repeat, eff_fill,
+                    eff_delay, in_seq_restart, scale_by
+    这些字段对应办公软件“动画窗格”里的：触发方式、开始（单击时/与上一动画同时）、
+    持续时间、重复、播完后保持结束状态。
+    """
+    info = {"present": False, "has_main_seq": False, "seqs": [],
+            "behaviors": [], "onclick_spids": []}
+    timing = root.find("p:timing", NS)
+    if timing is None:
+        return info
+    info["present"] = True
+    parent = {}
+    for node in timing.iter():
+        for ch in list(node):
+            parent[ch] = node
+
+    def spid_of(cond):
+        t = cond.find("p:tgtEl/p:spTgt", NS)
+        return t.get("spid") if t is not None else None
+
+    for cond in timing.iter("{%s}cond" % _P):
+        if cond.get("evt") == "onClick":
+            up = parent.get(cond)
+            if up is not None and _local(up) == "stCondLst":
+                info["onclick_spids"].append(spid_of(cond))
+
+    for seq in timing.iter("{%s}seq" % _P):
+        ctn = seq.find("p:cTn", NS)
+        trig, nxt = [], []
+        for cond in (ctn.findall("p:stCondLst/p:cond", NS) if ctn is not None else []):
+            if cond.get("evt") == "onClick":
+                trig.append(spid_of(cond))
+        for cond in seq.findall("p:nextCondLst/p:cond", NS):
+            if cond.get("evt") == "onClick":
+                nxt.append(spid_of(cond))
+        indefinite = False
+        for cond in seq.iter("{%s}cond" % _P):
+            up = parent.get(cond)
+            if (cond.get("delay") == "indefinite" and cond.get("evt") is None
+                    and up is not None and _local(up) == "stCondLst"):
+                indefinite = True
+        node_type = ctn.get("nodeType") if ctn is not None else None
+        if node_type == "mainSeq":
+            info["has_main_seq"] = True
+        info["seqs"].append({
+            "el": seq, "node_type": node_type,
+            "restart": ctn.get("restart") if ctn is not None else None,
+            "concurrent": seq.get("concurrent"), "next_ac": seq.get("nextAc"),
+            "trigger_spids": trig, "next_spids": nxt,
+            "has_indefinite_start": indefinite,
+        })
+
+    for kind in _BEHAVIOR_TAGS:
+        for beh in timing.iter("{%s}%s" % (_P, kind)):
+            cbhvr = beh.find("p:cBhvr", NS)
+            inner = cbhvr.find("p:cTn", NS) if cbhvr is not None else None
+            tgt = cbhvr.find("p:tgtEl/p:spTgt", NS) if cbhvr is not None else None
+            by_node = beh.find("p:by", NS)
+            scale_by = None
+            if by_node is not None and by_node.get("x") is not None:
+                scale_by = (by_node.get("x"), by_node.get("y"))
+            eff = {"node_type": None, "repeat": None, "fill": None, "delay": None,
+                   "end_cond": False, "seq_restart": None}
+            up = parent.get(beh)
+            while up is not None:
+                if _local(up) == "cTn" and up.get("nodeType"):
+                    eff["node_type"] = up.get("nodeType")
+                    eff["repeat"] = up.get("repeatCount")
+                    eff["fill"] = up.get("fill")
+                    cond = up.find("p:stCondLst/p:cond", NS)
+                    eff["delay"] = cond.get("delay") if cond is not None else None
+                    eff["end_cond"] = up.find("p:endCondLst", NS) is not None
+                    break
+                up = parent.get(up)
+            up = parent.get(beh)
+            while up is not None:
+                if _local(up) == "seq":
+                    c = up.find("p:cTn", NS)
+                    eff["seq_restart"] = c.get("restart") if c is not None else None
+                    break
+                up = parent.get(up)
+            info["behaviors"].append({
+                "kind": kind,
+                "spid": tgt.get("spid") if tgt is not None else None,
+                "dur": inner.get("dur") if inner is not None else None,
+                "inner_fill": inner.get("fill") if inner is not None else None,
+                "by": beh.get("by"), "to": beh.get("to"),
+                "scale_by": scale_by,
+                "attr": ",".join(a.text or "" for a in beh.iter("{%s}attrName" % _P)),
+                "eff": eff,
+            })
+
+    return info
+
+
+def _wheel_profile(shapes, wheel, palette, clrmap):
+    """统计某个转盘候选内部的扇形块与纯数字文本。"""
+    kids = _descendants(shapes, wheel["sid"]) if wheel["tag"] == "grpSp" else []
+    sectors, numbers = [], []
+    for k in kids:
+        if k["tag"] != "sp":
+            continue
+        el = k["el"]
+        is_sector = _has_custgeom(el) or _prst(el) in ("pie", "chord", "blockArc", "arc")
+        if is_sector:
+            hx = _fill_hex(el, palette, clrmap)
+            lum = _lum(hx)
+            # 近白色（亮度≥0.95）的窄块视为扇形之间的分隔线，不计为扇形
+            if hx and lum is not None and lum < 0.95:
+                sectors.append({"hex": hx, "center": _center(k)})
+        txt = _shape_text(el).strip()
+        if txt.isdigit():
+            numbers.append({"num": int(txt), "pts": [p for _, p in _font_pts(el)]})
+    return sectors, numbers
+
+
+def _identify(shapes, palette, clrmap, timing):
+    """识别第 10 页的各类角色对象。"""
+    top = [s for s in shapes if s["depth"] == 0]
+    page_area = PAGE_W_CM * PAGE_H_CM
+    pics = [s for s in top if s["tag"] == "pic"]
+    bg = None
+    for s in pics:
+        if (abs(s["x"]) <= 0.15 and abs(s["y"]) <= 0.15
+                and abs(s["w"] - PAGE_W_CM) <= 0.35 and abs(s["h"] - PAGE_H_CM) <= 0.35):
+            bg = s
+            break
+    icons = [s for s in pics if s is not bg]
+
+    cross = None
+    for s in top:
+        if s["tag"] != "sp":
+            continue
+        if _prst(s["el"]) == "mathMultiply" or _shape_text(s["el"]).strip() in ("×", "✕", "x", "X", "*"):
+            cross = s
+            break
+
+    cands = []
+    for s in shapes:
+        if s["tag"] not in ("grpSp", "sp"):
+            continue
+        if min(s["w"], s["h"]) < 4.0:
+            continue
+        ratio = (s["w"] / s["h"]) if s["h"] else 0.0
+        if not (0.90 <= ratio <= 1.11):
+            continue
+        sec, num = _wheel_profile(shapes, s, palette, clrmap)
+        if len(sec) >= 6 or len(num) >= 6:
+            cands.append(s)
+    cand_sids = set(c["sid"] for c in cands)
+
+    def has_cand_ancestor(s):
+        p = s["parent"]
+        guard = 0
+        while p and guard < 20:
+            if p in cand_sids:
+                return True
+            up = [q for q in shapes if q["sid"] == p]
+            p = up[0]["parent"] if up else None
+            guard += 1
+        return False
+
+    cands = [c for c in cands if not has_cand_ancestor(c)]
+    cands.sort(key=_area, reverse=True)
+    wheels = sorted(cands[:2], key=lambda s: _center(s)[0])
+
+    wheel_sids = set(w["sid"] for w in wheels)
+    inside_wheel = set()
+    for w in wheels:
+        for k in _descendants(shapes, w["sid"]):
+            inside_wheel.add(k["sid"])
+
+    # 底板：顶层、有填充、完整包住某个转盘、面积为转盘的 1.05—2.5 倍
+    boards = []
+    for w in wheels:
+        pick = None
+        for s in top:
+            if s["tag"] != "sp" or s["sid"] in wheel_sids or (cross and s is cross):
+                continue
+            if _fill_hex(s["el"], palette, clrmap) is None:
+                continue
+            if not _contains(_rect(s), _rect(w)):
+                continue
+            ratio = _area(s) / _area(w) if _area(w) else 0.0
+            if 1.05 <= ratio <= 2.5:
+                if pick is None or _area(s) < _area(pick):
+                    pick = s
+        boards.append(pick)
+    board_sids = set(b["sid"] for b in boards if b)
+
+    # 按钮：优先取动画触发对象；否则取带文字、面积 < 页面 20% 的顶层形状
+    trig = set(x for seq in timing["seqs"] for x in seq["trigger_spids"] if x)
+    button = None
+    for s in top:
+        if s["tag"] != "sp" or s["sid"] in wheel_sids or s["sid"] in board_sids:
+            continue
+        if cross and s is cross:
+            continue
+        if not _shape_text(s["el"]).strip():
+            continue
+        if _area(s) > 0.20 * page_area:
+            continue
+        if s["sid"] in trig:
+            button = s
+            break
+        if button is None:
+            button = s
+
+    # 指针：顶层、不在转盘组内、面积≤转盘 15%、中心 x 与转盘中心对齐、位于转盘中心之上
+    pointers = []
+    for w in wheels:
+        wcx, wcy = _center(w)
+        pick = None
+        for s in top:
+            if s["tag"] not in ("sp", "pic", "cxnSp"):
+                continue
+            if s["sid"] in wheel_sids or s["sid"] in board_sids or s["sid"] in inside_wheel:
+                continue
+            if (cross and s is cross) or (button and s is button):
+                continue
+            if _area(w) and _area(s) > 0.15 * _area(w):
+                continue
+            cx, cy = _center(s)
+            if abs(cx - wcx) <= 0.3 and cy < wcy:
+                if pick is None or abs(_center(pick)[0] - wcx) > abs(cx - wcx):
+                    pick = s
+        pointers.append(pick)
+
+    return {"bg": bg, "bg_first": bool(bg) and bg["z"] == 0, "icons": icons,
+            "cross": cross, "wheels": wheels, "boards": boards,
+            "pointers": pointers, "button": button, "page_area": page_area}
+
+
+def _open_presentation(file_path):
+    """
+    打开演示文稿包。返回 (zipfile, dim1_reason)；reason 非空表示维度1 不通过。
+    仅做“能否打开、是不是 .pptx 演示文稿、是否被加密或锁定”这类格式层判定，
+    不涉及文件里的内容。
+    """
+    if not file_path.lower().endswith(".pptx"):
+        return None, "交付物不是 .pptx 演示文稿：%s" % os.path.basename(file_path)
+    try:
+        z = zipfile.ZipFile(file_path)
+    except zipfile.BadZipFile:
+        return None, "文件损坏或被加了打开密码，无法作为 .pptx 打开"
+    except Exception as exc:
+        return None, "文件无法打开：%s" % exc
+    names = set(z.namelist())
+    if "ppt/presentation.xml" not in names:
+        z.close()
+        return None, "包内缺少 ppt/presentation.xml，不是可编辑的 .pptx 演示文稿"
+    ct = _xml(z, "[Content_Types].xml")
+    if ct is not None:
+        macro_ct = any("macroEnabled.main+xml" in (o.get("ContentType") or "")
+                       for o in ct.iter() if o.get("ContentType"))
+        if macro_ct:
+            z.close()
+            return None, "含宏代码却存成 .pptx，打开时会报错"
+    custom = _xml(z, "docProps/custom.xml")
+    if custom is not None:
+        for prop in custom:
+            if (prop.get("name") or "") == "_MarkAsFinal":
+                vals = [(v.text or "").strip().lower() for v in list(prop)]
+                if "true" in vals or "1" in vals:
+                    z.close()
+                    return None, "文件被设为“标记为最终状态”，不可继续编辑"
+    if os.path.exists(file_path) and not os.access(file_path, os.W_OK):
+        z.close()
+        return None, "文件为只读，不可继续编辑"
+    return z, ""
+
+
+def evaluate(dir_path):
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
     }
+    try:
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError("目录不存在：%s" % dir_path)
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith(".pptx") and not f.startswith("~$"))
+        if not cands:
+            raise FileNotFoundError("目录内未找到 .pptx 文件：%s" % dir_path)
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except Exception as exc:
+        # status 为 error 时未能完成判定，dim1_pass 留空，dim1_reason 也为空
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+
+def _evaluate_impl(file_path, result):
+    results = []
+
+    # ---------------- 维度1：可用或可修改性（仅格式层闸门） ----------------
+    z, reason = _open_presentation(file_path)
+    if reason:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = reason
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = MAX_SCORE_TOTAL
+        return result
+    result["dim1_pass"] = True
+    # dim1_reason 只记录"维度一不通过的原因"，通过时保持为空字符串。
+    result["dim1_reason"] = ""
 
     try:
-        if not os.path.isdir(dir_path):
-            result["status"] = "error"
-            result["error"] = f"目录不存在：{dir_path}"
-            return result
+        names = z.namelist()
+        pres = _xml(z, "ppt/presentation.xml")
+        sld_sz = pres.find("p:sldSz", NS) if pres is not None else None
+        page_w = _cm(sld_sz.get("cx")) if sld_sz is not None else 0.0
+        page_h = _cm(sld_sz.get("cy")) if sld_sz is not None else 0.0
+        slide_parts = _slide_parts(z)
+        slide_roots = [_xml(z, n) for n in slide_parts]
+        palette, clrmap = _theme_palette(z)
 
-        file_path = _locate_document(dir_path)
-        if file_path is None:
-            result["status"] = "error"
-            result["error"] = f"目录中未找到 .pptx 文件：{dir_path}"
-            return result
-        result["file_name"] = os.path.basename(file_path)
+        idx10 = TARGET_INDEX - 1
+        root10 = slide_roots[idx10] if len(slide_roots) > idx10 else None
+        if root10 is None and slide_roots:
+            root10 = slide_roots[-1]
+        tree10 = root10.find("p:cSld/p:spTree", NS) if root10 is not None else None
+        shapes = _collect(tree10)
+        top10 = [s for s in shapes if s["depth"] == 0]
+        timing = _parse_timing(root10) if root10 is not None else _parse_timing(ET.Element("x"))
+        ident = _identify(shapes, palette, clrmap, timing)
+        wheels = ident["wheels"]
+        boards = ident["boards"]
+        pointers = ident["pointers"]
+        cross = ident["cross"]
+        button = ident["button"]
+        page_area = PAGE_W_CM * PAGE_H_CM
+        rots = [b for b in timing["behaviors"] if b["kind"] == "animRot"]
+        wheel_sids = [w["sid"] for w in wheels]
 
-        rep = Evaluator(file_path).run()
+        # 01 +1 乘号必须是能单独点选的对象（形状/文本框/图片/组合），画在背景像素里不得分
+        results.append(("+1：第10页存在一个可单独选中的乘号对象"
+                        if cross is not None else "+0：第10页存在一个可单独选中的乘号对象"))
 
-        result["dim1_pass"] = rep.dim1_pass
-        if not rep.dim1_pass:
-            # 维度一未通过：把关键原因串起来供人工回看
-            result["dim1_reason"] = "；".join(rep.dim1_reasons)
+        # 02 +3 乘号中心落在 (17.03, 9.71) cm，容差 0.3cm（对应“对象位置/大小”对话框）
+        ok = False
+        if cross is not None:
+            ccx, ccy = _center(cross)
+            ok = (abs(ccx - CROSS_CENTER_CM[0]) <= 0.3 and abs(ccy - CROSS_CENTER_CM[1]) <= 0.3)
+        results.append(("+3：乘号中心位于横向17.03厘米、纵向9.71厘米处，偏差不超过0.3厘米"
+                        if ok else "+0：乘号中心位于横向17.03厘米、纵向9.71厘米处，偏差不超过0.3厘米"))
 
-        items = []
-        total = 0
-        max_score = 0
-        for r in rep.rules:
-            delta = r.score if r.matched else 0
-            items.append({
-                "rule": r.title,
-                "max_delta": r.score,
-                "delta": delta,
-                "hit": r.matched,
-                "detail": "",
-            })
-            total += delta
-            if r.score > 0:
-                max_score += r.score
+        # 03 +1 乘号高 2.4—4.8cm、填充为亮色（亮度≥0.6）、被上层对象遮挡不超过 20%
+        ok = False
+        if cross is not None:
+            lum = _lum(_fill_hex(cross["el"], palette, clrmap))
+            cover = 0.0
+            for s in top10:
+                if s is cross or s["z"] <= cross["z"]:
+                    continue
+                cover += _inter_area(_rect(cross), _rect(s))
+            ok = (2.4 <= cross["h"] <= 4.8 and lum is not None and lum >= 0.6
+                  and (cover / _area(cross) if _area(cross) else 1.0) <= 0.20)
+        results.append(("+1：乘号高度在2.4至4.8厘米之间、填充为亮色，且被其他对象遮挡的面积不超过两成"
+                        if ok else "+0：乘号高度在2.4至4.8厘米之间、填充为亮色，且被其他对象遮挡的面积不超过两成"))
 
-        result["dim2_items"] = items
-        result["total_score"] = total
-        result["max_score"] = max_score
-    except Exception as e:
-        result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        # 04 +3 两个转盘一左一右、中心离 17.03cm 竖线≥2.5cm、中心 y 在 3—16cm、直径≥4cm
+        ok = False
+        if len(wheels) == 2:
+            c1, c2 = _center(wheels[0]), _center(wheels[1])
+            ok = (c1[0] < CENTER_X_CM < c2[0]
+                  and abs(c1[0] - CENTER_X_CM) >= 2.5 and abs(c2[0] - CENTER_X_CM) >= 2.5
+                  and all(3.0 <= c[1] <= 16.0 for c in (c1, c2))
+                  and all(min(w["w"], w["h"]) >= 4.0 for w in wheels))
+        results.append(("+3：页面上有两个转盘，一个在左、一个在右，中心距横向17.03厘米竖线各不少于2.5厘米，中心纵向都在3至16厘米之间，直径都不小于4厘米"
+                        if ok else "+0：页面上有两个转盘，一个在左、一个在右，中心距横向17.03厘米竖线各不少于2.5厘米，中心纵向都在3至16厘米之间，直径都不小于4厘米"))
 
+        # 05 +3 每盘扇形≥6 块、颜色≥4 种、按角度排序后相邻两块不同色
+        ok = len(wheels) == 2
+        for w in wheels:
+            sec, _num = _wheel_profile(shapes, w, palette, clrmap)
+            if len(sec) < 6 or len(set(s["hex"] for s in sec)) < 4:
+                ok = False
+                break
+            wc = _center(w)
+            order = sorted(sec, key=lambda s: math.atan2(s["center"][1] - wc[1],
+                                                         s["center"][0] - wc[0]))
+            for i in range(len(order)):
+                if order[i]["hex"] == order[(i + 1) % len(order)]["hex"]:
+                    ok = False
+                    break
+        results.append(("+3：每个转盘都被分成不少于6块扇形，用了不少于4种颜色，且相邻两块颜色不同"
+                        if ok else "+0：每个转盘都被分成不少于6块扇形，用了不少于4种颜色，且相邻两块颜色不同"))
+
+        # 06 +3 每盘纯数字文本≥6 个、个数与扇形块数一致、盘内不重复
+        ok = len(wheels) == 2
+        wheel_nums = []
+        for w in wheels:
+            sec, num = _wheel_profile(shapes, w, palette, clrmap)
+            vals = [n["num"] for n in num]
+            wheel_nums.append(num)
+            if len(vals) < 6 or len(vals) != len(sec) or len(set(vals)) != len(vals):
+                ok = False
+        results.append(("+3：每个转盘的扇形里各写着一个数字，数量不少于6个、与扇形块数一一对应且同盘内不重复"
+                        if ok else "+0：每个转盘的扇形里各写着一个数字，数量不少于6个、与扇形块数一一对应且同盘内不重复"))
+
+        # 07 +1 一盘全是 1—9 的一位数，另一盘全是 10—90 的整十数
+        ok = False
+        if len(wheel_nums) == 2 and all(wheel_nums):
+            a = [n["num"] for n in wheel_nums[0]]
+            b = [n["num"] for n in wheel_nums[1]]
+            single = lambda v: all(1 <= x <= 9 for x in v)
+            tens = lambda v: all(10 <= x <= 90 and x % 10 == 0 for x in v)
+            ok = (single(a) and tens(b)) or (single(b) and tens(a))
+        results.append(("+1：一个转盘上的数字全是1到9的一位数，另一个转盘上的数字全是10到90的整十数"
+                        if ok else "+0：一个转盘上的数字全是1到9的一位数，另一个转盘上的数字全是10到90的整十数"))
+
+        # 08 +3 两个指针各归一盘、中心 x 与转盘中心差≤0.3cm、面积≤转盘 15%、不在旋转组内
+        ok = (len(wheels) == 2 and all(p is not None for p in pointers)
+              and pointers[0] is not pointers[1])
+        if ok:
+            for w, p in zip(wheels, pointers):
+                if abs(_center(p)[0] - _center(w)[0]) > 0.3:
+                    ok = False
+                if _area(w) and _area(p) > 0.15 * _area(w):
+                    ok = False
+                if p["sid"] in [k["sid"] for k in _descendants(shapes, w["sid"])]:
+                    ok = False
+        results.append(("+3：两个转盘各配一个指针、共2个，指针中心与所属转盘中心的横向偏差不超过0.3厘米，面积不超过转盘的15%，且不随转盘一起旋转"
+                        if ok else "+0：两个转盘各配一个指针、共2个，指针中心与所属转盘中心的横向偏差不超过0.3厘米，面积不超过转盘的15%，且不随转盘一起旋转"))
+
+        # 09 +1 底板完整包住转盘、面积为转盘的 1.05—2.5 倍，且盘上数字字号≥12 磅
+        ok = (len(wheels) == 2 and all(b is not None for b in boards))
+        if ok:
+            for num in wheel_nums:
+                for n in num:
+                    if any(p < 12.0 for p in n["pts"]) or not n["pts"]:
+                        ok = False
+        results.append(("+1：每个转盘下方都有一块把转盘完整包住的底板，底板面积是转盘的1.05至2.5倍，盘上数字字号不小于12磅"
+                        if ok else "+0：每个转盘下方都有一块把转盘完整包住的底板，底板面积是转盘的1.05至2.5倍，盘上数字字号不小于12磅"))
+
+        # 10 +3 两盘宽差、高差均≤0.1cm（对应“大小”面板的宽度/高度）
+        ok = (len(wheels) == 2 and abs(wheels[0]["w"] - wheels[1]["w"]) <= 0.1
+              and abs(wheels[0]["h"] - wheels[1]["h"]) <= 0.1)
+        results.append(("+3：两个转盘的宽度差和高度差都不超过0.1厘米"
+                        if ok else "+0：两个转盘的宽度差和高度差都不超过0.1厘米"))
+
+        # 11 +3 两盘中心纵坐标差≤0.1cm（左右齐平）
+        ok = (len(wheels) == 2
+              and abs(_center(wheels[0])[1] - _center(wheels[1])[1]) <= 0.1)
+        results.append(("+3：两个转盘的中心纵坐标差不超过0.1厘米，左右齐平"
+                        if ok else "+0：两个转盘的中心纵坐标差不超过0.1厘米，左右齐平"))
+
+        # 12 +3 两盘中心横坐标的中点与 17.03cm 差≤0.3cm（整体关于乘号左右对称）
+        ok = False
+        if len(wheels) == 2:
+            mid = (_center(wheels[0])[0] + _center(wheels[1])[0]) / 2.0
+            ok = abs(mid - CENTER_X_CM) <= 0.3
+        results.append(("+3：两个转盘中心横坐标的中点与横向17.03厘米的偏差不超过0.3厘米，整体左右对称"
+                        if ok else "+0：两个转盘中心横坐标的中点与横向17.03厘米的偏差不超过0.3厘米，整体左右对称"))
+
+        # 13 +1 新增对象全部落在页面内，且左右两个转盘单元（转盘+底板+指针）互不重叠
+        added = [s for s in [cross, button] + list(wheels) + list(boards) + list(pointers) if s]
+        ok = bool(added)
+        for s in added:
+            r = _rect(s)
+            if r[0] < -0.05 or r[1] < -0.05 or r[2] > PAGE_W_CM + 0.05 or r[3] > PAGE_H_CM + 0.05:
+                ok = False
+        if len(wheels) == 2:
+            units = []
+            for i in range(2):
+                parts = [wheels[i]] + ([boards[i]] if boards[i] else []) \
+                        + ([pointers[i]] if pointers[i] else [])
+                rs = [_rect(p) for p in parts]
+                units.append((min(r[0] for r in rs), min(r[1] for r in rs),
+                              max(r[2] for r in rs), max(r[3] for r in rs)))
+            if _inter_area(units[0], units[1]) > 0:
+                ok = False
+        else:
+            ok = False
+        results.append(("+1：新增的对象都完整落在页面范围内，左右两个转盘单元互不重叠"
+                        if ok else "+0：新增的对象都完整落在页面范围内，左右两个转盘单元互不重叠"))
+
+        # 14 +3 有且只有一个带文字的按钮，并且它是两个转盘旋转动画的触发对象
+        trig_all = set(x for seq in timing["seqs"] for x in seq["trigger_spids"] if x)
+        rot_sids = set(b["spid"] for b in rots if b["spid"])
+        ok = (button is not None and _shape_text(button["el"]).strip() != ""
+              and button["sid"] in trig_all and len(wheel_sids) == 2
+              and rot_sids == set(wheel_sids))
+        results.append(("+3：页面上有一个写着文字的控制按钮，单击它就能让两个转盘转起来"
+                        if ok else "+0：页面上有一个写着文字的控制按钮，单击它就能让两个转盘转起来"))
+
+        # 15 +1 按钮中心 x 与 17.03cm 差≤0.5cm，且位于两个转盘中心连线之下
+        ok = False
+        if button is not None and len(wheels) == 2:
+            bcx, bcy = _center(button)
+            ok = (abs(bcx - CENTER_X_CM) <= 0.5
+                  and bcy > max(_center(w)[1] for w in wheels))
+        results.append(("+1：按钮中心与横向17.03厘米的偏差不超过0.5厘米，且位于两个转盘中心的下方"
+                        if ok else "+0：按钮中心与横向17.03厘米的偏差不超过0.5厘米，且位于两个转盘中心的下方"))
+
+        # 16 +1 按钮是带填色的矩形/圆角矩形/椭圆类形状，字号≥14 磅，底色与文字明暗差≥0.25
+        ok = False
+        if button is not None:
+            prst = _prst(button["el"])
+            shape_ok = (prst in ("roundRect", "round1Rect", "round2SameRect", "round2DiagRect",
+                                 "rect", "ellipse", "snip1Rect", "snipRoundRect", "flowChartTerminator")
+                        or _has_custgeom(button["el"]))
+            fill = _fill_hex(button["el"], palette, clrmap)
+            pts = [p for _, p in _font_pts(button["el"])]
+            l1 = _lum(fill)
+            l2 = _lum(_text_hex(button["el"], palette, clrmap))
+            ok = (shape_ok and fill is not None and pts and min(pts) >= 14.0
+                  and l1 is not None and l2 is not None and abs(l1 - l2) >= 0.25)
+        results.append(("+1：按钮是带填充色的圆角矩形一类形状，文字字号不小于14磅，底色与文字明暗对比明显"
+                        if ok else "+0：按钮是带填充色的圆角矩形一类形状，文字字号不小于14磅，底色与文字明暗对比明显"))
+
+        # 17 +5 单击按钮后两盘同时开始转，没有先后延迟
+        #    对应动画窗格：两条旋转效果的“开始”分别为“单击时”和“与上一动画同时”，延迟 0 秒
+        ok = False
+        if len(rots) == 2 and button is not None and rot_sids == set(wheel_sids):
+            delays = [(b["eff"]["delay"] in (None, "0", "0ms")) for b in rots]
+            types = [b["eff"]["node_type"] for b in rots]
+            in_inter = any(seq["node_type"] == "interactiveSeq"
+                           and button["sid"] in seq["trigger_spids"] for seq in timing["seqs"])
+            ok = all(delays) and "withEffect" in types and in_inter
+        results.append(("+5：单击按钮后两个转盘同时开始旋转，两者之间没有先后延迟"
+                        if ok else "+0：单击按钮后两个转盘同时开始旋转，两者之间没有先后延迟"))
+
+        # 18 +5 两条旋转都是无限重复，单圈整 360 度（by=±21600000，即 ±360×60000）
+        ok = len(rots) == 2
+        for b in rots:
+            if b["eff"]["repeat"] != "indefinite":
+                ok = False
+            try:
+                if abs(int(b["by"])) != 21600000:
+                    ok = False
+            except (TypeError, ValueError):
+                ok = False
+        results.append(("+5：两个转盘都是无限重复地转，单圈刚好转满360度"
+                        if ok else "+0：两个转盘都是无限重复地转，单圈刚好转满360度"))
+
+        # 19 +5 再次单击同一按钮两盘同时停下，并可反复启停
+        #    对应：p:seq 带 nextCondLst（onClick 指向按钮）+ 另一组 delay="indefinite" 的触发分支
+        ok = False
+        if button is not None:
+            for seq in timing["seqs"]:
+                if button["sid"] in seq["next_spids"] and seq["has_indefinite_start"]:
+                    ok = True
+        results.append(("+5：再次单击同一个按钮，两个转盘同时停下，并且可以反复启动和停止"
+                        if ok else "+0：再次单击同一个按钮，两个转盘同时停下，并且可以反复启动和停止"))
+
+        # 20 +3 暂停后停在当前角度：用相对旋转量 by（而非绝对 to），且效果保持结束状态 fill=hold
+        ok = len(rots) == 2
+        for b in rots:
+            if not b["by"] or b["to"]:
+                ok = False
+            if b["eff"]["fill"] != "hold" or b["inner_fill"] not in ("hold", None):
+                ok = False
+        results.append(("+3：暂停后转盘停在当前角度而不回到起始位置，动画用相对旋转量并保持结束状态"
+                        if ok else "+0：暂停后转盘停在当前角度而不回到起始位置，动画用相对旋转量并保持结束状态"))
+
+        # 21 +3 只由按钮控制：没有“单击任意处/自动播放”的主序列，所有单击触发都指向按钮
+        ok = (not timing["has_main_seq"] and button is not None
+              and bool(timing["onclick_spids"])
+              and all(sp == button["sid"] for sp in timing["onclick_spids"]))
+        results.append(("+3：旋转只能由这个按钮控制，既不是单击页面任意处触发，也不是打开页面就自动播放"
+                        if ok else "+0：旋转只能由这个按钮控制，既不是单击页面任意处触发，也不是打开页面就自动播放"))
+
+        # 22 +3 只有两个转盘在动；按钮自身的占位动画（≤0.1 秒且缩放 100%）不算多余动画
+        ok = len(rots) == 2 and rot_sids == set(wheel_sids)
+        for b in timing["behaviors"]:
+            if b["spid"] in wheel_sids:
+                continue
+            try:
+                dur = int(b["dur"])
+            except (TypeError, ValueError):
+                dur = 99999
+            placeholder = (b["kind"] == "animScale" and dur <= 100
+                           and b["scale_by"] == ("100000", "100000"))
+            if not placeholder:
+                ok = False
+        results.append(("+3：整页只有两个转盘在动，没有给其他对象额外加动画"
+                        if ok else "+0：整页只有两个转盘在动，没有给其他对象额外加动画"))
+
+        # 23 +3 绕自身圆心转：旋转对象外框宽高比 0.95—1.05，且外框中心与扇形分布中心差≤0.2cm
+        ok = len(rots) == 2 and len(wheels) == 2
+        for w in wheels:
+            if w["sid"] not in rot_sids:
+                ok = False
+                continue
+            ratio = (w["w"] / w["h"]) if w["h"] else 0.0
+            if not (0.95 <= ratio <= 1.05):
+                ok = False
+            sec, _num = _wheel_profile(shapes, w, palette, clrmap)
+            if sec:
+                mx = sum(s["center"][0] for s in sec) / len(sec)
+                my = sum(s["center"][1] for s in sec) / len(sec)
+                wc = _center(w)
+                if math.hypot(wc[0] - mx, wc[1] - my) > 0.2:
+                    ok = False
+            else:
+                ok = False
+        results.append(("+3：转盘是绕自己的圆心转的，外框接近正方形，旋转中心与扇形圆心偏差不超过0.2厘米"
+                        if ok else "+0：转盘是绕自己的圆心转的，外框接近正方形，旋转中心与扇形圆心偏差不超过0.2厘米"))
+
+        # 24 +1 单圈耗时 0.3—1 秒（动画窗格“持续时间”300—1000 毫秒）
+        ok = len(rots) == 2
+        for b in rots:
+            try:
+                if not (300 <= int(b["dur"]) <= 1000):
+                    ok = False
+            except (TypeError, ValueError):
+                ok = False
+        results.append(("+1：转盘转一圈用0.3至1秒，快慢适合课堂抢答"
+                        if ok else "+0：转盘转一圈用0.3至1秒，快慢适合课堂抢答"))
+
+        # 25 +1 每盘由一个组合承担旋转、嵌套不超过 4 层，且不是图片或视频在转
+        ok = len(wheels) == 2
+        for w in wheels:
+            if w["tag"] != "grpSp" or w["sid"] not in rot_sids:
+                ok = False
+                continue
+            if _max_depth(shapes, w["sid"]) > 4:
+                ok = False
+            for k in _descendants(shapes, w["sid"]):
+                if k["tag"] == "pic" or k["el"].find(".//p:nvPr/a:videoFile", NS) is not None:
+                    ok = False
+        results.append(("+1：每个转盘由一个组合整体承担旋转，组合嵌套不超过4层，转的不是图片或视频"
+                        if ok else "+0：每个转盘由一个组合整体承担旋转，组合嵌套不超过4层，转的不是图片或视频"))
+
+        # 26 −3 背景图必须还在原位：铺满整页、位于 (0,0)、且是 spTree 里的第一个对象（最底层）
+        bad = (ident["bg"] is None) or (not ident["bg_first"])
+        results.append(("−3：第10页铺满整页的背景图被删除、移动、改了尺寸，或不再位于最底层"
+                        if bad else "−0：第10页铺满整页的背景图被删除、移动、改了尺寸，或不再位于最底层"))
+
+        # 27 −3 不得再压一层覆盖页面 60% 以上的图片或视频（整页贴图、整页录屏视频）
+        bad = False
+        for s in top10:
+            if s is ident["bg"]:
+                continue
+            is_media = (s["tag"] == "pic") or (s["el"].find(".//a:videoFile", NS) is not None) \
+                or (s["el"].find(".//p:nvPr/p:audioFile", NS) is not None)
+            if is_media and _area(s) >= 0.60 * page_area:
+                bad = True
+        results.append(("−3：第10页多出了一个覆盖页面六成以上的图片或视频对象"
+                        if bad else "−0：第10页多出了一个覆盖页面六成以上的图片或视频对象"))
+
+        # 28 −1 4 个小图标位置与大小基线（cm）：见 ICONS_CM，位置容差 0.30、尺寸容差 0.15
+        bad = len(ident["icons"]) != 4
+        if not bad:
+            used = []
+            for exp in ICONS_CM:
+                match = None
+                for s in ident["icons"]:
+                    if s in used:
+                        continue
+                    if (abs(s["x"] - exp[0]) <= 0.30 and abs(s["y"] - exp[1]) <= 0.30
+                            and abs(s["w"] - exp[2]) <= 0.15 and abs(s["h"] - exp[2]) <= 0.15):
+                        match = s
+                        break
+                if match is None:
+                    bad = True
+                    break
+                used.append(match)
+        results.append(("−1：第10页原有的4个小图标中有被删除、被移动或被改了大小的"
+                        if bad else "−0：第10页原有的4个小图标中有被删除、被移动或被改了大小的"))
+
+        # 29 −3 原粉色椭圆区域（11.54,3.73)-(22.52,15.68) 不得被单个新增对象盖住过半
+        er = ELLIPSE_RECT_CM
+        er_area = (er[2] - er[0]) * (er[3] - er[1])
+        bad = False
+        for s in top10:
+            if s is ident["bg"] or _area(s) >= 0.95 * page_area:
+                continue
+            if er_area and _inter_area(er, _rect(s)) / er_area > 0.50:
+                bad = True
+        results.append(("−3：原来放粉色椭圆的那片区域被某个新增对象盖住了一半以上"
+                        if bad else "−0：原来放粉色椭圆的那片区域被某个新增对象盖住了一半以上"))
+
+        # 30 −1 页面上残留提示字样，或出现面积超过页面 15% 且没有文字的纯色块
+        page_text = "".join(_shape_text(s["el"]) for s in shapes if s["tag"] == "sp")
+        low = page_text.lower()
+        bad = any(w.lower() in low for w in BANNED_WORDS)
+        for s in top10:
+            if s["tag"] != "sp" or _shape_text(s["el"]).strip():
+                continue
+            if _fill_hex(s["el"], palette, clrmap) and _area(s) > 0.15 * page_area:
+                bad = True
+        results.append(("−1：第10页残留了“同步/双转盘/示例/demo/水印/模板/参考图”之类的说明文字，或多出面积超过页面15%的无文字纯色块"
+                        if bad else "−0：第10页残留了“同步/双转盘/示例/demo/水印/模板/参考图”之类的说明文字，或多出面积超过页面15%的无文字纯色块"))
+
+        # 31 −5 页数必须是 11 页，页面尺寸必须是 33.87×19.05cm（容差 0.1cm）
+        bad = (len(slide_parts) != SLIDE_COUNT
+               or abs(page_w - PAGE_W_CM) > 0.1 or abs(page_h - PAGE_H_CM) > 0.1)
+        results.append(("−5：演示文稿不是11页，或页面尺寸不是宽33.87厘米、高19.05厘米"
+                        if bad else "−0：演示文稿不是11页，或页面尺寸不是宽33.87厘米、高19.05厘米"))
+
+        # 32 −5 第 1—9、11 页文字指纹必须与内联 SHA-1 完全一致（改字、删框、加框都会变）
+        bad = False
+        for page, want in TEXT_SHA1.items():
+            i = page - 1
+            if i >= len(slide_roots) or slide_roots[i] is None:
+                bad = True
+                continue
+            got, _n = _text_sha1(slide_roots[i].find("p:cSld/p:spTree", NS))
+            if got != want:
+                bad = True
+        results.append(("−5：除第10页以外的其余10页文字被改动了，与原有文字指纹不符"
+                        if bad else "−0：除第10页以外的其余10页文字被改动了，与原有文字指纹不符"))
+
+        # 33 −3 任意页出现自动缩小字号或压缩行距（a:normAutofit 带 fontScale/lnSpcReduction）
+        bad = False
+        for root in slide_roots:
+            if root is None:
+                continue
+            for af in root.iter("{%s}normAutofit" % _A):
+                if af.get("fontScale") or af.get("lnSpcReduction"):
+                    bad = True
+        results.append(("−3：有页面的文本框出现了自动缩小字号或压缩行距，说明文字装不下了"
+                        if bad else "−0：有页面的文本框出现了自动缩小字号或压缩行距，说明文字装不下了"))
+
+        # 34 −1 不得有隐藏页（p:sld@show="0"）或页面切换效果（p:transition）
+        bad = False
+        for root in slide_roots:
+            if root is None:
+                continue
+            if root.get("show") == "0":
+                bad = True
+            if root.find(".//p:transition", NS) is not None:
+                bad = True
+        results.append(("−1：演示文稿里出现了隐藏页或页面切换效果"
+                        if bad else "−0：演示文稿里出现了隐藏页或页面切换效果"))
+
+        # 35 −1 母版应为 2 个、版式 3 个，主题中英文字体均为 Microsoft YaHei
+        masters = len([n for n in names if re.match(r"ppt/slideMasters/slideMaster\d+\.xml$", n)])
+        layouts = len([n for n in names if re.match(r"ppt/slideLayouts/slideLayout\d+\.xml$", n)])
+        theme = _xml(z, "ppt/theme/theme1.xml")
+        fonts = []
+        if theme is not None:
+            for tag in ("majorFont", "minorFont"):
+                node = theme.find(".//a:fontScheme/a:%s/a:latin" % tag, NS)
+                fonts.append((node.get("typeface") or "") if node is not None else "")
+        bad = (masters != MASTER_COUNT or layouts != LAYOUT_COUNT
+               or fonts != [THEME_FONT_EXPECT, THEME_FONT_EXPECT])
+        results.append(("−1：母版数量不是2个、版式数量不是3个，或主题字体不再是 Microsoft YaHei"
+                        if bad else "−0：母版数量不是2个、版式数量不是3个，或主题字体不再是 Microsoft YaHei"))
+
+        # 36 −1 每页备注都应保留一段以“课堂备注：”开头、长度 40—90 字的段落
+        #    注意：备注页里还有日期与页码占位符，必须逐段匹配，不能拿整页备注文本判断
+        bad = False
+        for part in slide_parts:
+            rels = _rels(z, part)
+            note_part = None
+            for _rid, (target, _mode) in rels.items():
+                if "notesSlide" in target:
+                    note_part = "ppt/notesSlides/" + os.path.basename(target)
+            hit_note = False
+            note_root = _xml(z, note_part) if note_part else None
+            if note_root is not None:
+                for para in note_root.iter("{%s}p" % _A):
+                    txt = "".join(t.text or "" for t in para.iter("{%s}t" % _A)).strip()
+                    if txt.startswith(NOTE_PREFIX) and NOTE_LEN_RANGE[0] <= len(txt) <= NOTE_LEN_RANGE[1]:
+                        hit_note = True
+            if not hit_note:
+                bad = True
+        results.append(("−1：有页面的备注丢了或被改写，缺少以“课堂备注：”开头、长度40到90字的段落"
+                        if bad else "−0：有页面的备注丢了或被改写，缺少以“课堂备注：”开头、长度40到90字的段落"))
+
+        # 37 −3 不得夹带宏代码（vbaProject.bin）
+        bad = any(n.lower().endswith("vbaproject.bin") for n in names)
+        results.append(("−3：文件里夹带了宏代码"
+                        if bad else "−0：文件里夹带了宏代码"))
+
+        # 38 −3 不得用外部链接的媒体（换台机器就播不出来）
+        bad = False
+        for part in [n for n in names if n.endswith(".rels")]:
+            root = _xml(z, part)
+            if root is None:
+                continue
+            for rel in root:
+                if (rel.get("TargetMode") or "") == "External":
+                    tgt = (rel.get("Target") or "").lower()
+                    if re.search(r"\.(mp4|avi|wmv|mov|mkv|flv|mp3|wav|wma|m4a|gif)($|\?)", tgt) \
+                            or "video" in (rel.get("Type") or "").lower() \
+                            or "audio" in (rel.get("Type") or "").lower() \
+                            or "image" in (rel.get("Type") or "").lower():
+                        bad = True
+        results.append(("−3：页面上的音视频或图片用的是外部链接，不是嵌入到文件里"
+                        if bad else "−0：页面上的音视频或图片用的是外部链接，不是嵌入到文件里"))
+
+        # 39 −1 体积不得超过 18MB，且不得留下没被任何页面引用的冗余素材
+        size = os.path.getsize(file_path)
+        referenced = set()
+        for part in [n for n in names if n.endswith(".rels")]:
+            root = _xml(z, part)
+            if root is None:
+                continue
+            for rel in root:
+                tgt = (rel.get("Target") or "").replace("../", "")
+                if tgt:
+                    referenced.add(os.path.basename(tgt))
+        media = [n for n in names if n.startswith("ppt/media/") and not n.endswith("/")]
+        unused = [n for n in media if os.path.basename(n) not in referenced]
+        bad = (size > SIZE_LIMIT_BYTES) or bool(unused)
+        results.append(("−1：文件体积超过18MB，或包里残留了没被任何页面引用的冗余素材"
+                        if bad else "−0：文件体积超过18MB，或包里残留了没被任何页面引用的冗余素材"))
+
+        # 40 −1 文件名必须是“口算教学课件.pptx”
+        bad = os.path.basename(file_path) != FILE_NAME_EXPECT
+        results.append(("−1：文件名不是“口算教学课件.pptx”"
+                        if bad else "−0：文件名不是“口算教学课件.pptx”"))
+
+        # 41 −1 第10页不得留下空形状（无文字且无填充无边框）、页面外对象或完全重复的对象
+        bad = False
+        for s in shapes:
+            if s["tag"] == "sp" and not _shape_text(s["el"]).strip():
+                spPr = s["el"].find("p:spPr", NS)
+                no_fill = spPr is not None and spPr.find("a:noFill", NS) is not None
+                ln = spPr.find("a:ln", NS) if spPr is not None else None
+                no_line = (ln is None) or (ln.find("a:noFill", NS) is not None)
+                if no_fill and no_line:
+                    bad = True
+            r = _rect(s)
+            if r[2] <= 0 or r[3] <= 0 or r[0] >= PAGE_W_CM or r[1] >= PAGE_H_CM:
+                bad = True
+        sig = [(s["name"], round(s["x"], 2), round(s["y"], 2), round(s["w"], 2), round(s["h"], 2))
+               for s in top10]
+        if len(sig) != len(set(sig)):
+            bad = True
+        results.append(("−1：第10页留下了空形状、跑到页面外的对象，或完全重复的对象"
+                        if bad else "−0：第10页留下了空形状、跑到页面外的对象，或完全重复的对象"))
+
+        # 42 −3 第 1—9、11 页不得被加动画（这些页原本没有任何动画）
+        bad = False
+        for i, root in enumerate(slide_roots):
+            if root is None or i == idx10:
+                continue
+            t = _parse_timing(root)
+            if t["behaviors"]:
+                bad = True
+        results.append(("−3：第1到9页或第11页被加上了动画"
+                        if bad else "−0：第1到9页或第11页被加上了动画"))
+
+        # 43 −1 第10页不得放音频或视频对象（旋转应由动画实现）
+        bad = False
+        if root10 is not None:
+            for tag in ("videoFile", "audioFile", "wavAudioFile", "audioCd"):
+                if root10.find(".//a:%s" % tag, NS) is not None:
+                    bad = True
+            if root10.find(".//p:nvPr/p:media", NS) is not None:
+                bad = True
+        results.append(("−1：第10页放了音频或视频对象"
+                        if bad else "−0：第10页放了音频或视频对象"))
+
+        # 44 −1 第10页不得用单击跳转超链接（会跳走而不是原地转）
+        bad = False
+        if root10 is not None:
+            for hl in root10.iter("{%s}hlinkClick" % _A):
+                if hl.get("{%s}id" % NS["r"]) or hl.get("action"):
+                    bad = True
+        results.append(("−1：第10页的对象被加了单击跳转的超链接"
+                        if bad else "−0：第10页的对象被加了单击跳转的超链接"))
+
+        # 45 −1 文档属性（标题、主题、作者）不得被清空或改错
+        core = _xml(z, "docProps/core.xml")
+        title = subject = creator = ""
+        if core is not None:
+            for tag, ns_key in (("title", "dc"), ("subject", "dc"), ("creator", "dc")):
+                node = core.find("%s:%s" % (ns_key, tag), NS)
+                val = (node.text or "").strip() if node is not None else ""
+                if tag == "title":
+                    title = val
+                elif tag == "subject":
+                    subject = val
+                else:
+                    creator = val
+        bad = (title != DOC_TITLE_EXPECT or subject != DOC_SUBJECT_EXPECT or not creator)
+        results.append(("−1：文档属性里的标题、主题或作者被清空或改错了"
+                        if bad else "−0：文档属性里的标题、主题或作者被清空或改错了"))
+
+
+
+
+
+
+
+
+
+    finally:
+        z.close()
+
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        token = head.replace("+", "").replace("−", "-").replace("－", "-").strip()
+        try:
+            delta = int(token)
+        except ValueError:
+            delta = 0
+        hit = delta != 0
+        dim2_items.append({"rule": rule, "max_delta": max_delta,
+                           "delta": max_delta if hit else 0,
+                           "hit": hit})
+        total_score += (max_delta if hit else 0)
+    result["dim2_items"] = dim2_items
+    result["total_score"] = max(0, total_score)
+    result["max_score"] = MAX_SCORE_TOTAL
     return result
 
 
 if __name__ == "__main__":
-    # 仅本地调试：传入脚本所在目录（默认取脚本自身所在目录）
-    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(
-        os.path.abspath(__file__)
-    )
-    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))
+
+
+
+
+
+
+
+
+
+
+
+

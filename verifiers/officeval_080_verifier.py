@@ -1,1178 +1,1341 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-自动评估脚本：对 “公开课_改造发布版_按要求修改_动画版.pptx” 按打分细则打分。
-
-评估逻辑：
-  维度1（可用与可修改性）：不满足 -> 直接 0 分，不再检查维度2。
-  维度2（完成度）：满足维度1后逐条检查。
-     - 加分细则：需满足细则内的“每一个点”才加分。
-     - 扣分细则：满足细则内“任意一点”即扣分。
-  最终打印命中的每条细则及总分。
-
-对于难以纯代码判定的点（例如图片画面内容、动画“效果不完全相同”），
-采用可量化的代理特征（图片存在性/尺寸/位置、动画 filter/preset 的差异性等）灵活实现评估意图。
-"""
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
 import os
 import re
 import sys
 import json
-from pathlib import Path
-from lxml import etree
+import math
 from pptx import Presentation
-from pptx.util import Emu
 
-A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
-P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
-NS = {"a": A_NS, "p": P_NS}
-
-EMU_PER_CM = 360000.0
-
-
-def cm(v):
-    return None if v is None else v / EMU_PER_CM
-
-
-def approx(value, target, tol):
-    return value is not None and abs(value - target) <= tol
-
-
-# ----------------------------------------------------------------------------
-# 辅助：提取形状信息 / 字号 / 动画 / 切换 / 背景
-# ----------------------------------------------------------------------------
-
-def all_runs_sizes(shape):
-    """返回 shape 内所有 run 的字号（pt）列表。"""
-    sizes = []
-    if not shape.has_text_frame:
-        return sizes
-    for para in shape.text_frame.paragraphs:
-        # 段落级默认字号
-        para_sz = None
-        try:
-            if para.font.size is not None:
-                para_sz = para.font.size.pt
-        except Exception:
-            pass
-        runs = para.runs
-        if not runs and para_sz is not None:
-            sizes.append(para_sz)
-        for r in runs:
-            sz = None
-            try:
-                if r.font.size is not None:
-                    sz = r.font.size.pt
-            except Exception:
-                pass
-            if sz is None:
-                sz = para_sz
-            if sz is not None:
-                sizes.append(sz)
-    return sizes
-
-
-def shape_text(shape):
-    if shape.has_text_frame:
-        return shape.text_frame.text
-    return ""
-
-
-def find_shape_by_text(slide, needle):
-    needle = needle.lower()
-    for sh in slide.shapes:
-        if needle in shape_text(sh).lower():
-            return sh
-    return None
-
-
-def get_transition(slide):
-    """返回 (effect_name, signature)；无“放映可见且可启动”的切换返回 (None, None)。
-
-    “放映时能看到且能启动”的判定（需同时满足）：
-      1) 须有具体效果子元素：transition 节点下存在效果子元素（fade/push/wipe…），
-         空 transition 节点（无效果名）不算。
-      2) 须可触发：advClick != "false"（单击翻页可播放）或设置了 advTm（自动翻页）。
-         若 advClick="false" 且无 advTm，则放映时永远不会推进、切换不会播放。
-      3) 速度正常可见：spd 不为异常的极快值（仅接受 slow/med/fast 或缺省；
-         其他异常取值视为不可见）。
-      4) 效果须为目标办公软件（WPS 演示）实际可渲染：部分 OOXML 切换效果
-         WPS 演示不支持，放映/切换面板表现为“无”，这类效果视为不可见。
-    签名包含效果名 + 方向/取向等属性，用于“任意两页不完全相同”的比较。
-    """
-    # WPS 演示不支持渲染的切换效果（放映看不到、切换面板显示“无”）。
-    WPS_UNSUPPORTED = {"uncover"}
-
-    tr = slide._element.find(".//p:transition", NS)
-    if tr is None:
-        return None, None
-
-    tr_attrs = dict(tr.attrib)
-
-    # 条件2：须可触发
-    adv_click = tr_attrs.get("advClick", "true")
-    adv_tm = tr_attrs.get("advTm")
-    if str(adv_click).lower() == "false" and not adv_tm:
-        return None, None
-
-    # 条件3：速度正常可见
-    spd = tr_attrs.get("spd")
-    if spd is not None and spd not in ("slow", "med", "fast"):
-        return None, None
-
-    # 条件1+4：须有具体效果子元素，且该效果在 WPS 演示中可实际渲染
-    for child in tr:
-        name = etree.QName(child).localname
-        if name in WPS_UNSUPPORTED:
-            return None, None
-        attrs = dict(child.attrib)
-        sig = name + "|" + "|".join("%s=%s" % (k, attrs[k]) for k in sorted(attrs))
-        return name, sig
-
-    # 有 transition 节点但无具体效果子元素 —— 放映时无可见切换效果
-    return None, None
-
-
-def animation_targets(slide):
-    """返回该页所有动画目标 spid -> filter/preset 列表。
-    用于判断哪些 shape 设了动画、各组动画是否不完全相同。"""
-    timing = slide._element.find(".//p:timing", NS)
-    result = {}  # spid -> list of effect signatures
-    if timing is None:
-        return result
-    # 遍历 animEffect / anim / set / animClr 等，向上找 cBhvr/spTgt
-    for spTgt in timing.iter("{%s}spTgt" % P_NS):
-        spid = spTgt.get("spid")
-        # 找最近的 animEffect / anim 等兄弟祖先以取 filter
-        node = spTgt
-        sig = None
-        while node is not None:
-            ln = etree.QName(node).localname
-            if ln == "animEffect":
-                sig = "animEffect:" + (node.get("filter") or node.get("transition") or "")
-                break
-            if ln in ("anim", "animClr", "animScale", "animRot", "set"):
-                sig = ln
-                # 不 break，animEffect 优先；但若无 animEffect 则用它
-            node = node.getparent()
-        result.setdefault(spid, []).append(sig or "set")
-    return result
-
-
-def timeline_is_triggerable(slide):
-    """判断该页动画时间线整体是否“可被触发/可播放”。
-
-    放映时动画要真正出现，除了单个 animEffect 自身有效外，整条时间线还必须能被启动：
-      - 存在主序列 <p:seq nodeType="mainSeq">；
-      - 主序列具备推进/启动接线：seq 上有 prevCondLst 或 nextCondLst（单击推进），
-        或 mainSeq 的 cTn 上有非 indefinite 的 stCondLst（自动启动）。
-    若主序列没有任何启动/推进条件（stCondLst/prevCondLst/nextCondLst 全缺，
-    或启动条件恒为 indefinite 且无单击推进），则 PowerPoint/WPS 放映时动画
-    不会被激活，动画面板表现为空，视为“放映看不见”。
-    """
-    timing = slide._element.find(".//p:timing", NS)
-    if timing is None:
-        return False
-    seq = timing.find(".//p:seq", NS)
-    if seq is None:
-        return False
-    # 单击推进接线（最常见的“点击逐条出现”方式）
-    has_prev = seq.find("p:prevCondLst", NS) is not None
-    has_next = seq.find("p:nextCondLst", NS) is not None
-    if has_prev or has_next:
-        return True
-    # 或：mainSeq 自身有非 indefinite 的启动条件（自动播放）
-    seq_ctn = seq.find("p:cTn", NS)
-    if seq_ctn is not None:
-        st = seq_ctn.find("p:stCondLst", NS)
-        if st is not None:
-            for cond in st.findall("p:cond", NS):
-                if cond.get("delay") != "indefinite":
-                    return True
-    return False
-
-
-def visible_animation_effects(slide):
-    """返回该页“放映时实际可见”的动画效果： spid -> set(签名)。
-
-    “放映时看得见”的判定（需同时满足）：
-      0) 整条动画时间线可被触发/可播放（见 timeline_is_triggerable）。
-         若主序列缺少启动/推进接线，放映时动画不会出现（WPS 动画面板为空），
-         则本页所有动画一律视为不可见，返回空。
-      1) 须有真效果类型：所在动画归属于 entr/emph/exit/path 之一（presetClass），
-         并且确实含 animEffect 节点（仅 set visibility 而无 animEffect 的不算）。
-      2) 持续时间 dur>0：animEffect 自身 cBhvr/cTn 的 dur 必须 > 0（“indefinite”视为有效）。
-      3) filter 须为具体效果：filter（或 transition）非空且不为 none。
-    目标形状是否可见由调用方结合 shape 内容另行判断（见 rule 内 visible_shape）。
-    """
-    timing = slide._element.find(".//p:timing", NS)
-    result = {}  # spid -> set of effect signatures
-    if timing is None:
-        return result
-
-    # 条件0：整条时间线必须可被触发，否则放映看不到任何动画
-    if not timeline_is_triggerable(slide):
-        return result
-
-    VALID_CLASSES = {"entr", "emph", "exit", "path"}
-
-    for ae in timing.findall(".//p:animEffect", NS):
-        filt = (ae.get("filter") or ae.get("transition") or "").strip()
-        # 条件3：filter 须为具体效果
-        if not filt or filt.lower() == "none":
-            continue
-
-        # 条件2：dur>0
-        ctn = ae.find(".//p:cBhvr/p:cTn", NS)
-        dur_raw = ctn.get("dur") if ctn is not None else None
-        if dur_raw is None:
-            continue
-        if dur_raw != "indefinite":
-            try:
-                if int(dur_raw) <= 0:
-                    continue
-            except (TypeError, ValueError):
-                continue
-
-        # 条件1：归属于真效果类型 presetClass
-        node = ae
-        pc = None
-        while node is not None:
-            if node.get("presetClass"):
-                pc = node.get("presetClass")
-                break
-            node = node.getparent()
-        if pc not in VALID_CLASSES:
-            continue
-
-        spt = ae.find(".//p:spTgt", NS)
-        spid = spt.get("spid") if spt is not None else None
-        if spid is None:
-            continue
-        result.setdefault(spid, set()).add("animEffect:" + filt)
-
-    return result
-
-
-def slide_animation_filters(slide):
-    """返回该页所有 animEffect 的 filter（按出现顺序）。"""
-    timing = slide._element.find(".//p:timing", NS)
-    if timing is None:
-        return []
-    return [e.get("filter") or e.get("transition") or "" for e in timing.findall(".//p:animEffect", NS)]
-
-
-def get_bg_fill(slide):
-    bg = slide._element.find(".//p:cSld/p:bg", NS)
-    if bg is None:
-        return None
-    srgb = bg.find(".//a:srgbClr", NS)
-    if srgb is not None:
-        return srgb.get("val")
-    return "non-solid"
-
-
-def shape_overlaps(a, b):
-    """两个形状矩形是否重叠（有正面积交集）。"""
-    ax1, ay1 = a.left, a.top
-    ax2, ay2 = a.left + a.width, a.top + a.height
-    bx1, by1 = b.left, b.top
-    bx2, by2 = b.left + b.width, b.top + b.height
-    ix = max(0, min(ax2, bx2) - max(ax1, bx1))
-    iy = max(0, min(ay2, by2) - max(ay1, by1))
-    return ix > 0 and iy > 0, ix, iy
-
-
-# ----------------------------------------------------------------------------
-# 维度2：各加分/扣分细则
-# ----------------------------------------------------------------------------
-
-def rule_p1_slide1_fontsizes(prs):
-    """+1：第1页
-       “Comics & Animation”约28至29磅，
-       “Story Writing Lab”约44至45磅，
-       副标题“Build a story from panels, bubbles, and action.”约18至19磅，
-       副标题下方的三条正文约19至20磅。
-    细则每一个点都要踩到：四处文本均需落在各自磅值区间，正文需为三条且每条都在区间内。
-    """
-    s = prs.slides[0]
-
-    def text_sizes(shape):
-        """返回 shape 内所有非空 run 的字号（pt）列表。"""
-        if shape is None:
-            return []
-        return [sz for sz in all_runs_sizes(shape)]
-
-    def all_in(shape, lo, hi):
-        sizes = text_sizes(shape)
-        return len(sizes) > 0 and all(lo <= sz <= hi for sz in sizes)
-
-    c_anim = find_shape_by_text(s, "Comics & Animation")
-    story = find_shape_by_text(s, "Story Writing Lab")
-    sub = find_shape_by_text(s, "Build a story from panels, bubbles, and action.")
-    body = find_shape_by_text(s, "observe visual clues")
-
-    # “Comics & Animation”约28至29磅
-    c1 = all_in(c_anim, 28, 29)
-    # “Story Writing Lab”约44至45磅
-    c2 = all_in(story, 44, 45)
-    # 副标题约18至19磅
-    c3 = all_in(sub, 18, 19)
-    # 副标题下方的三条正文约19至20磅（须为三条，且每条都在区间内）
-    body_lines = []
-    if body is not None:
-        for para in body.text_frame.paragraphs:
-            if para.text.strip():
-                psizes = [sz for r in para.runs for sz in ([r.font.size.pt] if r.font.size else [])]
-                if not psizes and para.font.size is not None:
-                    psizes = [para.font.size.pt]
-                body_lines.append(psizes)
-    c4 = (len(body_lines) == 3
-          and all(len(ps) > 0 and all(19 <= sz <= 20 for sz in ps) for ps in body_lines))
-
-    checks = [("“Comics & Animation”约28至29磅 (实测%s)" % (text_sizes(c_anim) or "无"), c1),
-              ("“Story Writing Lab”约44至45磅 (实测%s)" % (text_sizes(story) or "无"), c2),
-              ("副标题“Build a story from panels, bubbles, and action.”约18至19磅 (实测%s)"
-               % (text_sizes(sub) or "无"), c3),
-              ("副标题下方的三条正文约19至20磅 (共%d条, 实测%s)"
-               % (len(body_lines), body_lines), c4)]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p1_slide2_bg(prs):
-    """+1：第2页背景：删除深蓝色背景，改为与第3页一致的米黄色背景。
-    细则每一个点都要踩到：
-      点1 删除深蓝色背景 —— 第2页背景不再是深蓝色。
-      点2 改为与第3页一致的米黄色背景 —— 第2页背景色与第3页一致，且为米黄色。
-           “与第3页一致”按细则要求理解为颜色代码完全一致（十六进制相同），
-           不能仅凭视觉接近判定。
-    """
-    s2 = prs.slides[1]
-    s3 = prs.slides[2]
-    bg2 = get_bg_fill(s2)
-    bg3 = get_bg_fill(s3)
-
-    def is_cream(h):
-        # 米黄色：高 R/G、较低 B
-        if not h or len(h) != 6:
-            return False
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return r > 200 and g > 200 and b > 180 and r >= b and g >= b
-
-    def is_dark_blue(h):
-        if not h or len(h) != 6:
-            return False
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return b > 80 and b > r + 20 and b > g + 20 and (r + g + b) < 360
-
-    def consistent(h1, h2):
-        # “与第3页一致”：要求颜色代码完全一致（十六进制相同，大小写不敏感），
-        # 不接受仅视觉接近的近似色。
-        if not (h1 and h2 and len(h1) == 6 and len(h2) == 6):
-            return False
-        return h1.upper() == h2.upper()
-
-    # 点1：删除深蓝色背景
-    c1 = bg2 is not None and not is_dark_blue(bg2)
-    # 点2：改为与第3页一致的米黄色背景 —— 与第3页背景色一致(同色系且接近) 且 为米黄色
-    c2 = (bg2 is not None and bg3 is not None
-          and is_cream(bg2) and is_cream(bg3) and consistent(bg2, bg3))
-
-    checks = [("删除深蓝色背景：第2页背景不再为深蓝色 (bg=%s)" % bg2, c1),
-              ("改为与第3页一致的米黄色背景：第2页(%s)与第3页(%s)一致且为米黄色"
-               % (bg2, bg3), c2)]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p1_slide3_pic(prs):
-    """+1：第3页图片宽度为12厘米，高为9厘米，位于页面右侧。
-    细则每一个点都要踩到（针对同一张图片同时满足）：
-      点1 插入学生学习场景图片 —— 第3页新增一张图片（学习场景，用图片存在/alt描述代理判定画面内容）。
-      点2 图片宽度为12厘米。
-      点3 图片高为9厘米。
-      点4 位于页面右侧。
-    """
-    s = prs.slides[2]
-    pics = [sh for sh in s.shapes if sh.shape_type == 13]
-    half_w = prs.slide_width / 2
-
-    # 逐张图片找出同时满足全部四点的那一张
-    best = None
-    for sh in pics:
-        w, h = cm(sh.width), cm(sh.height)
-        center_x = (sh.left + sh.width / 2) if sh.left is not None else None
-        p1 = True  # 存在图片对象即视为“插入了图片”；画面内容用 alt 描述做代理
-        p2 = approx(w, 12, 0.5)            # 宽度 12cm
-        p3 = approx(h, 9, 0.5)             # 高度 9cm
-        p4 = center_x is not None and center_x > half_w   # 位于页面右侧（中心在右半页）
-        if p1 and p2 and p3 and p4:
-            best = sh
-            break
-
-    if best is not None:
-        cNvPr = best._element.find(".//p:nvPicPr/p:cNvPr", NS)
-        alt = (cNvPr.get("descr") if cNvPr is not None else "") or ""
-        w, h = cm(best.width), cm(best.height)
-        center_x = best.left + best.width / 2
-        checks = [
-            ("插入学生学习场景图片 (代理: 第3页存在图片对象, alt=%r)" % alt, True),
-            ("图片宽度为12厘米 (实测 %.2fcm)" % w, True),
-            ("图片高为9厘米 (实测 %.2fcm)" % h, True),
-            ("位于页面右侧 (图片中心 %.2fcm > 半页 %.2fcm)" % (center_x / EMU_PER_CM, half_w / EMU_PER_CM), True),
-        ]
-        return True, checks
-
-    # 未找到同时满足四点的图片：分别报告各点状态（取最接近的一张做展示）
-    if pics:
-        sh = max(pics, key=lambda x: (x.left or 0))  # 最靠右的图片
-        w, h = cm(sh.width), cm(sh.height)
-        center_x = (sh.left + sh.width / 2) if sh.left is not None else None
-        checks = [
-            ("插入学生学习场景图片 (第3页图片数=%d)" % len(pics), True),
-            ("图片宽度为12厘米 (实测 %.2fcm)" % w, approx(w, 12, 0.5)),
-            ("图片高为9厘米 (实测 %.2fcm)" % h, approx(h, 9, 0.5)),
-            ("位于页面右侧", center_x is not None and center_x > half_w),
-        ]
-    else:
-        checks = [
-            ("插入学生学习场景图片 (第3页无图片)", False),
-            ("图片宽度为12厘米", False),
-            ("图片高为9厘米", False),
-            ("位于页面右侧", False),
-        ]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p1_slide4_layout(prs):
-    """+1：第4页整体排版：页面左侧有一张图片，标题、提问内容和说明文字排列在右侧。
-    细则每一个点都要踩到：
-      点1 探险人物图片移至页面左侧 —— 图片中心位于左半页。
-      点2 标题、提问内容和说明文字排列在右侧 —— 这三类文本中心均位于右半页；
-           其中“标题”包括页面上所有标题性质的文字（如栏目标题
-           “Warm-up: meet the explorer” 与内容标题 “What kind of story is this?”），
-           只要有任意一个标题不在右半页，本点即不达标。
-      点3 左右布局清晰 —— 图片整体在左、文字整体在右，二者不左右交叉（图片右缘 ≤ 文字左缘）。
-    """
-    s = prs.slides[3]
-    half = prs.slide_width / 2
-    pics = [sh for sh in s.shapes if sh.shape_type == 13]
-
-    def center_x(sh):
-        return (sh.left + sh.width / 2) if sh.left is not None else None
-
-    # 点1：探险人物图片位于页面左侧（图片中心在左半页）
-    left_pics = [sh for sh in pics if center_x(sh) is not None and center_x(sh) < half]
-    pic_left = len(left_pics) >= 1
-
-    # 点2：标题、提问内容、说明文字 分别位于右侧
-    # “标题”涵盖页面上所有标题性质文字（栏目标题 + 内容标题），任意一个在左侧即不达标。
-    title_kws = ["Warm-up: meet the explorer", "What kind of story"]
-    titles = [t for t in (find_shape_by_text(s, kw) for kw in title_kws) if t is not None]
-    question = find_shape_by_text(s, "Who is the hero")        # 提问内容
-    note = find_shape_by_text(s, "stronger plot")              # 说明文字
-
-    def on_right(sh):
-        return sh is not None and center_x(sh) is not None and center_x(sh) > half
-
-    title_states = [(shape_text(t).strip()[:30], on_right(t)) for t in titles]
-    title_right = len(titles) > 0 and all(state for _, state in title_states)
-    question_right = on_right(question)
-    note_right = on_right(note)
-    text_right = title_right and question_right and note_right
-
-    # 点3：左右布局清晰 —— 图片右缘不越过右侧文字的左缘
-    clear = False
-    right_texts = titles + [t for t in (question, note) if t is not None]
-    if left_pics and right_texts:
-        pic_right_edge = max(p.left + p.width for p in left_pics)
-        text_left_edges = [t.left for t in right_texts if t.left is not None]
-        if text_left_edges:
-            clear = pic_right_edge <= min(text_left_edges)
-
-    checks = [
-        ("探险人物图片移至页面左侧 (左侧图片数=%d)" % len(left_pics), pic_left),
-        ("标题/提问内容/说明文字排列在右侧 (各标题=%s 提问=%s 说明=%s)"
-         % (title_states, question_right, note_right), text_right),
-        ("左右布局清晰 (图片右缘不越过右侧文字左缘)", clear),
-    ]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p3_slide5_pics(prs):
-    """+3：第5页图片：第5页出现两张图片，横纵比分别是3:2和4:3，且没有遮挡文本。
-    细则每一个点都要踩到：
-      点1 第5页出现两张图片。
-      点2 两张图片的横纵比（宽:高）分别是 3:2(=1.5) 和 4:3(≈1.333)，
-           即两张图片各对应一个比例（不分先后顺序），比值误差≤0.05。
-      点3 没有遮挡文本 —— 两张图片均不与任何含文字的文本框显著交叠。
-    """
-    s = prs.slides[4]
-    pics = [sh for sh in s.shapes if sh.shape_type == 13]
-
-    # 点1：第5页出现两张图片
-    p1 = len(pics) == 2
-
-    # 点2：两张图片横纵比分别是 3:2 与 4:3（宽:高），不分先后；误差容差 0.05
-    TOL = 0.05
-    TARGETS = {"3:2": 1.5, "4:3": 4.0 / 3.0}
-
-    def ratio(sh):
-        if sh.width and sh.height:
-            return sh.width / sh.height
-        return None
-
-    ratios = [(sh, ratio(sh)) for sh in pics]
-    p2 = False
-    ratio_detail = [(sh.shape_id, round(r, 4) if r else None) for sh, r in ratios]
-    if len(pics) == 2 and all(r is not None for _, r in ratios):
-        r0, r1 = ratios[0][1], ratios[1][1]
-        # 一张匹配 3:2、另一张匹配 4:3（两种配对方式任一成立即可）
-        match_a = (abs(r0 - TARGETS["3:2"]) <= TOL and abs(r1 - TARGETS["4:3"]) <= TOL)
-        match_b = (abs(r1 - TARGETS["3:2"]) <= TOL and abs(r0 - TARGETS["4:3"]) <= TOL)
-        p2 = match_a or match_b
-
-    # 点3：没有遮挡文本 —— 图片不与任何含文字的文本框显著交叠（交集 > 文本框面积的20%）
-    text_shapes = [sh for sh in s.shapes
-                   if sh.has_text_frame and shape_text(sh).strip()
-                   and sh.left is not None and sh.width is not None
-                   and sh.top is not None and sh.height is not None]
-
-    def covers_text(pic, txt):
-        ov, ix, iy = shape_overlaps(pic, txt)
-        if not ov:
-            return False
-        txt_area = txt.width * txt.height
-        return txt_area > 0 and (ix * iy) / txt_area > 0.2
-
-    cover_hits = []
-    for pic in pics:
-        if pic.left is None or pic.width is None:
-            continue
-        for txt in text_shapes:
-            if covers_text(pic, txt):
-                cover_hits.append("图片%s 遮挡文本 %r" % (pic.shape_id, shape_text(txt).strip()[:20]))
-    p3 = len(pics) >= 1 and len(cover_hits) == 0
-
-    checks = [
-        ("第5页出现两张图片 (图片数=%d)" % len(pics), p1),
-        ("两张图片横纵比分别为3:2和4:3 (实测宽高比=%s)" % ratio_detail, p2),
-        ("没有遮挡文本 (遮挡情况=%s)" % (cover_hits or "无"), p3),
-    ]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p1_slide6_lines(prs):
-    """+1：第6页箭头右侧区域：每一个箭头右侧对应空白区域均出现两条水平横线，
-       箭头右侧除横线外没有其余文字。
-    细则每一个点都要踩到：
-      点1 每一个箭头右侧对应空白区域均出现两条水平横线。
-      点2 箭头右侧除横线外没有其余文字。
-    实现说明：横线以占位下划线 '____' 作为代理（一段连续下划线=一条水平横线）；
-             “箭头右侧”取含箭头 '→' 的文本框中、箭头之后的内容。
-    """
-    s = prs.slides[5]
-    # 所有“箭头”所在的文本框（含 '→'）
-    arrow_shapes = [sh for sh in s.shapes
-                    if sh.has_text_frame and "→" in shape_text(sh)]
-
-    per_arrow_two_lines = []   # 点1：每个箭头右侧是否恰有两条横线
-    per_arrow_no_extra = []    # 点2：每个箭头右侧除横线外是否无其余文字
-    detail = []
-    for sh in arrow_shapes:
-        txt = shape_text(sh)
-        # 取箭头之后（右侧）的内容
-        right_part = txt.split("→", 1)[1] if "→" in txt else txt
-        # 一段或多段连续下划线各算一条横线
-        line_segments = re.findall(r"_+", right_part)
-        n_lines = len(line_segments)
-        # 除横线外的残余文字（去掉下划线与空白）
-        residual = re.sub(r"_+", "", right_part)
-        residual = residual.replace("\n", "").strip()
-        two_lines = (n_lines == 2)
-        no_extra = (residual == "")
-        per_arrow_two_lines.append(two_lines)
-        per_arrow_no_extra.append(no_extra)
-        detail.append("箭头条目: 横线数=%d 残余文字=%r" % (n_lines, residual))
-
-    has_arrows = len(arrow_shapes) > 0
-    # 点1：每一个箭头右侧均出现两条水平横线
-    p1 = has_arrows and all(per_arrow_two_lines)
-    # 点2：每一个箭头右侧除横线外没有其余文字
-    p2 = has_arrows and all(per_arrow_no_extra)
-
-    checks = [
-        ("每一个箭头右侧对应空白区域均出现两条水平横线 (箭头数=%d, 全部达标=%s)"
-         % (len(arrow_shapes), all(per_arrow_two_lines) if has_arrows else False), p1),
-        ("箭头右侧除横线外没有其余文字 (全部达标=%s)"
-         % (all(per_arrow_no_extra) if has_arrows else False), p2),
-    ]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p5_slide8_anim(prs):
-    """+5：第8页四组内容动画：“Speech bubble”“Caption”“Sound effect”“Thought bubble”
-       及各自说明文字均设置动画，各组动画效果不完全相同。
-    细则每一个点都要踩到：
-      点1 四组名称文本框（Speech bubble / Caption / Sound effect / Thought bubble）均设置动画。
-      点2 各自说明文字文本框均设置动画。
-      点3 各组动画效果不完全相同。
-    判定原则（严格按 rubric）：
-      仅按 OOXML/PowerPoint 中动画是否“存在”和“效果签名是否互异”判断。
-      rubric 未要求“放映时可见”，故不再额外强加 timeline 触发接线、presetClass、
-      dur、filter 非空等可见性限制。凡在 timing 中有 spTgt 指向该形状的动画节点
-      （animEffect/anim/animClr/animScale/animRot/set 等）均计入“已设置动画”，
-      其签名参与“各组不完全相同”的比较。
-    """
-    s = prs.slides[7]
-    targets = animation_targets(s)    # spid -> list(动画签名)，按存在性判定
-
-    def has_anim(sh):
-        """该形状是否设置了动画：timing 中存在指向其 spid 的动画节点即可。"""
-        if sh is None:
-            return False
-        sid = str(sh.shape_id)
-        return len(targets.get(sid, [])) > 0
-
-    group_names = ["Speech bubble", "Caption", "Sound effect", "Thought bubble"]
-
-    def center_y(sh):
-        return (sh.top + sh.height / 2) if sh.top is not None else None
-
-    name_anim = []        # 点1：每组名称是否设置了动画
-    desc_anim = []        # 点2：每组说明文字是否设置了动画
-    group_sig = []        # 点3：每组动画效果签名（名称+说明合并）
-    detail = []
-
-    for kw in group_names:
-        name_sh = find_shape_by_text(s, kw)
-        a_name = has_anim(name_sh)
-        name_anim.append(a_name)
-
-        # 该组“说明文字”：与名称同一行（top 接近）、位于名称右侧、且非名称本身的文本框
-        desc_sh = None
-        if name_sh is not None:
-            row_y = center_y(name_sh)
-            cands = [sh for sh in s.shapes
-                     if sh.has_text_frame and sh is not name_sh
-                     and shape_text(sh).strip()
-                     and sh.left is not None and name_sh.left is not None
-                     and sh.left > name_sh.left                       # 在名称右侧
-                     and center_y(sh) is not None and row_y is not None
-                     and abs(center_y(sh) - row_y) < int(0.6 * EMU_PER_CM)]  # 同一行
-            if cands:
-                desc_sh = min(cands, key=lambda x: x.left)            # 紧邻右侧的说明文字
-        a_desc = has_anim(desc_sh)
-        desc_anim.append(a_desc)
-
-        # 组效果签名：该组名称与说明所用动画签名的集合（存在性签名，不做可见性过滤）
-        sigs = set()
-        for sh in (name_sh, desc_sh):
-            if sh is not None:
-                sigs |= set(targets.get(str(sh.shape_id), []))
-        group_sig.append(tuple(sorted(sigs)))
-        detail.append("组%r: 名称有动画=%s 说明有动画=%s 效果=%s"
-                      % (kw, a_name, a_desc, sorted(sigs)))
-
-    p1 = len(group_names) == 4 and all(name_anim)
-    p2 = all(desc_anim)
-    # 点3：各组动画效果不完全相同 —— 四组效果签名互不完全相同（去重后等于组数）
-    p3 = len(set(group_sig)) == len(group_sig) and all(group_sig)
-
-    checks = [
-        ("四组名称均设置动画 (%s)" % dict(zip(group_names, name_anim)), p1),
-        ("各自说明文字均设置动画 (%s)" % dict(zip(group_names, desc_anim)), p2),
-        ("各组动画效果不完全相同 (各组效果=%s)" % [list(x) for x in group_sig], p3),
-    ]
-    return all(c[1] for c in checks), checks + [(d, True) for d in detail]
-
-
-def rule_p5_slide9_anim(prs):
-    """+5：第9页四组内容动画：“Caption”“Speech bubble”“Thought bubble”“Sound effect”
-       及对应例句均设置动画，各组动画效果不完全相同。
-    细则每一个点都要踩到：
-      点1 四组名称文本框（Caption / Speech bubble / Thought bubble / Sound effect）均设置动画。
-      点2 各自对应例句文本框均设置动画。
-      点3 各组动画效果不完全相同。
-    判定原则（严格按 rubric）：
-      仅按 OOXML/PowerPoint 中动画是否“存在”和“效果签名是否互异”判断。
-      rubric 未要求“放映时可见”，故不再额外强加 timeline 触发接线、presetClass、
-      dur、filter 非空等可见性限制。凡在 timing 中有 spTgt 指向该形状的动画节点
-      （animEffect/anim/animClr/animScale/animRot/set 等）均计入“已设置动画”，
-      其签名参与“各组不完全相同”的比较。
-    """
-    s = prs.slides[8]
-    targets = animation_targets(s)    # spid -> list(动画签名)，按存在性判定
-
-    def has_anim(sh):
-        """该形状是否设置了动画：timing 中存在指向其 spid 的动画节点即可。"""
-        if sh is None:
-            return False
-        return len(targets.get(str(sh.shape_id), [])) > 0
-
-    group_names = ["Caption", "Speech bubble", "Thought bubble", "Sound effect"]
-
-    name_anim = []        # 点1：每组名称是否设置了动画
-    quote_anim = []       # 点2：每组例句是否设置了动画
-    group_sig = []        # 点3：每组动画效果签名
-    detail = []
-
-    for kw in group_names:
-        name_sh = find_shape_by_text(s, kw)
-        a_name = has_anim(name_sh)
-        name_anim.append(a_name)
-
-        # 该组“例句”：与名称同一列（left 接近）、位于名称下方、紧邻的非空文本框
-        quote_sh = None
-        if name_sh is not None:
-            cands = [sh for sh in s.shapes
-                     if sh.has_text_frame and sh is not name_sh
-                     and shape_text(sh).strip()
-                     and sh.left is not None and name_sh.left is not None
-                     and abs(sh.left - name_sh.left) < int(0.6 * EMU_PER_CM)   # 同一列
-                     and sh.top is not None and name_sh.top is not None
-                     and sh.top > name_sh.top]                                 # 在名称下方
-            if cands:
-                quote_sh = min(cands, key=lambda x: x.top)                     # 紧邻下方的例句
-        a_quote = has_anim(quote_sh)
-        quote_anim.append(a_quote)
-
-        # 组效果签名：该组名称与例句所用动画签名的集合（存在性签名，不做可见性过滤）
-        sigs = set()
-        for sh in (name_sh, quote_sh):
-            if sh is not None:
-                sigs |= set(targets.get(str(sh.shape_id), []))
-        group_sig.append(tuple(sorted(sigs)))
-        detail.append("组%r: 名称有动画=%s 例句有动画=%s 效果=%s"
-                      % (kw, a_name, a_quote, sorted(sigs)))
-
-    p1 = len(group_names) == 4 and all(name_anim)
-    p2 = all(quote_anim)
-    # 点3：各组动画效果不完全相同 —— 四组效果签名互不完全相同
-    p3 = len(set(group_sig)) == len(group_sig) and all(group_sig)
-
-    checks = [
-        ("四组名称均设置动画 (%s)" % dict(zip(group_names, name_anim)), p1),
-        ("各自对应例句均设置动画 (%s)" % dict(zip(group_names, quote_anim)), p2),
-        ("各组动画效果不完全相同 (各组效果=%s)" % [list(x) for x in group_sig], p3),
-    ]
-    return all(c[1] for c in checks), checks + [(d, True) for d in detail]
-
-
-def rule_p3_slide10_replace(prs):
-    """+3：第10页标题准确显示“Match five stages of the story with frames”。标题下方有一张图片，图片宽度为20厘米，高度为12.79厘米。
-    细则每一个点都要踩到（同一张曲线图同时满足尺寸与位置）：
-      点1 新第10页标题准确显示“Match five stages of the story with frames”。
-      点2 存在故事五阶段曲线图（图片对象）。
-      点3 曲线图置于标题下方。
-      点4 图片宽度为20厘米。
-      点5 图片高度为12.79厘米。
-    """
-    TITLE = "Match five stages of the story with frames"
-    s = prs.slides[9]
-
-    # 点1：标题文本准确等于目标字符串
-    title = find_shape_by_text(s, TITLE)
-    p1 = title is not None and shape_text(title).strip() == TITLE
-
-    pics = [sh for sh in s.shapes if sh.shape_type == 13]
-
-    # 尺寸公差：严格 ±0.005cm（按两位小数四舍五入须分别等于 20.00 与 12.79）
-    SIZE_TOL = 0.005
-
-    # 找出同时满足“标题下方 + 宽20cm + 高12.79cm”的曲线图
-    chart = None
-    for sh in pics:
-        w, h = cm(sh.width), cm(sh.height)
-        below = (title is not None and sh.top is not None and title.top is not None
-                 and sh.top >= title.top + (title.height or 0))   # 完全位于标题下方
-        if below and approx(w, 20, SIZE_TOL) and approx(h, 12.79, SIZE_TOL):
-            chart = sh
-            break
-
-    # 点2：存在曲线图（图片对象）
-    p2 = len(pics) >= 1
-    # 点3/4/5：取上面命中的 chart；若没有同时满足者，则分别报告最接近的一张
-    if chart is not None:
-        w, h = cm(chart.width), cm(chart.height)
-        p3 = p4 = p5 = True
-        below_desc = "实际 top=%.2fcm > 标题底=%.2fcm" % (
-            chart.top / EMU_PER_CM,
-            (title.top + (title.height or 0)) / EMU_PER_CM if title is not None else 0)
-        size_w_desc = "实测 %.4fcm" % w
-        size_h_desc = "实测 %.4fcm" % h
-    else:
-        ref = pics[0] if pics else None
-        w = cm(ref.width) if ref is not None else None
-        h = cm(ref.height) if ref is not None else None
-        title_bottom = (title.top + (title.height or 0)) if title is not None else None
-        p3 = (ref is not None and ref.top is not None and title_bottom is not None
-              and ref.top >= title_bottom)
-        p4 = approx(w, 20, SIZE_TOL)
-        p5 = approx(h, 12.79, SIZE_TOL)
-        below_desc = "图片 top=%s" % (round(ref.top / EMU_PER_CM, 2) if ref is not None else None)
-        size_w_desc = "实测 %s" % (round(w, 4) if w is not None else None)
-        size_h_desc = "实测 %s" % (round(h, 4) if h is not None else None)
-
-    checks = [
-        ("新第10页标题准确显示“%s” (实测=%r)" % (TITLE, shape_text(title).strip() if title is not None else None), p1),
-        ("存在故事五阶段曲线图 (第10页图片数=%d)" % len(pics), p2),
-        ("曲线图置于标题下方 (%s)" % below_desc, p3),
-        ("图片宽度为20厘米 (%s)" % size_w_desc, p4),
-        ("图片高度为12.79厘米 (%s)" % size_h_desc, p5),
-    ]
-    return all(c[1] for c in checks), checks
-
-
-def rule_p5_slide11_anim(prs):
-    """+5：第11页文本框动画：除主标题外，副标题、页码和六条对白文本框均设置相同的动画，
-       各文本框可按讲解顺序分别触发。
-    细则每一个点都要踩到：
-      点1 副标题设置动画。
-      点2 页码设置动画。
-      点3 六条对白文本框均设置动画（且确为六条）。
-      点4 上述文本框设置的是“相同的”动画（动画效果一致）。
-      点5 各文本框可按讲解顺序分别触发（每个文本框都对应一次独立的单击触发，
-           且在动画时间线中按讲解顺序逐一匹配）。
-    “除主标题外”：主标题不在被检查/被要求的对象之列（不约束其是否有动画）。
-    判定原则（严格按 rubric）：
-      仅按 OOXML/PowerPoint 中动画是否“存在”、效果签名是否一致，以及时间线中
-      clickEffect 的目标 spid 序列是否逐一匹配各要求对象来判定，不再叠加
-      “放映可见”“presetClass”“dur>0”“filter 非空”等 rubric 未提出的门槛。
-    对象识别（避免依赖易变文案/引号形态）：
-      主标题：字号最大、位于页面上部的文本框。
-      页码：文本形如 “11”（可含小空白/前后修饰）的短小文本框。
-      对白：以任意引号（中文/英文/角引号）起首，或含成对引号的文本框；
-            数量应为六条。
-      副标题：除主标题、页码、对白之外，页面上剩余的显著文本框中最靠上的一个。
-    """
-    s = prs.slides[10]
-    targets = animation_targets(s)    # spid -> list(动画签名)，按存在性判定
-
-    # ---- 识别页面上各角色的文本框 ----
-    all_text_shapes = [sh for sh in s.shapes
-                       if sh.has_text_frame and shape_text(sh).strip()
-                       and sh.top is not None]
-
-    # 主标题：字号最大且位于页面上部的文本框（不用固定关键词 "While writing"）
-    def max_font_pt(sh):
-        sizes = all_runs_sizes(sh)
-        return max(sizes) if sizes else 0
-
-    page_h = prs.slide_height
-    upper_candidates = [sh for sh in all_text_shapes
-                        if sh.top is not None and sh.top < page_h * 0.35]
-    main_title = None
-    if upper_candidates:
-        main_title = max(upper_candidates, key=lambda x: (max_font_pt(x), -(x.top or 0)))
-
-    # 页码："11"（允许前后空白），且是较小的文本框
-    page_num = None
-    for sh in s.shapes:
-        if sh.has_text_frame and shape_text(sh).strip() == "11":
-            page_num = sh
-            break
-
-    # 六条对白：以任意常见引号起首 或 含成对引号
-    QUOTE_STARTS = ("“", "”", "‘", "’",
-                    "「", "『",   # 「 『
-                    "«",              # «
-                    '"', "'")
-
-    def is_dialogue(sh):
-        if not sh.has_text_frame:
-            return False
-        t = shape_text(sh).strip()
-        if not t:
-            return False
-        if t.startswith(QUOTE_STARTS):
-            return True
-        # 含成对引号（中文成对 “ ”/ ‘ ’ 或英文成对 " " / ' '）
-        pairs = [
-            ("“", "”"),
-            ("‘", "’"),
-            ("「", "」"),
-            ("『", "』"),
-        ]
-        if any(a in t and b in t for a, b in pairs):
-            return True
-        if t.count('"') >= 2 or t.count("'") >= 2:
-            return True
-        return False
-
-    dialogues = [sh for sh in s.shapes if is_dialogue(sh)]
-
-    # 副标题：排除主标题/页码/对白后，剩余显著文本中位置最靠上者
-    excluded_ids = {id(x) for x in [main_title, page_num] + dialogues if x is not None}
-    remaining = [sh for sh in all_text_shapes if id(sh) not in excluded_ids]
-    subtitle = min(remaining, key=lambda x: x.top) if remaining else None
-
-    # ---- 动画存在性 / 签名 ----
-    def sid(sh):
-        return str(sh.shape_id) if sh is not None else None
-
-    def has_anim(sh):
-        """该文本框是否设置了动画：timing 中存在指向其 spid 的动画节点即可。"""
-        return sh is not None and len(targets.get(sid(sh), [])) > 0
-
-    def eff_sig(sh):
-        """该文本框设置的动画效果签名集合（按存在性汇总，不做可见性过滤）。"""
-        if sh is None:
-            return tuple()
-        return tuple(sorted(set(targets.get(sid(sh), []))))
-
-    # 点1：副标题设置动画
-    p1 = has_anim(subtitle)
-    # 点2：页码设置动画
-    p2 = has_anim(page_num)
-    # 点3：六条对白文本框均设置动画 且 恰为六条
-    n_dialog = len(dialogues)
-    p3 = (n_dialog == 6) and all(has_anim(d) for d in dialogues)
-
-    # 需要设相同动画的全部对象（副标题、页码、六条对白）
-    required = [("副标题", subtitle), ("页码", page_num)] + \
-               [("对白:" + shape_text(d).strip()[:12], d) for d in dialogues]
-    required_present = [(lbl, sh) for lbl, sh in required if sh is not None]
-
-    # 点4：相同的动画 —— 所有要求对象的效果签名一致（且非空、均已设动画）
-    sigs = [eff_sig(sh) for _, sh in required_present]
-    p4 = (len(sigs) > 0
-          and all(sg for sg in sigs)                       # 每个都设了动画
-          and len(set(sigs)) == 1)                         # 且效果完全相同
-
-    # 点5：各文本框可按讲解顺序分别触发 ——
-    #      时间线中 clickEffect 的目标 spid 序列应包含每一个要求对象；
-    #      即每个要求对象都能被独立触发（不是一次单击触发多个/或漏触发）。
-    #      同时按 clickEffect 出现顺序与要求对象在页面上的讲解顺序（自上而下）
-    #      比对，允许一致或页面上明确的其它单向顺序（此处以“每个 spid 至少出现一次
-    #      作为独立 clickEffect 目标”作为核心检查，避免因编辑器改序造成误判）。
-    timing = s._element.find(".//p:timing", NS)
-    click_target_seq = []              # clickEffect 触发目标 spid 序列（按时间线顺序）
-    if timing is not None:
-        for ctn in timing.iter("{%s}cTn" % P_NS):
-            if ctn.get("nodeType") == "clickEffect":
-                sp = ctn.find(".//p:spTgt", NS)
-                if sp is not None and sp.get("spid"):
-                    click_target_seq.append(sp.get("spid"))
-
-    required_spids = [sid(sh) for _, sh in required_present]
-    # 每个要求对象都出现在独立的 clickEffect 目标中
-    each_independently_triggered = (len(required_spids) > 0
-                                    and all(spid in click_target_seq
-                                            for spid in required_spids))
-
-    # 讲解顺序的“逐一匹配”：clickEffect 中按首次出现次序抽出的要求对象子序列
-    # 应恰好等于要求对象集合（即数量匹配、无遗漏、无重复目标混入）
-    seen = set()
-    click_order_of_required = []
-    for spid in click_target_seq:
-        if spid in required_spids and spid not in seen:
-            seen.add(spid)
-            click_order_of_required.append(spid)
-    order_ok = (len(click_order_of_required) == len(required_spids))
-
-    p5 = each_independently_triggered and order_ok
-
-    anim_detail = ", ".join("%s=%s" % (lbl, "动" if has_anim(sh) else "无")
-                            for lbl, sh in required_present)
-
-    checks = [
-        ("副标题设置动画 (识别到副标题=%r)"
-         % (shape_text(subtitle).strip()[:20] if subtitle is not None else None), p1),
-        ("页码设置动画 (识别到页码=%r)"
-         % (shape_text(page_num).strip() if page_num is not None else None), p2),
-        ("六条对白文本框均设置动画 (共%d条)" % n_dialog, p3),
-        ("上述文本框设置相同的动画 (效果集合=%s)" % {x for x in sigs}, p4),
-        ("各文本框可按讲解顺序分别触发 "
-         "(clickEffect 目标序列=%s, 需触发对象数=%d, 匹配数=%d)"
-         % (click_target_seq, len(required_spids), len(click_order_of_required)), p5),
-    ]
-    return all(c[1] for c in checks), checks + [("明细: " + anim_detail, True)]
-
-
-def _rubric_transition(slide):
-    """按 rubric 直读该页 <p:transition> 的“效果名 + 方向属性”。
-
-    仅判断“是否设置了切换效果”并抽取（名称, 方向属性组合）：
-      - 有 <p:transition> 且其下存在至少一个效果子元素（fade/push/wipe/cover/…），
-        即视为“已设置切换效果”；空 transition 节点或无效果子元素不算。
-      - 签名 = 效果名 + 该效果节点的属性（含 dir / orient / thruBlk 等方向/取向），
-        用于“任意两页不完全相同”的比较。
-    不额外检查 advClick/advTm（是否单击/自动触发）、spd（速度）、
-    以及具体渲染宿主（如 WPS）是否支持——这些均为 rubric 未要求的条件，
-    引入会误判“已设置但不满足代理条件”的页为缺失。
-    """
-    tr = slide._element.find(".//p:transition", NS)
-    if tr is None:
-        return None, None
-    for child in tr:
-        name = etree.QName(child).localname
-        attrs = dict(child.attrib)
-        sig = name + "|" + "|".join("%s=%s" % (k, attrs[k]) for k in sorted(attrs))
-        return name, sig
-    # 有 transition 节点但无具体效果子元素 —— 未设置具体切换效果
-    return None, None
-
-
-def rule_p5_transitions(prs):
-    """+5：第1至第18页切换动画：每页均设置切换效果，
-       任意两页的切换效果名称或方向组合不完全相同。
-    细则每一个点都要踩到：
-      点1 第1至第18页每页均设置切换效果。
-      点2 任意两页的切换效果“名称或方向组合”不完全相同
-          —— 即不存在任意两页的(名称, 方向组合)完全相同。
-    判定原则（严格按 rubric）：
-      直接读取每页 <p:transition> 的效果名与方向属性来判定“是否设置”与
-      “是否互异”。不再引入 rubric 未要求的可触发（advClick/advTm）、速度（spd）、
-      具体渲染宿主（如 WPS）支持等前提。
-    """
-    sigs = []     # 每页的 (名称|方向组合) 签名
-    missing = []  # 未设置切换效果的页
-    per_page = []
-    for i, s in enumerate(prs.slides, 1):
-        name, sig = _rubric_transition(s)
-        if name is None:
-            missing.append(i)
-        sigs.append(sig)
-        per_page.append((i, sig))
-
-    # 点1：第1-18页每页均设置切换效果
-    p1 = (len(prs.slides) == 18) and (len(missing) == 0)
-
-    # 点2：任意两页的“名称或方向组合”不完全相同 —— 没有任何重复签名
-    # 找出重复项以便报告
-    seen = {}
-    dup_pairs = []
-    for i, sig in per_page:
-        if sig in seen:
-            dup_pairs.append((seen[sig], i, sig))
-        else:
-            seen[sig] = i
-    p2 = len(dup_pairs) == 0 and (None not in sigs)
-
-    checks = [
-        ("第1至第18页每页均设置切换效果 (总页数=%d, 缺失页=%s)"
-         % (len(prs.slides), missing or "无"), p1),
-        ("任意两页切换效果名称或方向组合不完全相同 (唯一组合=%d/%d, 重复=%s)"
-         % (len(set(sigs)), len(sigs),
-            [(a, b) for a, b, _ in dup_pairs] or "无"), p2),
-    ]
-    return all(c[1] for c in checks), checks
-
-
-# ---------------- 扣分项 ----------------
-
-
-# ----------------------------------------------------------------------------
-# 主流程
-# ----------------------------------------------------------------------------
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 本脚本不做渲染，全部判定都落在 OOXML/PresentationML 里可读可改的属性上：
+# 形状几何（EMU→厘米）、run 字号/西文字体/字体颜色、页面背景 srgbClr、图片
+# 原始像素与 a:srcRect 裁剪、p:timing 动画树（p:animEffect/@filter、
+# p:cTn/@presetClass|@nodeType、p:spTgt/@spid）、p:transition 切换效果，
+# 与在 PowerPoint/WPS 里打开后看到的效果口径一致。
 
 SCRIPT_ID = "080"
 
+# 维度二全部评分项；元组顺序 == _evaluate_impl 中 _score(...) 的调用顺序。
+# 正分为加分项（命中记满分），负分为减分项（触发记负分）。文案与细则逐条一致。
+_RULES = (
+    (3, '第一页"UNIT 3""Comics & Animation""Story Writing Lab""Build a story from panels, bubbles, and action."及"observe visual clues／organize events／write a vivid adventure"三条要点的字号统一增大2-3磅，实测分别为15-16磅、28-29磅、44-45磅、18-19磅、19-20磅'),
+    (1, '第一页字号增大后各段文字仍完整显示在各自文本框内，未与右侧插图重叠、未溢出页面边界'),
+    (5, '第二页背景填充改为与第三页完全一致的米黄色，色值精确为FFF7E8'),
+    (3, '第二页改为浅色底后，"Writing""From comic strip to complete story""Turn pictures into paragraphs.""• notice character, place, and action"等文字颜色同步改为深色，与米黄底对比清晰可读，未出现白色/浅青色字压米黄底而不可见'),
+    (1, '第二页右侧插图、标题下方装饰分隔线与右下角"02"页码均完整保留'),
+    (3, '第三页页面右侧新增1张插图（教室黑板"Today\'s Plan"场景），图片宽度为11.8-12.2厘米，且未被横向或纵向拉伸变形'),
+    (1, '第三页新增图片整体位于页面右半区（左边界≥18厘米）并完整落在页面内'),
+    (1, '第三页"Learning objectives"标题为25磅、副标题为10.5磅，"01-05"五条学习目标文字为18磅且各自单行显示未折行'),
+    (5, '第四页完成左右版式对调——插图移至页面左侧（左边界≤2.5厘米），"What kind of story is this?"、三条提问要点及"A strong prediction helps you write a stronger plot."整体移至页面右侧（左边界≥17厘米）'),
+    (1, '第四页"Warm-up: meet the explorer"标题、"Observe the character and predict the adventure."副标题及其下方装饰分隔线随正文一并移至页面右侧，与右栏文字左对齐'),
+    (1, '第四页图文对调后图片与文字区互不重叠，文字右边界未超出33.9厘米'),
+    (3, '第五页新增2张插图（漫画分镜页面素材）'),
+    (3, '第五页两张新增图片放置于页面空白区，未压盖"1""2""3"三个序号、"The Cloud Compass""Island Under the Waves""Clockwork Cave"三个标题、三段说明文字及三条分隔线'),
+    (1, '第五页两张新增图片完整落在页面内，未超出上、下、左、右页面边界'),
+    (5, '第六页"Clear sky""Storm wind""Huge wave""New island"四行中箭头后的文字（start the trip／face danger／make a choice／find a way out）全部删除，页面上不再出现这四段文字'),
+    (3, '第六页四行箭头后各补充上下两条横线（共8条），横线为可单独选中的直线形状或下划线，同行两条横线上下分离不重叠'),
+    (1, '第六页每条新增横线横向长度≥5厘米（约6.5厘米），留有可书写填空的空间'),
+    (1, '第六页左侧插图、"Clear sky""Storm wind""Huge wave""New island"四个标签文字及四个箭头符号"→"均完整保留'),
+    (5, '第八页4组（A／Speech bubble、B／Caption、C／Sound effect、D／Thought bubble）的小标题与其对应释义文字均添加了进入动画'),
+    (5, '第九页4组（Caption、Speech bubble、Thought bubble、Sound effect）的小标题与其对应例句（The scene begins at sunset.／"Watch out!"／I hope the boat is strong.／Crash!）均添加了进入动画'),
+    (5, '第八页所添加的各条动画效果两两互不相同，且每组小标题与其对应释义使用的效果也不相同（8个对象对应8种不同效果）'),
+    (5, '第九页所添加的各条动画效果两两互不相同，且每组小标题与其对应例句使用的效果也不相同（8个对象对应8种不同效果）'),
+    (1, '第八、九页动画均为单击触发，并按"小标题→对应内容"的先后顺序依次播放'),
+    (5, '标题为"Build a clear structure"、含"Character → Change → Sequence"及三条编号提问的整页内容已删除，并在第10页位置新增一页，交付稿仍为18页'),
+    (3, '新增第10页的标题文字为"Match five stages of the story with frames"，位于页面顶部标题位置（顶边纵向≤1.5厘米）'),
+    (5, '新增第10页在标题下方插入故事发展曲线图（含Beginning/Opening、Development/Rising action、Climax/Turning point、Falling action、Ending五个阶段），图片宽度为19.8-20.2厘米且未被拉伸变形'),
+    (1, '新增第10页图片顶边位于标题下方（纵向≥3.5厘米），并在页面内水平居中（左右留白差≤1厘米）'),
+    (1, '新增第10页标题字号与其余内容页标题一致，为25磅'),
+    (1, '新增第10页右下角保留与页序一致的"10"页码标记'),
+    (1, '新增第10页背景与其余内容页一致，为米黄色FFF7E8'),
+    (5, '第十一页6个对话文本框（"A storm is coming!""We are in trouble.""Look! There is an island.""Quick! Row faster!""Thank goodness!""We made it!"）全部添加了进入动画'),
+    (3, '第十一页6个对话文本框使用的进入动画为同一种效果，且为单击逐个触发，便于逐条讲解'),
+    (1, '第十一页主标题"While writing"未被添加动画'),
+    (3, '第十六页右下角插图（位于横向21.3厘米、纵向13.5厘米，尺寸约8.9×3.4厘米）已删除，该位置无残留图片或空白图片框'),
+    (1, '第十六页"Tense／Person／Voice"三行共9个文本框的文字内容、字号与位置完整保留，未随图片删除而丢失'),
+    (5, '全部18页均设置了页面切换动画'),
+    (5, '18页的切换动画效果两两互不相同，共出现18种不同的切换效果'),
+    (1, '交付稿仍为18页，页序与各页主题（封面→Writing→Learning objectives→…→Final checklist）保持一致'),
+    (-5, '第二、三、四、五、六、八、九、十、十一、十二、十三、十四、十五页的标题与正文文字不满足西文字体随主题字体（Aptos Display／Aptos）设置，被统一写死为"Arial"'),
+    (-3, '第三页"Identify frames, bubbles, captions, and sound words""Organize the plot: beginning, problem, action, ending"等5条学习目标文本框不满足宽度25.15厘米、文字单行显示（被压窄至13.8厘米，导致文字折行并超出0.81厘米的框高）'),
+    (-3, '第五页底部"Use title words to guess the setting, conflict, and mood."不满足字号22磅、顶边位于纵向14.35厘米（被改为11.5磅并上移至纵向11.78厘米）'),
+    (-1, '第一页右下角页码"01"不满足字号8磅'),
+    (-1, '第九页位于纵向7.44厘米与11.76厘米处的4条装饰分隔线不满足不参与动画（被一并加入动画播放序列）'),
+    (-1, '第十页不满足无空白元素残留（纵向2.39厘米处遗留1个无任何文字的空文本框）'),
+)
 
-def _find_pptx(dir_path: str):
-    """在给定目录中定位被评估的 .pptx 文件。
-    优先返回目录下第一个 .pptx（排除 ~$ 临时文件）。"""
-    d = os.path.abspath(dir_path)
-    if not os.path.isdir(d):
+# 维度二各评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。
+_MAX_DELTAS_ORDER = [p for p, _ in _RULES]
+# 维度二满分 = 全部加分项之和（减分项只在触发时扣，不计入满分）
+MAX_SCORE_TOTAL = sum(p for p in _MAX_DELTAS_ORDER if p > 0)
+MIN_PENALTY_TOTAL = sum(p for p in _MAX_DELTAS_ORDER if p < 0)
+assert len(_RULES) == 44
+assert MAX_SCORE_TOTAL == 104 and MIN_PENALTY_TOTAL == -14
+
+# ---------------------------------------------------------------- 基础常量/工具
+
+_A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+_P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
+
+EMU_PER_CM = 360000.0
+PT_PER_CM = 28.3465
+PAGE_W_CM = 33.87
+PAGE_H_CM = 19.05
+
+# PowerPoint 里"动画窗格"能列出的行为节点；p:cTn 的 childTnLst 直接挂这些标签
+# 时才算一条真实动画效果（cBhvr 内部的 p:cTn 不带 childTnLst，自动被排除）。
+_BEHAVIOR_TAGS = {'animEffect', 'set', 'anim', 'animScale', 'animRot',
+                  'animMotion', 'animClr'}
+# a:latin/@typeface 取这些值表示"跟随主题字体"，不算写死字体
+_THEME_FONT_REFS = {'+mj-lt', '+mn-lt', '+mj-ea', '+mn-ea', '+mj-cs', '+mn-cs'}
+
+
+def _a(tag):
+    return '{%s}%s' % (_A_NS, tag)
+
+
+def _p(tag):
+    return '{%s}%s' % (_P_NS, tag)
+
+
+def _local(elem):
+    """去掉命名空间的标签名。"""
+    return elem.tag.split('}')[-1] if isinstance(elem.tag, str) else ''
+
+
+def _cm(emu):
+    """EMU → 厘米；360000 EMU = 1cm，与 PowerPoint 标尺一致。"""
+    return None if emu is None else float(emu) / EMU_PER_CM
+
+
+def _norm(s):
+    """折叠空白后的可见文本，用于按文案定位形状。"""
+    return re.sub(r'\s+', ' ', (s or '').replace(' ', ' ')).strip()
+
+
+def _squash(s):
+    """去掉全部空白，用于比对含空格差异的短语。"""
+    return re.sub(r'\s+', '', s or '')
+
+def _shape_text(shape):
+    """形状里的可见文字；无文本框/纯装饰形状返回空串。"""
+    try:
+        if not shape.has_text_frame:
+            return ''
+        return _norm(shape.text_frame.text)
+    except Exception:
+        return ''
+
+
+def _sid(shape):
+    """形状 id；与 p:timing 里 p:spTgt/@spid 同一套编号。"""
+    try:
+        return int(shape.shape_id)
+    except Exception:
+        return -1
+
+
+def _box(shape):
+    """(left, top, right, bottom) 单位厘米；几何缺失返回 None。"""
+    try:
+        if None in (shape.left, shape.top, shape.width, shape.height):
+            return None
+        l = _cm(shape.left)
+        t = _cm(shape.top)
+        return (l, t, l + _cm(shape.width), t + _cm(shape.height))
+    except Exception:
         return None
-    for name in sorted(os.listdir(d)):
-        if name.lower().endswith(".pptx") and not name.startswith("~$"):
-            return os.path.join(d, name)
+
+
+def _area(b):
+    return 0.0 if b is None else max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _overlap(b1, b2):
+    """两个矩形的相交面积（cm²）。"""
+    if b1 is None or b2 is None:
+        return 0.0
+    ow = min(b1[2], b2[2]) - max(b1[0], b2[0])
+    oh = min(b1[3], b2[3]) - max(b1[1], b2[1])
+    return ow * oh if ow > 0 and oh > 0 else 0.0
+
+def _defrpr_sz(elem):
+    """从 a:pPr/a:defRPr 或 a:lstStyle//a:defRPr 取字号（半点→磅）。"""
+    if elem is None:
+        return None
+    for d in elem.iter(_a('defRPr')):
+        v = d.get('sz')
+        if v and v.isdigit():
+            return int(v) / 100.0
     return None
 
 
-def evaluate(dir_path: str) -> dict:
-    """统一入口：接收脚本所在目录路径，在该目录中定位并评估 .pptx 文件。
+def _run_sizes(para, shape):
+    """段落内各非空 run 的实际字号（磅）：run 级 sz → 段落 defRPr → 形状 lstStyle。"""
+    out = []
+    try:
+        runs = list(para.runs)
+    except Exception:
+        return out
+    for run in runs:
+        if not (run.text or '').strip():
+            continue
+        v = None
+        try:
+            if run.font.size is not None:
+                v = run.font.size.pt
+        except Exception:
+            v = None
+        if v is None:
+            v = _defrpr_sz(para._p.find(_a('pPr')))
+        if v is None:
+            try:
+                v = _defrpr_sz(shape.text_frame._txBody.find(_a('lstStyle')))
+            except Exception:
+                v = None
+        out.append(v)
+    return out
 
-    返回结构化字典，字段见项目《脚本接口差异与统一建议》§2.2。
-    """
+
+def _latin_typefaces(shape):
+    """形状内全部 a:latin/@typeface（含 defRPr），对应"西文字体"下拉框的取值。"""
+    out = []
+    try:
+        if not shape.has_text_frame:
+            return out
+        for el in shape.text_frame._txBody.iter(_a('latin')):
+            tf = el.get('typeface')
+            if tf:
+                out.append(tf)
+    except Exception:
+        pass
+    return out
+
+def _run_color_hex(run):
+    """run 的显式字体颜色（a:rPr/a:solidFill）；schemeClr 归并为黑/白，未显式设置返回 None。"""
+    try:
+        rPr = run._r.find(_a('rPr'))
+    except Exception:
+        return None
+    if rPr is None:
+        return None
+    fill = rPr.find(_a('solidFill'))
+    if fill is None:
+        return None
+    srgb = fill.find(_a('srgbClr'))
+    if srgb is not None and srgb.get('val'):
+        return srgb.get('val').upper()
+    sch = fill.find(_a('schemeClr'))
+    if sch is not None:
+        v = (sch.get('val') or '').lower()
+        if v in ('tx1', 'dk1', 'tx2', 'dk2'):
+            return '000000'
+        if v in ('bg1', 'lt1', 'bg2', 'lt2'):
+            return 'FFFFFF'
+    return None
+
+
+def _brightness(hex_val):
+    """感知亮度（0-255）；用于判定"深色字"是否压得住米黄底。"""
+    try:
+        r = int(hex_val[0:2], 16)
+        g = int(hex_val[2:4], 16)
+        b = int(hex_val[4:6], 16)
+    except Exception:
+        return None
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _bg_hex(slide):
+    """页面背景色：先看幻灯片自身 p:cSld/p:bg，再回退版式/母版。"""
+    if slide is None:
+        return None
+    try:
+        holders = [slide._element, slide.slide_layout._element,
+                   slide.slide_layout.slide_master._element]
+    except Exception:
+        holders = [slide._element]
+    for el in holders:
+        cSld = el.find(_p('cSld'))
+        if cSld is None:
+            continue
+        bg = cSld.find(_p('bg'))
+        if bg is None:
+            continue
+        srgb = bg.find('.//' + _a('srgbClr'))
+        if srgb is not None and srgb.get('val'):
+            return srgb.get('val').upper()
+        sch = bg.find('.//' + _a('schemeClr'))
+        if sch is not None:
+            return 'SCHEME:' + (sch.get('val') or '')
+    return None
+
+def _pictures(slide):
+    """页面上的图片形状（p:pic）。"""
+    out = []
+    if slide is None:
+        return out
+    for sh in slide.shapes:
+        if _local(sh._element) == 'pic':
+            out.append(sh)
+    return out
+
+
+def _pic_aspect_delta(pic):
+    """图片显示宽高比与"原始像素经 a:srcRect 裁剪后"宽高比的相对偏差。
+    与办公软件对齐：只要不勾选"锁定纵横比"就可能被拉伸，此处按裁剪后有效像素
+    计算真实比例，偏差>阈值即判为横向/纵向拉伸变形。无法取到像素时返回 None。"""
+    try:
+        px_w, px_h = pic.image.size
+    except Exception:
+        return None
+    try:
+        kw = 1.0 - (pic.crop_left or 0.0) - (pic.crop_right or 0.0)
+        kh = 1.0 - (pic.crop_top or 0.0) - (pic.crop_bottom or 0.0)
+    except Exception:
+        kw = kh = 1.0
+    kw = max(1e-6, kw)
+    kh = max(1e-6, kh)
+    if not px_w or not px_h or not pic.width or not pic.height:
+        return None
+    native = (px_w * kw) / (px_h * kh)
+    shown = float(pic.width) / float(pic.height)
+    return abs(shown - native) / native
+
+
+def _is_line_shape(shape):
+    """可单独选中的直线/装饰分隔线：连接符，或一维方向极扁的形状。"""
+    if _local(shape._element) == 'cxnSp':
+        return True
+    b = _box(shape)
+    if b is None:
+        return False
+    w, h = b[2] - b[0], b[3] - b[1]
+    return (h <= 0.25 and w >= 1.0) or (w <= 0.25 and h >= 1.0)
+
+
+def _line_length_cm(shape):
+    b = _box(shape)
+    if b is None:
+        return 0.0
+    return max(b[2] - b[0], b[3] - b[1])
+
+def _est_width_cm(text, size_pt, factor=0.5):
+    """按西文平均字宽 0.5em 估算一行文字的排版宽度（厘米）。
+    与办公软件对齐：不渲染时无法拿到精确字宽，用 0.5em 这一保守均值判断"该行
+    是否放得下"，只用来识别明显折行/明显溢出，不做像素级结论。"""
+    if not text or not size_pt:
+        return 0.0
+    return len(text) * factor * float(size_pt) / PT_PER_CM
+
+
+def _single_line(shape):
+    """形状内每个段落估算宽度是否都不超过框宽（即文字单行显示未折行）。"""
+    b = _box(shape)
+    if b is None:
+        return True
+    box_w = max(0.1, b[2] - b[0])
+    try:
+        paras = list(shape.text_frame.paragraphs)
+    except Exception:
+        return True
+    for para in paras:
+        t = _norm(para.text)
+        if not t:
+            continue
+        szs = [v for v in _run_sizes(para, shape) if v]
+        sz = max(szs) if szs else 18.0
+        if _est_width_cm(t, sz) > box_w:
+            return False
+    return True
+
+
+def _text_fits_box(shape, slack=2.0):
+    """粗估文本总高是否落在文本框内（含自动换行后的行数）。slack 给足余量，
+    只拦明显放不下的情形。"""
+    b = _box(shape)
+    if b is None:
+        return True
+    box_w = max(0.1, b[2] - b[0])
+    box_h = max(0.01, b[3] - b[1])
+    try:
+        paras = list(shape.text_frame.paragraphs)
+    except Exception:
+        return True
+    total = 0.0
+    for para in paras:
+        t = _norm(para.text)
+        szs = [v for v in _run_sizes(para, shape) if v]
+        sz = max(szs) if szs else 18.0
+        if not t:
+            total += sz * 0.6 / PT_PER_CM
+            continue
+        lines = max(1, int(math.ceil(_est_width_cm(t, sz) / box_w)))
+        total += lines * sz * 1.25 / PT_PER_CM
+    return total <= box_h * slack
+
+def _anim_nodes(slide):
+    """解析 p:timing，按播放顺序返回动画效果节点。
+    与办公软件对齐：动画窗格里的每一行对应一个带 childTnLst 行为的 p:cTn；
+    mainSeq 下的每个直接子节点是"一次单击放出的一组动画"，故用该组序号
+    （group）判断是否单击逐个触发以及先后顺序，比读 @nodeType 稳（部分生成
+    器只在组级写 clickEffect）。效果种类优先取 @presetID（动画窗格里的效果名
+    就是它），无 presetID 时退化用 p:animEffect/@filter；进入动画由
+    @presetClass="entr"、animEffect/@transition="in" 或 p:set 把 visibility
+    置 visible 来识别。"""
+    out = []
+    if slide is None:
+        return out
+    timing = slide._element.find(_p('timing'))
+    if timing is None:
+        return out
+    gmap = {}
+    groups = []
+    mains = [c for c in timing.iter(_p('cTn'))
+             if (c.get('nodeType') or '') == 'mainSeq']
+    if mains:
+        top = mains[0].find(_p('childTnLst'))
+        if top is not None:
+            # 注意：groups 必须持有这些元素的引用，否则 lxml 代理对象会被回收、
+            # id() 复用，导致组号错乱。
+            groups = [list(g.iter(_p('cTn'))) for g in list(top)]
+            for gi, ctns in enumerate(groups):
+                for ctn in ctns:
+                    gmap[id(ctn)] = gi
+    for ctn in timing.iter(_p('cTn')):
+        ctl = ctn.find(_p('childTnLst'))
+        if ctl is None:
+            continue
+        behaviors = [c for c in ctl if _local(c) in _BEHAVIOR_TAGS]
+        if not behaviors:
+            continue
+        spids = set()
+        for tgt in ctn.iter(_p('spTgt')):
+            sid = tgt.get('spid')
+            if sid:
+                try:
+                    spids.add(int(sid))
+                except ValueError:
+                    pass
+        if not spids:
+            continue
+        filt = None
+        is_entr = (ctn.get('presetClass') or '') == 'entr'
+        for ae in ctn.iter(_p('animEffect')):
+            if filt is None and ae.get('filter'):
+                filt = ae.get('filter').split('(')[0].strip().lower()
+            if (ae.get('transition') or '') == 'in':
+                is_entr = True
+        if not is_entr:
+            for st in ctn.iter(_p('set')):
+                for sv in st.iter(_a('strVal')):
+                    if (sv.get('val') or '') == 'visible':
+                        is_entr = True
+        preset_id = ctn.get('presetID')
+        if preset_id:
+            key = 'preset:' + preset_id
+        elif filt:
+            key = 'filter:' + filt
+        else:
+            key = 'behavior:' + '|'.join(sorted({_local(b) for b in behaviors}))
+        grp = gmap.get(id(ctn))
+        out.append({'spids': spids, 'effect': key, 'is_entr': is_entr,
+                    'node_type': ctn.get('nodeType') or '',
+                    'group': grp if grp is not None else 1000 + len(out)})
+    return out
+
+def _entr_index(slide):
+    """(进入动画节点列表, spid→该形状首次出现的播放序号)。"""
+    nodes = [n for n in _anim_nodes(slide) if n['is_entr']]
+    first = {}
+    for i, nd in enumerate(nodes):
+        for spid in nd['spids']:
+            first.setdefault(spid, i)
+    return nodes, first
+
+
+def _all_anim_spids(slide):
+    """页面上被任何动画（不限进入动画）引用的形状 id 集合。"""
+    out = set()
+    for nd in _anim_nodes(slide):
+        out |= nd['spids']
+    return out
+
+
+def _transition_key(slide):
+    """页面切换效果标识；无切换返回 None。
+    与办公软件对齐：新式切换（平滑/涟漪/翻页等）写在 mc:AlternateContent 的
+    mc:Choice 里（p14/p159 命名空间），mc:Fallback 里放一个老版本兜底效果；
+    切换选项卡显示的是 Choice 的效果，故优先取非 Fallback 的那个。"""
+    if slide is None:
+        return None
+    found = []
+    for tr in slide._element.iter():
+        if _local(tr) != 'transition':
+            continue
+        in_fb = False
+        anc = tr.getparent()
+        while anc is not None:
+            if anc.tag == '{%s}Fallback' % _MC_NS:
+                in_fb = True
+                break
+            anc = anc.getparent()
+        eff = None
+        for ch in tr:
+            ln = _local(ch)
+            if ln in ('sndAc', 'extLst'):
+                continue
+            eff = ln
+            if ch.get('prst'):
+                eff += '(' + ch.get('prst') + ')'
+            break
+        if eff:
+            found.append((in_fb, eff))
+    if not found:
+        return None
+    for in_fb, eff in found:
+        if not in_fb:
+            return eff
+    return found[0][1]
+
+class _TargetMissing(Exception):
+    """目录不存在或目录中没有 .pptx：连待评测对象都没有，不进入维度判定。"""
+
+def evaluate(dir_path):
+    """按接口约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估的
+    .pptx（忽略以 ~$ 开头的 PowerPoint 临时锁文件）。脚本自身崩溃（含目录不
+    存在、未发现文档等）由本函数捕获并返回 status='error'。"""
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        file_path = _find_pptx(dir_path)
-        if not file_path or not os.path.isfile(file_path):
-            result["status"] = "error"
-            result["error"] = "在目录 %r 中未找到 .pptx 文件" % dir_path
-            return result
-
+        if not dir_path or not os.path.isdir(dir_path):
+            raise _TargetMissing("目录不存在：%s" % dir_path)
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith('.pptx') and not f.startswith('~$')
+        )
+        if not cands:
+            raise _TargetMissing("目录中未找到 .pptx 文件：%s" % dir_path)
+        file_path = os.path.join(dir_path, cands[0])
         result["file_name"] = os.path.basename(file_path)
-
-        prs = Presentation(file_path)
-
-        # ---- 维度2 加分项定义（无论维度1是否通过，都作为满分基线列出）----
-        plus_rules = [
-            (1, "第1页“Comics & Animation”约28至29磅，“Story Writing Lab”约44至45磅，"
-                "副标题“Build a story from panels, bubbles, and action.”约18至19磅，"
-                "副标题下方的三条正文约19至20磅。", rule_p1_slide1_fontsizes),
-            (1, "第2页背景：删除深蓝色背景，改为与第3页一致的米黄色背景。", rule_p1_slide2_bg),
-            (1, "第3页图片宽度为12厘米，高为9厘米，位于页面右侧。",
-                rule_p1_slide3_pic),
-            (1, "第4页整体排版：页面左侧有一张图片，标题、提问内容和说明文字排列在右侧。",
-                rule_p1_slide4_layout),
-            (3, "第5页图片：第5页出现两张图片，横纵比分别是3:2和4:3，且没有遮挡文本。",
-                rule_p3_slide5_pics),
-            (1, "第6页箭头右侧区域：每一个箭头右侧对应空白区域均出现两条水平横线，"
-                "箭头右侧除横线外没有其余文字。", rule_p1_slide6_lines),
-            (5, "第8页四组内容动画：“Speech bubble”“Caption”“Sound effect”“Thought bubble”"
-                "及各自说明文字均设置动画，各组动画效果不完全相同。", rule_p5_slide8_anim),
-            (5, "第9页四组内容动画：“Caption”“Speech bubble”“Thought bubble”“Sound effect”"
-                "及对应例句均设置动画，各组动画效果不完全相同。", rule_p5_slide9_anim),
-            (3, "第10页标题准确显示“Match five stages of the story with frames”。标题下方有一张图片，图片宽度为20厘米，高度为12.79厘米。",
-                rule_p3_slide10_replace),
-            (5, "第11页文本框动画：除主标题外，副标题、页码和六条对白文本框均设置相同的动画，"
-                "各文本框可按讲解顺序分别触发。", rule_p5_slide11_anim),
-            (5, "第1至第18页切换动画：每页均设置切换效果，任意两页的切换效果名称或方向组合不完全相同。",
-                rule_p5_transitions),
-        ]
-
-        # ---- 维度2 加分项分值即为满分基线 ----
-        # 满分：加分项分值之和
-        result["max_score"] = sum(pts for pts, _, _ in plus_rules)
-
-        # ---- 维度1 ----
-        result["dim1_pass"] = True
-
-        # 维度1通过：逐项评估维度2
-        dim2_items = []
-        total = 0
-
-        for pts, rule_text, fn in plus_rules:
-            ok, _checks = fn(prs)
-            delta = pts if ok else 0
-            total += delta
-            dim2_items.append({
-                "rule": rule_text,
-                "max_delta": pts,
-                "delta": delta,
-                "hit": bool(ok),
-                "detail": "",
-            })
-
-        result["dim2_items"] = dim2_items
-        result["total_score"] = total
-        return result
-
-    except Exception as e:
+        return _evaluate_impl(file_path, result)
+    except _TargetMissing as exc:
+        # 找不到待评测文件：维度1 未参与判定，dim1_pass / dim1_reason 一律留空，满分也置 0
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = "%s: %s" % (type(e).__name__, e)
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        # 文件存在但打不开 / 解析失败：维度1 判不通过，dim1_reason 给出错误摘要
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "文件无法解析或无法打开：%s: %s" % (type(exc).__name__, exc)
+        result["dim2_items"] = []
+        result["total_score"] = 0
         return result
 
+def _evaluate_impl(file_path, result):
+    prs = Presentation(file_path)
+    slides = list(prs.slides)
+    page_w = _cm(prs.slide_width) or PAGE_W_CM
+    page_h = _cm(prs.slide_height) or PAGE_H_CM
+
+    results = []
+    details = []
+    _cursor = [0]
+
+    def _score(ok, detail=""):
+        """按 _RULES 顺序追加一条结果。加分项 ok=命中；减分项 ok=触发扣分。"""
+        points, rule = _RULES[_cursor[0]]
+        _cursor[0] += 1
+        if points > 0:
+            results.append(("+%d：%s" % (points, rule)) if ok else ("+0：%s" % rule))
+        else:
+            results.append(("%d：%s" % (points, rule)) if ok else ("-0：%s" % rule))
+        details.append(detail)
+
+    # ---------------------------------------------------------- 页内定位小工具
+    def sl(n):
+        """第 n 页（1 基）。"""
+        return slides[n - 1] if 0 < n <= len(slides) else None
+
+    def texts(slide):
+        """[(shape, 可见文本)]，只含有文字的形状。"""
+        out = []
+        if slide is None:
+            return out
+        for sh in slide.shapes:
+            t = _shape_text(sh)
+            if t:
+                out.append((sh, t))
+        return out
+
+    def paras_with(slide, needle):
+        """按文案定位段落：[(shape, paragraph, 段落文本)]，忽略空白与大小写差异。"""
+        out = []
+        if slide is None:
+            return out
+        key = _squash(needle).lower()
+        for sh in slide.shapes:
+            try:
+                if not sh.has_text_frame:
+                    continue
+                paras = list(sh.text_frame.paragraphs)
+            except Exception:
+                continue
+            for para in paras:
+                t = _norm(para.text)
+                if key and key in _squash(t).lower():
+                    out.append((sh, para, t))
+        return out
+
+    def shapes_with(slide, needle):
+        """按文案定位形状（去重，保持页面 z 序）。"""
+        seen, out = set(), []
+        for sh, _para, _t in paras_with(slide, needle):
+            if _sid(sh) not in seen:
+                seen.add(_sid(sh))
+                out.append(sh)
+        return out
+
+    def page_num_ids(slide):
+        """右下角页码标记的形状 id 集合（纯数字且位于右下角）。"""
+        out = set()
+        for sh, t in texts(slide):
+            b = _box(sh)
+            if b and b[0] >= 27.5 and b[1] >= 15.5 and re.fullmatch(r'\d{1,2}', t):
+                out.add(_sid(sh))
+        return out
+
+    def header_ids(slide):
+        """页眉区（顶边 <3.5cm）的文本形状 id：页标题与副标题。"""
+        out = set()
+        for sh, _t in texts(slide):
+            b = _box(sh)
+            if b and b[1] < 3.5:
+                out.add(_sid(sh))
+        return out
+
+    def sizes_of(shapes_list):
+        """一批形状里全部非空 run 的字号。"""
+        out = []
+        for sh in shapes_list:
+            try:
+                paras = list(sh.text_frame.paragraphs)
+            except Exception:
+                continue
+            for para in paras:
+                out.extend(_run_sizes(para, sh))
+        return out
+
+    def near(vals, lo, hi):
+        """所有实测值都落在 [lo, hi]（含 0.05 磅/厘米容差）且至少有一个实测值。"""
+        vals = [v for v in vals if v is not None]
+        return bool(vals) and all(lo - 0.05 <= v <= hi + 0.05 for v in vals)
+
+    def in_page(b, tol=0.1):
+        return (b is not None and b[0] >= -tol and b[1] >= -tol
+                and b[2] <= page_w + tol and b[3] <= page_h + tol)
+
+    # ========== 维度1：可用与可修改性 ==========
+    # 只判一件事：交付文件是 1 个可正常打开的 .pptx。打不开（文件损坏、格式不
+    # 符、目录内无文档）会在 evaluate 里被捕获并落到 status='error'、
+    # dim1_pass=False；能走到这里即视为通过。
+    result["dim1_reason"] = "交付文件为1个可正常打开的 PowerPoint 演示文稿（.pptx）"
+
+    # ========== 维度2：完成度评分 ==========
+    S1, S2, S3, S4, S5, S6 = sl(1), sl(2), sl(3), sl(4), sl(5), sl(6)
+    S8, S9, S10, S11, S16 = sl(8), sl(9), sl(10), sl(11), sl(16)
+
+    # +3：第一页五处文字字号统一增大 2-3 磅
+    # ①"UNIT 3" 15-16磅；②"Comics & Animation" 28-29磅；③"Story Writing Lab"
+    # 44-45磅；④"Build a story from panels, bubbles, and action." 18-19磅；
+    # ⑤observe visual clues／organize events／write a vivid adventure 19-20磅。
+    # 与办公软件对齐：字号取 a:rPr/@sz（半点），缺省时回退段落 a:defRPr 与形状
+    # a:lstStyle，与"开始→字号"框里显示的值一致。
+    _SPEC1 = (("UNIT 3", 15.0, 16.0),
+              ("Comics & Animation", 28.0, 29.0),
+              ("Story Writing Lab", 44.0, 45.0),
+              ("Build a story from panels", 18.0, 19.0),
+              ("observe visual clues", 19.0, 20.0),
+              ("organize events", 19.0, 20.0),
+              ("write a vivid adventure", 19.0, 20.0))
+    r1_ok = True
+    r1_msg = []
+    for needle, lo, hi in _SPEC1:
+        hits = paras_with(S1, needle)
+        if not hits:
+            r1_ok = False
+            r1_msg.append("%s=未找到" % needle)
+            continue
+        vals = []
+        for shp, para, _t in hits:
+            vals.extend(_run_sizes(para, shp))
+        r1_msg.append("%s=%s磅" % (needle, "/".join(
+            "?" if v is None else ("%g" % v) for v in vals)))
+        if not near(vals, lo, hi):
+            r1_ok = False
+    _score(r1_ok, "；".join(r1_msg))
+
+    # +1：第一页放大后文字仍完整显示在框内、未压右侧插图、未溢出页面
+    # ①每个文本框的估算文本高度不超出框高；②文本框与插图的相交面积不超过其自身
+    # 面积的 5%；③文本框四边都在页面内。
+    r2_msg = []
+    for sh, t in texts(S1):
+        b = _box(sh)
+        if b is None:
+            continue
+        if not in_page(b):
+            r2_msg.append("\"%s\"超出页面边界" % t[:14])
+        if not _text_fits_box(sh):
+            r2_msg.append("\"%s\"文字溢出文本框" % t[:14])
+        for pic in _pictures(S1):
+            if _area(b) > 0 and _overlap(b, _box(pic)) / _area(b) > 0.05:
+                r2_msg.append("\"%s\"与右侧插图重叠" % t[:14])
+    _score(not r2_msg, "；".join(r2_msg) or "各段文字均在框内且未与插图重叠")
+
+    # +5：第二页背景改为与第三页完全一致的米黄色 FFF7E8
+    # 与办公软件对齐：读 p:cSld/p:bg//a:srgbClr/@val，即"设置背景格式→纯色填充"
+    # 里的十六进制色值；必须精确等于 FFF7E8，且与第三页取值一致。
+    bg2, bg3 = _bg_hex(S2), _bg_hex(S3)
+    _score(bg2 == 'FFF7E8' and bg3 == 'FFF7E8',
+           "第二页背景=%s，第三页背景=%s" % (bg2, bg3))
+
+    # +3：第二页文字同步改为深色，浅底上清晰可读
+    # ①"Writing"②"From comic strip to complete story"③"Turn pictures into
+    # paragraphs."④"notice character, place, and action" 四处文字的显式字体色
+    # 感知亮度 ≤180（即不再是白色/浅青色）。
+    # 与办公软件对齐：颜色取 a:rPr/a:solidFill/a:srgbClr；schemeClr 归并为深/浅。
+    _DARK_NEEDLES = ("Writing", "From comic strip to complete story",
+                     "Turn pictures into paragraphs", "notice character, place, and action")
+    r4_seen, r4_msg = 0, []
+    for needle in _DARK_NEEDLES:
+        for shp, para, t in paras_with(S2, needle):
+            for run in para.runs:
+                if not (run.text or '').strip():
+                    continue
+                hx = _run_color_hex(run)
+                if hx is None:
+                    continue
+                r4_seen += 1
+                br = _brightness(hx)
+                if br is None or br > 180:
+                    r4_msg.append("\"%s\"=%s" % (t[:16], hx))
+    _score(r4_seen > 0 and not r4_msg,
+           ("仍为浅色字：" + "；".join(r4_msg)) if r4_msg
+           else "已识别%d处显式深色字体色" % r4_seen)
+
+    # +1：第二页右侧插图、标题下方装饰分隔线、右下角"02"页码均保留
+    has_pic2 = len(_pictures(S2)) >= 1
+    has_div2 = any(_is_line_shape(s) and not _shape_text(s) for s in S2.shapes)
+    has_pn2 = any(t == '02' for _s, t in texts(S2))
+    _score(has_pic2 and has_div2 and has_pn2,
+           "插图=%s，分隔线=%s，\"02\"页码=%s" % (has_pic2, has_div2, has_pn2))
+
+    # ---- 第三页元素归类：标题 / 副标题 / 01-05 序号 / 5条学习目标 / 页码
+    t3 = texts(S3)
+    title3 = shapes_with(S3, 'Learning objectives')
+    title3_ids = {_sid(s) for s in title3}
+    pn3_ids = page_num_ids(S3)
+    mark3_ids = {_sid(sh) for sh, t in t3
+                 if re.fullmatch(r'0[1-5]', t) and _sid(sh) not in pn3_ids}
+    # 页顶（顶边<3.5厘米）的文本框属于标题／副标题区，不计入 01-05 学习目标
+    head3_ids = header_ids(S3)
+    obj3 = [(sh, t) for sh, t in t3
+            if len(t) >= 15
+            and _sid(sh) not in title3_ids | pn3_ids | mark3_ids | head3_ids]
+    obj3_ids = {_sid(sh) for sh, _t in obj3}
+    sub3 = [(sh, t) for sh, t in t3
+            if _sid(sh) in head3_ids
+            and _sid(sh) not in title3_ids | pn3_ids | mark3_ids | obj3_ids]
+
+    # +3：第三页右侧新增1张插图，宽 11.8-12.2 厘米且未被拉伸变形
+    # 与办公软件对齐：宽度取 p:spPr/a:xfrm/a:ext/@cx；变形判定按图片原始像素经
+    # a:srcRect 裁剪后的真实宽高比与显示宽高比之差（相对偏差>5% 视为拉伸）。
+    pics3 = _pictures(S3)
+    new_pic3 = None
+    r6_ok = False
+    r6_msg = []
+    for pp in pics3:
+        w = _cm(pp.width)
+        d = _pic_aspect_delta(pp)
+        r6_msg.append("宽%.2fcm，宽高比偏差%s"
+                      % (w or 0.0, "未知" if d is None else "%.1f%%" % (d * 100)))
+        if w is not None and 11.8 <= w <= 12.2:
+            if new_pic3 is None:
+                new_pic3 = pp
+            if d is None or d <= 0.05:
+                new_pic3 = pp
+                r6_ok = True
+                break
+    if new_pic3 is None and pics3:
+        new_pic3 = pics3[0]
+    _score(r6_ok, "；".join(r6_msg) or "该页未发现图片")
+
+    # +1：第三页新增图片整体位于右半区（左边界≥18厘米）并完整落在页面内
+    b3 = _box(new_pic3) if new_pic3 is not None else None
+    _score(b3 is not None and b3[0] >= 18.0 and in_page(b3),
+           "无图片" if b3 is None else "左边界%.2fcm，右边界%.2fcm，下边界%.2fcm"
+           % (b3[0], b3[2], b3[3]))
+
+    # +1：第三页标题25磅、副标题10.5磅、5条学习目标18磅且各自单行显示未折行
+    sz_t3 = sizes_of(title3)
+    sz_s3 = sizes_of([s for s, _t in sub3])
+    sz_o3 = sizes_of([s for s, _t in obj3])
+    fold3 = [t[:18] for sh, t in obj3 if not _single_line(sh)]
+    r8_ok = (near(sz_t3, 25.0, 25.0) and near(sz_s3, 10.5, 10.5)
+             and len(obj3) == 5 and near(sz_o3, 18.0, 18.0) and not fold3)
+    _score(r8_ok, "标题%s磅，副标题%s磅，%d条目标%s磅%s"
+           % ("/".join("%g" % v for v in sz_t3 if v is not None) or "?",
+              "/".join("%g" % v for v in sz_s3 if v is not None) or "?",
+              len(obj3),
+              "/".join(sorted({"%g" % v for v in sz_o3 if v is not None})) or "?",
+              ("，折行：" + "；".join(fold3)) if fold3 else "，均单行显示"))
+
+    # +5：第四页左右版式对调——插图移至左侧（左边界≤2.5厘米），正文移至右侧
+    # （左边界≥17厘米）
+    # 与办公软件对齐：位置取 a:off/@x，即"设置形状格式→位置→水平位置"。
+    pics4 = _pictures(S4)
+    pic4_left = min([_cm(p.left) for p in pics4 if p.left is not None] or [None]) \
+        if pics4 else None
+    body4 = []
+    for needle in ("What kind of story is this?",
+                   "A strong prediction helps you write a stronger plot"):
+        body4.extend(shapes_with(S4, needle))
+    body4_lefts = [_box(s)[0] for s in body4 if _box(s) is not None]
+    right_cnt4 = sum(1 for sh, _t in texts(S4)
+                     if _box(sh) is not None and _box(sh)[0] >= 17.0)
+    r9_ok = (pic4_left is not None and pic4_left <= 2.5
+             and bool(body4_lefts) and min(body4_lefts) >= 17.0
+             and right_cnt4 >= 3)
+    _score(r9_ok, "插图左边界%s，正文左边界%s，页面右半区文本框%d个"
+           % ("无图" if pic4_left is None else "%.2fcm" % pic4_left,
+              "/".join("%.2fcm" % v for v in body4_lefts) or "未找到", right_cnt4))
+
+    # +1：第四页标题、副标题及其下方装饰分隔线随正文一并右移，并与右栏文字左对齐
+    tt4 = shapes_with(S4, 'Warm-up: meet the explorer')
+    st4 = shapes_with(S4, 'Observe the character and predict the adventure')
+    div4 = [s for s in S4.shapes
+            if _is_line_shape(s) and not _shape_text(s)
+            and _box(s) is not None and _box(s)[1] < 6.0]
+    ref_left4 = min(body4_lefts) if body4_lefts else None
+    head4 = [s for s in (tt4 + st4 + div4)]
+    head4_lefts = [_box(s)[0] for s in head4 if _box(s) is not None]
+    r10_ok = (bool(tt4) and bool(st4) and bool(div4) and ref_left4 is not None
+              and bool(head4_lefts) and min(head4_lefts) >= 17.0
+              and all(abs(v - ref_left4) <= 0.6 for v in head4_lefts))
+    _score(r10_ok, "标题/副标题/分隔线左边界=%s，右栏正文左边界=%s"
+           % ("/".join("%.2f" % v for v in head4_lefts) or "未找到",
+              "?" if ref_left4 is None else "%.2f" % ref_left4))
+
+    # +1：第四页图文互不重叠，文字右边界未超出33.9厘米
+    r11_msg = []
+    for sh, t in texts(S4):
+        b = _box(sh)
+        if b is None:
+            continue
+        if b[2] > 33.9:
+            r11_msg.append("\"%s\"右边界%.2fcm" % (t[:14], b[2]))
+        for pic in _pictures(S4):
+            if _area(b) > 0 and _overlap(b, _box(pic)) / _area(b) > 0.05:
+                r11_msg.append("\"%s\"与插图重叠" % t[:14])
+    _score(not r11_msg, "；".join(r11_msg) or "图文分列且文字右边界均≤33.9厘米")
+
+    # +3：第五页新增2张插图（漫画分镜页面素材）
+    pics5 = _pictures(S5)
+    _score(len(pics5) >= 2, "该页图片数=%d" % len(pics5))
+
+    # +3：第五页两张新增图片放置在空白区，未压盖三个序号、三个标题、三段说明文字
+    # 及三条分隔线
+    # 与办公软件对齐：不做渲染，按形状外框相交面积判断"压盖"；受保护对象为该页
+    # 除页标题/副标题（顶边<3.5cm）、右下角页码、底部提示句以外的文字形状，以及
+    # 位于内容区（顶边≥4cm）的分隔线。
+    bottom5 = shapes_with(S5, 'Use title words to guess the setting')
+    excl5 = page_num_ids(S5) | header_ids(S5) | {_sid(s) for s in bottom5}
+    protected5 = [(sh, t) for sh, t in texts(S5) if _sid(sh) not in excl5]
+    protected5 += [(s, '分隔线') for s in S5.shapes
+                   if _is_line_shape(s) and not _shape_text(s)
+                   and _box(s) is not None and _box(s)[1] >= 4.0]
+    r13_msg = []
+    for pic in pics5:
+        pb = _box(pic)
+        for sh, t in protected5:
+            b = _box(sh)
+            if _area(b) > 0 and _overlap(pb, b) / _area(b) > 0.15:
+                r13_msg.append("压盖\"%s\"（相交%.0f%%）"
+                               % (t[:16], _overlap(pb, b) / _area(b) * 100))
+    _score(len(pics5) >= 2 and not r13_msg,
+           "；".join(sorted(set(r13_msg))) or "两张图片均未压盖序号/标题/说明/分隔线")
+
+    # +1：第五页两张新增图片完整落在页面内
+    out5 = ["图%d越界" % (i + 1) for i, p in enumerate(pics5) if not in_page(_box(p))]
+    _score(len(pics5) >= 2 and not out5,
+           "；".join(out5) or "；".join(
+               "图%d(%.2f,%.2f)-(%.2f,%.2f)" % ((i + 1,) + tuple(_box(p)))
+               for i, p in enumerate(pics5) if _box(p) is not None))
+
+    # +5：第六页箭头后的四段文字全部删除
+    all6 = " ".join(t for _s, t in texts(S6)).lower()
+    gone6 = [k for k in ('start the trip', 'face danger', 'make a choice',
+                         'find a way out') if k in all6]
+    _score(not gone6, ("仍存在：" + "／".join(gone6)) if gone6 else "四段文字均已删除")
+
+    # +3：第六页四行箭头后各补充上下两条横线（共8条），可单独选中，同行上下分离
+    # 与办公软件对齐：既接受"插入→形状→直线"（p:cxnSp / 极扁形状，可单独点选），
+    # 也接受在文本框里用连续下划线字符排出的横线；两者都只统计位于箭头右侧
+    # （左边界≥15厘米）的对象，避免把标题下方装饰分隔线算进来。
+    lines6 = [s for s in S6.shapes
+              if _is_line_shape(s) and _box(s) is not None and _box(s)[0] >= 15.0]
+    us6 = []
+    for sh in S6.shapes:
+        b = _box(sh)
+        try:
+            if not sh.has_text_frame or b is None or b[0] < 15.0:
+                continue
+            paras = list(sh.text_frame.paragraphs)
+        except Exception:
+            continue
+        for para in paras:
+            m = re.search(r'_{3,}', para.text or '')
+            if m:
+                szs = [v for v in _run_sizes(para, sh) if v]
+                us6.append((m.group(0), max(szs) if szs else 16.0, b))
+    n6 = len(lines6) + len(us6)
+    tops6 = sorted({round(_box(s)[1], 2) for s in lines6})
+    sep6 = (len(us6) >= 8) or (len(tops6) >= 8)
+    _score(n6 >= 8 and sep6,
+           "直线形状%d条、下划线%d条，独立纵向位置%d个" % (len(lines6), len(us6), len(tops6)))
+
+    # +1：第六页每条新增横线横向长度≥5厘米
+    len6 = [_line_length_cm(s) for s in lines6]
+    len6 += [min(_est_width_cm(u[0], u[1]), u[2][2] - u[2][0]) for u in us6]
+    _score(bool(len6) and all(v >= 5.0 for v in len6),
+           "各横线长度=%s（厘米）" % "/".join("%.2f" % v for v in len6) if len6
+           else "未发现新增横线")
+
+    # +1：第六页左侧插图、四个标签文字与四个"→"箭头符号均完整保留
+    labels6 = ('Clear sky', 'Storm wind', 'Huge wave', 'New island')
+    miss6 = [k for k in labels6 if not shapes_with(S6, k)]
+    n_arrow6 = sum(t.count('→') for _s, t in texts(S6))
+    _score(len(_pictures(S6)) >= 1 and not miss6 and n_arrow6 >= 4,
+           "插图%d张，缺失标签=%s，箭头%d个"
+           % (len(_pictures(S6)), "／".join(miss6) or "无", n_arrow6))
+
+    # ---- 第八/九页：按"小标题→对应内容"配对，再查动画
+    def group_pairs(slide, sub_needles):
+        """[(小标题文案, 小标题形状, 对应内容形状)]。
+        内容形状按版式二选一：①同一行且在小标题右侧（顶边差≤0.5厘米）的最近文本
+        框（左右分栏排法）；②小标题正下方、左边界对齐（±2.5厘米）的最近文本框
+        （上下堆叠排法）。字数<3 的对象一并排除，从而排除 A/B/C/D 字母标记与
+        页标题/副标题/页码。"""
+        tx = texts(slide)
+        excl = page_num_ids(slide) | header_ids(slide)
+        subs = []
+        for n in sub_needles:
+            for sh, t in tx:
+                if t.lower() == n.lower() and _sid(sh) not in excl:
+                    subs.append((n, sh))
+                    break
+        sub_ids = {_sid(sh) for _n, sh in subs}
+        pairs = []
+        for n, sub in subs:
+            sb = _box(sub)
+            cands = []
+            for sh, t in tx:
+                if _sid(sh) in excl or _sid(sh) in sub_ids or len(t) < 3:
+                    continue
+                b = _box(sh)
+                if b is None or sb is None:
+                    continue
+                if abs(b[1] - sb[1]) <= 0.5 and b[0] > sb[0] + 0.1:
+                    cands.append((0, b[0], sh))          # 同行右侧
+                elif b[1] > sb[1] + 0.1 and abs(b[0] - sb[0]) <= 2.5:
+                    cands.append((1, b[1], sh))          # 正下方
+            cands.sort(key=lambda c: (c[0], c[1]))
+            pairs.append((n, sub, cands[0][2] if cands else None))
+        return pairs
+
+    def anim_report(slide, sub_needles):
+        """返回 (8个对象的动画明细, 缺动画说明, 触发方式/顺序说明)。
+        明细项为 (组名, 角色, 效果标识, mainSeq 单击组序号)。"""
+        nodes, first = _entr_index(slide)
+        objs, miss, seq = [], [], []
+        for n, sub, cont in group_pairs(slide, sub_needles):
+            idxs = {}
+            for role, shp in (("小标题", sub), ("内容", cont)):
+                if shp is None:
+                    miss.append("%s-%s未找到" % (n, role))
+                    continue
+                i = first.get(_sid(shp))
+                if i is None:
+                    miss.append("%s-%s无进入动画" % (n, role))
+                    continue
+                idxs[role] = i
+                objs.append((n, role, nodes[i]['effect'], nodes[i]['group']))
+            if "小标题" in idxs and "内容" in idxs and idxs["小标题"] > idxs["内容"]:
+                seq.append("%s的内容早于小标题播放" % n)
+        return objs, miss, seq
+
+    _SUBS8 = ('Speech bubble', 'Caption', 'Sound effect', 'Thought bubble')
+    _SUBS9 = ('Caption', 'Speech bubble', 'Thought bubble', 'Sound effect')
+    objs8, miss8, seq8 = anim_report(S8, _SUBS8)
+    objs9, miss9, seq9 = anim_report(S9, _SUBS9)
+
+    # +5：第八页4组小标题与其对应释义文字均添加了进入动画
+    # 与办公软件对齐：进入动画=p:timing 里 p:cTn/@presetClass="entr"（或
+    # animEffect/@transition="in"），作用对象由 p:spTgt/@spid 指向的形状 id 确定。
+    _score(len(objs8) == 8 and not miss8,
+           ("；".join(miss8)) if miss8 else "8个对象均已添加进入动画")
+
+    # +5：第九页4组小标题与其对应例句均添加了进入动画
+    _score(len(objs9) == 8 and not miss9,
+           ("；".join(miss9)) if miss9 else "8个对象均已添加进入动画")
+
+    # +5：第八页8个对象对应8种互不相同的效果
+    # 与办公软件对齐：效果种类取 p:cTn/@presetID（动画窗格里显示的效果名就是它），
+    # 无 presetID 时退化取 p:animEffect/@filter 基名；同组小标题与释义若同名即不算
+    # 不同。
+    eff8 = [e for _n, _r, e, _g in objs8]
+    _score(len(objs8) == 8 and not miss8 and len(set(eff8)) == 8,
+           "实测效果=%s（去重后%d种）" % ("／".join(eff8) or "无", len(set(eff8))))
+
+    # +5：第九页8个对象对应8种互不相同的效果
+    eff9 = [e for _n, _r, e, _g in objs9]
+    _score(len(objs9) == 8 and not miss9 and len(set(eff9)) == 8,
+           "实测效果=%s（去重后%d种）" % ("／".join(eff9) or "无", len(set(eff9))))
+
+    # +1：第八、九页动画均为单击触发，并按"小标题→对应内容"的先后顺序依次播放
+    # 与办公软件对齐：p:timing 里 mainSeq 的每个直接子节点＝"一次单击放出的一组
+    # 动画"，故 8 个对象必须落在 8 个不同的单击组里才算逐个单击触发；被打包进同
+    # 一组的对象会随一次单击同时出现。顺序按小标题所在组序号早于其内容判定。
+    def click_check(objs, tag):
+        msg = []
+        gs = [g for _n, _r, _e, g in objs]
+        merged = sum(1 for g in set(gs) if gs.count(g) > 1)
+        if len(objs) == 8 and merged:
+            msg.append("%s有%d次单击同时放出多个对象" % (tag, merged))
+        by = {}
+        for n, r, _e, g in objs:
+            by.setdefault(n, {})[r] = g
+        for n, d in by.items():
+            if "小标题" in d and "内容" in d and d["小标题"] >= d["内容"]:
+                msg.append("%s%s未按小标题→内容顺序" % (tag, n))
+        return msg
+
+    click_msg = click_check(objs8, "第八页") + click_check(objs9, "第九页")
+    r23_ok = (len(objs8) == 8 and len(objs9) == 8 and not miss8 and not miss9
+              and not click_msg and not seq8 and not seq9)
+    _score(r23_ok, "；".join(click_msg[:6] + seq8 + seq9) or "均为单击逐个触发且顺序正确")
+
+    # +5：旧"Build a clear structure"整页已删除，并在第10页位置新增一页，仍18页
+    page_text = {i: " ".join(t for _s, t in texts(s)) for i, s in enumerate(slides, 1)}
+    old_pages = [i for i, v in page_text.items()
+                 if 'build a clear structure' in v.lower()
+                 or 'character→change→sequence' in _squash(v).lower()]
+    new10 = shapes_with(S10, 'Match five stages of the story with frames')
+    _score(len(slides) == 18 and not old_pages and bool(new10),
+           "总页数%d，旧页残留=%s，第10页新标题=%s"
+           % (len(slides), old_pages or "无", "有" if new10 else "无"))
+
+    # +3：新增第10页标题文字正确且位于页面顶部标题位置（顶边≤1.5厘米）
+    b10t = _box(new10[0]) if new10 else None
+    _score(bool(new10) and b10t is not None and b10t[1] <= 1.5,
+           "未找到标题" if b10t is None else "标题顶边%.2fcm" % b10t[1])
+
+    # +5：新增第10页在标题下方插入故事发展曲线图，宽19.8-20.2厘米且未被拉伸变形
+    pics10 = _pictures(S10)
+    pic10, r26_ok, r26_msg = None, False, []
+    for pp in pics10:
+        w = _cm(pp.width)
+        d = _pic_aspect_delta(pp)
+        r26_msg.append("宽%.2fcm，宽高比偏差%s"
+                       % (w or 0.0, "未知" if d is None else "%.1f%%" % (d * 100)))
+        if w is not None and 19.8 <= w <= 20.2:
+            if pic10 is None:
+                pic10 = pp
+            if d is None or d <= 0.05:
+                pic10, r26_ok = pp, True
+                break
+    if pic10 is None and pics10:
+        pic10 = pics10[0]
+    _score(r26_ok, "；".join(r26_msg) or "该页未发现图片")
+
+    # +1：新增第10页图片顶边≥3.5厘米（在标题下方）且在页面内水平居中
+    b10p = _box(pic10) if pic10 is not None else None
+    r27_ok = (b10p is not None and b10p[1] >= 3.5 and in_page(b10p)
+              and abs(b10p[0] - (page_w - b10p[2])) <= 1.0)
+    _score(r27_ok, "无图片" if b10p is None else
+           "图片顶边%.2fcm，左留白%.2fcm，右留白%.2fcm"
+           % (b10p[1], b10p[0], page_w - b10p[2]))
+
+    # +1：新增第10页标题字号与其余内容页标题一致，为25磅
+    sz10 = sizes_of(new10)
+    _score(near(sz10, 25.0, 25.0),
+           "标题字号=%s磅" % ("/".join("%g" % v for v in sz10 if v is not None) or "?"))
+
+    # +1：新增第10页右下角保留与页序一致的"10"页码标记
+    pn10 = [t for sh, t in texts(S10) if _sid(sh) in page_num_ids(S10)]
+    _score('10' in pn10, "右下角页码=%s" % ("／".join(pn10) or "无"))
+
+    # +1：新增第10页背景与其余内容页一致，为米黄色FFF7E8
+    bg10 = _bg_hex(S10)
+    _score(bg10 == 'FFF7E8', "第10页背景=%s" % bg10)
+
+    # +5：第十一页6个对话文本框全部添加了进入动画
+    _BUBBLES = ('A storm is coming!', 'We are in trouble.',
+                'Look! There is an island.', 'Quick! Row faster!',
+                'Thank goodness!', 'We made it!')
+    nodes11, first11 = _entr_index(S11)
+    bub11, miss11 = [], []
+    for n in _BUBBLES:
+        shp = None
+        for sh in shapes_with(S11, n):
+            shp = sh
+            break
+        if shp is None:
+            miss11.append("\"%s\"未找到" % n)
+            continue
+        i = first11.get(_sid(shp))
+        if i is None:
+            miss11.append("\"%s\"无进入动画" % n)
+            continue
+        bub11.append((n, nodes11[i]['effect'], nodes11[i]['group']))
+    _score(len(bub11) == 6 and not miss11,
+           "；".join(miss11) or "6个对话文本框均已添加进入动画")
+
+    # +3：第十一页6个对话文本框使用同一种进入动画效果，且为单击逐个触发
+    # 与办公软件对齐：逐个单击=6个对话框分别落在 mainSeq 的 6 个不同单击组里。
+    eff11 = {e for _n, e, _g in bub11}
+    grp11 = [g for _n, _e, g in bub11]
+    solo11 = (len(set(grp11)) == len(grp11))
+    _score(len(bub11) == 6 and len(eff11) == 1 and solo11,
+           "效果=%s；单击组序号=%s"
+           % ("／".join(sorted(eff11)) or "无",
+              "/".join(str(g) for g in grp11) or "无"))
+
+    # +1：第十一页主标题"While writing"未被添加动画
+    anim11 = _all_anim_spids(S11)
+    title11 = shapes_with(S11, 'While writing')
+    _score(bool(title11) and all(_sid(s) not in anim11 for s in title11),
+           "未找到主标题" if not title11 else
+           ("主标题被加入动画" if any(_sid(s) in anim11 for s in title11)
+            else "主标题未参与动画"))
+
+    # +3：第十六页右下角插图已删除，该位置无残留图片或空白图片框
+    # 与办公软件对齐：删除干净=该页不再有 p:pic，也没有留在原位（横向21.3厘米、
+    # 纵向13.5厘米附近）的空图片占位框。
+    res16 = []
+    for pp in _pictures(S16):
+        b = _box(pp)
+        res16.append("残留图片(%.2f,%.2f)" % (b[0], b[1]) if b else "残留图片")
+    for sh in S16.shapes:
+        b = _box(sh)
+        if b is None or _shape_text(sh) or _local(sh._element) != 'sp':
+            continue
+        if 20.0 <= b[0] <= 23.0 and 12.0 <= b[1] <= 15.0 \
+                and (b[2] - b[0]) >= 6.0 and (b[3] - b[1]) >= 2.0:
+            res16.append("残留空图片框(%.2f,%.2f)" % (b[0], b[1]))
+    _score(not res16, "；".join(res16) or "右下角插图已删除且无残留")
+
+    # +1：第十六页"Tense／Person／Voice"三行共9个文本框完整保留
+    miss16 = [k for k in ('Tense', 'Person', 'Voice') if not shapes_with(S16, k)]
+    grid16 = [sh for sh, _t in texts(S16)
+              if _sid(sh) not in page_num_ids(S16) | header_ids(S16)]
+    _score(not miss16 and len(grid16) >= 9,
+           "缺失行标签=%s，内容区文本框%d个" % ("／".join(miss16) or "无", len(grid16)))
+
+    # +5：全部18页均设置了页面切换动画
+    # 与办公软件对齐：切换效果写在 p:sld/p:transition 下（新式效果放在
+    # mc:AlternateContent 的 mc:Choice 里），即"切换"选项卡当前选中的效果。
+    trans = [_transition_key(s) for s in slides]
+    no_tr = [i for i, v in enumerate(trans, 1) if not v]
+    _score(len(slides) == 18 and not no_tr,
+           ("无切换的页：" + "、".join("第%d页" % i for i in no_tr)) if no_tr
+           else "18页均已设置切换效果")
+
+    # +5：18页的切换动画效果两两互不相同，共18种
+    uniq_tr = {v for v in trans if v}
+    dup_tr = sorted({v for v in trans if v and trans.count(v) > 1})
+    _score(len(slides) == 18 and not no_tr and len(uniq_tr) == 18,
+           "去重后%d种；重复效果=%s" % (len(uniq_tr), "／".join(dup_tr) or "无"))
+
+    # +1：交付稿仍为18页，页序与各页主题保持一致
+    order_ok = (len(slides) == 18
+                and 'story writing lab' in page_text.get(1, '').lower()
+                and 'writing' in page_text.get(2, '').lower()
+                and 'learning objectives' in page_text.get(3, '').lower()
+                and 'final checklist' in page_text.get(18, '').lower())
+    _score(order_ok, "共%d页；首页/第2页/第3页/末页主题匹配=%s"
+           % (len(slides), order_ok))
+
+    # ---------- 减分项：指令未涉及、却被一并改坏的项 ----------
+    # -5：第二至十五页正文西文字体被写死为"Arial"，未随主题字体（Aptos Display／
+    # Aptos）
+    # 与办公软件对齐：随主题=a:latin/@typeface 取 "+mj-lt"/"+mn-lt" 或干脆不写；
+    # 一旦写成具体字体名，改主题字体就不再生效。
+    hard_font = []
+    for n in (2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15):
+        s = sl(n)
+        if s is None:
+            continue
+        fonts = set()
+        for sh in s.shapes:
+            for tf in _latin_typefaces(sh):
+                if tf not in _THEME_FONT_REFS:
+                    fonts.add(tf)
+        if fonts:
+            hard_font.append("第%d页=%s" % (n, "／".join(sorted(fonts))))
+    _score(bool(hard_font), "；".join(hard_font) or "各页西文字体均随主题字体")
+
+    # -3：第三页5条学习目标文本框被压窄，宽度不再是25.15厘米且文字折行
+    w_bad = ["%.2fcm" % (_cm(sh.width) or 0.0) for sh, _t in obj3
+             if sh.width is None or not (25.0 <= (_cm(sh.width) or 0.0) <= 25.3)]
+    trig40 = len(obj3) != 5 or bool(w_bad) or bool(fold3)
+    _score(trig40, "实测框宽异常=%s；折行=%s"
+           % ("／".join(w_bad) or "无", "；".join(fold3) or "无")
+           if trig40 else "5条目标框宽25.15厘米且均单行显示")
+
+    # -3：第五页底部提示句被改字号并上移（应为22磅、顶边纵向14.35厘米）
+    trig41, r41_msg = True, "未找到该句"
+    if bottom5:
+        shb = bottom5[0]
+        bb = _box(shb)
+        szb = sizes_of([shb])
+        r41_msg = "字号=%s磅，顶边=%s" % (
+            "/".join("%g" % v for v in szb if v is not None) or "?",
+            "?" if bb is None else "%.2fcm" % bb[1])
+        trig41 = not (near(szb, 22.0, 22.0) and bb is not None
+                      and abs(bb[1] - 14.35) <= 0.15)
+    _score(trig41, r41_msg)
+
+    # -1：第一页右下角页码"01"字号被改（应为8磅）
+    pn1 = [sh for sh, t in texts(S1) if t == '01']
+    sz_pn1 = sizes_of(pn1)
+    trig42 = not near(sz_pn1, 8.0, 8.0)
+    _score(trig42, "\"01\"字号=%s磅"
+           % ("/".join("%g" % v for v in sz_pn1 if v is not None) or "未找到"))
+
+    # -1：第九页4条装饰分隔线被一并加入动画播放序列
+    # 与办公软件对齐：分隔线是无文字的直线/极扁形状；只要其 shape id 出现在
+    # p:timing 的任一 p:spTgt/@spid 上，就会在动画窗格里占一行并参与播放。
+    anim9 = _all_anim_spids(S9)
+    div9 = [s for s in S9.shapes if _is_line_shape(s) and not _shape_text(s)]
+    hit9 = [s for s in div9 if _sid(s) in anim9]
+    trig43 = bool(hit9)
+    _score(trig43, "参与动画的分隔线%d条（该页分隔线共%d条）%s"
+           % (len(hit9), len(div9),
+              "，纵向位置=" + "／".join("%.2fcm" % _box(s)[1] for s in hit9
+                                    if _box(s) is not None) if hit9 else ""))
+
+    # -1：第十页遗留无任何文字的空文本框
+    # 与办公软件对齐：只统计"真正的空文本框"——有 txBody 但无可见文字，且尺寸
+    # 达到正常文本框量级（宽≥1厘米、高≥0.5厘米），从而排除装饰用的极扁分隔线。
+    empty10 = []
+    for sh in S10.shapes:
+        b = _box(sh)
+        try:
+            if not sh.has_text_frame:
+                continue
+        except Exception:
+            continue
+        if _shape_text(sh) or b is None:
+            continue
+        if (b[2] - b[0]) >= 1.0 and (b[3] - b[1]) >= 0.5:
+            empty10.append("顶边%.2fcm、%.2f×%.2f厘米"
+                           % (b[1], b[2] - b[0], b[3] - b[1]))
+    trig44 = bool(empty10)
+    _score(trig44, "；".join(empty10) or "无空白元素残留")
+
+    # ========== 将 results 反解为结构化 dim2_items ==========
+    # 逐项按追加顺序对齐 _MAX_DELTAS_ORDER：解析每条 "+N：说明" / "-N：说明" 的
+    # N 与 rule。加分项 N=max_delta 表示命中；减分项 N=max_delta（负值）表示触发
+    # 扣分；两者未命中/未触发均写作 "+0"/"-0"。
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            "dim2 项数不一致：results=%d vs order=%d"
+            % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _sep, rule = raw.partition("：")
+        try:
+            delta = int(head.strip())
+        except ValueError:
+            delta = 0
+        hit = (delta != 0)
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total_score += (max_delta if hit else 0)
+
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 if __name__ == "__main__":
-    # 本地自测：默认以脚本所在目录为参数
-    target = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    _out = json.dumps(evaluate(target), ensure_ascii=False, indent=2)
-    # 不改 sys.stdout，直接以 UTF-8 写字节，规避 Windows cp1252 报错
-    try:
-        sys.stdout.buffer.write((_out + "\n").encode("utf-8"))
-    except AttributeError:
-        print(_out)
+    # 本地调试入口：evaluate 只接收"脚本所在目录的路径"，由脚本自己在该目录里
+    # 定位并打开被评估的 .pptx。命令行第 1 个参数可覆盖目录路径；未指定时使用
+    # 脚本自身所在目录。
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,1840 +1,1613 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-对 "晨岚咖啡品牌运营研究_标题栏与结束页_完成版.pptx" 的自动评估脚本。
-
-评估流程：
-  维度1（可用与可修改性）  —— 任意一项不达标，总分直接判为 0，不再检查维度2。
-  维度2（完成度）          —— 包含若干加分细则与扣分细则。
-                             加分细则：必须满足该细则内的"全部要点"才计这条加分。
-                             扣分细则：只要满足该细则内的"任意一个要点"即计这条扣分。
-
-依赖：python-pptx
-"""
-
-from __future__ import annotations
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
 import os
+import re
 import sys
 import json
-import zipfile
-import traceback
-from typing import List, Optional, Tuple
-
+import hashlib
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.util import Emu
+from pptx.enum.text import PP_ALIGN
 
-# 脚本编号（与文件名 officeval_XXX_verifier.py 保持一致）
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 本脚本只读取被评估的 .pptx，全部判定都在该文件内部自洽完成（坐标、字体、
+# 颜色、层级、媒体关系均取自文件本身），不与任何输入文件或原始素材做比对。
+#
+# 返回信息约定：
+#   status="error"（目录不存在、目录中没有 .pptx、脚本自身异常）表示这份作业
+#   根本没评上，此时 dim1_pass 为空串（未判定）、dim1_reason 为空串、
+#   dim2_items 为 []、total_score 与 max_score 均为 0；
+#   维度一未通过时 status 仍为 "ok"，dim1_pass 为 False、dim1_reason 写错误摘要、
+#   dim2_items 为 []（未真正逐条评过）、total_score 为 0、max_score 为满分；
+#   维度一通过时 dim1_pass 为 True、dim1_reason 保持空串。
+#   dim2_items 每条只含 rule / max_delta / delta / hit 四个键。
+
 SCRIPT_ID = "062"
+# 维度二所有"加分项"max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 67
 
-# ---------- 单位换算 ----------
-EMU_PER_CM = 360000
-EMU_PER_PT = 12700
+# 每一项的满分（加分项为正、减分项为负），顺序必须与下方 results.append 严格一致。
+_MAX_DELTAS_ORDER = [
+    5,   # 01 2-15 页顶部装饰组构成与摆放位置一致
+    5,   # 02 2-15 页顶部平行四边形数字块
+    1,   # 03 数字块蓝色系填充、白色数字且不小于 24 磅
+    3,   # 04 数字块内数字与页码对应递增 02-15
+    3,   # 05 数字块右侧衔接紧凑横条底板/蓝色细线框
+    3,   # 06 装饰整体外接矩形宽高比 2.5:1-7:1 且宽度不超过 16.9 厘米
+    3,   # 07 装饰整体外接矩形位于页面左上角
+    3,   # 08 中文标题文本框紧邻数字块右侧、落在横幅高度内
+    3,   # 09 中文标题文字与页码对应
+    1,   # 10 中文标题不小于 30 磅且加粗
+    3,   # 11 中文标题下方/右侧的英文文字 10-13 磅蓝色系
+    3,   # 12 英文文字为对应译名且 14 页互不相同
+    3,   # 13 横幅右端不少于 9 个小点呈 3 行 3 列点阵
+    1,   # 14 3 个平行小斜条 + 1 个独立小斜块
+    3,   # 15 第 16 页含独立"谢谢观看"文本对象
+    3,   # 16 "谢谢观看"中西文字体均为宋体
+    1,   # 17 "谢谢观看"加粗
+    1,   # 18 "谢谢观看"蓝色系
+    3,   # 19 "谢谢观看"段落居中且文本框水平居中
+    5,   # 20 第 16 页两个嵌入到文件内部的可播放视频
+    3,   # 21 两个视频指向两个不同的媒体文件
+    5,   # 22 两个视频左右并列、文本在上、完整位于页内
+    1,   # 23 两个视频宽度差与高度差不超过 0.5 厘米
+    1,   # 24 两个视频宽高比 0.71-0.79
+    1,   # 25 两个视频均带首帧预览画面
+    -5,  # 26 顶部标题栏装饰形状覆盖页面已有元素
+    -1,  # 27 第 2 页页面之外的 0×0 空白形状
+    -1,  # 28 第 14 页两处"风险管理"且一处超出页面右边界
+    -1,  # 29 第 15 页正文段落位置
+    -1,  # 30 第 16 页圆角矩形边框对象
+    -1,  # 31 第 16 页页码内容不为"16"
+    -3,  # 32 第 1 页主标题格式与位置
+    -1,  # 33 第 1 页副标题格式与位置
+    -1,  # 34 第 1 页右侧照片位置与尺寸
+    -3,  # 35 2-15 页左下角页脚格式与位置
+    -1,  # 36 2-15 页右下角页码格式与位置
+    -3,  # 37 2-15 页导语段落格式
+    -3,  # 38 2-15 页条目正文段落格式
+    -3,  # 39 第 4/6/7/8/12/13 页各含 1 个可编辑图表
+    -3,  # 40 2-15 页照片位置与尺寸
+    -1,  # 41 第 3 页品牌关键词色块填充色与边线色
+    -1,  # 42 第 9 页"协同重点"文字块
+    -1,  # 43 第 2/10/14 页条目左侧深灰色小竖条
+    -1,  # 44 页面尺寸 33.86×19.05 厘米
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+
+# ---------------------------------------------------------------- 常量与词表
+
+EMU_PER_CM = 360000.0
+PAGE_W_CM = 33.86          # 页面宽（厘米）
+PAGE_H_CM = 19.05          # 页面高（厘米）
+TOP_BAND_CM = 2.6          # "顶部区域"：距页面上边界 2.6 厘米以内
+HALF_W_CM = 16.9           # 页面宽度的一半：紧凑横幅右边界上限
+CENTER_X_CM = 16.93        # 页面水平中心
+
+# 第 2 页至第 15 页依次对应的中文标题
+TITLES = [
+    "内容框架", "品牌定位", "消费场景", "产品矩阵", "数字化运营", "会员运营",
+    "门店模型", "供应链协同", "品质控制", "增长路径", "营销策略", "效率提升",
+    "风险管理", "总结展望",
+]
+
+# 各页英文文字须为该页中文标题的英文译名：以译名关键词（小写子串）判定，
+# 兼容 "brand positioning" / "Brand Positioning" / "Brand Position" 等写法。
+EN_KEYWORDS = {
+    "内容框架": ("content", "framework", "outline"),
+    "品牌定位": ("brand", "position"),
+    "消费场景": ("consum", "scenario", "scene", "occasion"),
+    "产品矩阵": ("product", "matrix", "portfolio"),
+    "数字化运营": ("digital", "operation"),
+    "会员运营": ("member", "loyalty", "operation"),
+    "门店模型": ("store", "shop", "model"),
+    "供应链协同": ("supply", "chain", "collaborat", "synerg", "coordinat"),
+    "品质控制": ("quality", "control"),
+    "增长路径": ("growth", "path", "route"),
+    "营销策略": ("marketing", "strateg"),
+    "效率提升": ("efficien", "improve", "enhance", "upgrad"),
+    "风险管理": ("risk", "manage", "control"),
+    "总结展望": ("summary", "outlook", "conclusion", "prospect", "future"),
+}
+
+# 第 2 页至第 15 页照片的"距左/距上/宽/高"（厘米）
+PHOTO_SPECS = {
+    2: (20.95, 2.54, 11.30, 13.97), 3: (1.78, 2.67, 14.48, 13.84),
+    4: (18.41, 2.41, 13.59, 14.73), 5: (1.65, 2.54, 13.21, 14.48),
+    6: (2.03, 2.41, 13.46, 14.99), 7: (18.29, 2.41, 13.72, 15.11),
+    8: (18.29, 2.41, 13.72, 15.11), 9: (1.78, 2.41, 15.11, 14.86),
+    10: (17.65, 2.41, 14.35, 15.11), 11: (18.41, 2.54, 13.21, 14.48),
+    12: (1.78, 2.41, 14.61, 14.86), 13: (1.65, 2.41, 13.59, 15.11),
+    14: (18.16, 2.41, 13.59, 15.11), 15: (18.03, 0.00, 15.82, 19.05),
+}
+
+CHART_PAGES = (4, 6, 7, 8, 12, 13)     # 须各含 1 个可编辑图表对象的页
+BAR_PAGES = (2, 10, 14)                # 条目左侧须含深灰色小竖条的页
+
+BODY_FONT = "Noto Sans CJK SC"         # 正文/标题/页脚统一字体
+SONG = ("宋体", "SimSun", "NSimSun")   # 宋体及其等价西文族名
+
+P15_TEXT = ("晨岚咖啡的增长关键，不是追逐单一爆品或短期声量，"
+            "而是把稳定出品、便利触达和轻量会员关系长期做细。")
+P9_TEXT = "协同重点：少压货、快流转、可追踪"
+DOC_TITLE = "晨岚咖啡品牌运营研究"
+SUB_TITLE = "城市轻饮场景的产品、渠道与运营重构"
+
+# 蓝色系：命中蓝色主题色或常见蓝色色值（用于装饰形状填充/线条的粗判）
+BLUE_XML_RE = re.compile(
+    r'srgbClr val="(?:2962FF|347BDC|4472C4|5590E2|6CA1EB|2360B9|88B5F5'
+    r'|BCD7FB|BCD6FA|C6DEFF|00B0F0|1F4E79|305496)"'
+    r'|schemeClr val="accent(?:1|5)"'
+)
+CJK_RE = re.compile(r'[一-鿿]')
+EN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 &\-/',\.]*$")
+
+# ---------------------------------------------------------------- 通用取值工具
 
 
-def emu_to_cm(v: int) -> float:
-    return v / EMU_PER_CM
+def _cm(v):
+    """EMU -> 厘米，保留 2 位小数（与办公软件"位置和大小"面板显示口径一致）。"""
+    return round((v or 0) / EMU_PER_CM, 2)
 
 
-def emu_to_pt(v: int) -> float:
-    return v / EMU_PER_PT
+def _box(sh):
+    """返回 (左, 上, 右, 下)，单位厘米。"""
+    left = _cm(sh.left)
+    top = _cm(sh.top)
+    return (left, top, left + _cm(sh.width), top + _cm(sh.height))
 
 
-# ---------- 维度2 评分记录器 ----------
-class Dim2Log:
-    """维度2 评分记录器：每条评分项无论是否命中都会追加一条记录。
-
-    每条记录形如：
-        {"rule": "...", "max_delta": 5, "delta": 5|0, "hit": bool, "detail": ""}
-    """
-
-    def __init__(self):
-        self.items: List[dict] = []
-
-    def record(self, rule: str, max_delta: int, hit: bool, detail: str = ""):
-        delta = max_delta if hit else 0
-        # 按要求：返回结构中 detail 字段一律置空（不影响命中判定与打分逻辑）
-        self.items.append({
-            "rule": rule,
-            "max_delta": max_delta,
-            "delta": delta,
-            "hit": bool(hit),
-            "detail": "",
-        })
-
-    def total(self) -> int:
-        return sum(it["delta"] for it in self.items)
+def _wh(sh):
+    return (_cm(sh.width), _cm(sh.height))
 
 
-# ---------- 颜色相关工具 ----------
-def _rgb_of(run_font) -> Optional[Tuple[int, int, int]]:
-    """安全地取出 run.font.color.rgb，没有就返回 None。"""
+def _inter_area(a, b):
+    """两个矩形的重叠面积（平方厘米）。"""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+def _area(b):
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _xml(sh):
     try:
-        c = run_font.color
-        if c is None or c.type is None:
-            return None
-        rgb = c.rgb
-        if rgb is None:
-            return None
-        return (rgb[0], rgb[1], rgb[2])
+        return sh._element.xml
     except Exception:
-        return None
+        return ""
 
 
-def is_blue(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """蓝色判定：B 通道为主，且 B>R 较多。"""
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    return b >= 120 and b > r + 20 and b >= g - 20
-
-
-def is_light_blue_or_white(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    if r >= 230 and g >= 230 and b >= 230:
-        return True  # 白
-    # 浅蓝：B 较高，整体偏亮
-    return b >= 180 and (r + g) >= 300 and b >= r
-
-
-def is_light_blue(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """浅蓝色（不含白色）：B 较高，整体偏亮，且 B > R（去掉白色分支）。"""
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    # 排除白色 / 灰色
-    if r >= 230 and g >= 230 and b >= 230:
-        return False
-    return b >= 180 and (r + g) >= 300 and b >= r and b > r + 5
-
-
-def is_blue_or_light_blue(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """严格"蓝色 或 浅蓝色"：不含白色、不含灰色。"""
-    return is_blue(rgb) or is_light_blue(rgb)
-
-
-# ---------- 非主题色（白/浅/灰）判定 ----------
-# 说明：以下若干判定用于"非主题色"色值要求（例如规范中的"白色"、"浅色"、"灰色"等）。
-# 对于这类要求，只需符合颜色本身的定义即可通过，不再要求与主题蓝色相近。
-def is_white(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """白色（非主题色）：三通道均较高。"""
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    return r >= 230 and g >= 230 and b >= 230
-
-
-def is_gray(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """灰色（非主题色）：三通道数值接近相等（差 ≤ 25），亮度不至于纯黑或纯白。"""
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    if max(r, g, b) - min(r, g, b) > 25:
-        return False
-    return 40 <= min(r, g, b) <= 230
-
-
-def is_light_color(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """浅色（非主题色）：最小通道 ≥ 180，即整体明亮的低饱和色。"""
-    if rgb is None:
-        return False
-    r, g, b = rgb
-    return min(r, g, b) >= 180
-
-
-def is_non_theme_light(rgb: Optional[Tuple[int, int, int]]) -> bool:
-    """非主题色的浅/白/灰颜色：符合白色 / 浅色 / 灰色其中之一即可。
-
-    用于"非主题色颜色设定"—— 只要颜色本身符合要求即通过，无需与主题蓝色相近。
-    """
-    return is_white(rgb) or is_gray(rgb) or is_light_color(rgb)
-
-
-def shape_fill_rgb(shape) -> Optional[Tuple[int, int, int]]:
-    """尝试取得形状填充色 RGB。"""
+def _txt(sh):
+    """形状内文字（去空白）。无文本框返回空串。"""
     try:
-        fill = shape.fill
-        if fill is None:
-            return None
-        # 渐变 / 图片 / 主题色 等情况 .fore_color.rgb 可能报错
-        rgb = fill.fore_color.rgb
-        if rgb is None:
-            return None
-        return (rgb[0], rgb[1], rgb[2])
-    except Exception:
-        return None
-
-
-def shape_has_gradient_fill(shape) -> bool:
-    """看 XML 是否使用 gradFill。"""
-    try:
-        xml = shape._element.xml
-        return "gradFill" in xml
-    except Exception:
-        return False
-
-
-def shape_line_width_pt(shape) -> Optional[float]:
-    try:
-        w = shape.line.width
-        if w is None:
-            return None
-        return emu_to_pt(w)
-    except Exception:
-        return None
-
-
-def shape_line_rgb(shape) -> Optional[Tuple[int, int, int]]:
-    try:
-        rgb = shape.line.color.rgb
-        if rgb is None:
-            return None
-        return (rgb[0], rgb[1], rgb[2])
-    except Exception:
-        return None
-
-
-# ---------- 几何工具 ----------
-def shape_bbox_cm(shape) -> Tuple[float, float, float, float]:
-    """返回 (left, top, right, bottom)，单位 cm。"""
-    l = emu_to_cm(shape.left or 0)
-    t = emu_to_cm(shape.top or 0)
-    w = emu_to_cm(shape.width or 0)
-    h = emu_to_cm(shape.height or 0)
-    return l, t, l + w, t + h
-
-
-def rect_intersect_area(a, b) -> float:
-    al, at, ar, ab = a
-    bl, bt, br, bb = b
-    iw = max(0.0, min(ar, br) - max(al, bl))
-    ih = max(0.0, min(ab, bb) - max(at, bt))
-    return iw * ih
-
-
-def rect_area(a) -> float:
-    return max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
-
-
-# ---------- 维度 1 ----------
-def check_dim1(pptx_path: str) -> Tuple[bool, List[str]]:
-    """维度1：
-       1) 交付文件为 .pptx 格式，文件可正常打开；
-       2) 交付PPT包含16页幻灯片。
-    返回 (是否通过, 失败原因列表)。
-    """
-    fails: List[str] = []
-
-    # 1. 文件存在 & 后缀必须为 .pptx
-    if not os.path.exists(pptx_path):
-        return False, [f"文件不存在: {pptx_path}"]
-    if not pptx_path.lower().endswith(".pptx"):
-        fails.append("文件后缀不是 .pptx")
-
-    # 2. 文件可正常打开：能作为 zip 解包，且能被 python-pptx 解析
-    try:
-        with zipfile.ZipFile(pptx_path, "r") as zf:
-            _ = zf.namelist()
-    except zipfile.BadZipFile:
-        return False, ["文件不是合法的 pptx (zip) 包，无法打开"]
-
-    try:
-        prs = Presentation(pptx_path)
-    except Exception as e:
-        return False, [f"python-pptx 解析失败，文件无法正常打开: {e}"]
-
-    # 3. 交付PPT包含16页幻灯片
-    slide_count = len(prs.slides)
-    if slide_count != 16:
-        fails.append(f"交付PPT幻灯片数量为 {slide_count}，不等于 16 页")
-
-    return (len(fails) == 0), fails
-
-
-# ---------- 标题栏识别 ----------
-# ---------- 维度 2 ----------
-def evaluate_dim2(pptx_path: str, log: Dim2Log):
-    prs = Presentation(pptx_path)
-    slide_w_cm = emu_to_cm(prs.slide_width)
-    slide_h_cm = emu_to_cm(prs.slide_height)
-    slides = list(prs.slides)
-
-    # 针对 2-15 页 (索引 1..14)，先抽取标题栏关键元素
-    page_header_info = []  # 每页一个 dict
-    for i in range(1, 15):
-        # page_num = 2..15，用于校验"页码/章节编号"与实际页码对应
-        page_header_info.append(
-            extract_header_info(slides[i], slide_w_cm, slide_h_cm, page_num=i + 1)
-        )
-
-    # +5：第2-15页PPT顶部标题外侧均添加蓝色形状组合标题栏
-    #    按细则拆分为以下并列要点（每一页都需要全部满足）：
-    #      a) 范围：第 2-15 页（共 14 页）；
-    #      b) 位置：标题栏位于 PPT "顶部"（顶端区域）；
-    #      c) 位置：位于原页面标题的"外侧"（不遮挡/不覆盖原标题，在其上方/外部）；
-    #      d) 形态：为"形状组合"——由多个形状组成（≥2 个形状）；
-    #      e) 颜色：整体呈蓝色（包含蓝色形状元素）。
-    cnt_top_outside_blue_group = sum(
-        1 for info in page_header_info if info["top_outside_blue_group_ok"]
-    )
-    log.record(
-        "第2-15页PPT顶部标题外侧均添加蓝色形状组合标题栏",
-        5,
-        cnt_top_outside_blue_group == 14,
-        f"达标页数 {cnt_top_outside_blue_group}/14",
-    )
-
-    # +5: 左侧蓝色主形状（梯形/折角/平行四边形），宽3-4cm，高2-3cm，蓝色或浅蓝色（含渐变），轮廓可编辑
-    ok_left_shape = sum(1 for info in page_header_info if info["left_main_ok"])
-    log.record(
-        "第2-15页标题栏左侧蓝色主形状（宽3-4cm、高2-3cm、蓝色/浅蓝/渐变填充）均达标",
-        5,
-        ok_left_shape == 14,
-        f"达标页数 {ok_left_shape}/14",
-    )
-
-    # +5: 右侧长条外框 宽12-15cm 高1.5-3cm 蓝细线 + 斜切过渡 + 所有标题栏形状线宽 0.75-1.5pt 蓝色
-    ok_right = sum(1 for info in page_header_info if info["right_bar_ok"])
-    log.record(
-        "第2-15页标题栏右侧长条外框（宽12-15cm、高1.5-3cm、蓝细实线）、斜切过渡形状与线宽均达标",
-        5,
-        ok_right == 14,
-        f"达标页数 {ok_right}/14",
-    )
-
-    # +5: 文本元素 —— 页码/编号(Arial 28-32pt 白/浅色)、中文标题(宋体加粗 30pt 蓝色)、英文副标题(Arial 10-14pt 浅蓝)
-    ok_text = sum(1 for info in page_header_info if info["text_ok"])
-    log.record(
-        "第2-15页标题栏文字（页码 Arial 28-32pt 白/浅色；中文宋体加粗 30pt 蓝色；英文 Arial 10-14pt 浅蓝）均达标",
-        5,
-        ok_text == 14,
-        f"达标页数 {ok_text}/14",
-    )
-
-    # +5: 装饰点阵(9-25 圆点) + 3 条短斜线，位于右侧、不重叠、线宽1-3pt
-    ok_decor = sum(1 for info in page_header_info if info["decor_ok"])
-    log.record(
-        "第2-15页标题栏右侧装饰点阵（9-25个圆点）与 3 条浅蓝色短斜线均达标",
-        5,
-        ok_decor == 14,
-        f"达标页数 {ok_decor}/14",
-    )
-
-    # +1：第16页 "谢谢观看" 文本
-    if len(slides) >= 16:
-        end_ok, end_detail = check_end_thanks(slides[15], slide_w_cm, slide_h_cm)
-    else:
-        end_ok, end_detail = False, "不足16页"
-    log.record(
-        "第16页'谢谢观看'文本（宋体、加粗、36-50pt、蓝色、居中且位于上方区域）达标",
-        1,
-        end_ok,
-        end_detail,
-    )
-
-    # +5：第16页视频对象（左右两段视频、尺寸、对齐、间距）
-    if len(slides) >= 16:
-        vid_ok, vid_detail = check_end_videos(slides[15], slide_w_cm, slide_h_cm)
-    else:
-        vid_ok, vid_detail = False, "不足16页"
-    log.record(
-        "第16页插入了左右两段视频，宽8-10cm、高11-12cm、顶部对齐、间距1.0-2.5cm、居中位于页面中下部",
-        5,
-        vid_ok,
-        vid_detail,
-    )
-
-    # +5：视频可播放 + 静态封面/首帧
-    media_ok, media_detail = check_end_videos_playable(pptx_path)
-    log.record(
-        "第16页两段视频在播放模式下可正常播放，且具备静态封面/首帧图像",
-        5,
-        media_ok,
-        media_detail,
-    )
-
-
-
-# ---------- 标题栏内部判定 ----------
-def extract_header_info(slide, slide_w_cm: float, slide_h_cm: float, page_num: int = 0) -> dict:
-    """从单页中提取标题栏的各项检测结论。
-
-    page_num：该页的实际页码（如 2, 3, ..., 15）；用于校验标题栏左侧
-    "页码/章节编号" 是否与当前页对应。0 表示不校验页码对应关系（保留兼容）。
-    """
-    header_shapes = [sh for sh in slide.shapes if emu_to_cm(sh.top or 0) < 3.0]
-
-    # ---------- top_outside_blue_group_ok：识别"标题栏形状集合"本身 ----------
-    # 思路：不再把"顶部 20% 内任意形状"当作标题栏，而是先识别真正构成"标题栏"的
-    # 形状集合 —— 位于页面顶部区域、具备蓝色特征（蓝色/浅蓝填充或描边、含蓝色渐变）
-    # 的 AutoShape 集合（排除图表、媒体、以及横跨整页的大图/背景）。
-    # 再从"标题栏形状集合本身"出发，验证：
-    #   a) 位置：整体位于页面顶部；
-    #   b) 蓝色组合：集合内至少有 2 个蓝色形状，形成"蓝色形状组合"；
-    #   c) 形状组合：由多个形状组成（≥2 个形状）；
-    #   d) 水平延展：集合的水平跨度足以构成"标题栏"（≥ 页宽 50%）；
-    #   e) 外侧关系：原页面主标题不被标题栏形状集合覆盖 ——
-    #      主标题（含中文、字号 ≥18pt 的文本框）与标题栏集合 bbox 的垂直重叠
-    #      不超过主标题自身高度的 30%。
-    top_zone_limit = slide_h_cm * 0.20
-
-    def _shape_is_blueish(sh):
-        fill_rgb = shape_fill_rgb(sh)
-        line_rgb = shape_line_rgb(sh)
-        return (
-            is_blue(fill_rgb)
-            or is_light_blue_or_white(fill_rgb)
-            or is_blue(line_rgb)
-            or is_light_blue_or_white(line_rgb)
-            or shape_has_gradient_fill(sh)
-        )
-
-    title_bar_shapes = []
-    for sh in slide.shapes:
-        if sh.shape_type in (MSO_SHAPE_TYPE.CHART, MSO_SHAPE_TYPE.MEDIA):
-            continue
-        top_cm = emu_to_cm(sh.top or 0)
-        if top_cm >= top_zone_limit:
-            continue
-        w_cm = emu_to_cm(sh.width or 0)
-        h_cm = emu_to_cm(sh.height or 0)
-        # 排除横跨整页的大图片（可能是背景 / 装饰底图，不属于标题栏组合）
-        if sh.shape_type == MSO_SHAPE_TYPE.PICTURE and w_cm >= slide_w_cm * 0.8:
-            continue
-        if _shape_is_blueish(sh):
-            title_bar_shapes.append(sh)
-
-    # c) 形状组合：≥2 个形状；b) 蓝色组合：集合本身即为蓝色形状（已在筛选时保证）
-    group_ok = len(title_bar_shapes) >= 2
-    has_blue_element = len(title_bar_shapes) >= 2
-
-    # a) / d) 标题栏集合的相对位置与水平跨度
-    if title_bar_shapes:
-        tb_left = min(emu_to_cm(sh.left or 0) for sh in title_bar_shapes)
-        tb_top = min(emu_to_cm(sh.top or 0) for sh in title_bar_shapes)
-        tb_right = max(
-            emu_to_cm((sh.left or 0) + (sh.width or 0)) for sh in title_bar_shapes
-        )
-        tb_bottom = max(
-            emu_to_cm((sh.top or 0) + (sh.height or 0)) for sh in title_bar_shapes
-        )
-        span_ok = (tb_right - tb_left) >= slide_w_cm * 0.5
-        # 集合整体位于顶部：bbox 顶端接近页面顶部（tb_top < 页高 15%）
-        top_position_ok = tb_top < slide_h_cm * 0.15
-    else:
-        tb_left = tb_top = tb_right = tb_bottom = 0
-        span_ok = False
-        top_position_ok = False
-
-    # e) 外侧关系：原页面主标题不被标题栏形状集合覆盖
-    #    ——识别整页中"含中文、字号 ≥18pt"的文本框作为主标题候选，
-    #    候选文本框不属于标题栏集合，其 bbox 与标题栏集合 bbox 的垂直重叠
-    #    应不超过其自身高度的 30%。
-    outside_ok = True
-    title_bar_set = set(id(s) for s in title_bar_shapes)
-    for sh in slide.shapes:
-        if id(sh) in title_bar_set:
-            continue
         if not sh.has_text_frame:
-            continue
-        txt = sh.text_frame.text.strip()
-        if not txt:
-            continue
-        has_cn = any("一" <= ch <= "鿿" for ch in txt)
-        if not has_cn:
-            continue
-        try:
-            run = sh.text_frame.paragraphs[0].runs[0]
-            size_pt = run.font.size.pt if run.font.size else 0
-        except Exception:
-            size_pt = 0
-        if size_pt < 18:
-            continue  # 非主标题级别字号
-        l, t, r, b = shape_bbox_cm(sh)
-        if b - t <= 0.01 or not title_bar_shapes:
-            continue
-        overlap_h = max(0.0, min(b, tb_bottom) - max(t, tb_top))
-        if overlap_h > (b - t) * 0.3:
-            outside_ok = False
-            break
-
-    top_outside_blue_group_ok = (
-        group_ok
-        and has_blue_element
-        and top_position_ok
-        and span_ok
-        and outside_ok
-    )
-
-    # ---------- has_header：保留旧字段（供其它评分项内部参考） ----------
-    blue_like_cnt = 0
-    for sh in header_shapes:
-        rgb = shape_fill_rgb(sh)
-        if is_blue(rgb) or is_light_blue_or_white(rgb) or shape_has_gradient_fill(sh):
-            blue_like_cnt += 1
-    has_header = blue_like_cnt >= 3
-
-    # ---------- left_main_ok：左侧蓝色主形状 ----------
-    # 按细则拆分为以下并列要点（每一页都需要全部满足）：
-    #   a) 位置：位于"标题栏左侧"；
-    #   b) 形态：为"梯形"或"折角卡片形状"（折角卡片可视为平行四边形/带斜边的卡片）；
-    #   c) 宽度：3-4 厘米；
-    #   d) 高度：2-3 厘米；
-    #   e) 填充：蓝色渐变 或 浅蓝色；
-    #   f) 轮廓可编辑（即非锁定 / 可读取到 line 属性）；
-    #   g) 唯一性：标题栏左侧"仅包含一个"满足上述形态(梯形/折角卡片)的形状（不能出现 2 个或以上）。
-    import re
-    card_shapes = {
-        "trapezoid",
-        "parallelogram",
-        "foldedCorner",
-        "flowChartManualOperation",
-        "flowChartManualInput",
-    }
-
-    # g) 先统计标题栏左侧区域内"梯形/折角卡片"形状总数
-    left_card_shapes_in_zone = []
-    for sh in header_shapes:
-        l, t, r, b = shape_bbox_cm(sh)
-        if l > slide_w_cm * 0.35:  # a) 标题栏左侧
-            continue
-        xml = sh._element.xml
-        m = re.search(r'prstGeom prst="([^"]+)"', xml)
-        prst = m.group(1) if m else ""
-        if prst in card_shapes:
-            left_card_shapes_in_zone.append(sh)
-
-    left_main_ok = False
-    # 仅当左侧区域恰好有 1 个梯形/折角卡片形状时才继续后续判定
-    if len(left_card_shapes_in_zone) == 1:
-        sh = left_card_shapes_in_zone[0]
-        l, t, r, b = shape_bbox_cm(sh)
-        w = r - l
-        h = b - t
-        ok = True
-        # c) 宽度 3-4cm
-        if not (3.0 <= w <= 4.0):
-            ok = False
-        # d) 高度 2-3cm
-        if ok and not (2.0 <= h <= 3.0):
-            ok = False
-        # e) 填充：蓝色渐变 或 浅蓝色
-        if ok:
-            has_grad = shape_has_gradient_fill(sh)
-            rgb = shape_fill_rgb(sh)
-            light_blue_hit = False
-            if rgb is not None:
-                rd, gn, bl = rgb
-                # 浅蓝：B 通道较高且整体偏亮（R/G 也较大但不超过 B）
-                if bl >= 180 and bl >= rd and bl >= gn - 20 and (rd + gn) >= 240:
-                    light_blue_hit = True
-            if not (has_grad or light_blue_hit):
-                ok = False
-        # f) 轮廓可编辑：能够访问 sh.line 即视为可编辑
-        if ok:
-            try:
-                _ = sh.line
-            except Exception:
-                ok = False
-        left_main_ok = ok
-
-    # ---------- right_bar_ok：右侧长条外框 + 斜切过渡 + 标题栏整体线宽颜色 ----------
-    # 按细则拆分为以下并列要点（每一页都需要全部满足）：
-    #   A. 右侧长条外框（"长圆角平行四边形外框"）：
-    #      A1) 位于标题栏"右侧"；
-    #      A2) 形态：长圆角平行四边形外框；
-    #      A3) 颜色：填充为浅蓝色 或 白色；
-    #      A4) 宽度 12-15 cm；
-    #      A5) 高度 1.5-3 cm；
-    #      A6) 边框：蓝色细实线。
-    #   B. 斜切过渡形状（位于左侧主形状与右侧长条之间）：
-    #      B1) 位置：处于左侧主形状与右侧长条之间；
-    #      B2) 角度约 15°-30°；
-    #      B3) 颜色：白色 或 浅蓝色；
-    #      B4) 形成层叠卡片效果（与左/右元素有水平交叠）。
-    #   C. 标题栏整体形状的边框：
-    #      C1) 线宽 0.75-1.5 磅；
-    #      C2) 颜色：蓝色 或 浅蓝色。
-    import re
-
-    def _prst_of(sh):
-        m = re.search(r'prstGeom prst="([^"]+)"', sh._element.xml)
-        return m.group(1) if m else ""
-
-    def _is_solid_blue_line(sh):
-        # 边框颜色只接受"蓝色 或 浅蓝色"，不再接受白色。
-        line_rgb = shape_line_rgb(sh)
-        if not is_blue_or_light_blue(line_rgb):
-            return False
-        xml = sh._element.xml
-        m_dash = re.search(r'prstDash\s+val="([^"]+)"', xml)
-        if m_dash and m_dash.group(1) != "solid":
-            return False
-        return True
-
-    def _is_white_or_light_blue_fill(sh):
-        # "填充为浅蓝色 或 白色"：仅接受浅蓝色 或 白色，不再放宽到灰色/其它浅色。
-        if shape_has_gradient_fill(sh):
-            return False
-        rgb = shape_fill_rgb(sh)
-        if rgb is None:
-            return False
-        # 白色：三通道均 ≥230
-        if is_white(rgb):
-            return True
-        # 浅蓝：不含白色，且 B 通道占优
-        if is_light_blue(rgb):
-            return True
-        return False
-
-    # A) 右侧长条外框
-    right_bar_found = False
-    right_bar_shape = None
-    parallelogram_card_shapes = {
-        "parallelogram",
-        "roundRect",
-        "round1Rect",
-        "round2SameRect",
-        "round2DiagRect",
-        "snip1Rect",
-        "snip2SameRect",
-        "snip2DiagRect",
-        "snipRoundRect",
-    }
-    for sh in header_shapes:
-        l, t, r, b = shape_bbox_cm(sh)
-        w = r - l
-        h = b - t
-        if (l + w / 2) < slide_w_cm * 0.5:  # A1) 右侧
-            continue
-        if not (12.0 <= w <= 15.0):  # A4)
-            continue
-        if not (1.5 <= h <= 3.0):  # A5)
-            continue
-        if _prst_of(sh) not in parallelogram_card_shapes:  # A2)
-            continue
-        if not _is_white_or_light_blue_fill(sh):  # A3)
-            continue
-        if not _is_solid_blue_line(sh):  # A6)
-            continue
-        right_bar_found = True
-        right_bar_shape = sh
-        break
-
-    # B) 斜切过渡形状
-    slant_found = False
-    left_main_bbox = None
-    for sh in header_shapes:
-        l, t, r, b = shape_bbox_cm(sh)
-        if l > slide_w_cm * 0.35:
-            continue
-        w = r - l
-        h = b - t
-        if not (3.0 <= w <= 4.0 and 2.0 <= h <= 3.0):
-            continue
-        if _prst_of(sh) not in {
-            "trapezoid",
-            "parallelogram",
-            "foldedCorner",
-            "flowChartManualOperation",
-            "flowChartManualInput",
-        }:
-            continue
-        left_main_bbox = (l, t, r, b)
-        break
-
-    for sh in header_shapes:
-        if _prst_of(sh) != "parallelogram":
-            continue
-        l, t, r, b = shape_bbox_cm(sh)
-        w = r - l
-        h = b - t
-        if w <= 0 or h <= 0:
-            continue
-        # B2) 角度：解析 parallelogram 的 adj 值（PPT 几何：tan(angle)≈adj）。
-        #     15°→adj≈0.268；30°→adj≈0.577。给一点容差 0.20-0.62。
-        xml = sh._element.xml
-        m_adj = re.search(r'<a:gd\s+name="adj"\s+fmla="val\s+(-?\d+)"', xml)
-        if m_adj:
-            adj = int(m_adj.group(1)) / 100000.0
-        else:
-            adj = 0.25  # parallelogram 默认值
-        if not (0.20 <= abs(adj) <= 0.62):
-            continue
-        if not _is_white_or_light_blue_fill(sh):  # B3)
-            continue
-        # B1) 位于左侧主形状与右侧长条之间
-        if left_main_bbox is not None and right_bar_shape is not None:
-            lm_right = left_main_bbox[2]
-            rb_l = emu_to_cm(right_bar_shape.left or 0)
-            rb_r = rb_l + emu_to_cm(right_bar_shape.width or 0)
-            cx = (l + r) / 2
-            if not (lm_right - 1.0 <= cx <= rb_r):
-                continue
-        # B4) 层叠卡片效果：与左侧主形状或右侧长条在水平上有重叠
-        stacked = False
-        if left_main_bbox is not None:
-            if not (r < left_main_bbox[0] or l > left_main_bbox[2]):
-                stacked = True
-        if (not stacked) and right_bar_shape is not None:
-            rb_l = emu_to_cm(right_bar_shape.left or 0)
-            rb_r = rb_l + emu_to_cm(right_bar_shape.width or 0)
-            if not (r < rb_l or l > rb_r):
-                stacked = True
-        if not stacked:
-            continue
-        slant_found = True
-        break
-
-    # C) 所有标题栏形状的可见边框必须显式满足：
-    #    - 线宽 0.75-1.5 磅（须显式设置且 > 0）
-    #    - 颜色为蓝色 或 浅蓝色（不接受白色/灰色）
-    # 判定策略：先识别"可见边框"的标题栏形状 —— 描边线宽已显式设置且 > 0，
-    # 或 XML 中定义了 <a:ln> 且未声明 noFill/noStroke。对这些形状逐一验证；
-    # 若识别到 0 个可见边框（异常情况），亦判为不满足（无法证明"均达标"）。
-    line_widths_ok = True
-    visible_border_count = 0
-    for sh in header_shapes:
-        lw = shape_line_width_pt(sh)
-        # 检测该形状是否显式声明了描边（<a:ln>...）且非 noFill
-        try:
-            sh_xml = sh._element.xml
-        except Exception:
-            sh_xml = ""
-        has_ln_elem = "<a:ln" in sh_xml
-        no_stroke = 'a:noFill' in sh_xml and "<a:ln" in sh_xml and (
-            re.search(r'<a:ln\b[^>]*>\s*<a:noFill', sh_xml) is not None
-        )
-        has_visible_border = (lw is not None and lw > 0) or (has_ln_elem and not no_stroke)
-        if not has_visible_border:
-            continue
-        visible_border_count += 1
-        # 线宽必须显式在 0.75-1.5pt
-        if lw is None or lw <= 0 or not (0.75 <= lw <= 1.5):
-            line_widths_ok = False
-            break
-        # 颜色必须为蓝色 或 浅蓝色（不再接受白色）
-        line_rgb = shape_line_rgb(sh)
-        if not is_blue_or_light_blue(line_rgb):
-            line_widths_ok = False
-            break
-    if visible_border_count == 0:
-        line_widths_ok = False
-
-    right_bar_ok = right_bar_found and slant_found and line_widths_ok
-
-    # ---------- text_ok：页码 / 中文标题 / 英文副标题 ----------
-    # 按细则拆分为以下并列要点（每一页都需要全部满足）：
-    #   I. 页码 / 章节编号（如 02、03、04 等）
-    #      I1) 显示对应页码/章节编号；
-    #      I2) 字体 Arial；
-    #      I3) 颜色为白色或浅色；
-    #      I4) 字号 28-32 磅；
-    #      I5) 位于"标题栏左侧区域"；
-    #      I6) 位于"蓝色主形状内部"（被左侧蓝色主形状的边界框包含）。
-    #   II. 中文页面标题
-    #      II1) 内容含中文；
-    #      II2) 字体宋体；
-    #      II3) 加粗；
-    #      II4) 颜色为蓝色；
-    #      II5) 字号 30 磅；
-    #      II6) 位于"长条中部偏左区域"（右侧长条 horizontal 范围内、偏左半侧）；
-    #      II7) 文字不超出标题栏边界（文本框完全在 header_shapes 整体外接矩形内）。
-    #   III. 英文副标题
-    #      III1) 内容为英文（含英文字符）；
-    #      III2) 字体 Arial；
-    #      III3) 颜色为浅蓝色；
-    #      III4) 字号 10-14 磅；
-    #      III5) 位于中文标题下方或附近；
-    #      III6) 文字内容与"页面主题"相对应（与同页中文标题相关）。
-
-    # 先重新定位"左侧蓝色主形状"的 bbox 与"右侧长条"的 bbox，用于位置判定
-    blue_main_bbox = None
-    for sh in header_shapes:
-        l, t, r, b = shape_bbox_cm(sh)
-        if l > slide_w_cm * 0.35:
-            continue
-        w = r - l
-        h = b - t
-        if not (3.0 <= w <= 4.0 and 2.0 <= h <= 3.0):
-            continue
-        if _prst_of(sh) not in {
-            "trapezoid",
-            "parallelogram",
-            "foldedCorner",
-            "flowChartManualOperation",
-            "flowChartManualInput",
-        }:
-            continue
-        blue_main_bbox = (l, t, r, b)
-        break
-
-    long_bar_bbox = None
-    for sh in header_shapes:
-        l, t, r, b = shape_bbox_cm(sh)
-        w = r - l
-        h = b - t
-        nm_l = sh.name.lower()
-        if (
-            ("rounded rectangle" in nm_l or "parallelogram" in nm_l or "rectangle" in nm_l)
-            and w >= 12.0
-            and 1.5 <= h <= 3.0
-            and (l + w / 2) >= slide_w_cm * 0.4
-        ):
-            long_bar_bbox = (l, t, r, b)
-            break
-
-    # 标题栏整体外接矩形（用于"文字不超出标题栏边界"）
-    if header_shapes:
-        hb_l = min(emu_to_cm(sh.left or 0) for sh in header_shapes)
-        hb_t = min(emu_to_cm(sh.top or 0) for sh in header_shapes)
-        hb_r = max(
-            emu_to_cm((sh.left or 0) + (sh.width or 0)) for sh in header_shapes
-        )
-        hb_b = max(
-            emu_to_cm((sh.top or 0) + (sh.height or 0)) for sh in header_shapes
-        )
-    else:
-        hb_l = hb_t = hb_r = hb_b = 0
-
-    page_num_ok = False
-    cn_title_ok = False
-    en_sub_ok = False
-    cn_title_text = ""       # 用于英文副标题主题对应判断
-    cn_title_bbox = None     # 用于英文副标题"位于中文标题下方或附近"判定
-
-    # 预扫描：先定位中文标题的位置和文本，再判定英文副标题时依赖它。
-    # 记录 (shape, txt, size_pt, font_name, rgb, bold, bbox)
-    text_items = []
-    for sh in header_shapes:
-        if not sh.has_text_frame:
-            continue
-        txt = sh.text_frame.text.strip()
-        if not txt:
-            continue
-        runs = []
-        for para in sh.text_frame.paragraphs:
-            runs.extend(para.runs)
-        if not runs:
-            continue
-        run = runs[0]
-        font_name = (run.font.name or "")
-        size_pt = run.font.size.pt if run.font.size else None
-        rgb = _rgb_of(run.font)
-        bold = run.font.bold
-        bbox = shape_bbox_cm(sh)
-        text_items.append((sh, txt, size_pt, font_name, rgb, bold, bbox))
-
-    # 页码 / 章节编号的目标字符串（当传入 page_num≥2 时才严格校验对应）
-    def _matches_page_num_text(txt: str, page_num: int) -> bool:
-        if page_num <= 0:
-            # 未指定实际页码 —— 退化为原来的宽松判定
-            return (txt.isdigit() and 1 <= len(txt) <= 3) or (
-                len(txt) <= 6
-                and any(ch.isdigit() for ch in txt)
-                and ("章" in txt or "节" in txt or txt.isdigit())
-            )
-        # 严格：显式对应当前页码
-        stripped = txt.strip()
-        expected_2 = f"{page_num:02d}"  # "02" .. "15"
-        expected_1 = str(page_num)      # "2" .. "15"
-        if stripped in (expected_1, expected_2):
-            return True
-        # 章节编号：形如 "第2章"、"第02章"、"第2节"
-        cn_num_map = {
-            2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七",
-            8: "八", 9: "九", 10: "十", 11: "十一", 12: "十二",
-            13: "十三", 14: "十四", 15: "十五",
-        }
-        cn_num = cn_num_map.get(page_num, "")
-        chapter_patterns = [
-            f"第{expected_1}章", f"第{expected_2}章",
-            f"第{expected_1}节", f"第{expected_2}节",
-        ]
-        if cn_num:
-            chapter_patterns.extend([f"第{cn_num}章", f"第{cn_num}节"])
-        for pat in chapter_patterns:
-            if pat in stripped:
-                return True
-        return False
-
-    # 第一轮：先扫描"页码 / 章节编号"和"中文标题"，把中文标题的 bbox / 文本记下来
-    for sh, txt, size_pt, font_name, rgb, bold, (sl, st, sr, sb) in text_items:
-        scx = (sl + sr) / 2
-        scy = (st + sb) / 2
-
-        is_page_num_text = _matches_page_num_text(txt, page_num)
-        if is_page_num_text:
-            cond_font = "arial" in font_name.lower()          # I2)
-            cond_color = is_non_theme_light(rgb)              # I3)
-            cond_size = size_pt is not None and 28 <= size_pt <= 32  # I4)
-            cond_left = scx < slide_w_cm * 0.35               # I5)
-            cond_inside_blue = False                          # I6)
-            if blue_main_bbox is not None:
-                bl, bt, br, bb = blue_main_bbox
-                if bl <= scx <= br and bt <= scy <= bb:
-                    cond_inside_blue = True
-            if cond_font and cond_color and cond_size and cond_left and cond_inside_blue:
-                page_num_ok = True
-
-        has_cn = any("一" <= ch <= "鿿" for ch in txt)
-        if has_cn and not is_page_num_text:
-            cond_font = (
-                "宋" in font_name
-                or "Song" in font_name
-                or "SimSun" in font_name
-                or font_name == ""
-            )                                                 # II2)
-            cond_bold = bool(bold)                            # II3)
-            cond_color = is_blue(rgb)                         # II4)
-            cond_size = size_pt is not None and abs(size_pt - 30) < 0.5  # II5)
-            cond_pos = True                                   # II6)
-            if long_bar_bbox is not None:
-                bl, bt, br, bb = long_bar_bbox
-                bar_mid = (bl + br) / 2
-                if not (bl <= scx <= bar_mid + 1.0 and bt <= scy <= bb):
-                    cond_pos = False
-            cond_inside = (                                   # II7)
-                sl >= hb_l - 0.1
-                and sr <= hb_r + 0.1
-                and st >= hb_t - 0.1
-                and sb <= hb_b + 0.1
-            )
-            if cond_font and cond_bold and cond_color and cond_size and cond_pos and cond_inside:
-                cn_title_ok = True
-                cn_title_text = txt
-                cn_title_bbox = (sl, st, sr, sb)
-
-    # 中文标题主题对应关键词（同时用于中文标题内容校验 与 英文副标题主题匹配）
-    theme_keywords_cn = [
-        "咖啡", "晨岚", "品牌", "运营", "研究", "市场", "分析", "调研",
-        "定位", "策略", "产品", "推广", "营销", "价格", "渠道", "消费者",
-        "目标", "总结", "背景", "现状", "规划",
-    ]
-    theme_keywords_en = [
-        "coffee", "brand", "research", "operation", "chenlan",
-        "café", "study", "analysis", "market",
-    ]
-
-    # 中文标题"内容与页面主题对应"—— 至少命中主题相关关键词 或 与英文副标题共享主题词
-    if cn_title_ok and cn_title_text:
-        if not any(k in cn_title_text for k in theme_keywords_cn):
-            cn_title_ok = False
-
-    # 第二轮：英文副标题
-    for sh, txt, size_pt, font_name, rgb, bold, (sl, st, sr, sb) in text_items:
-        scx = (sl + sr) / 2
-        scy = (st + sb) / 2
-        has_cn = any("一" <= ch <= "鿿" for ch in txt)
-        if has_cn:
-            continue
-        has_en = any("a" <= ch.lower() <= "z" for ch in txt)
-        if not has_en:
-            continue
-        cond_font = "arial" in font_name.lower()              # III2)
-        cond_color = is_light_blue(rgb)                       # III3) 浅蓝色（排除白色）
-        cond_size = size_pt is not None and 10 <= size_pt <= 14  # III4)
-
-        # III5) 位于中文标题下方或附近：
-        #   要求英文副标题文本框的顶部不高于中文标题的中线，
-        #   且水平方向与中文标题存在交叠或距离 ≤2cm（"附近"）。
-        cond_pos = False
-        if cn_title_ok and cn_title_bbox is not None:
-            cl, ct, cr, cb = cn_title_bbox
-            cn_mid_y = (ct + cb) / 2
-            # 下方：副标题顶部 st 大于中文标题中线（允许 0.2cm 容差）
-            below_ok = st >= cn_mid_y - 0.2
-            # 附近：水平方向有交叠 或 中心距 ≤2cm
-            horiz_overlap = not (sr < cl or sl > cr)
-            horiz_near = abs(scx - (cl + cr) / 2) <= 2.0
-            cond_pos = below_ok and (horiz_overlap or horiz_near)
-
-        # III6) 主题对应：与中文标题共享主题（关键词命中）
-        cond_topic = any(k in txt.lower() for k in theme_keywords_en)
-
-        if cond_font and cond_color and cond_size and cond_pos and cond_topic:
-            en_sub_ok = True
-            break
-
-    text_ok = page_num_ok and cn_title_ok and en_sub_ok
-
-    # ---------- decor_ok：点阵装饰 + 3 条短斜线装饰 ----------
-    # 按细则拆分为以下并列要点（每一页都需要全部满足）：
-    #   D. 浅蓝色点阵装饰：
-    #      D1) 包含点阵装饰；
-    #      D2) 颜色为浅蓝色；
-    #      D3) 由 9-25 个小圆点组成；
-    #      D4) 位于"标题栏右上区域"（标题栏右半侧 + 偏上 1/2）；
-    #      D5) 圆点大小一致。
-    #   E. 短斜线装饰：
-    #      E1) 共 3 条；
-    #      E2) 颜色为浅蓝色；
-    #      E3) 位于"标题栏右下方"（标题栏右半侧 + 偏下 1/2）；
-    #      E4) 与点阵装饰不重叠；
-    #      E5) 线宽 1-3 磅（包含线宽 或 形状窄边的视觉宽度）；
-    #      E6) 角度一致；
-    #      E7) 不遮挡正文（不与标题栏外的正文元素相交）。
-
-    # 标题栏整体外接矩形（右上 / 右下区域划分依据）
-    # 注：header_shapes 是按 top<3cm 筛出的；但有些页面装饰图片紧贴标题栏顶部（top≈2.5cm），
-    # 会把 bbox 的 bottom 拉得过低。这里只用"真正属于标题装饰带"的形状来界定 bbox ——
-    # 即排除大图片/正文图表，只保留 AutoShape（线段、圆、卡片等）。
-    decor_band = [
-        sh
-        for sh in header_shapes
-        if sh.shape_type not in (
-            MSO_SHAPE_TYPE.PICTURE,
-            MSO_SHAPE_TYPE.CHART,
-            MSO_SHAPE_TYPE.MEDIA,
-        )
-    ]
-    if decor_band:
-        h_left = min(emu_to_cm(sh.left or 0) for sh in decor_band)
-        h_top = min(emu_to_cm(sh.top or 0) for sh in decor_band)
-        h_right = max(
-            emu_to_cm((sh.left or 0) + (sh.width or 0)) for sh in decor_band
-        )
-        h_bottom = max(
-            emu_to_cm((sh.top or 0) + (sh.height or 0)) for sh in decor_band
-        )
-    else:
-        h_left = h_top = h_right = h_bottom = 0
-    h_mid_x = (h_left + h_right) / 2
-    h_mid_y = (h_top + h_bottom) / 2
-
-    # 收集圆点与短斜线 —— 按 prstGeom / 线段类型识别，而不是仅看 shape.name。
-    # 圆点：prstGeom = "ellipse" / "oval" 的 AutoShape，且宽高相近（≈圆形），尺寸小；
-    # 短斜线：Connector（直线连接符）或 prstGeom = "line" / "straightConnector1"，
-    #        或形态为窄长的 parallelogram（细长条 + 有斜切量），且尺寸小。
-    def _prst(sh) -> str:
-        try:
-            m = re.search(r'prstGeom prst="([^"]+)"', sh._element.xml)
-            return m.group(1) if m else ""
-        except Exception:
             return ""
-
-    def _is_line_connector(sh) -> bool:
-        try:
-            xml = sh._element.xml
-        except Exception:
-            return False
-        return ("<p:cxnSp" in xml) or (
-            "<a:ln " in xml and "prstGeom prst=\"line\"" in xml
-        )
-
-    dot_shapes = []
-    slash_shapes = []
-    for sh in header_shapes:
-        l, t, r, b = shape_bbox_cm(sh)
-        w = r - l
-        h = b - t
-        prst = _prst(sh)
-        # ---- 圆点识别 ----
-        # 依据 prstGeom = ellipse/oval；要求近似圆形（|w-h| < 0.15cm）；尺寸小（≤0.5cm）。
-        is_dot_prst = prst in ("ellipse", "oval")
-        if is_dot_prst and w <= 0.5 and h <= 0.5 and abs(w - h) <= 0.15 and w > 0 and h > 0:
-            dot_shapes.append(sh)
-            continue
-        # ---- 短斜线识别 ----
-        # (a) 直线连接符/直线：<p:cxnSp> 或 prstGeom = "line" / "straightConnector1"；
-        # (b) 或者：窄长 parallelogram（细长条：min(w,h)<=0.3cm 且 max(w,h)<=1.2cm）。
-        line_like = (
-            _is_line_connector(sh)
-            or prst in ("line", "straightConnector1")
-        )
-        narrow_para = (
-            prst == "parallelogram"
-            and min(w, h) <= 0.3
-            and max(w, h) <= 1.2
-        )
-        if (line_like and max(w, h) <= 1.5 and min(w, h) <= 0.4) or narrow_para:
-            slash_shapes.append(sh)
-
-    # D2) 点阵颜色：浅蓝色
-    dots_color_ok = all(
-        _is_white_or_light_blue_fill(sh) and not _is_white_fill(sh)
-        if False
-        else (
-            (shape_fill_rgb(sh) is not None)
-            and (shape_fill_rgb(sh)[2] >= 180)
-            and (shape_fill_rgb(sh)[2] >= shape_fill_rgb(sh)[0])
-        )
-        for sh in dot_shapes
-    ) if dot_shapes else False
-    # D3) 9-25 个
-    dots_count_ok = 9 <= len(dot_shapes) <= 25
-    # D4) 位于"标题栏右上区域"：所有点中心 X 偏右半侧；且点阵整体偏上（点阵平均 Y < 斜线平均 Y）
-    dots_x_right = all(
-        ((emu_to_cm(sh.left or 0) + emu_to_cm(sh.width or 0) / 2) >= h_mid_x)
-        for sh in dot_shapes
-    ) if dot_shapes else False
-    if dot_shapes and slash_shapes:
-        dots_avg_y = sum(
-            (emu_to_cm(sh.top or 0) + emu_to_cm(sh.height or 0) / 2)
-            for sh in dot_shapes
-        ) / len(dot_shapes)
-        slashes_avg_y = sum(
-            (emu_to_cm(sh.top or 0) + emu_to_cm(sh.height or 0) / 2)
-            for sh in slash_shapes
-        ) / len(slash_shapes)
-        dots_upper_relative = dots_avg_y <= slashes_avg_y
-    else:
-        dots_upper_relative = False
-    dots_position_ok = dots_x_right and dots_upper_relative
-    # D5) 圆点大小一致：所有点宽度方差小于 0.02cm，高度同
-    if dot_shapes:
-        ws = [emu_to_cm(sh.width or 0) for sh in dot_shapes]
-        hs = [emu_to_cm(sh.height or 0) for sh in dot_shapes]
-        dots_size_uniform = (max(ws) - min(ws) <= 0.05) and (max(hs) - min(hs) <= 0.05)
-    else:
-        dots_size_uniform = False
-    dots_ok = dots_count_ok and dots_color_ok and dots_position_ok and dots_size_uniform
-
-    # E1) 3 条
-    slashes_count_ok = len(slash_shapes) == 3
-    # E2) 颜色浅蓝色
-    slashes_color_ok = all(
-        (shape_fill_rgb(sh) is not None)
-        and (shape_fill_rgb(sh)[2] >= 180)
-        and (shape_fill_rgb(sh)[2] >= shape_fill_rgb(sh)[0])
-        for sh in slash_shapes
-    ) if slash_shapes else False
-    # E3) 位于标题栏右下方
-    slashes_position_ok = all(
-        ((emu_to_cm(sh.left or 0) + emu_to_cm(sh.width or 0) / 2) >= h_mid_x)
-        and ((emu_to_cm(sh.top or 0) + emu_to_cm(sh.height or 0) / 2) >= h_mid_y)
-        for sh in slash_shapes
-    ) if slash_shapes else False
-    # E4) 与点阵不重叠：以"斜线中心是否落入圆点 bbox 内 或 圆点中心是否落入斜线 bbox 内"作为
-    #     视觉重叠判据（斜线/圆点的 bounding box 矩形会包含空白边界，单纯 bbox 相交容易误判）。
-    if dot_shapes and slash_shapes:
-        no_overlap = True
-        for sl in slash_shapes:
-            sb = shape_bbox_cm(sl)
-            scx = (sb[0] + sb[2]) / 2
-            scy = (sb[1] + sb[3]) / 2
-            for d in dot_shapes:
-                db = shape_bbox_cm(d)
-                dcx = (db[0] + db[2]) / 2
-                dcy = (db[1] + db[3]) / 2
-                # 斜线中心落入点 bbox
-                if db[0] <= scx <= db[2] and db[1] <= scy <= db[3]:
-                    no_overlap = False
-                    break
-                # 点中心落入斜线 bbox
-                if sb[0] <= dcx <= sb[2] and sb[1] <= dcy <= sb[3]:
-                    no_overlap = False
-                    break
-            if not no_overlap:
-                break
-        slashes_no_overlap = no_overlap
-    else:
-        slashes_no_overlap = False
-    # E5) 线宽严格 1-3 磅：
-    #     - 直线连接符 / prstGeom=line 的斜线：使用 line.width（EMU→pt）判定；
-    #     - 窄长 parallelogram 斜线：其视觉粗细 = 形状最短边，
-    #       将其从 cm 换算为 pt（1cm≈28.35pt），必须落在 1-3pt 内。
-    #     两种情况均严格限定 1-3pt，不再放宽到 12pt。
-    slashes_lw_ok = True
-    for sh in slash_shapes:
-        prst = _prst(sh)
-        is_line_shape = _is_line_connector(sh) or prst in ("line", "straightConnector1")
-        lw = shape_line_width_pt(sh)
-        if is_line_shape:
-            # 直线：必须显式设置线宽，且落在 1-3pt
-            if lw is None or lw <= 0 or not (1.0 <= lw <= 3.0):
-                slashes_lw_ok = False
-                break
-        else:
-            # 窄长 parallelogram 斜线：优先看描边线宽；若无描边则使用视觉短边
-            if lw is not None and lw > 0:
-                if not (1.0 <= lw <= 3.0):
-                    slashes_lw_ok = False
-                    break
-            else:
-                h_cm = emu_to_cm(sh.height or 0)
-                w_cm = emu_to_cm(sh.width or 0)
-                short_edge_pt = min(h_cm, w_cm) * 28.3464567
-                if not (1.0 <= short_edge_pt <= 3.0):
-                    slashes_lw_ok = False
-                    break
-    # E6) 角度一致：解析每条斜线的 adj 值（parallelogram 的斜切量），方差 ≤ 0.05；
-    #     若无 adj（默认 25%），则要求形状宽高比一致（≤0.05 差）
-    slashes_angle_ok = True
-    if slash_shapes:
-        adj_vals = []
-        ratio_vals = []
-        for sh in slash_shapes:
-            xml = sh._element.xml
-            m_adj = re.search(r'<a:gd\s+name="adj"\s+fmla="val\s+(-?\d+)"', xml)
-            if m_adj:
-                adj_vals.append(int(m_adj.group(1)) / 100000.0)
-            w_cm = emu_to_cm(sh.width or 0)
-            h_cm = emu_to_cm(sh.height or 0)
-            ratio_vals.append(h_cm / w_cm if w_cm > 0 else 0)
-        if adj_vals and len(adj_vals) == len(slash_shapes):
-            if max(adj_vals) - min(adj_vals) > 0.05:
-                slashes_angle_ok = False
-        else:
-            if max(ratio_vals) - min(ratio_vals) > 0.05:
-                slashes_angle_ok = False
-    else:
-        slashes_angle_ok = False
-    # E7) 不遮挡正文：与 top ≥ 标题栏底边 的非标题栏对象不相交
-    slashes_no_block = True
-    body_shapes_local = [
-        sh
-        for sh in slide.shapes
-        if emu_to_cm(sh.top or 0) >= h_bottom - 0.1
-    ]
-    for sh in slash_shapes:
-        sb = shape_bbox_cm(sh)
-        for bsh in body_shapes_local:
-            bb = shape_bbox_cm(bsh)
-            iw = max(0.0, min(sb[2], bb[2]) - max(sb[0], bb[0]))
-            ih = max(0.0, min(sb[3], bb[3]) - max(sb[1], bb[1]))
-            if iw > 0.05 and ih > 0.05:
-                slashes_no_block = False
-                break
-        if not slashes_no_block:
-            break
-
-    slashes_ok_overall = (
-        slashes_count_ok
-        and slashes_color_ok
-        and slashes_position_ok
-        and slashes_no_overlap
-        and slashes_lw_ok
-        and slashes_angle_ok
-        and slashes_no_block
-    )
-
-    decor_ok = dots_ok and slashes_ok_overall
-
-    return {
-        "has_header": has_header,
-        "top_outside_blue_group_ok": top_outside_blue_group_ok,
-        "left_main_ok": left_main_ok,
-        "right_bar_ok": right_bar_ok,
-        "text_ok": text_ok,
-        "decor_ok": decor_ok,
-    }
-
-
-# ---------- 第16页判定 ----------
-def check_end_thanks(slide, slide_w_cm, slide_h_cm) -> Tuple[bool, str]:
-    """第16页"谢谢观看"文本细则（每一点都必须满足）：
-       1) 显示"谢谢观看"文本；
-       2) 位于"页面上方或中上部"；
-       3) 居中显示；
-       4) 字体宋体；
-       5) 字号 36-50 磅；
-       6) 加粗；
-       7) 颜色为蓝色；
-       8) 文本框位于页面宽度 30%-70% 范围内；
-       9) 文本框位于页面高度 10%-25% 范围内；
-       10) 水平居中；
-       11) 文字没有倾斜或变形（无旋转、无 X/Y 形变）。
-    """
-    # 1) 找到"谢谢观看"文本
-    target = None
-    for sh in slide.shapes:
-        if not sh.has_text_frame:
-            continue
-        if "谢谢观看" in sh.text_frame.text:
-            target = sh
-            break
-    if target is None:
-        return False, "未找到'谢谢观看'文本"
-
-    runs = []
-    for p in target.text_frame.paragraphs:
-        runs.extend(p.runs)
-    if not runs:
-        return False, "'谢谢观看'文本框为空"
-    run = runs[0]
-    font_name = (run.font.name or "")
-    size_pt = run.font.size.pt if run.font.size else None
-    rgb = _rgb_of(run.font)
-    bold = run.font.bold
-
-    tl = emu_to_cm(target.left or 0)
-    tt = emu_to_cm(target.top or 0)
-    tw = emu_to_cm(target.width or 0)
-    th = emu_to_cm(target.height or 0)
-    cx_cm = tl + tw / 2
-    cy_cm = tt + th / 2
-
-    reasons = []
-
-    # 4) 字体宋体
-    if not (
-        "宋" in font_name
-        or "Song" in font_name
-        or "SimSun" in font_name
-        or font_name == ""
-    ):
-        reasons.append(f"字体非宋体({font_name})")
-    # 5) 字号 36-50pt
-    if size_pt is None or not (36 <= size_pt <= 50):
-        reasons.append(f"字号 {size_pt} 不在 36-50pt")
-    # 6) 加粗
-    if not bold:
-        reasons.append("未加粗")
-    # 7) 颜色蓝色
-    if not is_blue(rgb):
-        reasons.append(f"颜色非蓝色 {rgb}")
-
-    # 2) 位于"页面上方或中上部"：文本框中心 Y < 页面高度 50%
-    if cy_cm > slide_h_cm * 0.5:
-        reasons.append(
-            f"文本未位于页面上方或中上部（中心 Y={cy_cm:.2f}cm > 页高 50%）"
-        )
-
-    # 3) 居中显示 + 10) 水平居中：文本框水平中线接近页面中线 (±1cm)
-    if abs(cx_cm - slide_w_cm / 2) > 1.0:
-        reasons.append(f"未水平居中（中心 X={cx_cm:.2f}cm 偏离页面中线>1cm）")
-    # 段落对齐方式 = CENTER 进一步确认"居中显示"
-    try:
-        from pptx.enum.text import PP_ALIGN
-
-        para_align_ok = any(
-            p.alignment == PP_ALIGN.CENTER for p in target.text_frame.paragraphs
-        )
-        if not para_align_ok:
-            # 文本框宽度若几乎横跨页面，也认可为视觉居中
-            if tw < slide_w_cm * 0.6:
-                reasons.append("段落对齐方式非居中")
     except Exception:
-        pass
-
-    # 8) 文本框位于页面宽度 30%-70% 范围内（文本框中心点）
-    if not (slide_w_cm * 0.30 <= cx_cm <= slide_w_cm * 0.70):
-        reasons.append(f"水平位置 {cx_cm:.2f}cm 不在页面 30%-70%")
-    # 9) 文本框位于页面高度 10%-25% 范围内（文本框中心点）
-    if not (slide_h_cm * 0.10 <= cy_cm <= slide_h_cm * 0.25):
-        reasons.append(f"垂直位置 {cy_cm:.2f}cm 不在页面 10%-25%")
-
-    # 11) 文字没有倾斜或变形（无旋转 & 无字符 X/Y 形变）
+        return ""
     try:
-        if target.rotation and abs(target.rotation) > 0.5:
-            reasons.append(f"文本框存在旋转 {target.rotation}°")
+        return (sh.text_frame.text or "").strip()
     except Exception:
-        pass
-    # 字符级倾斜/变形检查：italic 视为倾斜；XML 中 sp3d/scene3d/warp 视为变形
-    if run.font.italic:
-        reasons.append("文字被设置为倾斜(italic)")
+        return ""
+
+
+def _prst(sh):
+    """预置几何类型（parallelogram / roundRect / rect / diagStripe ...）。
+    自由曲线（custGeom）返回 'custGeom'，取不到返回 None。"""
+    x = _xml(sh)
+    m = re.search(r'<a:prstGeom[^>]+prst="([^"]+)"', x)
+    if m:
+        return m.group(1)
+    if "<a:custGeom" in x:
+        return "custGeom"
+    return None
+
+
+def _stype(sh):
     try:
-        xml = target._element.xml
-        if any(
-            tag in xml
-            for tag in ("<a:sp3d", "<a:scene3d", 'prst="textArchUp"', "prstTxWarp")
-        ):
-            reasons.append("文本存在 3D/变形(prstTxWarp)效果")
+        return sh.shape_type
     except Exception:
-        pass
-
-    return (len(reasons) == 0), ("；".join(reasons) if reasons else "")
-
-
-def _is_media(shape) -> bool:
-    return shape.shape_type == MSO_SHAPE_TYPE.MEDIA
-
-
-def check_end_videos(slide, slide_w_cm, slide_h_cm) -> Tuple[bool, str]:
-    """第16页视频对象细则（每一点都必须满足）：
-        L1) 左侧插入"咖啡制作"视频；
-        L2) 位于"谢谢观看"下方左侧；
-        L3) 左视频宽度 8-10cm；
-        L4) 左视频高度 11-12cm；
-        R1) 右侧插入"咖啡店环境介绍"视频；
-        R2) 位于"谢谢观看"下方右侧；
-        R3) 右视频宽度 8-10cm；
-        R4) 右视频高度 11-12cm；
-        P1) 两段视频左右并排；
-        P2) 顶部对齐；
-        P3) 高度一致或接近一致；
-        P4) 水平间距 1.0-2.5cm；
-        P5) 整体位于"页面中下部"；
-        P6) 整体"居中"区域。
-    """
-    medias = [sh for sh in slide.shapes if _is_media(sh)]
-    if len(medias) < 2:
-        return False, f"页面媒体对象数量 {len(medias)} <2"
-    medias = sorted(medias, key=lambda s: s.left or 0)
-    left_v, right_v = medias[0], medias[1]
-
-    reasons = []
-
-    # 找到"谢谢观看"文本框，用于"下方左/右"判定
-    thanks_box = None
-    for sh in slide.shapes:
-        if sh.has_text_frame and "谢谢观看" in sh.text_frame.text:
-            thanks_box = sh
-            break
-
-    def _media_topic(media_shape) -> str:
-        """从媒体对象提取主题名：先看 shape.name；再回退到关联媒体文件的 rId 名称。"""
-        name = (media_shape.name or "").lower()
-        # 关联文件名（如 'coffee_grind_to_latte_xxx.mp4'）
-        try:
-            xml = media_shape._element.xml
-            # 形如 r:embed 或 r:link
-            import re
-
-            for m in re.finditer(r'r:(?:embed|link)="([^"]+)"', xml):
-                rid = m.group(1)
-                try:
-                    part = media_shape.part.related_part(rid)
-                    rel_name = (
-                        getattr(part, "partname", "") or ""
-                    ).lower() + " " + (
-                        getattr(part, "filename", "") or ""
-                    ).lower()
-                    name += " " + rel_name
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return name
-
-    left_name = _media_topic(left_v)
-    right_name = _media_topic(right_v)
-
-    # L1) 左侧 = "咖啡制作"视频
-    coffee_make_kw = [
-        "咖啡制作",
-        "制作",
-        "grind",
-        "latte",
-        "brew",
-        "coffee_grind",
-        "coffee make",
-        "coffee_making",
-    ]
-    if not any(k in left_name for k in coffee_make_kw):
-        reasons.append(f"左侧视频不是'咖啡制作'相关 (name={left_name})")
-    # R1) 右侧 = "咖啡店环境介绍"视频
-    env_intro_kw = [
-        "环境",
-        "店",
-        "咖啡店",
-        "introduction",
-        "intro",
-        "shop",
-        "环境介绍",
-        "ambient",
-    ]
-    if not any(k in right_name for k in env_intro_kw):
-        reasons.append(f"右侧视频不是'咖啡店环境介绍'相关 (name={right_name})")
-
-    # L3 / R3 / L4 / R4：尺寸
-    for label, v in (("左视频", left_v), ("右视频", right_v)):
-        w = emu_to_cm(v.width or 0)
-        h = emu_to_cm(v.height or 0)
-        if not (8.0 <= w <= 10.0):
-            reasons.append(f"{label}宽 {w:.2f}cm 不在 8-10cm")
-        if not (11.0 <= h <= 12.0):
-            reasons.append(f"{label}高 {h:.2f}cm 不在 11-12cm")
-
-    # L2 / R2：位于"谢谢观看"下方左/右
-    if thanks_box is not None:
-        thanks_cx = emu_to_cm(thanks_box.left or 0) + emu_to_cm(thanks_box.width or 0) / 2
-        thanks_bottom = emu_to_cm(thanks_box.top or 0) + emu_to_cm(thanks_box.height or 0)
-        left_cx = emu_to_cm(left_v.left or 0) + emu_to_cm(left_v.width or 0) / 2
-        right_cx = emu_to_cm(right_v.left or 0) + emu_to_cm(right_v.width or 0) / 2
-        left_top = emu_to_cm(left_v.top or 0)
-        right_top = emu_to_cm(right_v.top or 0)
-        if not (left_cx < thanks_cx and left_top >= thanks_bottom - 0.2):
-            reasons.append("左视频未位于'谢谢观看'下方左侧")
-        if not (right_cx > thanks_cx and right_top >= thanks_bottom - 0.2):
-            reasons.append("右视频未位于'谢谢观看'下方右侧")
-    else:
-        reasons.append("未找到'谢谢观看'文本，无法判断视频位置")
-
-    # P1) 左右并排：左视频右边界 <= 右视频左边界（中间允许间距）
-    left_right_edge = emu_to_cm(left_v.left or 0) + emu_to_cm(left_v.width or 0)
-    right_left_edge = emu_to_cm(right_v.left or 0)
-    if not (left_right_edge <= right_left_edge):
-        reasons.append("两视频未呈左右并排")
-
-    # P2) 顶部对齐（允许 ≤0.3cm 误差）
-    top_diff = abs(emu_to_cm(left_v.top or 0) - emu_to_cm(right_v.top or 0))
-    if top_diff > 0.3:
-        reasons.append(f"两视频顶部差 {top_diff:.2f}cm，未对齐")
-
-    # P3) 高度一致或接近一致（允许 ≤0.3cm）
-    h_diff = abs(emu_to_cm(left_v.height or 0) - emu_to_cm(right_v.height or 0))
-    if h_diff > 0.3:
-        reasons.append(f"两视频高度差 {h_diff:.2f}cm，不一致")
-
-    # P4) 水平间距 1.0-2.5cm
-    gap = right_left_edge - left_right_edge
-    if not (1.0 <= gap <= 2.5):
-        reasons.append(f"两视频水平间距 {gap:.2f}cm 不在 1.0-2.5cm")
-
-    # P5) 整体位于"页面中下部"：两视频上下垂直范围位于页面下半部分（顶 >= 50% 偏松到 30%）
-    top_cm = min(emu_to_cm(left_v.top or 0), emu_to_cm(right_v.top or 0))
-    bottom_cm = max(
-        emu_to_cm(left_v.top or 0) + emu_to_cm(left_v.height or 0),
-        emu_to_cm(right_v.top or 0) + emu_to_cm(right_v.height or 0),
-    )
-    mid_y = (top_cm + bottom_cm) / 2
-    if not (mid_y >= slide_h_cm * 0.5):
-        reasons.append(f"视频整体未位于页面中下部（中线 Y={mid_y:.2f}cm）")
-
-    # P6) 整体"居中"：两视频整体水平中心接近页面中线 (≤1.5cm)
-    overall_left = emu_to_cm(left_v.left or 0)
-    overall_right = emu_to_cm(right_v.left or 0) + emu_to_cm(right_v.width or 0)
-    overall_cx = (overall_left + overall_right) / 2
-    if abs(overall_cx - slide_w_cm / 2) > 1.5:
-        reasons.append(f"两视频整体中心 {overall_cx:.2f}cm 偏离页面中线")
-
-    return (len(reasons) == 0), ("；".join(reasons) if reasons else "")
-
-
-def _decode_first_frame_playable(video_bytes: bytes, ext: str) -> Tuple[bool, str]:
-    """尝试用真实媒体解码器解码视频首帧，用于证明"可播放"。
-
-    优先级：
-      1) opencv-python (cv2)；
-      2) 系统 ffprobe / ffmpeg 命令行（若可用）。
-    任一路径能读出首帧的合法帧数据即视为"可播放"；全部失败则不通过。
-    """
-    import tempfile
-    import subprocess
-    import shutil
-
-    # 写入临时文件（大多数解码器不接受内存流）
-    tmp_dir = tempfile.mkdtemp(prefix="pptx_video_")
-    tmp_path = os.path.join(tmp_dir, f"clip{ext}")
-    try:
-        with open(tmp_path, "wb") as f:
-            f.write(video_bytes)
-
-        # -------- 1) OpenCV --------
-        try:
-            import cv2  # type: ignore
-            cap = cv2.VideoCapture(tmp_path)
-            try:
-                if cap.isOpened():
-                    ok, frame = cap.read()
-                    if ok and frame is not None and frame.size > 0:
-                        return True, "cv2 解码首帧成功"
-            finally:
-                cap.release()
-        except Exception:
-            pass
-
-        # -------- 2) ffprobe / ffmpeg CLI --------
-        ffprobe = shutil.which("ffprobe")
-        if ffprobe:
-            try:
-                cp = subprocess.run(
-                    [
-                        ffprobe, "-v", "error",
-                        "-select_streams", "v:0",
-                        "-show_entries", "stream=codec_name,width,height,duration",
-                        "-of", "default=noprint_wrappers=1",
-                        tmp_path,
-                    ],
-                    capture_output=True, text=True, timeout=15,
-                )
-                out = (cp.stdout or "") + (cp.stderr or "")
-                if cp.returncode == 0 and "codec_name=" in out and "width=" in out:
-                    return True, f"ffprobe 识别视频流成功：{out.strip()[:80]}"
-            except Exception:
-                pass
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
-            try:
-                # 用 ffmpeg 抽取首帧到 /dev/null 或临时文件
-                out_frame = os.path.join(tmp_dir, "frame0.png")
-                cp = subprocess.run(
-                    [ffmpeg, "-y", "-i", tmp_path, "-vframes", "1", out_frame],
-                    capture_output=True, timeout=20,
-                )
-                if cp.returncode == 0 and os.path.exists(out_frame) and os.path.getsize(out_frame) > 0:
-                    return True, "ffmpeg 抽取首帧成功"
-            except Exception:
-                pass
-
-        return False, "无可用媒体解码器（opencv-python / ffmpeg），无法证明视频可播放"
-    finally:
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-def _cover_image_ok(img_bytes: bytes) -> Tuple[bool, str]:
-    """封面图检查：
-       - 能够被解码器完整加载（image.load() 不抛异常，可"渲染"）；
-       - 尺寸有效：宽 ≥ 64 像素、高 ≥ 64 像素（排除占位缩略图/1x1 空图）；
-       - 非纯黑：从 25 个采样点中最大亮度 ≥ 30；
-       - 非空白：并非所有像素颜色一致（不是纯色占位）。
-    """
-    try:
-        from PIL import Image  # type: ignore
-    except ImportError:
-        return False, "缺少 PIL/Pillow，无法验证封面清晰度"
-    from io import BytesIO
-    try:
-        img = Image.open(BytesIO(img_bytes))
-        img.load()  # 完整解码；损坏图会在此抛异常
-        img = img.convert("RGB")
-    except Exception as e:
-        return False, f"封面无法渲染（解码失败）：{e}"
-
-    w, h = img.size
-    if w < 64 or h < 64:
-        return False, f"封面尺寸过小 {w}x{h}（<64 像素，疑似占位图）"
-
-    # 25 采样点：5x5 网格
-    pts = []
-    for i in range(1, 6):
-        for j in range(1, 6):
-            pts.append((w * i // 6, h * j // 6))
-    max_lum = 0.0
-    colors = set()
-    for x, y in pts:
-        px = img.getpixel((x, y))
-        if isinstance(px, tuple) and len(px) >= 3:
-            r_, g_, b_ = int(px[0]), int(px[1]), int(px[2])
-        else:
-            v = int(px) if isinstance(px, (int, float)) else 0
-            r_ = g_ = b_ = v
-        lum = 0.299 * r_ + 0.587 * g_ + 0.114 * b_
-        if lum > max_lum:
-            max_lum = lum
-        colors.add((r_ // 8, g_ // 8, b_ // 8))
-    if max_lum < 30:
-        return False, f"封面抽样最大亮度 {max_lum:.1f} <30（疑似纯黑）"
-    if len(colors) < 3:
-        return False, f"封面像素颜色几乎一致（{len(colors)} 种，疑似纯色占位）"
-    return True, ""
-
-
-def check_end_videos_playable(pptx_path: str) -> Tuple[bool, str]:
-    """第16页"视频可播放 + 静态封面"细则（每一点都必须满足）：
-        播放 (Play):
-          PL1) slide16 关系与视频节点结构完整 —— PowerPoint 播放模式启用媒体的必要前提；
-          PL2) 点击播放或自动播放触发存在（timing 中 <p:video> 或 hlinkClick media）——
-               PowerPoint 播放模式下响应"点击/自动播放"的依据；
-          PL3) 引用的视频文件在 pptx 内真实存在（不出现"媒体缺失/路径错误"）；
-          PL4) 使用真实媒体解码器（cv2 / ffmpeg CLI）能解码每段视频的首帧，
-               证明视频容器与编码可被主流解码器打开，不会在 PowerPoint 中出现"损坏/无法播放"。
-          —— PL1~PL4 组合即可覆盖 rubric 中"播放模式下可正常播放、不出现媒体缺失/无法播放/
-             路径错误"的判定条件，无需再启用 PowerPoint COM 自动化，避免 Windows +
-             PowerPoint 环境依赖以及 SlideShow 窗口副作用。
-        静止封面 (Cover):
-          CV1) 每段视频均引用了封面 blip；
-          CV2/CV3/CV4) 封面可被真实图像解码器完整加载并渲染（Pillow 打开+load 无异常）；
-                        尺寸不小于 64x64；不为纯黑；不为空白占位（颜色种类 ≥3）。
-    """
-    try:
-        with zipfile.ZipFile(pptx_path, "r") as zf:
-            namelist = set(zf.namelist())
-
-            # 读取 slide16 内容与关系
-            if "ppt/slides/slide16.xml" not in namelist:
-                return False, "ppt/slides/slide16.xml 不存在"
-            slide_xml = zf.read("ppt/slides/slide16.xml").decode("utf-8", errors="ignore")
-            rels_path = "ppt/slides/_rels/slide16.xml.rels"
-            if rels_path not in namelist:
-                return False, "slide16.xml.rels 不存在"
-            rels_xml = zf.read(rels_path).decode("utf-8", errors="ignore")
-
-            import re
-
-            # 解析 rels：id -> (type, target)
-            rel_map = {}
-            for m in re.finditer(
-                r'<Relationship\s+[^/]*Id="([^"]+)"[^/]*Type="([^"]+)"[^/]*Target="([^"]+)"',
-                rels_xml,
-            ):
-                rid, rtype, target = m.group(1), m.group(2), m.group(3)
-                rel_map[rid] = (rtype, target)
-
-            # PL1) 两段视频对应的 video 节点数量 ≥2
-            video_pics = re.findall(r"<p:pic\b[^>]*>.*?</p:pic>", slide_xml, re.DOTALL)
-            video_pic_blocks = [b for b in video_pics if "a:videoFile" in b]
-            if len(video_pic_blocks) < 2:
-                return False, f"slide16 中视频对象 p:pic 数量 {len(video_pic_blocks)} <2"
-
-            # PL2) 点击/自动播放触发
-            timing_video_ok = "<p:video>" in slide_xml
-            click_play_ok = all("ppaction://media" in b for b in video_pic_blocks)
-            if not (timing_video_ok or click_play_ok):
-                return False, "未检测到点击播放或自动播放（无 timing video / hlinkClick media）"
-
-            # PL3) 媒体文件存在 & 引用完整
-            video_files_seen = set()
-            blip_rids = []
-            for blk in video_pic_blocks:
-                for m in re.finditer(r'r:(?:link|embed)="([^"]+)"', blk):
-                    rid = m.group(1)
-                    if rid in rel_map:
-                        _, target = rel_map[rid]
-                        if target.lower().endswith(
-                            (".mp4", ".mov", ".avi", ".wmv", ".m4v", ".mkv")
-                        ):
-                            tgt_norm = (
-                                "ppt/" + target.replace("../", "")
-                                if target.startswith("..")
-                                else target
-                            )
-                            tgt_norm = tgt_norm.replace("ppt/ppt/", "ppt/")
-                            video_files_seen.add(tgt_norm)
-                for m in re.finditer(r'<a:blip\s+r:embed="([^"]+)"', blk):
-                    blip_rids.append(m.group(1))
-
-            if len(video_files_seen) < 2:
-                return False, f"slide16 引用的视频文件数量 {len(video_files_seen)} <2"
-
-            # PL4) 用真实解码器解码每段视频的首帧
-            for vf in video_files_seen:
-                if vf not in namelist:
-                    return False, f"视频文件缺失：{vf}（媒体缺失/路径错误）"
-                video_bytes = zf.read(vf)
-                ext = os.path.splitext(vf)[1].lower() or ".mp4"
-                ok, msg = _decode_first_frame_playable(video_bytes, ext)
-                if not ok:
-                    return False, f"视频 {vf} 无法解码播放：{msg}"
-
-            # CV1) 每段视频均有封面 blip
-            if len(blip_rids) < 2:
-                return False, f"封面 blip 数量 {len(blip_rids)} <2，部分视频缺少封面"
-
-            # CV2/CV3/CV4) 封面图像清晰性 —— 用真实图像解码器完整加载并采样
-            for rid in blip_rids[:2]:
-                if rid not in rel_map:
-                    return False, f"封面关系 {rid} 不存在"
-                _, target = rel_map[rid]
-                tgt = (
-                    "ppt/" + target.replace("../", "")
-                    if target.startswith("..")
-                    else target
-                )
-                tgt = tgt.replace("ppt/ppt/", "ppt/")
-                if tgt not in namelist:
-                    return False, f"封面图像缺失：{tgt}"
-                img_bytes = zf.read(tgt)
-                ok, msg = _cover_image_ok(img_bytes)
-                if not ok:
-                    return False, f"封面 {tgt} 不合格：{msg}"
-
-    except Exception as e:
-        return False, f"读取媒体信息失败：{e}"
-    return True, ""
-
-
-# ---------- 统一入口 ----------
-def _locate_pptx(dir_path: str) -> Optional[str]:
-    """在给定目录内定位被评估的 .pptx 文档；找不到时返回 None。
-
-    规则：仅识别 .pptx（不再兼容 .ppt 老格式）；忽略 ~$ 打头的临时文件、
-    以 . 打头的隐藏文件；同目录多个 .pptx 时按文件名排序取第一个。
-    """
-    if not os.path.isdir(dir_path):
         return None
-    candidates = []
-    for name in os.listdir(dir_path):
-        if name.startswith("~$") or name.startswith("."):
-            continue
-        if name.lower().endswith(".pptx"):
-            candidates.append(os.path.join(dir_path, name))
-    if not candidates:
+
+
+def _is_pic(sh):
+    return _stype(sh) == MSO_SHAPE_TYPE.PICTURE
+
+
+def _has_chart(sh):
+    try:
+        return bool(sh.has_chart)
+    except Exception:
+        return False
+
+def _runs(sh):
+    out = []
+    try:
+        for p in sh.text_frame.paragraphs:
+            out.extend(list(p.runs))
+    except Exception:
+        pass
+    return out
+
+
+def _sig_runs(sh):
+    """"有效 run"：文本长度大于 1 个字符。
+    与办公软件对齐：段落末尾常被切分出单独一个标点 run（如"。"），
+    其字号/字体沿用段落属性且不承载可视格式，逐字符比对易误判，故不计。"""
+    rs = [r for r in _runs(sh) if len(r.text.strip()) > 1]
+    if rs:
+        return rs
+    return [r for r in _runs(sh) if r.text.strip()]
+
+
+def _run_size(run):
+    try:
+        return run.font.size.pt if run.font.size is not None else None
+    except Exception:
         return None
-    candidates.sort()
-    return candidates[0]
 
 
-def evaluate(dir_path: str) -> dict:
-    """脚本对外统一入口：接收"脚本所在目录的路径"，脚本自行在该目录定位并评估文档。
+def _run_bold(run):
+    try:
+        return bool(run.font.bold)
+    except Exception:
+        return False
 
-    返回结构（参见"脚本接口差异与统一建议.md" §2.2）：
-        {
-            "id": "062",
-            "file_name": "xxx.pptx",
-            "status": "ok" | "error",
-            "error": None | str,
-            "dim1_pass": bool,
-            "dim1_reason": str,
-            "dim2_items": [ {rule, max_delta, delta, hit, detail}, ... ],
-            "total_score": int,
-            "max_score": int,
-        }
-    """
-    result: dict = {
+
+def _run_latin(run):
+    m = re.search(r'<a:latin[^>]+typeface="([^"]*)"', run._r.xml)
+    return m.group(1) if m else None
+
+
+def _run_ea(run):
+    m = re.search(r'<a:ea[^>]+typeface="([^"]*)"', run._r.xml)
+    return m.group(1) if m else None
+
+
+def _run_color(run):
+    """run 的文字颜色：直接色值返回 6 位大写十六进制，主题色返回 'scheme:xxx'。"""
+    x = run._r.xml
+    m = re.search(r'<a:solidFill>\s*<a:srgbClr val="([0-9A-Fa-f]{6})"', x)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r'<a:solidFill>\s*<a:schemeClr val="([A-Za-z0-9]+)"', x)
+    if m:
+        return "scheme:" + m.group(1)
+    return None
+
+def _hex_is_blue(h):
+    """蓝色系：蓝通道足够高且明显强于红通道、不低于绿通道。"""
+    try:
+        r = int(h[0:2], 16)
+        g = int(h[2:4], 16)
+        b = int(h[4:6], 16)
+    except Exception:
+        return False
+    return b >= 0x80 and b > r + 0x20 and b >= g
+
+
+def _is_blue_color(c):
+    if not c:
+        return False
+    if c.startswith("scheme:"):
+        return c.split(":", 1)[1] in ("accent1", "accent5", "hlink")
+    return _hex_is_blue(c)
+
+
+def _is_near_hex(c, refs, tol=0x50):
+    """色值近似判定：与任一参考色的各通道偏差都在 tol 以内。"""
+    if not c or c.startswith("scheme:"):
+        return False
+    try:
+        cur = [int(c[i:i + 2], 16) for i in (0, 2, 4)]
+    except Exception:
+        return False
+    for ref in refs:
+        rv = [int(ref[i:i + 2], 16) for i in (0, 2, 4)]
+        if all(abs(a - b) <= tol for a, b in zip(cur, rv)):
+            return True
+    return False
+
+
+def _is_white(c):
+    if not c:
+        return False
+    if c.startswith("scheme:"):
+        return c.split(":", 1)[1] in ("bg1", "lt1")
+    try:
+        return all(int(c[i:i + 2], 16) >= 0xF0 for i in (0, 2, 4))
+    except Exception:
+        return False
+
+
+def _is_song(v):
+    return bool(v) and any(k in v for k in SONG)
+
+def _shape_blue(sh):
+    """形状自身（填充或线条）是否为蓝色系。"""
+    return bool(BLUE_XML_RE.search(_xml(sh)))
+
+
+def _shape_light(sh):
+    """形状是否为浅色填充（任一显式色值的平均亮度不低于 0xD0）。"""
+    for h in re.findall(r'srgbClr val="([0-9A-Fa-f]{6})"', _xml(sh)):
+        try:
+            v = (int(h[0:2], 16) + int(h[2:4], 16) + int(h[4:6], 16)) / 3.0
+        except Exception:
+            continue
+        if v >= 0xD0:
+            return True
+    return False
+
+
+def _line_w_pt(sh):
+    """线宽（磅）。未显式设置返回 None（沿用主题默认细线）。"""
+    m = re.search(r'<a:ln[^>]*\sw="(\d+)"', _xml(sh))
+    return round(int(m.group(1)) / 12700.0, 2) if m else None
+
+
+def _clusters(vals, tol=0.1):
+    """把一维坐标按容差聚成若干簇（用于识别点阵的行/列）。"""
+    groups = []
+    for v in sorted(vals):
+        if groups and abs(v - groups[-1][-1]) <= tol:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+    return groups
+
+# --------------------------------------------------------- 顶部区域形状集合
+
+
+def _band_shapes(slide):
+    """顶部区域形状：整体（含高度）都落在距上边界 2.6 厘米以内。
+    与办公软件对齐：只有完整位于顶部标题栏内的对象才算标题栏构件，
+    仅"上边界在 2.6 厘米内"会把正文照片（上边界 2.41 厘米）误纳入。"""
+    out = []
+    for sh in slide.shapes:
+        left, top, _, bottom = _box(sh)
+        if left > 100 or top > 100:      # 页面之外的幽灵形状不参与
+            continue
+        if bottom <= TOP_BAND_CM:
+            out.append(sh)
+    return out
+
+def _decor(slide):
+    """顶部装饰形状：顶部区域内不承载文字的对象（排除标题、英文、数字文本）。"""
+    return [sh for sh in _band_shapes(slide) if not _txt(sh)]
+
+
+def _decor_bbox(slide):
+    """装饰图形整体外接矩形；不计宽高均为 0 厘米的空形状。"""
+    boxes = []
+    for sh in _decor(slide):
+        w, h = _wh(sh)
+        if w == 0 and h == 0:
+            continue
+        boxes.append(_box(sh))
+    if not boxes:
+        return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def _num_shapes(slide):
+    """顶部区域内文字为两位数字的对象（数字块，不限几何类型）。"""
+    return [sh for sh in _band_shapes(slide)
+            if re.fullmatch(r"\d{2}", _txt(sh))]
+
+
+def _num_para(slide):
+    """顶部区域内几何类型为 parallelogram 且文字为两位数字的对象。"""
+    return [sh for sh in _num_shapes(slide) if _prst(sh) == "parallelogram"]
+
+
+def _num_right(slide):
+    """数字块右边界（无数字块时返回 0）。"""
+    return max([_box(sh)[2] for sh in _num_shapes(slide)], default=0.0)
+
+
+def _title_shape(slide, expected):
+    """按预期标题文字定位中文标题文本框，优先取落在顶部区域的那个。"""
+    cands = [sh for sh in slide.shapes if _txt(sh) == expected]
+    band = [sh for sh in cands if _cm(sh.top) <= TOP_BAND_CM]
+    if band:
+        return band[0]
+    return cands[0] if cands else None
+
+
+def _en_shape(slide):
+    """标题栏英文文字对象：页面上部纯英文（含空格/连字符）的最上方文本对象。"""
+    best = None
+    for sh in slide.shapes:
+        t = _txt(sh)
+        if len(t) < 4 or not EN_RE.fullmatch(t):
+            continue
+        if _cm(sh.top) > 6.0:
+            continue
+        if best is None or _cm(sh.top) < _cm(best.top):
+            best = sh
+    return best
+
+def _fmt_ok(sh, font=None, size=None, bold=None, color=None,
+            left=None, top=None, pos_tol=0.05, size_tol=0.6):
+    """逐项校验一个文本对象的字体族、字号、加粗、颜色与页面坐标。
+    返回 (是否全部满足, 差异说明)。字号容差 0.6 磅，坐标容差 0.05 厘米。"""
+    if sh is None:
+        return (False, "对象缺失")
+    bad = []
+    if left is not None and abs(_cm(sh.left) - left) > pos_tol:
+        bad.append("距左边界%.2f≠%.2f" % (_cm(sh.left), left))
+    if top is not None and abs(_cm(sh.top) - top) > pos_tol:
+        bad.append("距上边界%.2f≠%.2f" % (_cm(sh.top), top))
+    rs = _sig_runs(sh)
+    if not rs:
+        bad.append("无文本内容")
+    for r in rs:
+        if font is not None:
+            la, ea = _run_latin(r), _run_ea(r)
+            hit = (la == font or ea == font)
+            clean = (la is None or la == font) and (ea is None or ea == font)
+            if not (hit and clean):
+                bad.append("字体%s/%s≠%s" % (la or "-", ea or "-", font))
+        if size is not None:
+            sz = _run_size(r)
+            if sz is None or abs(sz - size) > size_tol:
+                bad.append("字号%s≠%s" % (sz, size))
+        if bold is not None and _run_bold(r) != bold:
+            bad.append("加粗%s≠%s" % (_run_bold(r), bold))
+        if color is not None and _run_color(r) != color:
+            bad.append("颜色%s≠%s" % (_run_color(r) or "-", color))
+    return (not bad, "；".join(list(dict.fromkeys(bad))[:3]))
+
+
+def _para_align(sh, keyword=None):
+    """取（含关键字的）段落的对齐方式。"""
+    try:
+        for p in sh.text_frame.paragraphs:
+            if keyword is None or keyword in (p.text or ""):
+                return p.alignment
+    except Exception:
+        pass
+    return None
+
+def _shape_has_fill(sh):
+    """形状自身是否设置了非"无填充"的填充（用于识别色块类对象）。
+    形状填充在 spPr 中先于线条出现，取 spPr 内第一个填充节点判定。"""
+    m = re.search(r'<p:spPr[ >].*?</p:spPr>', _xml(sh), re.S)
+    if not m:
+        return False
+    f = re.search(r'<a:(solidFill|gradFill|blipFill|pattFill|grpFill|noFill)',
+                  m.group(0))
+    return bool(f) and f.group(1) != "noFill"
+
+
+def _body_paras(slide):
+    """正文区中文段落（导语 + 条目）。
+    过滤掉顶部标题栏（上边界 2.2 厘米以内）、页脚与页码（上边界 17 厘米以下），
+    以及带填充的色块类对象——色块承载的是关键词标签而非正文段落。"""
+    out = []
+    for sh in slide.shapes:
+        if not _txt(sh):
+            continue
+        left, top, _, _ = _box(sh)
+        if left > 100 or top < 2.2 or top > 17.0:
+            continue
+        if _stype(sh) not in (MSO_SHAPE_TYPE.TEXT_BOX, MSO_SHAPE_TYPE.AUTO_SHAPE):
+            continue
+        if _shape_has_fill(sh):
+            continue
+        try:
+            paras = list(sh.text_frame.paragraphs)
+        except Exception:
+            continue
+        for p in paras:
+            t = (p.text or "").strip()
+            if not t or not CJK_RE.search(t):
+                continue
+            rs = [r for r in p.runs if len(r.text.strip()) > 1]
+            if not rs:
+                rs = [r for r in p.runs if r.text.strip()]
+            if not rs:
+                continue
+            out.append((sh, t, rs))
+    return out
+
+
+def _para_fmt_bad(rs, font, size, color, bold=None, size_tol=0.6):
+    """段落 run 级格式校验，返回差异说明（空串表示全部满足）。"""
+    bad = []
+    for r in rs:
+        la, ea = _run_latin(r), _run_ea(r)
+        hit = (la == font or ea == font)
+        clean = (la is None or la == font) and (ea is None or ea == font)
+        if not (hit and clean):
+            bad.append("字体%s/%s≠%s" % (la or "-", ea or "-", font))
+        sz = _run_size(r)
+        if sz is None or abs(sz - size) > size_tol:
+            bad.append("字号%s≠%s" % (sz, size))
+        if bold is not None and _run_bold(r) != bold:
+            bad.append("加粗%s≠%s" % (_run_bold(r), bold))
+        if _run_color(r) != color:
+            bad.append("颜色%s≠%s" % (_run_color(r) or "-", color))
+    return "；".join(list(dict.fromkeys(bad))[:3])
+
+# ------------------------------------------------------------- 媒体对象工具
+
+
+def _is_media(sh):
+    """可播放视频媒体对象：媒体形状，或图形内含 videoFile / p14:media 引用。"""
+    if _stype(sh) == MSO_SHAPE_TYPE.MEDIA:
+        return True
+    x = _xml(sh)
+    return ("<a:videoFile" in x) or ("p14:media" in x)
+
+
+def _media_rids(sh):
+    """返回 (视频关系 id 列表, 嵌入媒体数据关系 id 列表)。"""
+    x = _xml(sh)
+    links = re.findall(r'<a:videoFile[^>]+r:link="([^"]+)"', x)
+    embeds = re.findall(r'<p14:media[^>]+r:embed="([^"]+)"', x)
+    return (links, embeds)
+
+
+def _media_parts(slide, sh):
+    """解析媒体形状引用到的内部媒体部件，返回 [(部件名, 数据摘要, 字节数)]。"""
+    out = []
+    links, embeds = _media_rids(sh)
+    for rid in list(dict.fromkeys(links + embeds)):
+        try:
+            rel = slide.part.rels[rid]
+        except Exception:
+            continue
+        try:
+            if rel.is_external:
+                continue
+        except Exception:
+            pass
+        try:
+            part = rel.target_part
+            blob = part.blob or b""
+        except Exception:
+            continue
+        out.append((str(part.partname),
+                    hashlib.sha1(blob).hexdigest(), len(blob)))
+    return out
+
+
+def _has_poster(sh):
+    """是否带首帧预览画面：形状内含图片填充（p:blipFill / a:blipFill）
+    且能解析到图片关系。纯黑框或空白框不会写入 blip 引用。"""
+    x = _xml(sh)
+    if "blipFill" not in x:
+        return False
+    return bool(re.search(r'<a:blip[^>]+r:(?:embed|link)="[^"]+"', x))
+
+# ------------------------------------------------------------------- 维度一
+
+
+def _dim1_check(prs):
+    """维度一：可用与可修改性。
+    ① 交付文件为 .pptx 且能被正常打开（能构造 Presentation 即视为未损坏）；
+    ② 总页数为 16 页；
+    ③ 不存在铺满整页的位图（宽>33 厘米且高>19 厘米的图片对象），
+       即页面内容仍为可编辑对象而非整页贴图。
+    维度一未通过时维度二完成度总分记 0，且不再返回逐条明细。"""
+    reasons = []
+    slides = list(prs.slides)
+    if len(slides) != 16:
+        reasons.append("总页数为%d页，不为16页" % len(slides))
+    for idx, s in enumerate(slides, 1):
+        for sh in s.shapes:
+            if not _is_pic(sh):
+                continue
+            w, h = _wh(sh)
+            if w > 33.0 and h > 19.0:
+                reasons.append("第%d页存在铺满整页的位图（%.2f×%.2f厘米）"
+                               % (idx, w, h))
+                break
+    return (not reasons), "；".join(reasons)
+
+
+# ------------------------------------------------------------------- 主入口
+
+# 维度一只接受 .pptx；目录里若只有下列格式，属于"交付物格式不被接受"，
+# 交给维度一记 0，而不是当作"这份作业没评上"。
+_EXT_REJECT = (".ppt", ".pps", ".ppsx", ".odp", ".dps", ".dpt", ".pdf", ".key")
+
+
+def evaluate(dir_path):
+    # 约定：status 为 "error" 表示"这份作业根本没评上"（目录不存在、目录里没有
+    # 待评文件、脚本自身异常），此时 dim1_pass 为空串（未判定）、dim1_reason 为
+    # 空串，dim2_items 为空列表，total_score 与 max_score 均为 0。
+    result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": "",
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
         "max_score": 0,
     }
-
     try:
-        pptx_path = _locate_pptx(dir_path)
-        if pptx_path is None:
+        if not dir_path or not os.path.isdir(dir_path):
             result["status"] = "error"
-            result["error"] = f"目录 {dir_path} 内未找到 .pptx 文件"
+            result["error"] = "目录不存在：%s" % dir_path
             return result
-        result["file_name"] = os.path.basename(pptx_path)
-
-        # 维度一
-        dim1_ok, dim1_fails = check_dim1(pptx_path)
-        result["dim1_pass"] = bool(dim1_ok)
-        result["dim1_reason"] = "" if dim1_ok else "；".join(dim1_fails)
-
-        # 维度二：满分（max_score）固定 = 所有加分项之和（扣分项不计入满分）
-        log = Dim2Log()
-        if dim1_ok:
-            evaluate_dim2(pptx_path, log)
-            result["dim2_items"] = log.items
-            total = log.total()
-            result["total_score"] = max(0, total)
-        else:
-            # 维度一未通过 —— 不检查维度二，总分 0，dim2_items 保持空
-            result["dim2_items"] = []
-            result["total_score"] = 0
-
-        # max_score：加分项 max_delta 之和（正值项），保持稳定即便本次 dim2_items 为空
-        result["max_score"] = _dim2_max_score()
-        return result
-
-    except Exception as e:
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith(".pptx") and not f.startswith("~"))
+        if not cands:
+            rejects = sorted(f for f in os.listdir(dir_path)
+                             if f.lower().endswith(_EXT_REJECT)
+                             and not f.startswith("~"))
+            if rejects:
+                # 目录里有交付物但格式不被接受：已有交付动作，交给维度一记 0
+                result["file_name"] = rejects[0]
+                return _dim1_fail(result, "交付物格式为 %s，维度一仅接受 .pptx"
+                                          % os.path.splitext(rejects[0])[1].lower())
+            result["status"] = "error"
+            result["error"] = "目录中未找到 .pptx 文件：%s" % dir_path
+            return result
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except Exception as exc:
+        # 脚本异常同样视为"没评上"：维度一未判定，两项分数归零。
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
 
 
-def _dim2_max_score() -> int:
-    """维度二加分项的满分总和（用于结果 max_score 字段的稳定输出）。
+def _dim1_fail(result, reason):
+    """维度一未通过：完成度总分记 0，不再逐条罗列（未真正逐条评过）。"""
+    result["dim1_pass"] = False
+    result["dim1_reason"] = reason or "维度一未通过（未给出具体原因）"
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
-    与 evaluate_dim2 中的加分项 max_delta 保持一致：
-        +5  第2-15页顶部标题外侧蓝色形状组合标题栏
-        +5  左侧蓝色主形状
-        +5  右侧长条外框 + 斜切过渡 + 线宽
-        +5  文本元素（页码/中文/英文）
-        +5  装饰点阵 + 短斜线
-        +1  第16页"谢谢观看"文本
-        +5  第16页视频对象
-        +5  视频可播放 + 静态封面
-    合计 36 分（扣分项不计入满分）
-    """
-    return 5 + 5 + 5 + 5 + 5 + 1 + 5 + 5
+
+def _evaluate_impl(file_path, result):
+    try:
+        prs = Presentation(file_path)
+    except Exception as exc:
+        # 文件在但打不开（损坏或只是改了扩展名）：属于维度一不通过，
+        # 不是"这份作业没评上"，所以走 _dim1_fail 而非 status="error"。
+        return _dim1_fail(result, "演示文稿无法打开：%s: %s"
+                                  % (type(exc).__name__, exc))
+    slides = list(prs.slides)
+
+    dim1_pass, dim1_reason = _dim1_check(prs)
+    if not dim1_pass:
+        return _dim1_fail(result, dim1_reason)
+    result["dim1_pass"] = True
+    # 约定：维度一通过时 dim1_reason 保持空串，只有未通过才写错误摘要。
+    result["dim1_reason"] = ""
+
+    results = []          # 形如 ("+5", "规则说明", "实测明细")
+
+    def add(hit, delta, rule, detail=""):
+        """delta 为该项满分：加分项传正数、减分项传负数。
+        hit 表示"该项成立"——加分项为达成、减分项为违规命中。"""
+        sign = "%+d" % delta if hit else ("+0" if delta > 0 else "-0")
+        results.append((sign, rule, detail))
+
+    # 页面尺寸（多项判定共用；不足 16 页时用默认页面尺寸兜底避免越界）
+    pw = _cm(prs.slide_width)
+    ph = _cm(prs.slide_height)
+    body = slides[1:15]                     # 第 2 页至第 15 页
+    s16 = slides[15] if len(slides) >= 16 else None
+    s1 = slides[0] if slides else None
+
+    # ============================================================ 加分项 01
+    # +5：14 个页面顶部均含不少于 6 个形状组成的装饰图形，且构成与摆放位置一致
+    # ①每页顶部装饰形状（不含标题/英文/数字文本框）数量不少于 6；
+    # ②各页装饰形状按坐标排序后一一对应，几何类型相同；
+    # ③对应形状左边界、上边界偏差均不超过 0.2 厘米。
+    sigs = []
+    counts = []
+    ok01 = len(body) == 14
+    for s in body:
+        d = _decor(s)
+        counts.append(len(d))
+        if len(d) < 6:
+            ok01 = False
+        sig = sorted((round(_cm(sh.left), 2), round(_cm(sh.top), 2),
+                      _prst(sh) or "none") for sh in d)
+        sigs.append(sig)
+    diff01 = ""
+    if ok01 and sigs:
+        ref = sigs[0]
+        for i, sig in enumerate(sigs[1:], 3):
+            if len(sig) != len(ref):
+                ok01 = False
+                diff01 = "第%d页装饰形状数量%d≠第2页%d" % (i, len(sig), len(ref))
+                break
+            for (l1, t1, g1), (l2, t2, g2) in zip(ref, sig):
+                if g1 != g2 or abs(l1 - l2) > 0.2 or abs(t1 - t2) > 0.2:
+                    ok01 = False
+                    diff01 = "第%d页存在偏差超 0.2 厘米的对应形状" % i
+                    break
+            if not ok01:
+                break
+    add(ok01, 5,
+        "第2页至第15页共14个页面的顶部区域（距页面上边界2.6厘米以内）均含有一组由不少于6个形状对象组成的装饰图形，"
+        "且14个页面中该组装饰形状（不含承载标题与英文文字的文本框）的构成与摆放位置一致，"
+        "各页对应形状的左边界、上边界坐标偏差不超过0.2厘米",
+        diff01 or ("各页顶部装饰形状 %d–%d 个" % (min(counts or [0]), max(counts or [0]))))
+
+    # ============================================================ 加分项 02
+    # +5：每页顶部均含一个几何类型为 parallelogram 的对象，内部文字为两位数字
+    miss02 = [i for i, s in enumerate(body, 2) if not _num_para(s)]
+    ok02 = (len(body) == 14) and not miss02
+    add(ok02, 5,
+        "第2页至第15页每页顶部区域均含有一个平行四边形（几何类型 parallelogram）对象，其内部文字为两位数字",
+        "全部14页均命中" if ok02 else "缺失页：%s" % (miss02 or "-"))
+
+    # ============================================================ 加分项 03
+    # +1：数字块蓝色系填充（纯色或渐变），块内数字为白色且字号不小于 24 磅
+    ok03 = ok02
+    diff03 = ""
+    for i, s in enumerate(body, 2):
+        ps = _num_para(s)
+        if not ps:
+            ok03 = False
+            diff03 = "第%d页无平行四边形数字块" % i
+            break
+        sh = ps[0]
+        if not _shape_blue(sh):
+            ok03 = False
+            diff03 = "第%d页数字块填充非蓝色系" % i
+            break
+        rs = _sig_runs(sh)
+        for r in rs:
+            sz = _run_size(r)
+            if not _is_white(_run_color(r)):
+                ok03 = False
+                diff03 = "第%d页数字颜色%s非白色" % (i, _run_color(r) or "-")
+            elif sz is None or sz < 24:
+                ok03 = False
+                diff03 = "第%d页数字字号%s小于24磅" % (i, sz)
+            if not ok03:
+                break
+        if not ok03:
+            break
+    add(ok03, 1,
+        "第2页至第15页顶部的平行四边形数字块为蓝色系填充（纯色或渐变，色值近似 #2962FF、#347BDC、#4472C4），"
+        "块内数字为白色且字号不小于24磅",
+        diff03 or "14页数字块均为蓝色系填充、白色数字且字号达标")
+
+    # ============================================================ 加分项 04
+    # +3：数字块内数字与页码对应递增，第 2 页 "02" ... 第 15 页 "15"
+    seq = []
+    for i, s in enumerate(body, 2):
+        ps = _num_para(s)
+        seq.append(_txt(ps[0]) if ps else "-")
+    exp_seq = ["%02d" % i for i in range(2, 16)]
+    ok04 = (seq == exp_seq)
+    add(ok04, 3,
+        "第2页至第15页顶部平行四边形数字块内的数字与页码对应递增：第2页为\"02\"、第3页为\"03\"，依次到第15页为\"15\"",
+        "实测序列 %s" % ",".join(seq))
+
+    # ============================================================ 加分项 05
+    # +3：数字块右侧衔接一条横向长条形浅色底板或蓝色细线框
+    # ①长度不小于 3 厘米、宽高比不小于 3:1（线条高度按 0.01 厘米计）；
+    # ②浅色填充或蓝色系线条，显式线宽不超过 3.5 磅；
+    # ③左边界不超过数字块右边界，右边界距页面左边界不超过 16.9 厘米。
+    ok05 = len(body) == 14
+    diff05 = ""
+    for i, s in enumerate(body, 2):
+        nr = _num_right(s)
+        found = None
+        for sh in _decor(s):
+            left, top, right, bottom = _box(sh)
+            w = right - left
+            h = bottom - top
+            if w < 3.0 or w < 3.0 * max(h, 0.01):
+                continue
+            if not (_shape_light(sh) or _shape_blue(sh)):
+                continue
+            lw = _line_w_pt(sh)
+            if lw is not None and lw > 3.5:
+                continue
+            if left > nr + 0.01 or right > HALF_W_CM:
+                continue
+            found = (left, right, w, h)
+            break
+        if found is None:
+            ok05 = False
+            diff05 = "第%d页未找到合规横条（数字块右边界%.2f厘米）" % (i, nr)
+            break
+    add(ok05, 3,
+        "第2页至第15页每页数字块右侧衔接一条横向长条形浅色填充底板或蓝色细线框（线宽不超过3.5磅），"
+        "该底板或线框长度不小于3厘米、宽高比不小于3:1，其左边界不超过数字块右边界、"
+        "右边界距页面左边界不超过16.9厘米，与数字块拼接成一条紧凑横幅而非横贯整页的通栏",
+        diff05 or "14页均命中紧凑横条且右边界在16.9厘米以内")
+
+    # ============================================================ 加分项 06
+    # +3：装饰整体外接矩形宽高比在 2.5:1 至 7:1 之间，且宽度不超过 16.9 厘米
+    ok06 = len(body) == 14
+    diff06 = ""
+    for i, s in enumerate(body, 2):
+        bb = _decor_bbox(s)
+        if bb is None:
+            ok06 = False
+            diff06 = "第%d页无装饰形状" % i
+            break
+        w = bb[2] - bb[0]
+        h = bb[3] - bb[1]
+        ratio = w / h if h > 0 else 999.0
+        if not (2.5 <= ratio <= 7.0) or w > HALF_W_CM:
+            ok06 = False
+            diff06 = "第%d页外接矩形%.2f×%.2f厘米、宽高比%.2f:1" % (i, w, h, ratio)
+            break
+    add(ok06, 3,
+        "第2页至第15页顶部装饰图形整体的外接矩形（不计宽高均为0厘米的空形状）宽高比在2.5:1至7:1之间，"
+        "且宽度不超过16.9厘米（不超过页面宽度的一半），呈紧凑横幅形态而非横贯整页的细长条",
+        diff06 or "14页外接矩形均为紧凑横幅")
+
+    # ============================================================ 加分项 07
+    # +3：装饰整体外接矩形左边界不超过 2 厘米、下边界不超过 2.6 厘米
+    ok07 = len(body) == 14
+    diff07 = ""
+    for i, s in enumerate(body, 2):
+        bb = _decor_bbox(s)
+        if bb is None or bb[0] > 2.0 or bb[3] > TOP_BAND_CM:
+            ok07 = False
+            diff07 = ("第%d页无装饰形状" % i) if bb is None else \
+                ("第%d页左边界%.2f、下边界%.2f厘米" % (i, bb[0], bb[3]))
+            break
+    add(ok07, 3,
+        "第2页至第15页顶部装饰图形整体的外接矩形左边界距页面左边界不超过2厘米、"
+        "下边界距页面上边界不超过2.6厘米，整体位于页面左上角",
+        diff07 or "14页装饰整体均位于页面左上角")
+
+    # ============================================================ 加分项 08
+    # +3：中文标题文本框左边界在 1 至 5 厘米之间，紧邻数字块右侧且落在横幅高度内
+    ok08 = len(body) == 14
+    diff08 = ""
+    for i, s in enumerate(body, 2):
+        sh = _title_shape(s, TITLES[i - 2])
+        if sh is None:
+            ok08 = False
+            diff08 = "第%d页未找到中文标题文本框" % i
+            break
+        left, top, _, bottom = _box(sh)
+        nr = _num_right(s)
+        bb = _decor_bbox(s)
+        if not (1.0 <= left <= 5.0):
+            ok08 = False
+            diff08 = "第%d页标题左边界%.2f厘米不在1-5厘米之间" % (i, left)
+            break
+        if left > nr + 2.0:
+            ok08 = False
+            diff08 = "第%d页标题左边界%.2f厘米未紧邻数字块（右边界%.2f）" % (i, left, nr)
+            break
+        if bb is not None and not (top >= bb[1] - 0.5 and bottom <= bb[3] + 0.5):
+            ok08 = False
+            diff08 = "第%d页标题垂直范围%.2f-%.2f超出横幅%.2f-%.2f" % (
+                i, top, bottom, bb[1], bb[3])
+            break
+    add(ok08, 3,
+        "第2页至第15页的中文标题文本框左边界距页面左边界在1至5厘米之间，"
+        "紧邻数字块右侧且在垂直方向落在顶部横幅高度范围内，未处于页面中部或右侧",
+        diff08 or "14页标题均紧邻数字块右侧且落在横幅高度内")
+
+    # ============================================================ 加分项 09
+    # +3：中文标题文字与页码对应（须位于顶部区域，避免命中正文里的同名文字）
+    miss09 = []
+    for i, s in enumerate(body, 2):
+        sh = _title_shape(s, TITLES[i - 2])
+        if sh is None or _cm(sh.top) > TOP_BAND_CM:
+            miss09.append(i)
+    ok09 = (len(body) == 14) and not miss09
+    add(ok09, 3,
+        "第2页至第15页的中文标题文字与页码对应，依次为\"内容框架\"\"品牌定位\"\"消费场景\"\"产品矩阵\""
+        "\"数字化运营\"\"会员运营\"\"门店模型\"\"供应链协同\"\"品质控制\"\"增长路径\"\"营销策略\""
+        "\"效率提升\"\"风险管理\"\"总结展望\"",
+        "14页标题文字全部对应" if ok09 else "不匹配页：%s" % (miss09 or "-"))
+
+    # ============================================================ 加分项 10
+    # +1：中文标题字号不小于 30 磅且为加粗
+    ok10 = len(body) == 14
+    diff10 = ""
+    for i, s in enumerate(body, 2):
+        sh = _title_shape(s, TITLES[i - 2])
+        rs = _sig_runs(sh) if sh is not None else []
+        if not rs:
+            ok10 = False
+            diff10 = "第%d页未取到标题文本" % i
+            break
+        for r in rs:
+            sz = _run_size(r)
+            if sz is None or sz < 30 or not _run_bold(r):
+                ok10 = False
+                diff10 = "第%d页标题字号%s、加粗%s" % (i, sz, _run_bold(r))
+                break
+        if not ok10:
+            break
+    add(ok10, 1,
+        "第2页至第15页的中文标题字号不小于30磅且为加粗",
+        diff10 or "14页标题均不小于30磅且加粗")
+
+    # ============================================================ 加分项 11
+    # +3：中文标题下方或右侧含一行英文文字，字号 10-13 磅，颜色蓝色系
+    ok11 = len(body) == 14
+    diff11 = ""
+    en_texts = []
+    for i, s in enumerate(body, 2):
+        en = _en_shape(s)
+        en_texts.append(_txt(en) if en is not None else "")
+        if en is None:
+            ok11 = False
+            diff11 = "第%d页未找到英文文字对象" % i
+            break
+        title = _title_shape(s, TITLES[i - 2])
+        el, et, _, _ = _box(en)
+        if title is not None:
+            tl, tt, tr, _ = _box(title)
+            if not (et >= tt - 0.1 or el >= tr - 0.5):
+                ok11 = False
+                diff11 = "第%d页英文既不在标题下方也不在右侧" % i
+                break
+        for r in _sig_runs(en):
+            sz = _run_size(r)
+            c = _run_color(r)
+            if sz is None or not (10.0 <= sz <= 13.0):
+                ok11 = False
+                diff11 = "第%d页英文字号%s不在10-13磅之间" % (i, sz)
+            elif not _is_blue_color(c):
+                ok11 = False
+                diff11 = "第%d页英文颜色%s非蓝色系" % (i, c or "-")
+            if not ok11:
+                break
+        if not ok11:
+            break
+    add(ok11, 3,
+        "第2页至第15页每页在中文标题下方或右侧含有一行英文文字，字号在10至13磅之间，颜色为蓝色系",
+        diff11 or "14页英文行均为10-13磅蓝色系")
+
+    # ============================================================ 加分项 12
+    # +3：英文文字为该页中文标题对应的英文译名，且 14 页互不相同
+    ok12 = (len(en_texts) == 14) and all(en_texts)
+    diff12 = ""
+    if ok12 and len(set(t.lower() for t in en_texts)) != 14:
+        ok12 = False
+        diff12 = "14页英文内容存在重复（去重后%d种）" % len(
+            set(t.lower() for t in en_texts))
+    if ok12:
+        for i, t in enumerate(en_texts, 2):
+            kws = EN_KEYWORDS[TITLES[i - 2]]
+            low = t.lower()
+            if len(t) > 48 or not any(k in low for k in kws):
+                ok12 = False
+                diff12 = "第%d页英文\"%s\"非\"%s\"的译名" % (i, t, TITLES[i - 2])
+                break
+    add(ok12, 3,
+        "第2页至第15页的英文文字分别为该页中文标题对应的英文译名（如\"品牌定位\"页为 brand positioning、"
+        "\"门店模型\"页为 Store Model、\"增长路径\"页为 Growth Path），14个页面的英文内容互不相同",
+        diff12 or "14页英文均为对应译名且互不相同")
+
+    # ============================================================ 加分项 13
+    # +3：横幅右端不少于 9 个尺寸不超过 0.3 厘米的小点，呈不少于 3 行 3 列点阵
+    # ①小点为装饰形状中宽高均大于 0 且不超过 0.3 厘米者，右边界不超过 16.9 厘米；
+    # ②按 0.1 厘米容差聚簇后，至少 3 个"含 3 个以上小点"的列簇与行簇；
+    # ③点阵重心落在装饰整体外接矩形的右半侧（位于横幅右端）。
+    ok13 = len(body) == 14
+    diff13 = ""
+    for i, s in enumerate(body, 2):
+        dots = []
+        for sh in _decor(s):
+            w, h = _wh(sh)
+            left, top, right, _ = _box(sh)
+            if 0 < w <= 0.3 and 0 < h <= 0.3 and right <= HALF_W_CM:
+                dots.append((left, top))
+        if len(dots) < 9:
+            ok13 = False
+            diff13 = "第%d页16.9厘米内不超过0.3厘米的小点仅%d个" % (i, len(dots))
+            break
+        cols = [g for g in _clusters([d[0] for d in dots]) if len(g) >= 3]
+        rows = [g for g in _clusters([d[1] for d in dots]) if len(g) >= 3]
+        if len(cols) < 3 or len(rows) < 3:
+            ok13 = False
+            diff13 = "第%d页点阵仅%d列%d行" % (i, len(cols), len(rows))
+            break
+        grid = [d for d in dots
+                if any(abs(d[0] - v) <= 0.1 for g in cols for v in g)]
+        bb = _decor_bbox(s)
+        gx = sum(d[0] for d in grid) / float(len(grid))
+        if bb is not None and gx < bb[0] + (bb[2] - bb[0]) / 2.0:
+            ok13 = False
+            diff13 = "第%d页点阵重心%.2f厘米未落在横幅右端" % (i, gx)
+            break
+    add(ok13, 3,
+        "第2页至第15页顶部装饰图形中含有不少于9个尺寸不超过0.3厘米的小圆点或小方点，"
+        "在横幅右端呈不少于3行3列的网格状排布，且该点阵整体的右边界距页面左边界不超过16.9厘米"
+        "（位于左上角横幅右端，而非页面右侧边缘）",
+        diff13 or "14页均含3行3列以上点阵且位于16.9厘米以内")
+
+    # ============================================================ 加分项 14
+    # +1：含 3 个平行排列的小斜条（平行四边形/斜纹）以及 1 个独立的小斜块，
+    #     且斜条与斜块的右边界距页面左边界均不超过 16.9 厘米。
+    ok14 = len(body) == 14
+    diff14 = ""
+    for i, s in enumerate(body, 2):
+        slants = []
+        for sh in _decor(s):
+            if _prst(sh) not in ("parallelogram", "diagStripe"):
+                continue
+            w, h = _wh(sh)
+            left, top, right, _ = _box(sh)
+            if 0 < w <= 1.2 and 0 < h <= 1.2 and right <= HALF_W_CM:
+                slants.append((left, top))
+        groups = [g for g in _clusters([v[1] for v in slants]) if len(g) >= 3]
+        if not groups or len(slants) < 4:
+            ok14 = False
+            diff14 = "第%d页16.9厘米内小斜条%d个、平行组%d组" % (
+                i, len(slants), len(groups))
+            break
+    add(ok14, 1,
+        "第2页至第15页顶部装饰图形中含有3个平行排列的小斜条（平行四边形或斜纹形状），以及1个独立的小斜块，"
+        "且这些斜条与斜块的右边界距页面左边界均不超过16.9厘米",
+        diff14 or "14页均含3个平行小斜条与1个独立小斜块")
+
+    # ---------------------------------------------- 第 16 页结束页相关对象定位
+    thx = []
+    vids = []
+    if s16 is not None:
+        thx = [sh for sh in s16.shapes if _txt(sh) == "谢谢观看"]
+        vids = [sh for sh in s16.shapes if _is_media(sh)]
+        vids.sort(key=lambda sh: _cm(sh.left))
+
+    # ============================================================ 加分项 15
+    # +3：第 16 页含独立的"谢谢观看"文本对象（单独一个文本对象，文字即"谢谢观看"）
+    ok15 = len(thx) >= 1
+    add(ok15, 3, "第16页含有独立的\"谢谢观看\"文本对象",
+        "命中%d个\"谢谢观看\"文本对象" % len(thx) if ok15 else "第16页未找到\"谢谢观看\"文本对象")
+
+    # ============================================================ 加分项 16
+    # +3："谢谢观看"的中文字体（东亚字体）与西文字体均为宋体
+    ok16 = False
+    diff16 = "对象缺失"
+    if ok15:
+        ok16 = True
+        for r in _sig_runs(thx[0]):
+            la, ea = _run_latin(r), _run_ea(r)
+            if not (_is_song(la) and _is_song(ea)):
+                ok16 = False
+                diff16 = "中文字体%s、西文字体%s" % (ea or "-", la or "-")
+                break
+        if ok16:
+            diff16 = "中西文字体均为宋体"
+    add(ok16, 3, "第16页\"谢谢观看\"的中文字体与西文字体均为宋体", diff16)
+
+    # ============================================================ 加分项 17
+    # +1："谢谢观看"为加粗
+    ok17 = bool(ok15) and all(_run_bold(r) for r in _sig_runs(thx[0]))
+    add(ok17, 1, "第16页\"谢谢观看\"为加粗",
+        "已加粗" if ok17 else "未加粗或对象缺失")
+
+    # ============================================================ 加分项 18
+    # +1："谢谢观看"为蓝色系（色值近似 #2360B9、#4472C4，或引用蓝色主题色）
+    ok18 = False
+    diff18 = "对象缺失"
+    if ok15:
+        cs = [_run_color(r) for r in _sig_runs(thx[0])]
+        ok18 = bool(cs) and all(
+            _is_near_hex(c, ("2360B9", "4472C4")) or
+            (c or "").startswith("scheme:accent") for c in cs)
+        diff18 = "文字颜色 %s" % ",".join(c or "-" for c in cs)
+    add(ok18, 1, "第16页\"谢谢观看\"为蓝色系（色值近似 #2360B9、#4472C4）", diff18)
+
+    # ============================================================ 加分项 19
+    # +3："谢谢观看"所在段落居中对齐，且文本框水平中心与页面水平中心偏差不超过 0.5 厘米
+    ok19 = False
+    diff19 = "对象缺失"
+    if ok15:
+        sh = thx[0]
+        left, _, right, _ = _box(sh)
+        cx = (left + right) / 2.0
+        al = _para_align(sh, "谢谢观看")
+        ok19 = (al == PP_ALIGN.CENTER) and abs(cx - CENTER_X_CM) <= 0.5
+        diff19 = "段落对齐%s、文本框水平中心%.2f厘米" % (
+            getattr(al, "name", al), cx)
+    add(ok19, 3,
+        "第16页\"谢谢观看\"所在段落为居中对齐，且其文本框水平中心与页面水平中心"
+        "（距页面左边界16.93厘米处）偏差不超过0.5厘米", diff19)
+
+    # ============================================================ 加分项 20
+    # +5：第 16 页含两个嵌入到文件内部的可播放视频媒体对象
+    # ①媒体对象数量为 2；②各自含 videoFile 视频关系与 p14:media 嵌入关系；
+    # ③嵌入关系能解析到包内非空媒体部件（真正的视频数据，而非静态图片）。
+    parts20 = []
+    ok20 = (len(vids) == 2)
+    diff20 = "媒体对象数量%d" % len(vids)
+    if ok20:
+        for sh in vids:
+            links, embeds = _media_rids(sh)
+            mp = _media_parts(s16, sh)
+            parts20.append(mp)
+            if not links or not embeds or not any(p[2] > 0 for p in mp):
+                ok20 = False
+        if ok20:
+            diff20 = "2个媒体对象，嵌入媒体数据 %s" % "、".join(
+                "%d字节" % max(p[2] for p in mp) for mp in parts20)
+    add(ok20, 5,
+        "第16页含有两个嵌入到文件内部的可播放视频媒体对象（含视频关系与嵌入的媒体数据），而非静态图片",
+        diff20)
+
+    # ============================================================ 加分项 21
+    # +3：两个视频对象指向两个不同的媒体文件（部件名不同且数据摘要不同）
+    ok21 = False
+    diff21 = "媒体对象不足2个"
+    if len(parts20) == 2 and all(parts20):
+        n1 = set(p[0] for p in parts20[0])
+        n2 = set(p[0] for p in parts20[1])
+        d1 = set(p[1] for p in parts20[0])
+        d2 = set(p[1] for p in parts20[1])
+        ok21 = bool(n1) and bool(n2) and not (n1 & n2) and not (d1 & d2)
+        diff21 = "引用媒体部件 %s / %s" % (
+            ",".join(os.path.basename(x) for x in sorted(n1)) or "-",
+            ",".join(os.path.basename(x) for x in sorted(n2)) or "-")
+    add(ok21, 3, "第16页两个视频对象指向两个不同的媒体文件，未重复引用同一段媒体数据", diff21)
+
+    # ============================================================ 加分项 22
+    # +5：两个视频左右并列排布
+    # ①"谢谢观看"文本框顶端高于两个视频顶端；②两视频顶端高度差不超过 0.5 厘米；
+    # ③水平投影互不重叠；④均完整位于页面内。
+    ok22 = False
+    diff22 = "媒体对象不足2个或文本对象缺失"
+    if len(vids) == 2 and ok15:
+        b1 = _box(vids[0])
+        b2 = _box(vids[1])
+        bt = _box(thx[0])
+        cond_a = bt[1] < min(b1[1], b2[1])
+        cond_b = abs(b1[1] - b2[1]) <= 0.5
+        cond_c = (b1[2] <= b2[0] + 0.001) or (b2[2] <= b1[0] + 0.001)
+        cond_d = all(b[0] >= -0.001 and b[2] <= PAGE_W_CM + 0.001
+                     and b[3] <= PAGE_H_CM + 0.001 for b in (b1, b2))
+        ok22 = cond_a and cond_b and cond_c and cond_d
+        diff22 = ("文本顶端%.2f，视频顶端%.2f/%.2f，横向%.2f-%.2f 与 %.2f-%.2f，"
+                  "下边界%.2f/%.2f" % (bt[1], b1[1], b2[1], b1[0], b1[2],
+                                    b2[0], b2[2], b1[3], b2[3]))
+    add(ok22, 5,
+        "第16页两个视频左右并列排布：\"谢谢观看\"文本框顶端高于两个视频顶端，两个视频顶端高度差不超过0.5厘米，"
+        "水平投影互不重叠，且均完整位于页面内（左边界不小于0厘米、右边界不超过33.86厘米、下边界不超过19.05厘米）",
+        diff22)
+
+    # ============================================================ 加分项 23
+    # +1：两个视频的宽度差与高度差均不超过 0.5 厘米
+    ok23 = False
+    diff23 = "媒体对象不足2个"
+    if len(vids) == 2:
+        w1, h1 = _wh(vids[0])
+        w2, h2 = _wh(vids[1])
+        ok23 = abs(w1 - w2) <= 0.5 and abs(h1 - h2) <= 0.5
+        diff23 = "尺寸 %.2f×%.2f 与 %.2f×%.2f 厘米" % (w1, h1, w2, h2)
+    add(ok23, 1, "第16页两个视频的宽度差与高度差均不超过0.5厘米", diff23)
+
+    # ============================================================ 加分项 24
+    # +1：两个视频的宽高比均在 0.71 至 0.79 之间（3:4 竖版，画面未横向变形）
+    ok24 = False
+    diff24 = "媒体对象不足2个"
+    if len(vids) == 2:
+        rs = []
+        for sh in vids:
+            w, h = _wh(sh)
+            rs.append(w / h if h > 0 else 0.0)
+        ok24 = all(0.71 <= r <= 0.79 for r in rs)
+        diff24 = "宽高比 %.3f / %.3f" % (rs[0], rs[1])
+    add(ok24, 1, "第16页两个视频的宽高比均在0.71至0.79之间（3:4竖版比例），画面未横向变形", diff24)
+
+    # ============================================================ 加分项 25
+    # +1：两个视频均带首帧预览画面（含预览图填充），不显示为纯黑框或空白框
+    ok25 = (len(vids) == 2) and all(_has_poster(sh) for sh in vids)
+    add(ok25, 1, "第16页两个视频均带首帧预览画面（含预览图填充），不显示为纯黑框或空白框",
+        "两个视频均含预览图填充" if ok25 else "存在未设置预览图填充的视频对象")
+
+    # ============================================================ 减分项 26
+    # -5：顶部标题栏的装饰形状位于页面已有元素之上层并与其重叠，任一页重叠面积
+    #     超过 1 平方厘米。层级按 spTree 顺序判定（下标越大越靠上层）。
+    bad26 = []
+    for i, s in enumerate(body, 2):
+        shapes = list(s.shapes)
+        order = {id(sh._element): k for k, sh in enumerate(shapes)}
+        band = _band_shapes(s)
+        band_ids = set(id(sh._element) for sh in band)
+        targets = []
+        for sh in shapes:
+            if id(sh._element) in band_ids:
+                continue
+            left, top, _, _ = _box(sh)
+            if left > 100 or top > 100:
+                continue
+            if _is_pic(sh) or _has_chart(sh) or _txt(sh):
+                targets.append(sh)
+        worst = 0.0
+        for bsh in band:
+            for tsh in targets:
+                if order[id(bsh._element)] <= order[id(tsh._element)]:
+                    continue
+                a = _inter_area(_box(bsh), _box(tsh))
+                if a > worst:
+                    worst = a
+        if worst > 1.0:
+            bad26.append((i, round(worst, 2)))
+    hit26 = bool(bad26)
+    add(hit26, -5,
+        "第2页至第15页中，顶部标题栏的装饰形状（浅色底板、线框、文字框等）位于页面已有元素"
+        "（照片、图表、文字块等）之上层并与其重叠，任一页重叠面积超过1平方厘米",
+        ("命中页/最大重叠面积：%s" % "，".join("第%d页%.2f平方厘米" % b for b in bad26))
+        if hit26 else "各页标题栏均未压盖页面已有元素")
+
+    # ============================================================ 减分项 27
+    # -1：第 2 页含宽高均为 0 厘米、左边界与上边界均大于 5000 厘米的页外空白形状
+    ghost = []
+    if len(slides) >= 2:
+        for sh in slides[1].shapes:
+            w, h = _wh(sh)
+            left, top, _, _ = _box(sh)
+            if w == 0 and h == 0 and left > 5000 and top > 5000:
+                ghost.append((left, top))
+    hit27 = bool(ghost)
+    add(hit27, -1,
+        "第2页含有一个宽度与高度均为0厘米、左边界与上边界均大于5000厘米、位于页面之外的空白形状对象",
+        ("命中%d个（左%.0f/上%.0f厘米）" % (len(ghost), ghost[0][0], ghost[0][1]))
+        if hit27 else "未发现页外空白形状")
+
+    # ============================================================ 减分项 28
+    # -1：第 14 页含两处"风险管理"文字，且其中一处文本框右边界超出页面右边界
+    hit28 = False
+    diff28 = "第14页缺失"
+    if len(slides) >= 14:
+        hits = [sh for sh in slides[13].shapes if "风险管理" in _txt(sh)]
+        out = [sh for sh in hits if _box(sh)[2] > PAGE_W_CM + 0.01]
+        hit28 = len(hits) >= 2 and bool(out)
+        diff28 = "\"风险管理\"文字%d处，超出页面右边界%d处" % (len(hits), len(out))
+    add(hit28, -1,
+        "第14页含有两处\"风险管理\"文字，且其中一处文本框右边界超出页面右边界（大于33.86厘米）",
+        diff28)
+
+    # ============================================================ 减分项 29
+    # -1：第 15 页正文段落须距页面左边界 1.98 厘米、距页面上边界 5.97 厘米
+    hit29 = True
+    diff29 = "第15页未找到该正文段落"
+    if len(slides) >= 15:
+        for sh in slides[14].shapes:
+            if P15_TEXT in _txt(sh):
+                left, top, _, _ = _box(sh)
+                diff29 = "实测距左%.2f、距上%.2f厘米" % (left, top)
+                if abs(left - 1.98) <= 0.05 and abs(top - 5.97) <= 0.05:
+                    hit29 = False
+                    break
+    add(hit29, -1,
+        "第15页正文段落\"晨岚咖啡的增长关键，不是追逐单一爆品或短期声量，而是把稳定出品、便利触达和轻量会员关系长期做细。\""
+        "不满足距页面左边界1.98厘米、距页面上边界5.97厘米", diff29)
+
+    # ============================================================ 减分项 30
+    # -1：第 16 页含包围"谢谢观看"文字或包围视频画面的圆角矩形边框对象
+    hit30 = False
+    diff30 = "未发现圆角矩形边框对象"
+    if s16 is not None:
+        frames = [sh for sh in s16.shapes
+                  if _prst(sh) in ("roundRect", "round1Rect", "round2SameRect")
+                  and not _txt(sh)]
+        tgts = [_box(sh) for sh in thx] + [_box(sh) for sh in vids]
+        worst = 0.0
+        for f in frames:
+            for tb in tgts:
+                a = _inter_area(_box(f), tb)
+                cov = a / _area(tb) if _area(tb) > 0 else 0.0
+                if cov > worst:
+                    worst = cov
+        hit30 = worst >= 0.5
+        if frames:
+            diff30 = "圆角矩形对象%d个，最大包围比例%.0f%%" % (len(frames), worst * 100)
+    add(hit30, -1,
+        "第16页含有包围\"谢谢观看\"文字的圆角矩形边框对象，或含有包围视频画面的圆角矩形边框对象",
+        diff30)
+
+    # ============================================================ 减分项 31
+    # -1：第 16 页含页码文字且其内容不为"16"（如与第 15 页重复显示为"15"）
+    pn16 = []
+    if s16 is not None:
+        pn16 = [_txt(sh) for sh in s16.shapes
+                if re.fullmatch(r"\d{1,2}", _txt(sh))]
+    hit31 = bool(pn16) and all(t != "16" for t in pn16)
+    add(hit31, -1, "第16页含有页码文字且其内容不为\"16\"（如与第15页重复显示为\"15\"）",
+        "页码文字：%s" % (",".join(pn16) if pn16 else "无页码文字"))
+
+    # ============================================================ 减分项 32
+    # -3：第 1 页主标题格式与位置
+    t32 = None
+    if s1 is not None:
+        cands = [sh for sh in s1.shapes if _txt(sh) == DOC_TITLE]
+        t32 = cands[0] if cands else None
+    ok32, diff32 = _fmt_ok(t32, font=BODY_FONT, size=40, bold=True,
+                           color="143A4A", left=1.83, top=5.84)
+    add(not ok32, -3,
+        "第1页主标题\"晨岚咖啡品牌运营研究\"不满足字体 Noto Sans CJK SC、40磅、加粗、颜色 143A4A，"
+        "距页面左边界1.83厘米、距页面上边界5.84厘米",
+        diff32 or "字体、字号、加粗、颜色与位置均满足")
+
+    # ============================================================ 减分项 33
+    # -1：第 1 页副标题格式与位置
+    t33 = None
+    if s1 is not None:
+        cands = [sh for sh in s1.shapes if _txt(sh) == SUB_TITLE]
+        t33 = cands[0] if cands else None
+    ok33, diff33 = _fmt_ok(t33, font=BODY_FONT, size=20,
+                           color="123B63", left=1.91, top=8.08)
+    add(not ok33, -1,
+        "第1页副标题\"城市轻饮场景的产品、渠道与运营重构\"不满足字体 Noto Sans CJK SC、20磅、颜色 123B63，"
+        "距页面左边界1.91厘米、距页面上边界8.08厘米",
+        diff33 or "字体、字号、颜色与位置均满足")
+
+    # ============================================================ 减分项 34
+    # -1：第 1 页右侧照片位置与尺寸（18.67/0/15.19×19.05）
+    hit34 = True
+    diff34 = "第1页未找到照片对象"
+    if s1 is not None:
+        pics = [sh for sh in s1.shapes
+                if _is_pic(sh) and _wh(sh)[0] >= 5 and _wh(sh)[1] >= 5]
+        for sh in pics:
+            left, top, _, _ = _box(sh)
+            w, h = _wh(sh)
+            diff34 = "实测 %.2f/%.2f/%.2f×%.2f" % (left, top, w, h)
+            if (abs(left - 18.67) <= 0.06 and abs(top - 0.0) <= 0.06
+                    and abs(w - 15.19) <= 0.06 and abs(h - 19.05) <= 0.06):
+                hit34 = False
+                break
+    add(hit34, -1,
+        "第1页右侧照片不满足距页面左边界18.67厘米、距页面上边界0厘米、宽15.19厘米、高19.05厘米",
+        diff34)
+
+    # ============================================================ 减分项 35
+    # -3：第 2 页至第 15 页左下角页脚格式与位置
+    hit35 = False
+    diff35 = "14页页脚字体、字号、颜色与位置均满足"
+    for i, s in enumerate(body, 2):
+        cands = [sh for sh in s.shapes
+                 if _txt(sh) == DOC_TITLE and _cm(sh.top) > 15.0]
+        sh = cands[0] if cands else None
+        ok, d = _fmt_ok(sh, font=BODY_FONT, size=8.5, color="7F99A8",
+                        left=1.40, top=17.91, size_tol=0.3)
+        if not ok:
+            hit35 = True
+            diff35 = "第%d页：%s" % (i, d)
+            break
+    add(hit35, -3,
+        "第2页至第15页左下角页脚\"晨岚咖啡品牌运营研究\"不满足字体 Noto Sans CJK SC、8.5磅、颜色 7F99A8，"
+        "距页面左边界1.40厘米、距页面上边界17.91厘米", diff35)
+
+    # ============================================================ 减分项 36
+    # -1：第 2 页至第 15 页右下角两位页码格式、右对齐与位置
+    # 页码与顶部数字块文字相同，按"上边界大于 15 厘米"限定在页面右下角取值。
+    hit36 = False
+    diff36 = "14页页码字体、字号、右对齐、颜色与位置均满足"
+    for i, s in enumerate(body, 2):
+        cands = [sh for sh in s.shapes
+                 if re.fullmatch(r"\d{2}", _txt(sh)) and _cm(sh.top) > 15.0]
+        sh = cands[0] if cands else None
+        ok, d = _fmt_ok(sh, font=BODY_FONT, size=9, color="7F99A8",
+                        left=31.11, top=17.83)
+        al = _para_align(sh) if sh is not None else None
+        if not ok or al != PP_ALIGN.RIGHT:
+            hit36 = True
+            diff36 = "第%d页：%s" % (i, d or ("对齐方式%s≠RIGHT"
+                                            % getattr(al, "name", al)))
+            break
+    add(hit36, -1,
+        "第2页至第15页右下角两位页码不满足字体 Noto Sans CJK SC、9磅、右对齐、颜色 7F99A8，"
+        "距页面左边界31.11厘米、距页面上边界17.83厘米", diff36)
+
+    # ============================================================ 减分项 37/38
+    # -3：导语段落须为 Noto Sans CJK SC、20磅、加粗、颜色 143A4A；
+    # -3：条目正文段落须为 Noto Sans CJK SC、20磅、颜色 5E7280。
+    # 正文区段落按"是否加粗"区分导语与条目：加粗者为导语，非加粗者为条目；
+    # 段落末尾单个标点字符不参与比对（见 _sig_runs 说明）。
+    hit37 = False
+    hit38 = False
+    diff37 = "14页导语段落格式均满足"
+    diff38 = "14页条目正文段落格式均满足"
+    for i, s in enumerate(body, 2):
+        leads = []
+        items = []
+        for sh, t, rs in _body_paras(s):
+            if all(_run_bold(r) for r in rs):
+                leads.append((t, rs))
+            else:
+                items.append((t, rs))
+        if not hit37:
+            if not leads:
+                hit37 = True
+                diff37 = "第%d页未识别到导语段落" % i
+            else:
+                for t, rs in leads:
+                    d = _para_fmt_bad(rs, BODY_FONT, 20, "143A4A", bold=True)
+                    if d:
+                        hit37 = True
+                        diff37 = "第%d页\"%s\"：%s" % (i, t[:12], d)
+                        break
+        if not hit38:
+            if not items:
+                hit38 = True
+                diff38 = "第%d页未识别到条目正文段落" % i
+            else:
+                for t, rs in items:
+                    d = _para_fmt_bad(rs, BODY_FONT, 20, "5E7280")
+                    if d:
+                        hit38 = True
+                        diff38 = "第%d页\"%s\"：%s" % (i, t[:12], d)
+                        break
+        if hit37 and hit38:
+            break
+    add(hit37, -3,
+        "第2页至第15页的导语段落（如第3页\"晨岚咖啡定位为\"高频轻饮补给站\"，面向通勤、办公、学习和轻社交人群。\"）"
+        "不满足字体 Noto Sans CJK SC、20磅、加粗、颜色 143A4A（不计段落末尾单个标点字符）", diff37)
+    add(hit38, -3,
+        "第2页至第15页的条目正文段落（如第3页\"价格表达采用区间化策略，减少单点价格依赖。\"）"
+        "不满足字体 Noto Sans CJK SC、20磅、颜色 5E7280", diff38)
+
+    # ============================================================ 减分项 39
+    # -3：第 4、6、7、8、12、13 页各含 1 个可编辑图表对象（未被移除或图片化）
+    bad39 = []
+    for n in CHART_PAGES:
+        if len(slides) < n:
+            bad39.append("第%d页缺失" % n)
+            continue
+        c = sum(1 for sh in slides[n - 1].shapes if _has_chart(sh))
+        if c != 1:
+            bad39.append("第%d页图表%d个" % (n, c))
+    hit39 = bool(bad39)
+    add(hit39, -3,
+        "第4、6、7、8、12、13页不满足各含有1个可编辑的图表对象（图表被移除或以图片形式呈现）",
+        "；".join(bad39) if hit39 else "6个页面均含1个可编辑图表对象")
+
+    # ============================================================ 减分项 40
+    # -3：第 2 页至第 15 页照片位置与尺寸（逐页比对，容差 0.06 厘米）
+    # 顶部装饰用的小图点尺寸远小于 5 厘米，不纳入照片比对。
+    bad40 = []
+    for n, (el, et, ew, eh) in sorted(PHOTO_SPECS.items()):
+        if len(slides) < n:
+            bad40.append("第%d页缺失" % n)
+            continue
+        pics = [sh for sh in slides[n - 1].shapes
+                if _is_pic(sh) and _wh(sh)[0] >= 5 and _wh(sh)[1] >= 5]
+        ok = False
+        for sh in pics:
+            left, top, _, _ = _box(sh)
+            w, h = _wh(sh)
+            if (abs(left - el) <= 0.06 and abs(top - et) <= 0.06
+                    and abs(w - ew) <= 0.06 and abs(h - eh) <= 0.06):
+                ok = True
+                break
+        if not ok:
+            got = "、".join("%.2f/%.2f/%.2f×%.2f" % (_box(p)[0], _box(p)[1],
+                                                   _wh(p)[0], _wh(p)[1])
+                           for p in pics) or "无照片"
+            bad40.append("第%d页应为%.2f/%.2f/%.2f×%.2f，实测%s"
+                         % (n, el, et, ew, eh, got))
+    hit40 = bool(bad40)
+    add(hit40, -3,
+        "第2页至第15页的照片不满足以下位置与尺寸：第2页 20.95/2.54/11.30×13.97，第3页 1.78/2.67/14.48×13.84，"
+        "第4页 18.41/2.41/13.59×14.73，第5页 1.65/2.54/13.21×14.48，第6页 2.03/2.41/13.46×14.99，"
+        "第7页 18.29/2.41/13.72×15.11，第8页 18.29/2.41/13.72×15.11，第9页 1.78/2.41/15.11×14.86，"
+        "第10页 17.65/2.41/14.35×15.11，第11页 18.41/2.54/13.21×14.48，第12页 1.78/2.41/14.61×14.86，"
+        "第13页 1.65/2.41/13.59×15.11，第14页 18.16/2.41/13.59×15.11，第15页 18.03/0/15.82×19.05"
+        "（依次为距页面左边界厘米/距页面上边界厘米/宽厘米×高厘米）",
+        "；".join(bad40[:2]) if hit40 else "14页照片位置与尺寸均满足")
+
+    # ============================================================ 减分项 41
+    # -1：第 3 页"品牌关键词"色块须为填充色 FFF9EF、边线色 D5E8F6
+    hit41 = True
+    diff41 = "第3页未找到品牌关键词色块"
+    if len(slides) >= 3:
+        for sh in slides[2].shapes:
+            if "品牌关键词" not in _txt(sh):
+                continue
+            x = _xml(sh).upper()
+            has_fill = 'SRGBCLR VAL="FFF9EF"' in x
+            has_line = 'SRGBCLR VAL="D5E8F6"' in x
+            diff41 = "填充色FFF9EF%s、边线色D5E8F6%s" % (
+                "命中" if has_fill else "缺失", "命中" if has_line else "缺失")
+            if has_fill and has_line:
+                hit41 = False
+                break
+    add(hit41, -1,
+        "第3页\"品牌关键词：稳定出品｜轻松下单｜快速取杯\"色块不满足填充色 FFF9EF、边线色 D5E8F6",
+        diff41)
+
+    # ============================================================ 减分项 42
+    # -1：第 9 页须含"协同重点：少压货、快流转、可追踪"文字块
+    hit42 = True
+    if len(slides) >= 9:
+        hit42 = not any(P9_TEXT in _txt(sh) for sh in slides[8].shapes)
+    add(hit42, -1, "第9页不满足含有\"协同重点：少压货、快流转、可追踪\"文字块",
+        "未找到该文字块" if hit42 else "已命中该文字块")
+
+    # ============================================================ 减分项 43
+    # -1：第 2、10、14 页各条目左侧须含宽 0.13、高 0.89 厘米、颜色 333333 的小竖条
+    bad43 = []
+    for n in BAR_PAGES:
+        if len(slides) < n:
+            bad43.append("第%d页缺失" % n)
+            continue
+        cnt = 0
+        for sh in slides[n - 1].shapes:
+            w, h = _wh(sh)
+            if abs(w - 0.13) <= 0.03 and abs(h - 0.89) <= 0.03 \
+                    and "333333" in _xml(sh).upper():
+                cnt += 1
+        if cnt < 1:
+            bad43.append("第%d页小竖条%d个" % (n, cnt))
+    hit43 = bool(bad43)
+    add(hit43, -1,
+        "第2、10、14页各条目左侧不满足含有宽0.13厘米、高0.89厘米、颜色 333333 的深灰色小竖条",
+        "；".join(bad43) if hit43 else "3个页面均含深灰色小竖条")
+
+    # ============================================================ 减分项 44
+    # -1：页面尺寸须为宽 33.86 厘米、高 19.05 厘米
+    hit44 = not (abs(pw - PAGE_W_CM) <= 0.05 and abs(ph - PAGE_H_CM) <= 0.05)
+    add(hit44, -1, "页面尺寸不满足宽33.86厘米、高19.05厘米",
+        "实测页面 %.2f×%.2f 厘米" % (pw, ph))
+
+    # ------------------------------------------------- results -> dim2_items
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    total_score = 0
+    # detail 只用于本地排查，不写入返回信息：命中与未命中登记的规则原文完全一致，
+    # 返回的 rule 不随判定结果变化。
+    for (head, rule, detail), max_delta in zip(results, _MAX_DELTAS_ORDER):
+        try:
+            delta_raw = int(head)
+        except ValueError:
+            delta_raw = 0
+        hit = (delta_raw != 0)
+        delta = max_delta if hit else 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": hit,
+        })
+        # 加分项命中累加正分，减分项命中累加负分
+        total_score += delta
+
+    if total_score < 0:
+        total_score = 0
+
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 本地调试入口：evaluate(脚本所在目录) 并打印 JSON
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _target_dir = sys.argv[1] if len(sys.argv) > 1 else _here
-    _r = evaluate(_target_dir)
-    print(json.dumps(_r, ensure_ascii=False, indent=2))
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))
+

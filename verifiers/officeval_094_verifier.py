@@ -1,1157 +1,830 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-自动评估脚本：七年级地理探究成绩登记_公开版(2)_嵌套饼图.xlsx
-
-评估逻辑
-========
-维度1（可用与可修改性）：硬性门槛。任一条不满足 -> 直接 0 分，不再检查维度2。
-维度2（完成度评分细则）：在维度1全部通过后才评估。
-    - 得分点：必须满足该细则的【每一个】子条件才加分（加分为正）。
-    - 扣分点：只要命中该细则的【任意一个】子条件即扣分（分数为负）。
-    - 最终得分 = 各命中细则分数之和（可正可负）。
-
-所有判定均自动完成，不依赖人工。对难以严格量化的意图（如“标签不大面积重叠”
-“颜色至少四种”），采用结构化、可度量的近似规则灵活实现评估意图。
-"""
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
 import os
 import re
 import sys
+import json
 import zipfile
+import colorsys
+import posixpath
 from xml.etree import ElementTree as ET
 
-# 脚本编号（与所在目录 officeval_094 一致）
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .xlsx / .xlsm。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 评分语义：
+#   维度1（可用与可修改性）：硬性门槛。任一条不满足 -> 直接 0 分，不再检查维度2。
+#   维度2：加分点必须满足【每一个】子条件才加分；减分点只要命中【任意一个】
+#          子条件即扣分（分数为负）。最终得分 = 各命中细则分数之和（可正可负）。
+#
+# 实现说明：不依赖 openpyxl —— 被评估文件里的圆环图 holeSize 可能为 0，
+# openpyxl 的描述符校验会直接抛 ValueError 拒绝加载，故全部走 zipfile +
+# ElementTree 直接解析 SpreadsheetML / DrawingML。
+
 SCRIPT_ID = "094"
+# 维度二所有加分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 50
 
-# 默认待评估文档文件名；实际以 evaluate(dir_path) 传入目录中的实际文件为准，
-# 若目录中无同名文件，则扫描该目录下的 .xlsx/.xlsm 作为兜底。
-TARGET_FILE = "七年级地理探究成绩登记_公开版(2)_嵌套饼图.xlsx"
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 emit(...) 的顺序严格一致；共 34 项 = 18 加分 + 16 减分。
+_MAX_DELTAS_ORDER = [
+    # ---- 一、加分项（合计 +50）----
+    3,   # 01 两表各内嵌 1 张图、共 2 张
+    1,   # 02 图表标题可区分班级
+    5,   # 03 饼/环形族双层同心嵌套
+    3,   # 04 圈心孔径为 0 或接近 0
+    5,   # 05 内层为六个探究表现大类或四个能力层级大类
+    5,   # 06 外层 24 个明细扇区、按大类连续排列、内外角度对齐
+    3,   # 07 只有两个层级、无第三层圈层
+    3,   # 08 内层数值等于大类之和、外层组内之和等于内层
+    3,   # 09 数据源为单元格区域引用
+    3,   # 10 汇总区域未占用 A1:Q7
+    3,   # 11 汇总数值由公式计算
+    1,   # 12 汇总区域带可读行列表头
+    3,   # 13 内外层同色系
+    3,   # 14 内外两层均显示数据标签
+    1,   # 15 扇区之间有描边
+    1,   # 16 图表带图例
+    3,   # 17 尺寸不小于约 15cm×10cm 且标签不重叠不截断
+    1,   # 18 图表与数据同表且未压盖数据表与汇总区
+    # ---- 二、减分项（合计 -26）----
+    -1,  # 19 第 1 行合并表头（含被覆盖格）填充/字体/对齐/边框被重置
+    -1,  # 20 第 2 行 16 个能力层级单元格格式
+    -1,  # 21 A 列 7 个标签单元格格式
+    -3,  # 22 第 1、2 行行高 15，第 3~7 行行高 25
+    -1,  # 23 数据区以外空白行逐行自定义行高
+    -1,  # 24 A 列列宽 24.17、B~Q 列列宽 8
+    -1,  # 25 S~AB 等空白列新增自定义列宽
+    -3,  # 26 A1:Q7 内文字或数值被增删改写
+    -3,  # 27 六个合并单元格被取消或范围改变
+    -3,  # 28 删除工作表或改变名称与顺序
+    -3,  # 29 删除或破坏已有图表/图片/批注等对象
+    -1,  # 30 "不显示网格线"设置被改为显示
+    -1,  # 31 单元格内新增与图表标题重复的文字标题
+    -1,  # 32 中间计算区域铺开超过 30 行
+    -1,  # 33 图表压盖 A1:Q7 或压盖汇总区域
+    -1,  # 34 新增无关工作表、隐藏行列或定义名称
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
 
-# ---- 命名空间 ----
-NS = {
-    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
-    "ss": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
-    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+# ---------------------------------------------------------------- 命名空间
+SS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+NS = {"ss": SS, "c": C, "a": A, "r": R, "xdr": XDR, "rel": REL}
+
+# ------------------------------------------------------- 成绩表基准（A1:Q7）
+SHEET_NAMES = ("七1班", "七13班")
+# 第 1 行六个探究表现大类，及其在数据表中占据的列区间（1 基，含端点）
+CATEGORIES = ("地图基础", "经纬定位", "地形判读", "气候要素", "区域差异", "聚落形态")
+CAT_SPANS = ((2, 4), (5, 7), (8, 9), (10, 11), (12, 14), (15, 17))
+# 第 2 行 16 个能力层级
+ABILITY_NAMES = ("识图", "判读", "表达", "观察", "分析", "归纳", "定位", "解释",
+                 "识别", "比较", "计算", "推理", "应用", "观察", "判断", "表达")
+# A 列 7 个标签；其中后四个同时是四个能力层级大类
+A_LABELS = ("探究表现", "能力层级", "参与人数", "卓越表现", "稳定达成", "基本达成", "持续提升")
+LEVELS = ("卓越表现", "稳定达成", "基本达成", "持续提升")
+MERGE_REFS = ("B1:D1", "E1:G1", "H1:I1", "J1:K1", "L1:N1", "O1:Q1")
+
+# 第 3~7 行共 80 个整数（行号 -> B..Q 的 16 个值）
+DATA_BASELINE = {
+    "七1班": {
+        3: (52, 48, 53, 49, 54, 50, 55, 51, 47, 52, 54, 49, 54, 51, 47, 52),
+        4: (30, 24, 23, 35, 36, 29, 28, 22, 33, 34, 27, 21, 38, 26, 20, 37),
+        5: (11, 12, 14, 7, 10, 11, 13, 14, 7, 9, 13, 13, 8, 12, 13, 8),
+        6: (7, 8, 10, 4, 5, 7, 9, 10, 4, 5, 9, 9, 5, 8, 9, 5),
+        7: (4, 4, 6, 3, 3, 3, 5, 5, 3, 4, 5, 6, 3, 5, 5, 2),
+    },
+    "七13班": {
+        3: (50, 55, 51, 47, 53, 48, 53, 49, 54, 50, 51, 47, 52, 49, 54, 50),
+        4: (22, 39, 34, 27, 27, 21, 38, 32, 31, 25, 36, 31, 30, 35, 36, 29),
+        5: (14, 8, 9, 10, 13, 13, 8, 9, 12, 12, 8, 8, 11, 7, 10, 11),
+        6: (10, 5, 5, 6, 8, 9, 5, 5, 7, 8, 5, 5, 7, 4, 5, 7),
+        7: (4, 3, 3, 4, 5, 5, 2, 3, 4, 5, 2, 3, 4, 3, 3, 3),
+    },
 }
+# 以探究表现作内层时六个扇区的应有数值
+INNER_BY_CATEGORY = {"七1班": (153, 153, 106, 99, 157, 150),
+                     "七13班": (156, 148, 102, 104, 150, 153)}
+# 以能力层级作内层时四个扇区的应有数值
+INNER_BY_LEVEL = {"七1班": (463, 175, 114, 66),
+                  "七13班": (493, 163, 101, 56)}
 
-# 业务常量
-SHEET_NAMES = ["七1班", "七13班"]
-COL_CATEGORIES = ["地图基础", "经纬定位", "地形判读", "气候要素", "区域差异", "聚落形态"]  # B1:Q1 能力大类
-ROW_LEVELS = ["卓越表现", "稳定达成", "基本达成", "持续提升"]                              # A4:A7 能力层级
-EXPECTED_TITLES = {
-    "七1班": "七1班 探究成绩多类别嵌套饼图",
-    "七13班": "七13班 探究成绩多类别嵌套饼图",
+# ------------------------------------------------- 表头/标签格式基准（逐格）
+HEAD_FILL = "FF174A55"          # 第 1 行合并表头填充
+HEAD_FONT = ("黑体", "11", True, "FFFFFFFF")
+ROW2_FILL = "FF2E6F73"          # 第 2 行填充
+ROW2_FONT = ("宋体", "11", True, "FFFFFFFF")
+# 第 1 行 B1..Q1 的（左竖边, 右竖边）样式；上下边一律 thin
+ROW1_VERT = {2: ("medium", "thin"), 3: ("thin", "thin"), 4: ("thin", "medium"),
+             5: ("medium", "thin"), 6: ("thin", "thin"), 7: ("thin", "medium"),
+             8: ("medium", "thin"), 9: ("thin", "medium"),
+             10: ("medium", "thin"), 11: ("thin", "medium"),
+             12: ("thin", None), 13: (None, None), 14: (None, "medium"),
+             15: ("medium", "thin"), 16: ("thin", "thin"), 17: ("thin", "medium")}
+# 第 2 行 B2..Q2 的（左竖边, 右竖边）样式；上下边一律 thin
+ROW2_VERT = {2: ("medium", "thin"), 3: ("thin", "thin"), 4: ("thin", "medium"),
+             5: ("medium", "thin"), 6: ("thin", "thin"), 7: ("thin", "medium"),
+             8: ("medium", "thin"), 9: ("thin", "medium"),
+             10: ("medium", "thin"), 11: ("thin", "medium"),
+             12: ("thin", "thin"), 13: ("thin", "thin"), 14: ("thin", "medium"),
+             15: ("medium", "thin"), 16: ("thin", "thin"), 17: ("thin", "medium")}
+# A 列 A1..A7 的（字体, 填充, 水平, 垂直, 上边, 下边）；左右竖边一律 medium
+ACOL_EXPECT = {
+    1: (("黑体", "11", True, "FFFFFFFF"), "FF174A55", "center", "center", "thin", "thin"),
+    2: (("黑体", "11", True, "FFFFFFFF"), "FF2E6F73", "center", "center", "thin", "thin"),
+    3: (("黑体", "11", True, "FF23464D"), "FFFFF1CC", "left", "center", "thin", "thin"),
+    4: (("黑体", "11", True, "FF23464D"), "FFDCEFE7", "left", "center", "thin", "thin"),
+    5: (("黑体", "11", True, "FF23464D"), "FFDDEBF7", "left", "center", "thin", "thin"),
+    6: (("黑体", "11", True, "FF23464D"), "FFFFF4D6", "left", "center", "thin", "thin"),
+    7: (("黑体", "11", True, "FF23464D"), "FFFCE4D6", "left", "center", "thin", "thin"),
 }
-ERROR_TOKENS = ["#REF!", "#VALUE!", "#N/A", "#DIV/0!", "#NUM!", "#NULL!", "#NAME?"]
-
-# 各评分细则的“分数 + 细则内容”原文（用于命中结果展示，格式为 “+1：...”）。
-# key 与 check_dimension2 中 results 的判定顺序一一对应。
-RULE_TEXTS = {
-    "p1_charts": "+1：工作簿中分别基于“七1班”和“七13班”两份成绩数据各生成1个多类别嵌套合并饼图，"
-                 "共2个图表，且两个图表标题能明确区分“七1班”和“七13班”。两个图表的数据源均来自"
-                 "对应工作表A1:Q7中的成绩数据，覆盖“地图基础”到“聚落形态”各非空能力层级数据，不遗漏主要成绩列。",
-    "p5_class": "+5：两个图表分类统计正确，如使用“卓越表现”“稳定达成”“基本达成”“持续提升”四类成绩数据"
-                "作为饼图统计对象，“地图基础”“经纬定位”“地形判读”“气候要素”“区域差异”“聚落形态”则作为"
-                "不同类别圆环层级；如使用“地图基础”“经纬定位”“地形判读”“气候要素”“区域差异”“聚落形态”"
-                "六类成绩数据作为饼图统计对象，“卓越表现”“稳定达成”“基本达成”“持续提升”四类成绩数据则作为"
-                "不同类别圆环层级。",
-    "p1_label": "+1：每个图表的扇形上有数据标签，至少显示数值或百分比之一，标签不大面积重叠且不遮挡主要扇区。",
-    "p1_legend": "+1：两个图表均包含图例，图例文字包含或能对应B1:Q1的“地图基础”“经纬定位”“地形判读”"
-                 "“气候要素”“区域差异”“聚落形态”等6个成绩类别或包含能对应A4:A7的“卓越表现”“稳定达成”"
-                 "“基本达成”“持续提升”等四个能力层级。",
-    "p1_color": "+1：两个图表中同一成绩类别使用一致或接近一致的颜色方案，便于比较两个班级的数据；"
-                "图中颜色至少四种颜色。",
-    "p1_title": "+1：图表上方出现图表标题，标题内容分别为“七1班 探究成绩多类别嵌套饼图”及"
-                "“七13班 探究成绩多类别嵌套饼图”。",
-}
+ROW_HEIGHTS = {1: 15.0, 2: 15.0, 3: 25.0, 4: 25.0, 5: 25.0, 6: 25.0, 7: 25.0}
+COL_WIDTH_A = 24.1666666666667
+COL_WIDTH_BQ = 8.0
+WIDTH_TOL = 0.6        # 列宽/行高容差：0.6 字符内显示效果一致，不计改动
+HEIGHT_TOL = 0.6
+DATA_ROWS = 7          # 数据表占 1~7 行
+DATA_COLS = 17         # 数据表占 A~Q 列
+EMU_PER_PX = 9525.0
+EMU_PER_CM = 360000.0
+MIN_CHART_CX = 15.0 * EMU_PER_CM     # 图表最小宽度 15cm
+MIN_CHART_CY = 10.0 * EMU_PER_CM     # 图表最小高度 10cm
+MAX_READABLE_POINTS = 24             # 单圈扇区数上限；超过则标签必然重叠
+HUE_TOL = 20.0                       # "同色系"允许的色相偏差（度）
+GRAY_SAT = 0.12                      # 饱和度低于此值视为无彩色（灰阶）
 
 
-# =========================================================================
-# 工具函数
-# =========================================================================
-def load_zip(path):
-    z = zipfile.ZipFile(path)
-    names = set(z.namelist())
-    return z, names
+# ================================================================ 基础工具
 
 
-def read_xml(z, name):
-    try:
-        return ET.fromstring(z.read(name))
-    except Exception:
-        return None
-
-
-def read_text(z, name):
-    try:
-        return z.read(name).decode("utf-8", errors="replace")
-    except Exception:
-        return ""
-
-
-def normalize_part_path(tgt):
-    """将 workbook.xml.rels 中的 Target 归一化为 zip 内部件路径。
-    Target 可能是 '/xl/worksheets/sheet1.xml'（绝对，相对包根）
-    或 'worksheets/sheet1.xml'（相对 xl/ 目录）。"""
-    if not tgt:
-        return tgt
-    if tgt.startswith("/"):
-        return tgt.lstrip("/")          # 相对包根 -> 去掉前导斜杠
-    if tgt.startswith("xl/"):
-        return tgt
-    return "xl/" + tgt                   # 相对 workbook 所在的 xl/ 目录
-
-
-# =========================================================================
-# 维度1：可用与可修改性
-# =========================================================================
-def check_dimension1(path, ctx):
-    """返回 (passed: bool, details: list[(ok, msg)])。details 全部记录用于打印。"""
-    details = []
-
-    # --- 1.1 交付文件为 xlsx 或 .xlsm 格式，且可正常打开 ---
-    ext = os.path.splitext(path)[1].lower()
-    fmt_ok = ext in (".xlsx", ".xlsm")
-    openable = False
-    if fmt_ok:
-        try:
-            z, names = load_zip(path)
-            # 关键部件存在即视为可正常打开
-            openable = "xl/workbook.xml" in names and "[Content_Types].xml" in names
-            ctx["zip"] = z
-            ctx["names"] = names
-        except Exception:
-            openable = False
-    ok = fmt_ok and openable
-    details.append((ok, "1.1 交付文件为 xlsx 或 .xlsm 格式，文件可正常打开（扩展名=%s）" % ext))
-    if not ok:
-        return False, details
-
-    z = ctx["zip"]
-    names = ctx["names"]
-
-    # 解析 workbook -> 表名到 sheetN.xml 的映射
-    wb = read_xml(z, "xl/workbook.xml")
-    rels = read_xml(z, "xl/_rels/workbook.xml.rels")
-    rid_to_target = {}
-    if rels is not None:
-        for rel in rels.findall("rel:Relationship", NS):
-            rid_to_target[rel.get("Id")] = rel.get("Target")
-    sheet_xml = {}   # 表名 -> "xl/worksheets/sheetN.xml"
-    if wb is not None:
-        for sh in wb.findall("ss:sheets/ss:sheet", NS):
-            nm = sh.get("name")
-            rid = sh.get("{%s}id" % NS["r"])
-            tgt = rid_to_target.get(rid, "")
-            tgt = normalize_part_path(tgt)
-            sheet_xml[nm] = tgt
-    ctx["sheet_xml"] = sheet_xml
-
-    # 解析各工作表数据网格，供维度2评分使用（不再作为维度1门槛判定）
-    for s in SHEET_NAMES:
-        if s not in sheet_xml:
-            continue
-        grid = parse_sheet_grid(z, sheet_xml[s], ctx)
-        ctx.setdefault("grids", {})[s] = grid
-
-    # 记录原生图表文件列表，供维度2评分使用（不再作为维度1门槛判定）
-    chart_files = [n for n in names if re.match(r"xl/charts/chart\d+\.xml$", n)]
-    ctx["chart_files"] = chart_files
-
-    return True, details
-
-
-# =========================================================================
-# 工作表解析辅助
-# =========================================================================
-def col_letter_to_idx(letters):
-    idx = 0
+def _col_index(letters):
+    """列字母 -> 1 基列号；'A'->1, 'AB'->28。"""
+    n = 0
     for ch in letters:
-        idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
-    return idx
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n
 
 
-def parse_ref(ref):
-    m = re.match(r"([A-Za-z]+)(\d+)", ref)
-    if not m:
+def _col_name(idx):
+    """1 基列号 -> 列字母。"""
+    s = ""
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _cell_addr(row, col):
+    return "%s%d" % (_col_name(col), row)
+
+
+def _resolve_part(base_part, target):
+    """按 OPC 规则把关系里的 Target 解析成包内绝对部件名（不带前导斜杠）。"""
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join(posixpath.dirname(base_part), target))
+
+
+def _norm_text(text):
+    """去掉全部空白字符，用于标题/标签的宽松比对（WPS 会在中文数字间插空格）。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def _norm_color(elem):
+    """把 <fgColor>/<color>/<srgbClr> 之类的颜色元素规格化成可比字符串。"""
+    if elem is None:
         return None
-    return int(m.group(2)), col_letter_to_idx(m.group(1))
+    rgb = elem.get("rgb") or elem.get("val")
+    if rgb:
+        rgb = rgb.upper()
+        return rgb if len(rgb) == 8 else "FF" + rgb
+    if elem.get("theme") is not None:
+        return "theme:%s" % elem.get("theme")
+    if elem.get("indexed") is not None:
+        return "indexed:%s" % elem.get("indexed")
+    return None
 
 
-def parse_sheet_grid(z, sheet_path, ctx):
-    """返回 {(row,col): value}。读取共享字符串。"""
-    if "shared_strings" not in ctx:
-        ss = read_xml(z, "xl/sharedStrings.xml")
-        strings = []
-        if ss is not None:
-            for si in ss.findall("ss:si", NS):
-                txt = "".join(t.text or "" for t in si.iter("{%s}t" % NS["ss"]))
-                strings.append(txt)
-        ctx["shared_strings"] = strings
-    strings = ctx["shared_strings"]
-
-    root = read_xml(z, sheet_path)
-    grid = {}
-    if root is None:
-        return grid
-    for c in root.iter("{%s}c" % NS["ss"]):
-        ref = c.get("r")
-        rc = parse_ref(ref) if ref else None
-        if not rc:
-            continue
-        t = c.get("t")
-        v_el = c.find("ss:v", NS)
-        is_el = c.find("ss:is", NS)
-        val = None
-        if t == "s" and v_el is not None:
-            try:
-                val = strings[int(v_el.text)]
-            except Exception:
-                val = v_el.text
-        elif t == "str" and v_el is not None:
-            val = v_el.text
-        elif t == "inlineStr" and is_el is not None:
-            val = "".join(tt.text or "" for tt in is_el.iter("{%s}t" % NS["ss"]))
-        elif v_el is not None:
-            val = v_el.text
-        grid[rc] = val
-    return grid
+def _bool_attr(elem):
+    """OOXML 布尔子元素：元素存在且 val 不为 0/false 即为真。"""
+    if elem is None:
+        return False
+    return (elem.get("val") or "1") not in ("0", "false", "False")
 
 
-# =========================================================================
-# 图表解析辅助
-# =========================================================================
-def chart_get_title(chart_root):
-    title_el = chart_root.find(".//c:chart/c:title", NS)
-    if title_el is None:
-        return ""
-    return "".join(t.text or "" for t in title_el.iter("{%s}t" % NS["a"]))
+# ============================================================ 工作簿解析
 
 
-def chart_title_present_and_top(chart_root):
-    """判断“图表上方出现图表标题”：
-      - 存在 c:title 标题元素且 autoTitleDeleted != 1（标题确实显示）；
-      - 标题位置在图表上方：未显式设置 layout 手动下移即视为默认顶部；
-        若存在 manualLayout 指定 y 偏移且明显大于0(>0.5)，视为被移到下方/中部 -> 不在上方。
-    返回 (present_top: bool, reason)。
-    """
-    title_el = chart_root.find(".//c:chart/c:title", NS)
-    if title_el is None:
-        return False, "无标题元素"
-    deleted = chart_root.find(".//c:chart/c:autoTitleDeleted", NS)
-    if deleted is not None and deleted.get("val") == "1":
-        return False, "标题被删除(autoTitleDeleted=1)"
-    # 标题位置：检查 title 的 manualLayout y 偏移
-    ml = title_el.find(".//c:manualLayout", NS)
-    if ml is not None:
-        y = ml.find("c:y", NS)
-        if y is not None:
-            try:
-                if float(y.get("val")) > 0.5:
-                    return False, "标题被手动下移(y=%s)" % y.get("val")
-            except ValueError:
-                pass
-    return True, "标题位于默认顶部"
+def _rels_of(zf, part):
+    """读取某部件的 .rels，返回 {rId: 包内绝对部件名}。"""
+    rels_part = posixpath.join(posixpath.dirname(part), "_rels",
+                               posixpath.basename(part) + ".rels")
+    out = {}
+    try:
+        root = ET.fromstring(zf.read(rels_part))
+    except (KeyError, ET.ParseError):
+        return out
+    for rel in root.findall("rel:Relationship", NS):
+        out[rel.get("Id")] = (rel.get("Target") if rel.get("TargetMode") == "External"
+                              else _resolve_part(part, rel.get("Target") or ""))
+    return out
 
 
-def chart_get_series(chart_root):
-    """返回系列列表，每个系列含 cat 引用、val 引用文本。"""
-    series = []
-    for ser in chart_root.iter("{%s}ser" % NS["c"]):
-        cat_refs = [f.text for f in ser.findall(".//c:cat//c:f", NS) if f.text]
-        val_refs = [f.text for f in ser.findall(".//c:val//c:f", NS) if f.text]
-        cat_cache = [v.text for v in ser.findall(".//c:cat//c:pt/c:v", NS) if v.text]
-        val_cache = [v.text for v in ser.findall(".//c:val//c:pt/c:v", NS) if v.text]
-        series.append({
-            "cat_refs": cat_refs, "val_refs": val_refs,
-            "cat_cache": cat_cache, "val_cache": val_cache,
+def _load_styles(zf):
+    """解析 styles.xml，返回 cellXfs 下标 -> 规格化格式字典 的列表。"""
+    try:
+        root = ET.fromstring(zf.read("xl/styles.xml"))
+    except (KeyError, ET.ParseError):
+        return []
+    fonts = root.findall("ss:fonts/ss:font", NS)
+    fills = root.findall("ss:fills/ss:fill", NS)
+    borders = root.findall("ss:borders/ss:border", NS)
+    styles = []
+    for xf in root.findall("ss:cellXfs/ss:xf", NS):
+        info = {"font": (None, None, False, None), "fill": (None, None),
+                "border": {}, "align": (None, None)}
+        fi = int(xf.get("fontId") or 0)
+        if fi < len(fonts):
+            font = fonts[fi]
+            name = font.find("ss:name", NS)
+            size = font.find("ss:sz", NS)
+            info["font"] = (name.get("val") if name is not None else None,
+                            size.get("val") if size is not None else None,
+                            _bool_attr(font.find("ss:b", NS)),
+                            _norm_color(font.find("ss:color", NS)))
+        fli = int(xf.get("fillId") or 0)
+        if fli < len(fills):
+            pat = fills[fli].find("ss:patternFill", NS)
+            info["fill"] = ((pat.get("patternType") if pat is not None else None),
+                            _norm_color(pat.find("ss:fgColor", NS) if pat is not None else None))
+        bi = int(xf.get("borderId") or 0)
+        if bi < len(borders):
+            for side in ("left", "right", "top", "bottom"):
+                sub = borders[bi].find("ss:%s" % side, NS)
+                info["border"][side] = sub.get("style") if sub is not None else None
+        align = xf.find("ss:alignment", NS)
+        if align is not None:
+            info["align"] = (align.get("horizontal"), align.get("vertical"))
+        styles.append(info)
+    return styles
+
+
+def _load_sheet(zf, part, strings):
+    """解析一张工作表，返回 {cells, rows, cols, merges, gridlines, fmt, drawing_rid}。"""
+    root = ET.fromstring(zf.read(part))
+    view = root.find("ss:sheetViews/ss:sheetView", NS)
+    fmt = root.find("ss:sheetFormatPr", NS)
+    sheet = {
+        "part": part,
+        "cells": {},
+        "rows": {},
+        "cols": [],
+        "merges": [],
+        "gridlines": True,
+        "default_width": 8.43,
+        "default_height": 15.0,
+        "drawing_rid": None,
+        "hidden_rc": False,
+    }
+    if view is not None and (view.get("showGridLines") or "1") in ("0", "false"):
+        sheet["gridlines"] = False
+    if fmt is not None:
+        if fmt.get("defaultColWidth"):
+            sheet["default_width"] = float(fmt.get("defaultColWidth"))
+        if fmt.get("defaultRowHeight"):
+            sheet["default_height"] = float(fmt.get("defaultRowHeight"))
+    for col in root.findall("ss:cols/ss:col", NS):
+        sheet["cols"].append({
+            "min": int(col.get("min") or 1), "max": int(col.get("max") or 1),
+            "width": float(col.get("width")) if col.get("width") else None,
+            "custom": (col.get("customWidth") or "0") not in ("0", "false"),
+            "hidden": (col.get("hidden") or "0") not in ("0", "false"),
         })
-    return series
+        if sheet["cols"][-1]["hidden"]:
+            sheet["hidden_rc"] = True
+    merge = root.find("ss:mergeCells", NS)
+    if merge is not None:
+        sheet["merges"] = [m.get("ref") for m in merge.findall("ss:mergeCell", NS)]
+    for row in root.findall("ss:sheetData/ss:row", NS):
+        rnum = int(row.get("r") or 0)
+        hidden = (row.get("hidden") or "0") not in ("0", "false")
+        if hidden:
+            sheet["hidden_rc"] = True
+        sheet["rows"][rnum] = {
+            "ht": float(row.get("ht")) if row.get("ht") else None,
+            "custom": (row.get("customHeight") or "0") not in ("0", "false"),
+            "hidden": hidden,
+        }
+        for cell in row.findall("ss:c", NS):
+            match = re.match(r"([A-Za-z]+)(\d+)", cell.get("r") or "")
+            if not match:
+                continue
+            sheet["cells"][(int(match.group(2)), _col_index(match.group(1)))] = \
+                _read_cell(cell, strings)
+    drawing = root.find("ss:drawing", NS)
+    if drawing is not None:
+        sheet["drawing_rid"] = drawing.get("{%s}id" % R)
+    return sheet
 
 
+def _read_cell(cell, strings):
+    """把 <c> 读成 {text, number, style, has_formula}。"""
+    ctype = cell.get("t")
+    vnode = cell.find("ss:v", NS)
+    fnode = cell.find("ss:f", NS)
+    inode = cell.find("ss:is", NS)
+    text, number = None, None
+    if ctype == "s" and vnode is not None:
+        try:
+            text = strings[int(vnode.text)]
+        except (ValueError, IndexError, TypeError):
+            text = vnode.text
+    elif ctype == "inlineStr" and inode is not None:
+        text = "".join(t.text or "" for t in inode.iter("{%s}t" % SS))
+    elif ctype == "str" and vnode is not None:
+        text = vnode.text
+    elif vnode is not None:
+        text = vnode.text
+        try:
+            number = float(vnode.text)
+        except (TypeError, ValueError):
+            number = None
+    return {"text": text, "number": number, "style": cell.get("s"),
+            "has_formula": fnode is not None}
 
 
-def chart_is_doughnut_or_pie(chart_root):
-    return (chart_root.find(".//c:doughnutChart", NS) is not None or
-            chart_root.find(".//c:pieChart", NS) is not None or
-            chart_root.find(".//c:ofPieChart", NS) is not None or
-            chart_root.find(".//c:pie3DChart", NS) is not None)
+def _load_package(file_path):
+    """打开 .xlsx / .xlsm 并解析出评分所需的全部上下文。"""
+    zf = zipfile.ZipFile(file_path)
+    names = set(zf.namelist())
+    ctx = {"zip": zf, "names": names, "file_path": file_path,
+           "sheets": {}, "sheet_order": [], "charts": [], "pictures": 0,
+           "defined_names": []}
+    # 共享字符串
+    strings = []
+    if "xl/sharedStrings.xml" in names:
+        sst = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+        for item in sst.findall("ss:si", NS):
+            strings.append("".join(t.text or "" for t in item.iter("{%s}t" % SS)))
+    ctx["strings"] = strings
+    ctx["styles"] = _load_styles(zf)
+    # 工作表清单
+    wb = ET.fromstring(zf.read("xl/workbook.xml"))
+    wb_rels = _rels_of(zf, "xl/workbook.xml")
+    for node in wb.findall("ss:sheets/ss:sheet", NS):
+        name = node.get("name")
+        part = wb_rels.get(node.get("{%s}id" % R))
+        ctx["sheet_order"].append(name)
+        if part and part in names:
+            ctx["sheets"][name] = _load_sheet(zf, part, strings)
+            ctx["sheets"][name]["state"] = node.get("state") or "visible"
+    for node in wb.findall("ss:definedNames/ss:definedName", NS):
+        ctx["defined_names"].append(node.get("name"))
+    _load_drawings(ctx)
+    return ctx
 
 
-def chart_ring_count(chart_root):
-    """返回饼图或环形图中的系列数量；每个环形图系列对应一层圆环。"""
-    chart_tags = ("doughnutChart", "pieChart", "ofPieChart", "pie3DChart")
-    return sum(
-        len(chart.findall("c:ser", NS))
-        for tag in chart_tags
-        for chart in chart_root.findall(f".//c:{tag}", NS)
-    )
+def _anchor_cell(node, tag):
+    """读取 <xdr:from>/<xdr:to>，返回 (col, colOff, row, rowOff)，均为 0 基/EMU。"""
+    sub = node.find("xdr:%s" % tag, NS)
+    if sub is None:
+        return None
+    def _val(key):
+        elem = sub.find("xdr:%s" % key, NS)
+        try:
+            return int(elem.text)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+    return (_val("col"), _val("colOff"), _val("row"), _val("rowOff"))
 
 
+def _load_drawings(ctx):
+    """把每张工作表的绘图锚点解析成图表对象；同时统计图片对象数量。"""
+    zf = ctx["zip"]
+    for name, sheet in ctx["sheets"].items():
+        if not sheet["drawing_rid"]:
+            continue
+        part = _rels_of(zf, sheet["part"]).get(sheet["drawing_rid"])
+        if not part or part not in ctx["names"]:
+            continue
+        droot = ET.fromstring(zf.read(part))
+        drels = _rels_of(zf, part)
+        for anchor in list(droot):
+            tag = anchor.tag.split("}")[-1]
+            if tag not in ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor"):
+                continue
+            if anchor.find(".//xdr:pic", NS) is not None:
+                ctx["pictures"] += 1
+            chart_rid = None
+            for gframe in anchor.iter("{%s}chart" % C):
+                chart_rid = gframe.get("{%s}id" % R)
+                break
+            if not chart_rid:
+                continue
+            cpart = drels.get(chart_rid)
+            if not cpart or cpart not in ctx["names"]:
+                continue
+            ext = anchor.find("xdr:ext", NS)
+            ctx["charts"].append({
+                "sheet": name,
+                "part": cpart,
+                "anchor_tag": tag,
+                "from": _anchor_cell(anchor, "from"),
+                "to": _anchor_cell(anchor, "to"),
+                "ext": ((int(ext.get("cx") or 0), int(ext.get("cy") or 0))
+                        if ext is not None else None),
+                "root": ET.fromstring(zf.read(cpart)),
+                "theme": _chart_theme(ctx, cpart),
+            })
+    ctx["charts"].sort(key=lambda ch: (ctx["sheet_order"].index(ch["sheet"])
+                                       if ch["sheet"] in ctx["sheet_order"] else 99,
+                                       ch["part"]))
 
+
+def _chart_theme(ctx, chart_part):
+    """解析该图表实际生效的配色方案：图表自带 themeOverride 优先，其次 theme1。
+    schemeClr 必须按这份方案解析，否则会把"同色系"误判为不同色。"""
+    part = None
+    for target in _rels_of(ctx["zip"], chart_part).values():
+        if "themeOverride" in target and target in ctx["names"]:
+            part = target
+            break
+    if part is None and "xl/theme/theme1.xml" in ctx["names"]:
+        part = "xl/theme/theme1.xml"
+    scheme = {}
+    if part is None:
+        return scheme
+    try:
+        root = ET.fromstring(ctx["zip"].read(part))
+    except (KeyError, ET.ParseError):
+        return scheme
+    clr = root.find(".//a:clrScheme", NS)
+    if clr is None:
+        return scheme
+    for slot in list(clr):
+        key = slot.tag.split("}")[-1]
+        srgb = slot.find("a:srgbClr", NS)
+        sysc = slot.find("a:sysClr", NS)
+        if srgb is not None and srgb.get("val"):
+            scheme[key] = srgb.get("val").upper()
+        elif sysc is not None and sysc.get("lastClr"):
+            scheme[key] = sysc.get("lastClr").upper()
+    # OOXML 别名：主题里叫 dk1/lt1/dk2/lt2，图形里引用 tx1/bg1/tx2/bg2
+    for alias, key in (("tx1", "dk1"), ("bg1", "lt1"), ("tx2", "dk2"), ("bg2", "lt2")):
+        if key in scheme:
+            scheme.setdefault(alias, scheme[key])
+    return scheme
+
+
+# ================================================== 单元格 / 区域引用工具
+
+
+def _cell(ctx, sheet_name, row, col):
+    sheet = ctx["sheets"].get(sheet_name)
+    if sheet is None:
+        return None
+    return sheet["cells"].get((row, col))
+
+
+def _style_of(ctx, cell):
+    """取单元格生效格式；无格式索引时返回 cellXfs[0]。"""
+    idx = 0
+    if cell is not None and cell.get("style") is not None:
+        try:
+            idx = int(cell["style"])
+        except ValueError:
+            idx = 0
+    if 0 <= idx < len(ctx["styles"]):
+        return ctx["styles"][idx]
+    return {"font": (None, None, False, None), "fill": (None, None),
+            "border": {}, "align": (None, None)}
+
+
+_REF_RE = re.compile(r"(?:'([^']+)'|([^!,()]+))!(\$?[A-Za-z]+\$?\d+)(?::(\$?[A-Za-z]+\$?\d+))?")
+
+
+def _iter_ref_cells(ref, default_sheet=None):
+    """解析图表引用（可能是 (A!$C$1:$F$1,A!$C$2:$F$2) 这样的多区域并集），
+    按出现顺序产出 (sheet, row, col)。"""
+    if not ref:
+        return
+    for match in _REF_RE.finditer(ref):
+        sheet = match.group(1) or match.group(2) or default_sheet
+        sheet = (sheet or "").strip()
+        start = match.group(3).replace("$", "")
+        end = (match.group(4) or match.group(3)).replace("$", "")
+        m1 = re.match(r"([A-Za-z]+)(\d+)", start)
+        m2 = re.match(r"([A-Za-z]+)(\d+)", end)
+        if not m1 or not m2:
+            continue
+        c1, r1 = _col_index(m1.group(1)), int(m1.group(2))
+        c2, r2 = _col_index(m2.group(1)), int(m2.group(2))
+        for row in range(min(r1, r2), max(r1, r2) + 1):
+            for col in range(min(c1, c2), max(c1, c2) + 1):
+                yield (sheet, row, col)
+
+
+def _ref_hits_data_area(ref, default_sheet=None):
+    """引用是否落进 A1:Q7 数据表区域。"""
+    for _, row, col in _iter_ref_cells(ref, default_sheet):
+        if row <= DATA_ROWS and col <= DATA_COLS:
+            return True
     return False
 
 
-def chart_datalabel_quality(ctx, chart_root):
-    """严格按细则三点判定“扇形数据标签”：
-      (1) 扇形上有数据标签；
-      (2) 至少显示数值或百分比之一；
-      (3) 标签不大面积重叠且不遮挡主要扇区。
-
-    返回 (ok, sub) ，sub 为各子条件布尔值字典。
-
-    第(3)点为视觉性要求，无法直接读取像素，采用可度量的结构化近似实现其评估意图，
-    但收紧到贴合饼/环图的实际渲染表现：
-      - 饼/环图的 dLblPos 只有 'bestFit'/'ctr'/'inEnd'/'outEnd' 四种取值
-        （'t'/'b'/'l'/'r' 是柱状/折线图专用，不适用于本判定）；
-      - 'ctr'（扇区几何中心）与 'inEnd'（扇区内端）都直接压在扇区内部，
-        点数一多就必然互相压盖、遮挡主要扇区内容 —— 不再视为安全布局；
-      - 仅 'outEnd'（扇区外部，环图/饼图默认较安全的位置）视为安全；
-      - 'bestFit' 本身会在点密集时自动退化为内部叠放，只有同时开启
-        showLeaderLines（引导线，用于在标签被推到外部时仍能指回原扇区）
-        才视为已采取有效防遮挡布局；
-      - 重叠风险按“环”（系列）逐一核查，而非只看全局最大点数：
-        任一环的数据点数 > 12（嵌套饼图六大类/四层级维度组合的常见密度，
-        远低于原先 40 的宽松阈值）且该环标签为内部位置（inEnd/ctr，或
-        bestFit 但无引导线），即判为该环大面积重叠/遮挡 -> 不通过。
-    """
-    sub = {}
-    # (1)+(2)：存在 dLbls 且 showVal 或 showPercent 为 1
-    has_label = False
-    show_val_or_pct = False
-    for dl in chart_root.iter("{%s}dLbls" % NS["c"]):
-        has_label = True
-        sv = dl.find("c:showVal", NS)
-        sp = dl.find("c:showPercent", NS)
-        if (sv is not None and sv.get("val") == "1") or (sp is not None and sp.get("val") == "1"):
-            show_val_or_pct = True
-    sub["1_扇形有数据标签"] = has_label
-    sub["2_显示数值或百分比之一"] = show_val_or_pct
-
-    # (3)：标签不大面积重叠且不遮挡主要扇区（按环逐一核查的结构化近似）
-    leader = any(
-        ll.get("val") == "1" for ll in chart_root.iter("{%s}showLeaderLines" % NS["c"]))
-    OVERLAP_RISK_THRESHOLD = 12  # 单环数据点数超过该值即视为拥挤风险
-    inside_pos = {"ctr", "inEnd"}
-
-    any_overlap = False
-    any_ring_checked = False
-    for ser in chart_root.iter("{%s}ser" % NS["c"]):
-        n_pts = max(
-            len([v for v in ser.findall(".//c:cat//c:pt/c:v", NS) if v.text]),
-            len([v for v in ser.findall(".//c:val//c:pt/c:v", NS) if v.text]),
-        )
-        ser_pos_vals = [p.get("val") for p in ser.iter("{%s}dLblPos" % NS["c"])]
-        if not ser_pos_vals:
-            # 该环未显式指定位置，饼/环图默认标签位置贴近扇区内部，按 'ctr' 处理
-            ser_pos_vals = ["ctr"]
-        any_ring_checked = True
-        for p in ser_pos_vals:
-            is_inside = (p in inside_pos) or (p == "bestFit" and not leader)
-            if is_inside and n_pts > OVERLAP_RISK_THRESHOLD:
-                any_overlap = True
-
-    # 是否存在明确的安全放置策略：outEnd，或 bestFit+引导线
-    pos_vals = [p.get("val") for p in chart_root.iter("{%s}dLblPos" % NS["c"])]
-    has_safe_layout = ("outEnd" in pos_vals) or ("bestFit" in pos_vals and leader)
-
-    sub["3_标签不重叠不遮挡"] = (
-        has_safe_layout and not any_overlap if any_ring_checked
-        else has_safe_layout
-    )
-
-    ok = all(sub.values())
-    return ok, sub
+# ==================================================== 图表结构与配色解析
 
 
-def chart_has_legend(chart_root):
-    return chart_root.find(".//c:legend", NS) is not None
-
-
-def chart_color_variety(chart_root):
-    """估计颜色种类数。
-
-    varyColors=1 时不再只按点数粗略估算，而是按 Excel 实际的自动调色板循环推断：
-    颜色种类至少是图表中数据点数量，但会按 6 色主题调色板循环。
-    否则统计显式填充色/主题色数量。
-    """
-    vc = chart_root.find(".//c:varyColors", NS)
-    if vc is not None and vc.get("val") == "1":
-        max_pts = 0
-        for s in chart_get_series(chart_root):
-            max_pts = max(max_pts, len(s["cat_cache"]), len(s["val_cache"]))
-        return max(max_pts, 6)
-    colors = set()
-    for srgb in chart_root.iter("{%s}srgbClr" % NS["a"]):
-        colors.add(srgb.get("val"))
-    for sch in chart_root.iter("{%s}schemeClr" % NS["a"]):
-        colors.add("scheme:" + (sch.get("val") or ""))
-    return len(colors)
-
-
-def _clamp8(x):
-    return max(0, min(255, int(round(x))))
-
-
-def _hex_to_rgb(hexv):
-    if not hexv:
-        return None
-    hexv = hexv.strip().lstrip("#")
-    if len(hexv) != 6 or not re.match(r"^[0-9A-Fa-f]{6}$", hexv):
-        return None
-    return tuple(int(hexv[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def _rgb_distance(a, b):
-    if a is None or b is None:
-        return 10**9
-    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
-
-
-def _apply_tint_shade(rgb, tint=None, shade=None, lum_mod=None, lum_off=None):
-    """按 DrawingML 的常见色彩修饰近似计算实际 RGB。"""
-    if rgb is None:
-        return None
-    r, g, b = rgb
-    if shade is not None:
-        try:
-            f = int(shade) / 100000.0
-            r, g, b = (_clamp8(r * f), _clamp8(g * f), _clamp8(b * f))
-        except Exception:
-            pass
-    if tint is not None:
-        try:
-            f = int(tint) / 100000.0
-            r = _clamp8(r + (255 - r) * f)
-            g = _clamp8(g + (255 - g) * f)
-            b = _clamp8(b + (255 - b) * f)
-        except Exception:
-            pass
-    if lum_mod is not None or lum_off is not None:
-        try:
-            mod = int(lum_mod) / 100000.0 if lum_mod is not None else 1.0
-            off = int(lum_off) / 100000.0 if lum_off is not None else 0.0
-            r = _clamp8(r * mod + 255 * off)
-            g = _clamp8(g * mod + 255 * off)
-            b = _clamp8(b * mod + 255 * off)
-        except Exception:
-            pass
-    return (r, g, b)
-
-
-DEFAULT_SCHEME_RGB = {
-    "accent1": (79, 129, 189),
-    "accent2": (192, 80, 77),
-    "accent3": (155, 187, 89),
-    "accent4": (128, 100, 162),
-    "accent5": (75, 172, 198),
-    "accent6": (247, 150, 70),
-    "dk1": (0, 0, 0),
-    "lt1": (255, 255, 255),
-    "dk2": (31, 73, 125),
-    "lt2": (238, 236, 225),
-}
-
-
-def _load_theme_scheme_rgb(z):
-    """读取 xl/theme/theme1.xml 中的主题色映射；缺失时回退到默认 Office 主题色。"""
-    root = read_xml(z, "xl/theme/theme1.xml")
-    if root is None:
-        return dict(DEFAULT_SCHEME_RGB)
-    scheme = root.find(".//a:clrScheme", NS)
-    if scheme is None:
-        return dict(DEFAULT_SCHEME_RGB)
-    out = dict(DEFAULT_SCHEME_RGB)
-    for child in list(scheme):
-        tag = child.tag.rsplit("}", 1)[-1]
-        clr = child.find("a:srgbClr", NS)
-        if clr is not None and clr.get("val"):
-            rgb = _hex_to_rgb(clr.get("val"))
-            if rgb is not None:
-                out[tag] = rgb
-                continue
-        sys_clr = child.find("a:sysClr", NS)
-        if sys_clr is not None and sys_clr.get("lastClr"):
-            rgb = _hex_to_rgb(sys_clr.get("lastClr"))
-            if rgb is not None:
-                out[tag] = rgb
+def _series_of(chart):
+    """取出图表内饼/环形族的全部系列，按 XML 顺序（内层在前）返回。"""
+    out = []
+    for tag in ("doughnutChart", "pieChart", "ofPieChart", "pie3DChart"):
+        for plot in chart["root"].findall(".//c:%s" % tag, NS):
+            for ser in plot.findall("c:ser", NS):
+                out.append({"ser": ser, "plot_tag": tag, "plot": plot})
     return out
 
 
-def _resolve_scheme_color(z, scheme_name, modifiers=None):
-    """把 schemeClr 解析为实际 RGB。"""
-    scheme_rgb = _load_theme_scheme_rgb(z)
-    rgb = scheme_rgb.get(scheme_name)
-    if rgb is None:
-        return None
-    modifiers = modifiers or {}
-    return _apply_tint_shade(rgb, modifiers.get("tint"), modifiers.get("shade"), modifiers.get("lumMod"), modifiers.get("lumOff"))
-
-
-def _extract_color_rgb(z, node):
-    """从 a:srgbClr / a:schemeClr 节点提取实际 RGB。"""
+def _ref_of(ser, kind):
+    """取系列的 cat / val 区域引用字符串。"""
+    node = ser.find("c:%s" % kind, NS)
     if node is None:
         return None
-    if node.tag.endswith("srgbClr"):
-        return _hex_to_rgb(node.get("val"))
-    if node.tag.endswith("schemeClr"):
-        mods = {}
-        for k in ("tint", "shade", "lumMod", "lumOff"):
-            el = node.find("a:%s" % k, NS)
-            if el is not None and el.get("val") is not None:
-                mods[k] = el.get("val")
-        return _resolve_scheme_color(z, node.get("val"), mods)
+    f = node.find(".//c:f", NS)
+    return f.text if f is not None else None
+
+
+def _cached_points(ser, kind):
+    """取系列缓存的 <c:pt> 文本列表（openpyxl 生成的图表通常没有缓存）。"""
+    node = ser.find("c:%s" % kind, NS)
+    if node is None:
+        return []
+    return [(pt.text or "") for pt in node.findall(".//c:pt/c:v", NS)]
+
+
+def _series_values(ctx, chart, ser):
+    """系列数值：优先按引用回表取单元格实算值，取不到再退回图表缓存。"""
+    ref = _ref_of(ser, "val")
+    values = []
+    if ref:
+        for sheet, row, col in _iter_ref_cells(ref, chart["sheet"]):
+            cell = _cell(ctx, sheet, row, col)
+            values.append(cell["number"] if cell and cell["number"] is not None else None)
+    if not values or all(v is None for v in values):
+        values = []
+        for raw in _cached_points(ser, "val"):
+            try:
+                values.append(float(raw))
+            except ValueError:
+                values.append(None)
+    return values
+
+
+def _series_labels(ctx, chart, ser):
+    """系列分类名：优先按引用回表取文本，取不到再退回图表缓存。"""
+    ref = _ref_of(ser, "cat")
+    labels = []
+    if ref:
+        for sheet, row, col in _iter_ref_cells(ref, chart["sheet"]):
+            cell = _cell(ctx, sheet, row, col)
+            labels.append((cell["text"] or "") if cell else "")
+    if not any(labels):
+        labels = _cached_points(ser, "cat")
+    return [_norm_text(x) for x in labels]
+
+
+def _fill_base_rgb(spPr, theme):
+    """从 spPr/solidFill 里取"基色"RGB。lumMod/lumOff 只改明度不改色相，
+    判定"同色系"时按基色比较即可。返回 'RRGGBB' 或 None。"""
+    if spPr is None:
+        return None
+    fill = spPr.find("a:solidFill", NS)
+    if fill is None:
+        return None
+    srgb = fill.find("a:srgbClr", NS)
+    if srgb is not None and srgb.get("val"):
+        return srgb.get("val").upper()
+    scheme = fill.find("a:schemeClr", NS)
+    if scheme is not None and scheme.get("val"):
+        return theme.get(scheme.get("val"))
     return None
 
 
-def _series_point_colors(ctx, ser):
-    """提取单个系列中每个点的实际 RGB 颜色。"""
-    z = ctx["zip"]
-    vary = ser.find(".//c:varyColors", NS)
-    vary_on = (vary is not None and vary.get("val") == "1")
-    theme_cycle = ["accent1", "accent2", "accent3", "accent4", "accent5", "accent6"]
-    points = []
+def _dpt_colors(ser, theme, count):
+    """按数据点下标返回长度为 count 的基色列表；未单独设色的位置为 None。"""
+    colors = [None] * count
     for dpt in ser.findall("c:dPt", NS):
-        idx_el = dpt.find("c:idx", NS)
-        if idx_el is None:
+        idx_node = dpt.find("c:idx", NS)
+        try:
+            idx = int(idx_node.get("val"))
+        except (AttributeError, TypeError, ValueError):
             continue
-        idx = int(idx_el.get("val"))
-        fill = dpt.find(".//a:solidFill/*", NS)
-        points.append((idx, _extract_color_rgb(z, fill)))
-    point_map = {idx: rgb for idx, rgb in points if rgb is not None}
-
-    # 自动配色：按 Excel 实际调色板顺序循环
-    auto_map = {}
-    if vary_on:
-        cat_count = 0
-        cats = []
-        if ser.find(".//c:cat", NS) is not None:
-            cats = [v.text for v in ser.findall(".//c:cat//c:pt/c:v", NS) if v.text]
-            if not cats:
-                for f in ser.findall(".//c:cat//c:f", NS):
-                    if f.text:
-                        cats.extend(str(v) for v in get_referenced_cell_values(ctx, f.text) if v)
-        cat_count = len(cats)
-        for i in range(cat_count):
-            scheme = theme_cycle[i % len(theme_cycle)]
-            auto_map[i] = _resolve_scheme_color(z, scheme)
-    return point_map, auto_map
+        if 0 <= idx < count:
+            colors[idx] = _fill_base_rgb(dpt.find("c:spPr", NS), theme)
+    return colors
 
 
-def chart_category_color_map(ctx, chart_root):
-    """构造 图表中“成绩类别 -> 实际RGB颜色”的映射。
-
-    取值优先级：
-      1) 若数据点(dPt)存在显式填充色，则按点序号映射到类别标签，取实际 RGB；
-      2) 否则在 varyColors=1 下，按 Excel 的实际自动调色板顺序循环得到 RGB，
-         再按类别标签映射。
-
-    返回 dict: 分类标签 -> RGB 三元组。
-    """
-    color_map = {}
-    for ser in chart_root.iter("{%s}ser" % NS["c"]):
-        cats = [v.text for v in ser.findall(".//c:cat//c:pt/c:v", NS) if v.text]
-        if not cats:
-            for f in ser.findall(".//c:cat//c:f", NS):
-                if f.text:
-                    cats.extend(str(v) for v in get_referenced_cell_values(ctx, f.text) if v)
-        point_map, auto_map = _series_point_colors(ctx, ser)
-        for pi, label in enumerate(cats):
-            if pi in point_map:
-                color_map[label] = point_map[pi]
-            elif pi in auto_map:
-                color_map.setdefault(label, auto_map[pi])
-    return color_map
+def _hue_sat(rgb):
+    """'RRGGBB' -> (色相角度, 饱和度)；解析失败返回 None。"""
+    if not rgb or len(rgb) < 6:
+        return None
+    try:
+        r = int(rgb[-6:-4], 16) / 255.0
+        g = int(rgb[-4:-2], 16) / 255.0
+        b = int(rgb[-2:], 16) / 255.0
+    except ValueError:
+        return None
+    hue, _, sat = colorsys.rgb_to_hsv(r, g, b)
+    return (hue * 360.0, sat)
 
 
-def chart_distinct_colors(ctx, chart_root):
-    """图中实际出现的不同颜色数（按 RGB 去重）。"""
-    cm = chart_category_color_map(ctx, chart_root)
-    return len({v for v in cm.values() if v is not None})
+def _same_color_family(rgb_a, rgb_b):
+    """同色系判定：都是灰阶算同系；否则色相差在 HUE_TOL 内算同系。"""
+    ha, hb = _hue_sat(rgb_a), _hue_sat(rgb_b)
+    if ha is None or hb is None:
+        return False
+    if ha[1] < GRAY_SAT and hb[1] < GRAY_SAT:
+        return True
+    if ha[1] < GRAY_SAT or hb[1] < GRAY_SAT:
+        return False
+    diff = abs(ha[0] - hb[0]) % 360.0
+    return min(diff, 360.0 - diff) <= HUE_TOL
 
 
-def parse_ref_sheet(ref):
-    """从 'sheet'!$A$1 形式的引用中取出工作表名。"""
-    m = re.match(r"(?:'?([^'!]+)'?)!", ref)
-    return m.group(1) if m else None
+def _chunk_align(inner, outer, tol=0.5):
+    """把外层数值按顺序切成若干连续块，使第 i 块之和等于内层第 i 个扇区的数值。
+    切得动说明"外层按大类顺序连续排列、每个内层扇区正对其下属外层扇区"；
+    返回块列表（每块是外层下标区间 [start, end)），切不动返回 None。"""
+    if not inner or not outer or any(v is None for v in inner + outer):
+        return None
+    chunks = []
+    pos = 0
+    for target in inner:
+        acc = 0.0
+        start = pos
+        while pos < len(outer) and acc + tol < target:
+            acc += outer[pos]
+            pos += 1
+        if abs(acc - target) > tol or pos == start:
+            return None
+        chunks.append((start, pos))
+    return chunks if pos == len(outer) else None
 
 
-def iter_ref_cells(ref):
-    """遍历 'sheet'!$A$1:$B$2 形式引用覆盖的所有 (row, col)。"""
-    m = re.search(r"!\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?", ref)
-    if not m:
-        return
-    c1, r1, c2, r2 = m.groups()
-    ci1, ri1 = col_letter_to_idx(c1), int(r1)
-    ci2, ri2 = (col_letter_to_idx(c2), int(r2)) if c2 else (ci1, ri1)
-    for rr in range(min(ri1, ri2), max(ri1, ri2) + 1):
-        for cc in range(min(ci1, ci2), max(ci1, ci2) + 1):
-            yield (rr, cc)
+def _chart_title(ctx, chart):
+    """图表标题文本（去空白）；支持富文本与引用单元格两种写法。"""
+    title = chart["root"].find(".//c:chart/c:title", NS)
+    if title is None:
+        return ""
+    text = "".join(t.text or "" for t in title.iter("{%s}t" % A))
+    if not text:
+        ref = None
+        f = title.find(".//c:strRef/c:f", NS)
+        if f is not None:
+            ref = f.text
+        if ref:
+            parts = []
+            for sheet, row, col in _iter_ref_cells(ref, chart["sheet"]):
+                cell = _cell(ctx, sheet, row, col)
+                if cell and cell["text"]:
+                    parts.append(cell["text"])
+            text = "".join(parts)
+    return _norm_text(text)
 
 
-def get_sheet_grid(ctx, sheet_name):
-    """获取（必要时解析）指定工作表的单元格网格。"""
-    grid = ctx.get("grids", {}).get(sheet_name)
-    if grid is None:
-        sp = ctx.get("sheet_xml", {}).get(sheet_name)
-        if sp:
-            grid = parse_sheet_grid(ctx["zip"], sp, ctx)
-            ctx.setdefault("grids", {})[sheet_name] = grid
-        else:
-            grid = {}
-    return grid
+def _shows_values(plot, ser):
+    """该系列的扇区是否显示数值标签：系列级 dLbls 优先，其次图表类型级 dLbls；
+    任一层把标签整体删除（delete=1）或存在被单独删除的标签，均视为不达标。"""
+    for scope in (ser, plot):
+        node = scope.find("c:dLbls", NS)
+        if node is None:
+            continue
+        if _bool_attr(node.find("c:delete", NS)):
+            return False
+        for dlbl in node.findall("c:dLbl", NS):
+            if _bool_attr(dlbl.find("c:delete", NS)):
+                return False
+        if _bool_attr(node.find("c:showVal", NS)) or _bool_attr(node.find("c:showPercent", NS)):
+            return True
+    return False
 
 
-def get_cells_text(ctx, sheet_name, cells):
-    """取指定工作表若干 (row, col) 单元格的文本值列表。"""
-    grid = get_sheet_grid(ctx, sheet_name)
-    out = []
-    for (rr, cc) in cells:
-        v = grid.get((rr, cc))
-        out.append(str(v).strip() if v is not None else "")
+def _has_outline(ser, count):
+    """扇区是否有描边：系列级 spPr/a:ln 有效，或每个数据点各自设了 a:ln。"""
+    def _visible_line(spPr):
+        if spPr is None:
+            return False
+        ln = spPr.find("a:ln", NS)
+        if ln is None:
+            return False
+        return ln.find("a:noFill", NS) is None
+    if _visible_line(ser.find("c:spPr", NS)):
+        return True
+    dpts = ser.findall("c:dPt", NS)
+    if not dpts or len(dpts) < count:
+        return False
+    return all(_visible_line(dpt.find("c:spPr", NS)) for dpt in dpts)
+
+
+def _col_width_px(sheet, col):
+    """列宽（字符）-> 像素，按 Calibri 11 的 MDW=7 折算。"""
+    width = None
+    for entry in sheet["cols"]:
+        if entry["min"] <= col <= entry["max"] and entry["width"] is not None:
+            width = entry["width"]
+            break
+    if width is None:
+        width = sheet["default_width"]
+    return round(width * 7.0) + 5.0
+
+
+def _row_height_px(sheet, row):
+    """行高（磅）-> 像素（96 DPI）。"""
+    info = sheet["rows"].get(row)
+    pts = info["ht"] if info and info["ht"] is not None else sheet["default_height"]
+    return pts * 96.0 / 72.0
+
+
+def _chart_geometry(ctx, chart):
+    """把锚点换算成 (宽 EMU, 高 EMU, 覆盖的 1 基单元格区域 c1,r1,c2,r2)。
+    twoCellAnchor 按起止格累加列宽/行高；oneCellAnchor 按 ext 反推终止格。"""
+    sheet = ctx["sheets"].get(chart["sheet"])
+    origin = chart["from"]
+    if sheet is None or origin is None:
+        return (0, 0, None)
+    col0, coloff, row0, rowoff = origin
+    if chart["anchor_tag"] == "twoCellAnchor" and chart["to"]:
+        col1, coloff1, row1, rowoff1 = chart["to"]
+        cx = sum(_col_width_px(sheet, c + 1) for c in range(col0, col1)) * EMU_PER_PX
+        cy = sum(_row_height_px(sheet, r + 1) for r in range(row0, row1)) * EMU_PER_PX
+        cx = cx - coloff + coloff1
+        cy = cy - rowoff + rowoff1
+        return (max(cx, 0), max(cy, 0), (col0 + 1, row0 + 1, col1 + 1, row1 + 1))
+    cx, cy = chart["ext"] or (0, 0)
+    col1, acc = col0, -coloff
+    while acc < cx and col1 - col0 < 256:
+        acc += _col_width_px(sheet, col1 + 1) * EMU_PER_PX
+        col1 += 1
+    row1, acc = row0, -rowoff
+    while acc < cy and row1 - row0 < 4096:
+        acc += _row_height_px(sheet, row1 + 1) * EMU_PER_PX
+        row1 += 1
+    return (cx, cy, (col0 + 1, row0 + 1, max(col1, col0 + 1), max(row1, row0 + 1)))
+
+
+def _rects_overlap(rect_a, rect_b):
+    """两个 1 基单元格矩形 (c1,r1,c2,r2) 是否相交。"""
+    if not rect_a or not rect_b:
+        return False
+    return not (rect_a[2] < rect_b[0] or rect_b[2] < rect_a[0] or
+                rect_a[3] < rect_b[1] or rect_b[3] < rect_a[1])
+
+
+def _new_cells_outside_data(sheet):
+    """数据表以外新写入的非空单元格；返回 {(row, col): cell}。"""
+    out = {}
+    for (row, col), cell in sheet["cells"].items():
+        if row <= DATA_ROWS and col <= DATA_COLS:
+            continue
+        if cell["text"] not in (None, "") or cell["number"] is not None:
+            out[(row, col)] = cell
     return out
 
 
-def get_referenced_cell_values(ctx, ref):
-    """根据 'sheet'!$A$1:$B$2 形式的引用，从已解析 grid 取出值列表。"""
-    m = re.match(r"(?:'?([^'!]+)'?)!\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?", ref)
-    if not m:
-        return []
-    sheet, c1, r1, c2, r2 = m.groups()
-    grid = ctx.get("grids", {}).get(sheet)
-    if grid is None:
-        # 按需解析
-        sp = ctx.get("sheet_xml", {}).get(sheet)
-        if sp:
-            grid = parse_sheet_grid(ctx["zip"], sp, ctx)
-            ctx.setdefault("grids", {})[sheet] = grid
-        else:
-            return []
-    ci1, ri1 = col_letter_to_idx(c1), int(r1)
-    ci2, ri2 = (col_letter_to_idx(c2), int(r2)) if c2 else (ci1, ri1)
-    vals = []
-    for rr in range(min(ri1, ri2), max(ri1, ri2) + 1):
-        for cc in range(min(ci1, ci2), max(ci1, ci2) + 1):
-            vals.append(grid.get((rr, cc)))
-    return vals
-
-
-def chart_all_category_text(ctx, chart_root):
-    """收集图表中所有分类标签文本（来自 cat 缓存或引用单元格）。"""
-    texts = []
-    for s in chart_get_series(chart_root):
-        texts.extend([t for t in s["cat_cache"] if t])
-        if not s["cat_cache"]:
-            for ref in s["cat_refs"]:
-                texts.extend([str(v) for v in get_referenced_cell_values(ctx, ref) if v])
-    return texts
-
-
-def chart_is_nested_doughnut(chart_root):
-    """是否为“多类别嵌套合并饼图”：饼/环图且含多个系列（多环嵌套）。"""
-    return chart_is_doughnut_or_pie(chart_root) and chart_ring_count(chart_root) >= 2
-
-
-def series_category_texts(ctx, ser):
-    """取单个系列(单环)的全部分类标签文本。"""
-    texts = [t for t in ser["cat_cache"] if t]
-    if not texts:
-        for ref in ser["cat_refs"]:
-            texts.extend(str(v) for v in get_referenced_cell_values(ctx, ref) if v)
-    return texts
-
-
-def _ring_dimension(labels):
-    """判断单个圆环(系列)承载的是哪个“纯维度”。
-
-    要求该环的分类标签是“干净的单一维度”：
-      - 'cat'：标签集合恰好就是六大类(地图基础..聚落形态)，且不掺入任何四层级字样；
-      - 'lvl'：标签集合恰好就是四层级(卓越/稳定/基本/持续)，且不掺入任何六大类字样；
-      - None：既不是纯六大类也不是纯四层级（例如“大类-能力-层级”这类组合串）。
-
-    “干净”的核心判据：每一个标签本身只能对应唯一维度的唯一一项，
-    不允许单个标签里同时出现两个维度的关键词（组合标签一律判 None）。
-    """
-    labels = [str(t).strip() for t in labels if str(t).strip()]
-    if not labels:
+def _bbox(keys):
+    """一组 (row, col) 的包围盒 (c1, r1, c2, r2)；空集合返回 None。"""
+    if not keys:
         return None
-    cat_set = set(COL_CATEGORIES)   # 六大类
-    lvl_set = set(ROW_LEVELS)       # 四层级
-
-    saw_cat = set()
-    saw_lvl = set()
-    for lab in labels:
-        hit_cat = [k for k in cat_set if k in lab]
-        hit_lvl = [k for k in lvl_set if k in lab]
-        # 单个标签同时命中两个维度 -> 组合标签，非纯维度
-        if hit_cat and hit_lvl:
-            return None
-        # 单个标签命中维度内多于一项(罕见) -> 视为不纯
-        if len(hit_cat) > 1 or len(hit_lvl) > 1:
-            return None
-        if hit_cat:
-            saw_cat.add(hit_cat[0])
-        elif hit_lvl:
-            saw_lvl.add(hit_lvl[0])
-        else:
-            # 出现既非大类也非层级的标签 -> 不是干净的目标维度环
-            return None
-
-    # 标签必须全部属于同一维度，且该维度完整覆盖
-    if saw_cat and not saw_lvl and saw_cat == cat_set:
-        return "cat"
-    if saw_lvl and not saw_cat and saw_lvl == lvl_set:
-        return "lvl"
-    return None
+    rows = [k[0] for k in keys]
+    cols = [k[1] for k in keys]
+    return (min(cols), min(rows), max(cols), max(rows))
 
 
-def classify_nested_scheme(ctx, chart_root):
-    """判断嵌套环图的分类统计组织方式是否符合细则两种合法方式之一。
-
-    细则：
-      方式A：饼图统计对象 = 四类成绩(卓越/稳定/基本/持续)，圆环层级 = 六大类(地图基础..聚落形态)
-      方式B：饼图统计对象 = 六大类(地图基础..聚落形态)，圆环层级 = 四类成绩(卓越/稳定/基本/持续)
-
-    返回 ('A'|'B'|None, reason)。
-    严格判定（不再接受组合标签蒙混）：
-      - 必须是多环嵌套饼/环图；
-      - “统计对象”取最内层(idx=0)系列，必须是“干净的单一维度”整环
-        （纯六大类，或纯四层级——单个标签不得同时含两维度关键词）；
-      - “圆环层级”由其余各环承载，必须存在某一外环是“另一个维度”的干净整环；
-      - 两个维度(六大类 / 四层级)需各自由一个纯维度环完整承载，互不混杂。
-    """
-    if not chart_is_doughnut_or_pie(chart_root):
-        return None, "非饼/环图"
-    sers = chart_get_series(chart_root)
-    if len(sers) < 2:
-        return None, "非多环嵌套(系列<2)"
-
-    # 逐环判定承载的纯维度：'cat'(纯六大类) / 'lvl'(纯四层级) / None(组合或不纯)
-    ring_dims = [_ring_dimension(series_category_texts(ctx, s)) for s in sers]
-    inner_dim = ring_dims[0]                 # 统计对象 = 最内层
-    outer_dims = set(ring_dims[1:])          # 圆环层级 = 其余各环
-
-    # 方式A：统计对象=纯四层级，且某外环=纯六大类
-    if inner_dim == "lvl" and "cat" in outer_dims:
-        return "A", "内层=纯四类成绩,外环含纯六大类"
-    # 方式B：统计对象=纯六大类，且某外环=纯四层级
-    if inner_dim == "cat" and "lvl" in outer_dims:
-        return "B", "内层=纯六大类,外环含纯四类成绩"
-
-    return None, "统计对象维度=%s 圆环层级维度=%s(组合/混杂标签不计为合法分类统计)" % (
-        inner_dim if inner_dim else "非纯维度",
-        sorted(d for d in outer_dims if d) if any(outer_dims) else "无纯维度环")
+# ==================================================================== 入口
 
 
-def ref_range_within_A1Q7(ref):
-    """判断单个引用 'sheet'!$A$1:$B$2 覆盖的单元格是否全部落在 A1:Q7 范围内
-    （行1..7、列A..Q，即列1..17）。只要引用越出该范围（如引用了辅助列/辅助行、
-    或 A1:Q7 之外的任意区域），即返回 False。"""
-    cells = list(iter_ref_cells(ref))
-    if not cells:
-        return False
-    return all(1 <= rr <= 7 and 1 <= cc <= 17 for (rr, cc) in cells)
-
-
-def chart_class_data_from_A1Q7(ctx, chart_root, class_name):
-    """判断图表数据源是否“均来自对应工作表 A1:Q7 中的成绩数据”。
-
-    严格判定（不再接受“60%数值能在A1:Q7值集合中找到即视为derived”的宽松近似）：
-      - 所有系列的分类/数值引用都必须指向 class_name 对应的工作表（来源正确）；
-      - 且每一条引用的单元格区域本身必须完整落在该表 A1:Q7 范围内
-        （不允许引用同表任意区域，如引用 A1:Q7 之外的辅助列/辅助行）；
-      - 若图表系列没有可核验的引用（仅有静态缓存值、无 cat_refs/val_refs），
-        视为“不可追溯到 A1:Q7”，不满足数据源要求。
-    返回 (all_refs_in_class_sheet, derived_from_A1Q7)。
-      - all_refs_in_class_sheet：所有引用都指向对应班级工作表；
-      - derived_from_A1Q7：在上一条基础上，所有引用区域都落在 A1:Q7 内
-        （即可直接追溯到 A1:Q7 的原始成绩数据，而非同表其他区域）。
-    """
-    all_refs_in_sheet = True
-    all_refs_in_A1Q7 = True
-    has_any_ref = False
-    for s in chart_get_series(chart_root):
-        refs = s["cat_refs"] + s["val_refs"]
-        if not refs:
-            # 无引用可核验（例如仅静态缓存值，无法追溯来源）-> 视为不满足可追溯要求
-            all_refs_in_A1Q7 = False
-            continue
-        for ref in refs:
-            has_any_ref = True
-            sheet = parse_ref_sheet(ref)
-            if sheet != class_name:
-                all_refs_in_sheet = False
-                all_refs_in_A1Q7 = False
-                continue
-            if not ref_range_within_A1Q7(ref):
-                all_refs_in_A1Q7 = False
-
-    if not has_any_ref:
-        all_refs_in_sheet = False
-        all_refs_in_A1Q7 = False
-
-    return all_refs_in_sheet, all_refs_in_A1Q7
-
-
-def chart_covers_nonempty_columns(ctx, chart_root, class_name):
-    """覆盖“地图基础”到“聚落形态”各非空能力层级数据，不遗漏主要成绩列。
-
-    严格判定（不再只检查六个类别名称是否出现在图表分类文本中）：
-      (1) 六大类维度覆盖：B1:Q1 中所有非空的能力大类（地图基础..聚落形态）
-          都必须作为图表某一环的分类标签完整出现；
-      (2) 四层级维度覆盖：A4:A7 中所有非空的能力层级（卓越表现/稳定达成/
-          基本达成/持续提升）都必须作为图表某一环的分类标签完整出现；
-      (3) 主要成绩列数值覆盖：对每一个非空大类 × 每一个非空层级构成的
-          B4:Q7 成绩单元格（该细则所指“主要成绩列”），其数值都必须能在
-          图表系列的数值缓存/引用值中找到，即逐列/逐层级确认非空成绩数据
-          均被统计，不允许仅凑够比例或只覆盖部分列。
-    返回 (ok, present_cats, missing)：
-      - present_cats：非空的六大类名称列表；
-      - missing：dict，包含 "categories"（缺失的大类）、"levels"（缺失的层级）、
-        "values"（未被图表数值覆盖的 (层级, 大类) 成绩列）三类缺项，全部为空
-        列表才算不遗漏。
-    """
-    grid = get_sheet_grid(ctx, class_name)
-
-    # B1:Q1 非空大类（按合并表头，取出现的 6 个大类名，去重保序）
-    present_cats = []
-    for cc in range(2, 18):            # B(2)..Q(17)
-        v = grid.get((1, cc))
-        if v is not None and str(v).strip() != "":
-            vv = str(v).strip()
-            if vv in COL_CATEGORIES and vv not in present_cats:
-                present_cats.append(vv)
-
-    # A4:A7 非空层级（去重保序）
-    present_lvls = []
-    for rr in range(4, 8):
-        v = grid.get((rr, 1))
-        if v is not None and str(v).strip() != "":
-            vv = str(v).strip()
-            if vv in ROW_LEVELS and vv not in present_lvls:
-                present_lvls.append(vv)
-
-    # 图表中各环的分类标签集合（逐环收集，用于判定“该维度是否完整出现”）
-    chart_cat_labels = set()
-    for s in chart_get_series(chart_root):
-        for t in series_category_texts(ctx, s):
-            t = str(t).strip()
-            if t:
-                chart_cat_labels.add(t)
-
-    missing_cats = [k for k in present_cats if k not in chart_cat_labels]
-    missing_lvls = [k for k in present_lvls if k not in chart_cat_labels]
-
-    # 图表实际用到的全部数值（数值缓存 + 数值引用解析值），逐列/逐层级核对来源
-    chart_values = set()
-    for s in chart_get_series(chart_root):
-        for v in s["val_cache"]:
-            if v is not None and str(v).strip() != "":
-                chart_values.add(str(v).strip())
-        for ref in s["val_refs"]:
-            for v in get_referenced_cell_values(ctx, ref):
-                if v is not None and str(v).strip() != "":
-                    chart_values.add(str(v).strip())
-
-    # 逐列(大类)/逐层级确认 B4:Q7 中每一个非空成绩数据都被图表数值覆盖
-    missing_values = []
-    col_idx_by_cat = {}
-    for cc in range(2, 18):
-        v = grid.get((1, cc))
-        if v is not None and str(v).strip() in COL_CATEGORIES:
-            col_idx_by_cat.setdefault(str(v).strip(), []).append(cc)
-    row_idx_by_lvl = {}
-    for rr in range(4, 8):
-        v = grid.get((rr, 1))
-        if v is not None and str(v).strip() in ROW_LEVELS:
-            row_idx_by_lvl[str(v).strip()] = rr
-
-    for lvl in present_lvls:
-        rr = row_idx_by_lvl.get(lvl)
-        if rr is None:
-            continue
-        for cat in present_cats:
-            for cc in col_idx_by_cat.get(cat, []):
-                cell_v = grid.get((rr, cc))
-                if cell_v is None or str(cell_v).strip() == "":
-                    continue
-                if str(cell_v).strip() not in chart_values:
-                    missing_values.append((lvl, cat, "R%dC%d" % (rr, cc)))
-
-    missing = {
-        "categories": missing_cats,
-        "levels": missing_lvls,
-        "values": missing_values,
-    }
-    ok = (len(missing_cats) == 0 and len(missing_lvls) == 0 and
-          len(missing_values) == 0 and len(present_cats) > 0 and len(present_lvls) > 0)
-    return ok, present_cats, missing
-
-
-
-# =========================================================================
-# 维度2：完成度评分细则
-# =========================================================================
-def check_dimension2(ctx):
-    z = ctx["zip"]
-    names = ctx["names"]
-    chart_files = sorted(ctx["chart_files"])
-    charts = []
-    for cf in chart_files:
-        root = read_xml(z, cf)
-        if root is not None:
-            charts.append((cf, root))
-
-    results = []  # (score, hit:bool, label)
-
-    # 将图表与班级匹配（通过标题/数据源引用判断）
-    chart_by_class = {}
-    for cf, root in charts:
-        title = chart_get_title(root)
-        refs = " ".join(
-            r for s in chart_get_series(root) for r in (s["cat_refs"] + s["val_refs"])
-        )
-        for cls in SHEET_NAMES:
-            if cls in title or ("'%s'" % cls) in refs or ("%s!" % cls) in refs:
-                # 精确匹配：七1班 不应误配到 七13班
-                if cls == "七1班" and ("七13班" in title or "七13班" in refs):
-                    continue
-                chart_by_class.setdefault(cls, []).append((cf, root))
-
-    # ---- 得分点 +1：严格按细则逐点判定（每个点都必须满足才加分）----
-    # 细则原文拆解为以下原子子条件：
-    #   (a) 分别基于“七1班”和“七13班”两份成绩数据，各生成 1 个“多类别嵌套合并饼图”
-    #   (b) 共 2 个图表
-    #   (c) 两个图表标题能明确区分“七1班”和“七13班”
-    #   (d) 两个图表的数据源均来自对应工作表 A1:Q7 中的成绩数据
-    #   (e) 覆盖“地图基础”到“聚落形态”各非空能力层级数据，不遗漏主要成绩列
-    sub = {}
-
-    # (a) 两个班级各有 1 个多类别嵌套合并饼图（饼/环图且为多环嵌套）
-    cls_nested = {}
-    for c in SHEET_NAMES:
-        lst = chart_by_class.get(c, [])
-        cls_nested[c] = (len(lst) >= 1 and chart_is_nested_doughnut(lst[0][1]))
-    sub["a_各班1个嵌套合并饼图"] = all(cls_nested[c] for c in SHEET_NAMES)
-
-    # (b) 共 2 个图表
-    sub["b_共2个图表"] = (len(charts) == 2)
-
-    cond_two_charts = all(len(chart_by_class.get(c, [])) >= 1 for c in SHEET_NAMES)
-
-    # (c) 标题明确区分两个班级：七1班图标题含“七1班”不含“七13班”；七13班图标题含“七13班”
-    if cond_two_charts:
-        t1 = chart_get_title(chart_by_class["七1班"][0][1])
-        t13 = chart_get_title(chart_by_class["七13班"][0][1])
-        sub["c_标题区分两班"] = ("七1班" in t1 and "七13班" not in t1 and "七13班" in t13)
-    else:
-        sub["c_标题区分两班"] = False
-
-    # (d) 数据源均来自对应工作表 A1:Q7 中的成绩数据
-    if cond_two_charts:
-        d_ok = True
-        for c in SHEET_NAMES:
-            in_sheet, derived = chart_class_data_from_A1Q7(ctx, chart_by_class[c][0][1], c)
-            if not (in_sheet and derived):
-                d_ok = False
-        sub["d_数据源来自对应表A1Q7"] = d_ok
-    else:
-        sub["d_数据源来自对应表A1Q7"] = False
-
-    # (e) 覆盖“地图基础”到“聚落形态”各非空能力层级，不遗漏主要成绩列
-    if cond_two_charts:
-        e_ok = True
-        e_missing = {}
-        for c in SHEET_NAMES:
-            ok_cov, present, missing = chart_covers_nonempty_columns(
-                ctx, chart_by_class[c][0][1], c)
-            if not ok_cov:
-                e_ok = False
-            if missing["categories"] or missing["levels"] or missing["values"]:
-                e_missing[c] = missing
-        sub["e_覆盖各非空能力列不遗漏"] = e_ok
-    else:
-        sub["e_覆盖各非空能力列不遗漏"] = False
-        e_missing = {}
-
-    # 每一个子条件都满足才加分
-    p1_hit = all(sub.values())
-    results.append((1, p1_hit, "p1_charts",
-        "+1 两班各基于本班成绩各生成1个多类别嵌套合并饼图(共2个)、标题区分七1/七13班、"
-        "数据源均来自对应表A1:Q7、覆盖地图基础~聚落形态各非空能力列不遗漏"
-        "（a各班嵌套饼图=%s b共2图=%s c标题区分=%s d数据源A1:Q7=%s e覆盖不遗漏=%s%s）"
-        % (sub["a_各班1个嵌套合并饼图"], sub["b_共2个图表"], sub["c_标题区分两班"],
-           sub["d_数据源来自对应表A1Q7"], sub["e_覆盖各非空能力列不遗漏"],
-           ("" if not e_missing else " 缺列=%s" % e_missing))))
-
-    # ---- 得分点 +5：分类统计正确（严格按细则两种合法组织方式之一，逐点判定）----
-    # 细则给出两种“分类统计正确”的合法方式，命中任一种即算正确：
-    #   方式A：以“卓越表现/稳定达成/基本达成/持续提升”四类成绩数据作为饼图统计对象，
-    #          以“地图基础/经纬定位/地形判读/气候要素/区域差异/聚落形态”六类作为不同类别圆环层级。
-    #   方式B：以“地图基础/经纬定位/地形判读/气候要素/区域差异/聚落形态”六类成绩数据作为饼图统计对象，
-    #          以“卓越表现/稳定达成/基本达成/持续提升”四类作为不同类别圆环层级。
-    # 判定要求两个图表都满足同一种合法方式（A 或 B），逐点核对四层级集合与六大类集合。
-    p5_hit = False
-    p5_msgs = []
-    if cond_two_charts:
-        ok_all = True
-        for c in SHEET_NAMES:
-            root = chart_by_class[c][0][1]
-            scheme, why = classify_nested_scheme(ctx, root)
-            p5_msgs.append("%s:%s" % (c, scheme if scheme else ("不符合(%s)" % why)))
-            if scheme not in ("A", "B"):
-                ok_all = False
-        p5_hit = ok_all
-    else:
-        p5_msgs.append("缺少两个图表")
-    results.append((5, p5_hit, "p5_class",
-        "+5 分类统计正确（方式A:四类成绩为统计对象+六大类为圆环层级；"
-        "或方式B:六大类为统计对象+四类成绩为圆环层级）（%s）"
-        % "; ".join(p5_msgs)))
-
-    # ---- 得分点 +1：严格按细则三点判定扇形数据标签 ----
-    # 细则拆解：
-    #   (1) 每个图表的扇形上有数据标签；
-    #   (2) 至少显示数值或百分比之一；
-    #   (3) 标签不大面积重叠且不遮挡主要扇区。
-    # 每个点都必须满足，且两个图表都满足，才加分。
-    p1b_hit = False
-    p1b_msgs = []
-    if cond_two_charts:
-        ok_all = True
-        for c in SHEET_NAMES:
-            ok, sub = chart_datalabel_quality(ctx, chart_by_class[c][0][1])
-            p1b_msgs.append("%s(有标签=%s 数值或百分比=%s 不重叠不遮挡=%s)" % (
-                c, sub["1_扇形有数据标签"], sub["2_显示数值或百分比之一"],
-                sub["3_标签不重叠不遮挡"]))
-            if not ok:
-                ok_all = False
-        p1b_hit = ok_all
-    else:
-        p1b_msgs.append("缺少两个图表")
-    results.append((1, p1b_hit, "p1_label",
-        "+1 每个图表扇形有数据标签、至少显示数值或百分比之一、标签不大面积重叠且不遮挡主要扇区"
-        "（%s）" % "; ".join(p1b_msgs)))
-
-    # ---- 得分点 +1：严格按细则判定图例 ----
-    # 细则拆解：
-    #   (1) 两个图表均包含图例；
-    #   (2) 图例文字 包含或能对应 B1:Q1 的6个成绩类别(地图基础/经纬定位/地形判读/气候要素/区域差异/聚落形态)
-    #        或 包含或能对应 A4:A7 的4个能力层级(卓越表现/稳定达成/基本达成/持续提升)。
-    # 两个图表都必须满足(1)且满足(2)，才加分。
-    p1c_hit = False
-    p1c_msgs = []
-    if cond_two_charts:
-        ok_all = True
-        for c in SHEET_NAMES:
-            root = chart_by_class[c][0][1]
-            has_leg = chart_has_legend(root)
-            # 取该班 B1:Q1 与 A4:A7 的实际文字作为对照标准
-            cat6 = get_cells_text(ctx, c, [(1, cc) for cc in range(2, 18)])   # B1:Q1
-            lvl4 = get_cells_text(ctx, c, [(rr, 1) for rr in range(4, 8)])    # A4:A7
-            cat6 = [t for t in cat6 if t]
-            lvl4 = [t for t in lvl4 if t]
-            # 图例文字 = 图表分类标签文字（饼/环图图例项来自各扇区分类名）
-            legend_text = "".join(chart_all_category_text(ctx, root))
-            match_cat = sum(1 for k in cat6 if k in legend_text)
-            match_lvl = sum(1 for k in lvl4 if k in legend_text)
-            corresp = (match_cat >= len(cat6) and len(cat6) > 0) or \
-                      (match_lvl >= len(lvl4) and len(lvl4) > 0)
-            p1c_msgs.append("%s(含图例=%s 对应B1:Q1=%d/%d 对应A4:A7=%d/%d)" % (
-                c, has_leg, match_cat, len(cat6), match_lvl, len(lvl4)))
-            if not (has_leg and corresp):
-                ok_all = False
-        p1c_hit = ok_all
-    else:
-        p1c_msgs.append("缺少两个图表")
-    results.append((1, p1c_hit, "p1_legend",
-        "+1 两图均含图例，且图例文字包含/对应B1:Q1的6个成绩类别 或 A4:A7的4个能力层级"
-        "（%s）" % "; ".join(p1c_msgs)))
-
-    # ---- 得分点 +1：严格按细则判定颜色方案 ----
-    # 细则拆解：
-    #   (1) 两个图表中“同一成绩类别”使用一致或接近一致的颜色方案（便于比较两个班级数据）；
-    #   (2) 图中颜色至少四种。
-    # 两点都要满足才加分。
-    p1d_hit = False
-    color_msg = "缺少两个图表"
-    if cond_two_charts:
-        cm1 = chart_category_color_map(ctx, chart_by_class["七1班"][0][1])
-        cm2 = chart_category_color_map(ctx, chart_by_class["七13班"][0][1])
-        # (1) 同一类别颜色一致/接近一致：按实际 RGB 颜色距离判断，不再要求字符串完全相等。
-        #     对 varyColors 自动配色，则以类别标签对应到的调色板色位为准；只要视觉接近即可。
-        common = [k for k in cm1 if k in cm2]
-        if common:
-            close = 0
-            for k in common:
-                if _rgb_distance(cm1[k], cm2[k]) <= 36:
-                    close += 1
-            ratio = close / len(common)
-        else:
-            ratio = 0.0
-        consistent = (len(common) > 0 and ratio >= 0.8)   # 一致或“接近一致”
-        # (2) 图中颜色至少四种（两个图表各自都需 >=4 种）
-        colors1 = chart_distinct_colors(ctx, chart_by_class["七1班"][0][1])
-        colors2 = chart_distinct_colors(ctx, chart_by_class["七13班"][0][1])
-        enough_colors = (colors1 >= 4 and colors2 >= 4)
-        p1d_hit = consistent and enough_colors
-        color_msg = "同类别颜色一致度=%.0f%%(共有类别%d个) 各图颜色数=[%d,%d] 至少4种=%s" % (
-            ratio * 100, len(common), colors1, colors2, enough_colors)
-    results.append((1, p1d_hit, "p1_color",
-        "+1 两图同一成绩类别颜色一致/接近一致、图中颜色至少4种（%s）" % color_msg))
-
-    # ---- 得分点 +1：严格按细则判定图表标题 ----
-    # 细则拆解：
-    #   (1) 图表上方出现图表标题；
-    #   (2) 标题内容分别为“七1班 探究成绩多类别嵌套饼图”及“七13班 探究成绩多类别嵌套饼图”。
-    # 两个图表都须满足(1)上方有标题 且 (2)标题内容精确匹配各自规定文本，才加分。
-    p1e_hit = False
-    p1e_msgs = []
-    if cond_two_charts:
-        ok_all = True
-        for c in SHEET_NAMES:
-            root = chart_by_class[c][0][1]
-            top_ok, why = chart_title_present_and_top(root)
-            title = chart_get_title(root).strip()
-            content_ok = (title == EXPECTED_TITLES[c])
-            p1e_msgs.append("%s(上方有标题=%s[%s] 内容匹配=%s:'%s')" % (
-                c, top_ok, why, content_ok, title))
-            if not (top_ok and content_ok):
-                ok_all = False
-        p1e_hit = ok_all
-    else:
-        p1e_msgs.append("缺少两个图表")
-    results.append((1, p1e_hit, "p1_title",
-        "+1 图表上方出现标题，内容分别为“七1班 探究成绩多类别嵌套饼图”“七13班 探究成绩多类别嵌套饼图”"
-        "（%s）" % "; ".join(p1e_msgs)))
-
-    return results
-
-
-# =========================================================================
-# 主流程：统一入口 evaluate(dir_path)
-# =========================================================================
-def _dim2_max_score() -> int:
-    """维度2满分（所有正向得分点 max_delta 之和），
-    用于维度1未通过时也能给出统一的 max_score。"""
-    return 1 + 5 + 1 + 1 + 1 + 1  # 对应 6 个 +N 得分点：p1_charts/p5_class/p1_label/p1_legend/p1_color/p1_title
+def _zero_items():
+    """维度1 判负或脚本报错时，仍按细则顺序给出完整的 34 条评分项：
+    delta 全 0、hit 全 False，避免调用方拿到空列表。"""
+    return [{"rule": rule, "max_delta": max_delta, "delta": 0, "hit": False}
+            for rule, max_delta in zip(RULES, _MAX_DELTAS_ORDER)]
 
 
 def evaluate(dir_path):
-    """统一入口：接收脚本所在目录路径，脚本负责在该目录内定位并打开被评估文档。
-
-    参数：
-        dir_path: 脚本所在目录路径（str）。脚本在该目录中定位并打开被评估文档。
-
-    返回：
-        dict：结构遵循《脚本接口差异与统一建议.md》§2.2 约定。
-
-    不 print 主结果、不修改 sys.stdout、不 sys.exit、不硬编码路径。
-    """
+    """按接口约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估的
+    .xlsx / .xlsm（忽略以 ~$ 开头的 Excel 临时锁文件）。目录不存在或目录内没有
+    工作簿时，返回"未找到文件"的空结果（各评分字段留空/归零）；其余脚本自身崩溃
+    由通用兜底捕获并返回 status='error'。"""
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
@@ -1161,72 +834,640 @@ def evaluate(dir_path):
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": _dim2_max_score(),
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        # 在给定目录内定位被评估文档：优先与脚本约定的 TARGET_FILE 同名文件；
-        # 若不存在则回退为目录内第一个 .xlsx/.xlsm 文件。
-        path = os.path.join(dir_path, TARGET_FILE)
-        if not os.path.exists(path):
-            try:
-                candidates = sorted(
-                    f for f in os.listdir(dir_path)
-                    if f.lower().endswith((".xlsx", ".xlsm"))
-                )
-            except OSError as e:
-                result["status"] = "error"
-                result["error"] = "无法读取目录：%s（%s）" % (dir_path, e)
-                return result
-            if candidates:
-                path = os.path.join(dir_path, candidates[0])
-
-        result["file_name"] = os.path.basename(path)
-
-        if not os.path.exists(path):
-            result["status"] = "error"
-            result["error"] = "文件不存在：%s" % path
-            return result
-
-        ctx = {}
-
-        # ---------- 维度1 ----------
-        d1_pass, d1_details = check_dimension1(path, ctx)
-        result["dim1_pass"] = d1_pass
-        if not d1_pass:
-            # 维度1 未全部通过 -> 直接 0 分，不再检查维度2
-            fail_reasons = [msg for ok, msg in d1_details if not ok]
-            result["dim1_reason"] = "; ".join(fail_reasons) if fail_reasons else "未通过"
-            result["total_score"] = 0
-            return result
-
-        # ---------- 维度2 ----------
-        d2_results = check_dimension2(ctx)
-        total = 0
-        items = []
-        for score, hit, rule_key, detail in d2_results:
-            delta = score if hit else 0
-            total += delta
-            items.append({
-                "rule": RULE_TEXTS.get(rule_key, rule_key),
-                "max_delta": score,
-                "delta": delta,
-                "hit": hit,
-                "detail": "",
-            })
-        result["dim2_items"] = items
-        result["total_score"] = total
-        return result
-
-    except Exception as e:
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"目录不存在或不是目录：{dir_path}")
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$")
+            and os.path.isfile(os.path.join(dir_path, f))
+        )
+        if not cands:
+            raise FileNotFoundError(f"目录中未找到 .xlsx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 未找到待评文件：不进入维度判定，dim1_pass 留空，分值一并归零
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = "%s: %s" % (type(e).__name__, e)
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = f"脚本运行异常：{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = (f"维度一未通过：文件无法打开或解析"
+                                f"（{type(exc).__name__}: {exc}），完成度总分记 0")
+        result["dim2_items"] = _zero_items()
+        result["total_score"] = 0
+        return result
+
+
+def _check_dimension1(ctx):
+    """维度1：可用与可修改性。返回不通过的原因列表（空列表 = 通过）。"""
+    fails = []
+    # 1) 包结构完整、所有 XML 部件可解析（打开时不会触发"发现部分内容有问题"）
+    for part in sorted(ctx["names"]):
+        if not part.endswith((".xml", ".rels")):
+            continue
+        try:
+            ET.fromstring(ctx["zip"].read(part))
+        except (ET.ParseError, KeyError) as exc:
+            fails.append("部件 %s 无法解析：%s" % (part, exc))
+    if "[Content_Types].xml" not in ctx["names"]:
+        fails.append("缺少 [Content_Types].xml，工作簿无法作为 OPC 包打开")
+    # 2) 两张成绩表仍在，且 A1:Q7 未错行错列、文字数字未大面积丢失
+    for name in SHEET_NAMES:
+        sheet = ctx["sheets"].get(name)
+        if sheet is None:
+            fails.append("工作表「%s」缺失，成绩数据无法定位" % name)
+            continue
+        bad_labels = [_cell_addr(r, 1) for r in range(1, DATA_ROWS + 1)
+                      if _norm_text((_cell(ctx, name, r, 1) or {}).get("text"))
+                      != A_LABELS[r - 1]]
+        if bad_labels:
+            fails.append("工作表「%s」A 列标签错位/丢失：%s" % (name, ",".join(bad_labels)))
+        kept = sum(1 for row in range(3, DATA_ROWS + 1) for col in range(2, DATA_COLS + 1)
+                   if (_cell(ctx, name, row, col) or {}).get("number") is not None)
+        if kept < 72:
+            fails.append("工作表「%s」A3:Q7 的 80 个数值仅剩 %d 个，数据大面积丢失"
+                         % (name, kept))
+    return fails + _check_dimension1_charts(ctx)
+
+
+def _check_dimension1_charts(ctx):
+    """维度1 中与图表对象有关的门槛：必须是可点选可改数据源的图表对象，
+    且图表区能渲染出扇区（不是空白框、也不是粘贴的静态位图）。"""
+    fails = []
+    if not ctx["charts"]:
+        if ctx["pictures"]:
+            fails.append("工作表内只有 %d 个图片对象、没有任何 Excel 图表对象，"
+                         "图表为图片形式" % ctx["pictures"])
+        else:
+            fails.append("工作簿内未发现任何图表对象")
+        return fails
+    for chart in ctx["charts"]:
+        series = _series_of(chart)
+        if not series:
+            fails.append("%s 内没有饼/环形系列，图表区空白无法渲染" % chart["part"])
+            continue
+        for item in series:
+            values = [v for v in _series_values(ctx, chart, item["ser"]) if v is not None]
+            if not values or sum(values) <= 0:
+                fails.append("%s 的某个系列取不到有效数值，扇区无法渲染" % chart["part"])
+                break
+    return fails
+
+
+def _evaluate_impl(file_path, result):
+    """维度一 + 维度二的评估主体；内部构造 results/details 两个平行列表，
+    末尾按 _MAX_DELTAS_ORDER 反解成结构化 dim2_items 填入 result。"""
+    ctx = _load_package(file_path)
+    results = []
+    details = []
+
+    def emit(hit, rule, detail=""):
+        """追加一条评分结论。命中记 max_delta，未命中记 0；顺序须与
+        _MAX_DELTAS_ORDER 一致，这里顺带校验，写错立即暴露。
+        detail 只作为内部取证说明留档，不随结果返回。"""
+        max_delta = _MAX_DELTAS_ORDER[len(results)]
+        results.append("%+d：%s" % (max_delta if hit else 0, rule))
+        details.append(str(detail).strip() or ("判定命中" if hit else "判定未命中"))
+
+    # ========== 维度1：可用与可修改性 ==========
+    fails = _check_dimension1(ctx)
+    if fails:
+        result["dim1_pass"] = False
+        # dim1_reason 统一带上「维度一未通过：…」前缀与计分后果，便于直接作为错误摘要展示
+        result["dim1_reason"] = "维度一未通过：%s，完成度总分记 0" % "；".join(fails[:6])
+        result["dim2_items"] = _zero_items()
+        result["total_score"] = 0
+        return result
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "工作簿可正常打开，两张成绩表完整，图表为可编辑的 Excel 图表对象"
+
+    # ========== 维度2：完成度评分 ==========
+    # --- 预处理：把每张图表整理成便于逐条判定的画像 ---
+    profiles = [_chart_profile(ctx, chart) for chart in ctx["charts"]]
+    by_sheet = {}
+    for prof in profiles:
+        by_sheet.setdefault(prof["sheet"], []).append(prof)
+
+    _score_charts(ctx, profiles, by_sheet, emit)
+    _score_summary(ctx, profiles, emit)
+    _score_readability(ctx, profiles, emit)
+    _score_deductions(ctx, profiles, emit)
+
+    # ========== 将 results 反解为结构化 dim2_items ==========
+    # 逐项按追加顺序对齐 _MAX_DELTAS_ORDER：解析每条 "±N：说明" 的 N 与 rule。
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"dim2 项数不一致：results={len(results)} vs order={len(_MAX_DELTAS_ORDER)}"
+        )
+    dim2_items = []
+    total_score = 0
+    # details 仅保留各判定处的取证说明供排查，不再随结果返回
+    for raw, _detail, max_delta in zip(results, details, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head)
+        except ValueError:
+            delta = 0
+        hit = delta != 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total_score += (max_delta if hit else 0)
+
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def _chart_profile(ctx, chart):
+    """把一张图表整理成逐条细则都能直接读的画像。"""
+    prof = {"sheet": chart["sheet"], "part": chart["part"], "chart": chart,
+            "title": _chart_title(ctx, chart), "series": [], "data_sheets": set()}
+    for item in _series_of(chart):
+        ser = item["ser"]
+        values = _series_values(ctx, chart, ser)
+        labels = _series_labels(ctx, chart, ser)
+        val_ref = _ref_of(ser, "val")
+        cells = list(_iter_ref_cells(val_ref, chart["sheet"])) if val_ref else []
+        prof["data_sheets"].update(s for s, _, _ in cells)
+        prof["series"].append({
+            "ser": ser, "plot": item["plot"], "plot_tag": item["plot_tag"],
+            "values": values, "labels": labels, "count": len(values),
+            "val_ref": val_ref, "cat_ref": _ref_of(ser, "cat"), "val_cells": cells,
+            "has_ref": ser.find("c:val//c:numRef/c:f", NS) is not None,
+            "colors": _dpt_colors(ser, chart["theme"], len(values)),
+            "shows_val": _shows_values(item["plot"], ser),
+            "outline": _has_outline(ser, len(values)),
+        })
+    prof["ring_count"] = len(prof["series"])
+    holes = []
+    for plot in chart["root"].findall(".//c:doughnutChart", NS):
+        node = plot.find("c:holeSize", NS)
+        holes.append(float(node.get("val")) if node is not None and node.get("val") else 0.0)
+    prof["hole"] = min(holes) if holes else 0.0
+    prof["is_pie_family"] = bool(prof["series"])
+    prof["legend"] = chart["root"].find(".//c:legend/c:legendPos", NS) is not None
+    # 内层 / 外层
+    inner = prof["series"][0] if prof["series"] else None
+    outer = prof["series"][1] if len(prof["series"]) > 1 else None
+    prof["inner"], prof["outer"] = inner, outer
+    prof["inner_kind"] = None
+    if inner is not None:
+        if tuple(inner["labels"]) == CATEGORIES:
+            prof["inner_kind"] = "category"
+        elif tuple(inner["labels"]) == LEVELS:
+            prof["inner_kind"] = "level"
+    expect = None
+    if prof["inner_kind"] == "category":
+        expect = INNER_BY_CATEGORY.get(prof["sheet"])
+    elif prof["inner_kind"] == "level":
+        expect = INNER_BY_LEVEL.get(prof["sheet"])
+    prof["inner_expect"] = expect
+    prof["inner_values_ok"] = bool(
+        expect and inner and len(inner["values"]) == len(expect) and
+        all(v is not None and abs(v - e) <= 0.5 for v, e in zip(inner["values"], expect)))
+    prof["chunks"] = (_chunk_align(inner["values"], outer["values"])
+                      if inner and outer else None)
+    prof["cx"], prof["cy"], prof["rect"] = _chart_geometry(ctx, chart)
+    return prof
+
+
+# ============================================== 细则原文（与 _MAX_DELTAS_ORDER 同序）
+RULES = (
+    # ---- 一、加分项 ----
+    '工作表"七1班"与"七13班"各内嵌 1 张图表，共 2 张，两个班的数据分别独立成图'
+    '（未把两班混在同一张图内、未只做 1 张）',
+    '两张图表各有可区分班级的图表标题（如"七1班 探究成绩多类别嵌套饼图"'
+    '"七13班 探究成绩多类别嵌套饼图"）',
+    '图表为饼/环形族的双层同心嵌套结构（同一张图内 2 个数据系列同心叠放），'
+    '不是并列摆放的两个独立饼图，也不是单层饼图',
+    '圈心孔径为 0 或接近 0，内层呈实心饼、外层呈环带，整体为"合并饼图"外观'
+    '而非中间大空洞的双环图',
+    '内层扇区依次为"地图基础""经纬定位""地形判读""气候要素""区域差异""聚落形态"'
+    '六个探究表现大类，或"卓越表现""稳定达成""基本达成""持续提升"四个能力层级大类',
+    '外层扇区为能力层级或探究表现细分（按 24 个能力层级或探究表现明细项），'
+    '且外层按大类顺序连续排列，每个内层扇区正对其下属外层扇区，内外层角度对齐',
+    '图表只有探究表现、能力层级两个层级，未额外堆叠第三层及以上圈层',
+    '内层各扇区数值等于该大类下各明细项之和——以探究表现作内层时，七1班依次 '
+    '153/153/106/99/157/150，七13班依次 156/148/102/104/150/153；以能力层级作内层时，'
+    '七1班依次 463/175/114/66，七13班依次 493/163/101/56（两班扇区合计分别为 818、813）；'
+    '且外层同一大类内各扇区之和等于对应内层扇区数值',
+    '图表数据源指向工作簿内的单元格区域引用，而非把数值硬编码为图表内字面量，'
+    '源数据改动后图表可更新',
+    '为绘图新增的汇总区域放在不覆盖数据表的空白区域，未占用 A1:Q7 任何单元格',
+    '汇总数值由公式（如 SUM）计算得出而非手敲常量，改动 A1:Q7 中人数后汇总与图表可联动',
+    '新增汇总区域带可读的行列表头（大类名称、能力层级或等级名称）',
+    '同一大类的内层扇区与其外层子扇区使用同一色系/同一主题色，可直观识别归属关系',
+    '内外两层扇区均显示数据标签（人数或百分比），标签数量与扇区数一致',
+    '扇区之间有描边（如白色细边线）分隔，相邻扇区不粘连',
+    '图表带图例，图例项为探究表现或能力层级的类别名称',
+    '图表尺寸不小于约 15cm×10cm（约横跨 12 列、纵跨 20 行），扇区标签互不重叠、不被截断',
+    '图表放在其数据所在的同一工作表内，且未压盖 A1:Q7 数据表区域与新增汇总区域',
+    # ---- 二、减分项 ----
+    '两张工作表第 1 行 B1:D1、E1:G1、H1:I1、J1:K1、L1:N1、O1:Q1 六个合并区域内的'
+    '全部单元格（含被合并覆盖的 C1、D1、F1、G1、I1、K1、M1、N1、P1、Q1）格式被重置'
+    '——不再满足纯色填充 #174A55、字体 黑体 11 磅加粗白色 #FFFFFF、水平居中 + 垂直居中，'
+    '以及"区域外侧竖边为中粗线、区域内部竖边为细线、上下边为细线"的分隔关系'
+    '（被合并覆盖的格被改成等线 12 磅非加粗且无填充、取消合并后暴露只有首格有底色的断色，'
+    'L1 右侧竖边被改为中粗线，均计）',
+    '第 2 行"识图/判读/表达/观察/分析/归纳/定位/解释/识别/比较/计算/推理/应用/观察/判断/表达"'
+    '16 个单元格的字体、填充、边框、居中格式被改动',
+    'A 列"探究表现""能力层级""参与人数""卓越表现""稳定达成""基本达成""持续提升"'
+    '7 个标签单元格的字体、填充、边框格式被改动',
+    '数据表第 1、2 行行高不满足 15，第 3~7 行行高不满足 25（被统一压成同一数值均计）',
+    '为数据区以外的大量空白行（如第 8~120 行）逐行设置了自定义行高',
+    'A 列列宽不满足 24.17、B~Q 列列宽不满足 8',
+    '在 S~AB 等空白列上新增自定义列宽（如 24/10/3），改变数据表以外区域的列宽外观',
+    'A1:Q7 内任一文字或数值被增删改写（6 个探究表现大类名、16 个能力层级名、'
+    '参与人数与四个等级共 80 个整数须逐一保持原值原类型）',
+    'B1:D1、E1:G1、H1:I1、J1:K1、L1:N1、O1:Q1 六个合并单元格被取消合并或合并范围改变',
+    '删除"七1班"或"七13班"任一工作表，或改变两张工作表的名称与先后顺序',
+    '删除或破坏工作簿内已有的其它图表、图片、批注等对象',
+    '工作表"不显示网格线"的显示设置被改为显示网格线',
+    '在工作表单元格内新增与图表标题重复的文字标题及其合并区域'
+    '（如在 S1:AB1 写入"七1班 探究成绩多类别嵌套饼图"）',
+    '新增的中间计算区域铺开超过 30 行（如展开成 60 行以上的逐项明细清单），'
+    '使工作表出现大段冗余内容',
+    '图表压盖 A1:Q7 数据表或压盖新增汇总区域，遮挡单元格内容',
+    '新增与绘图无关的工作表、隐藏行列或定义名称',
+)
+assert len(RULES) == len(_MAX_DELTAS_ORDER)
+
+
+# =============================================================== 维度2 计分
+
+
+def _summary_cells(prof):
+    """该图表在自己工作表上、数据表以外引用到的单元格（即为绘图新增的汇总区域）。"""
+    keys = set()
+    for item in prof["series"]:
+        for ref in (item["val_ref"], item["cat_ref"]):
+            for sheet, row, col in _iter_ref_cells(ref, prof["sheet"]):
+                if sheet == prof["sheet"] and not (row <= DATA_ROWS and col <= DATA_COLS):
+                    keys.add((row, col))
+    return keys
+
+
+def _score_charts(ctx, profiles, by_sheet, emit):
+    """加分项 01~08：交付覆盖与嵌套结构。"""
+    # 01 两表各内嵌 1 张、两班数据分别独立成图
+    spread = [len(by_sheet.get(name, [])) for name in SHEET_NAMES]
+    cross = [p["sheet"] for p in profiles if p["data_sheets"] - {p["sheet"]}]
+    emit(len(profiles) == 2 and spread == [1, 1] and not cross, RULES[0],
+         "图表共 %d 张，按表分布 %s，跨班取数的图表：%s"
+         % (len(profiles), dict(zip(SHEET_NAMES, spread)), cross or "无"))
+    # 02 标题可区分班级
+    titles = {p["sheet"]: p["title"] for p in profiles}
+    emit(len(profiles) == 2 and len(set(titles.values())) == 2
+         and all(name in (titles.get(name) or "") for name in SHEET_NAMES),
+         RULES[1], "图表标题：%s" % (titles,))
+    # 03 双层同心嵌套：同一张图内恰为 2 个饼/环形系列同心叠放
+    rings = [p["ring_count"] for p in profiles]
+    emit(bool(profiles) and all(n == 2 for n in rings), RULES[2],
+         "各图饼/环形系列数：%s（应恰为 2 层；1 层是单层饼图，3 层及以上已不是双层结构）"
+         % (rings,))
+    # 04 圈心孔径为 0 或接近 0
+    holes = [p["hole"] for p in profiles]
+    emit(bool(profiles) and all(h <= 10.0 for h in holes), RULES[3],
+         "各图 holeSize：%s（<=10 视为接近实心）" % (holes,))
+    # 05 内层为六个探究表现大类或四个能力层级大类
+    kinds = {p["sheet"]: (p["inner_kind"] or "未识别（内层分类名=%s）"
+                          % ((p["inner"]["labels"][:6] if p["inner"] else []),))
+             for p in profiles}
+    emit(bool(profiles) and all(p["inner_kind"] for p in profiles), RULES[4],
+         "内层分类：%s" % (kinds,))
+    # 06 外层 24 个明细扇区、按大类顺序连续排列、内外角度对齐
+    outer_n = [(p["outer"]["count"] if p["outer"] else 0) for p in profiles]
+    aligned = [p["chunks"] is not None for p in profiles]
+    emit(bool(profiles) and all(n == 24 for n in outer_n) and all(aligned), RULES[5],
+         "外层扇区数：%s；内外层分组对齐：%s" % (outer_n, aligned))
+    # 07 只有两个层级
+    emit(bool(profiles) and all(n == 2 for n in rings), RULES[6],
+         "各图圈层数：%s" % (rings,))
+    # 08 内层数值等于大类之和，外层组内之和等于内层
+    vals_ok = [(p["inner_values_ok"], p["chunks"] is not None) for p in profiles]
+    emit(bool(profiles) and all(a and b for a, b in vals_ok), RULES[7],
+         "（内层数值匹配, 外层分组求和匹配）=%s" % (vals_ok,))
+
+
+_LABEL_VOCAB = tuple(set(CATEGORIES) | set(LEVELS) | set(ABILITY_NAMES) | {"类别", "人数"})
+
+
+def _score_summary(ctx, profiles, emit):
+    """加分项 09~12：汇总数据与联动。"""
+    # 09 数据源为单元格区域引用
+    refs = [item["has_ref"] for p in profiles for item in p["series"]]
+    emit(bool(refs) and all(refs), RULES[8],
+         "%d/%d 个系列的数值绑定了 c:numRef 区域引用" % (sum(1 for x in refs if x), len(refs)))
+    # 10 汇总区域未占用 A1:Q7
+    invade = []
+    for prof in profiles:
+        for item in prof["series"]:
+            for ref in (item["val_ref"], item["cat_ref"]):
+                if ref and _ref_hits_data_area(ref, prof["sheet"]):
+                    invade.append(ref)
+    emit(bool(profiles) and not invade, RULES[9],
+         "引用落入 A1:Q7 的区域：%s" % (invade[:3] or "无"))
+    # 11 汇总数值由公式计算
+    total = hardcoded = 0
+    for prof in profiles:
+        for item in prof["series"]:
+            for sheet, row, col in _iter_ref_cells(item["val_ref"], prof["sheet"]):
+                cell = _cell(ctx, sheet, row, col)
+                total += 1
+                if cell is None or not cell["has_formula"]:
+                    hardcoded += 1
+    emit(bool(total) and hardcoded == 0, RULES[10],
+         "被引用的 %d 个数值单元格中，%d 个是手敲常量（无公式）" % (total, hardcoded))
+    # 12 汇总区域带可读行列表头
+    counts = {}
+    for prof in profiles:
+        sheet = ctx["sheets"].get(prof["sheet"])
+        if sheet is None:
+            continue
+        hit = 0
+        for (row, col), cell in _new_cells_outside_data(sheet).items():
+            text = _norm_text(cell["text"])
+            if not text or cell["number"] is not None:
+                continue
+            if any(word in text for word in _LABEL_VOCAB):
+                hit += 1
+        counts[prof["sheet"]] = hit
+    emit(bool(counts) and all(n >= 4 for n in counts.values()), RULES[11],
+         "各表汇总区可读表头/分类名数量：%s" % (counts,))
+
+
+def _color_family_ok(prof):
+    """内层每个扇区与其下属外层子扇区是否同色系；返回 (是否达标, 说明)。"""
+    if prof["chunks"] is None or not prof["inner"] or not prof["outer"]:
+        return (False, "内外层无法按大类对齐，无法判定归属配色")
+    inner_c, outer_c = prof["inner"]["colors"], prof["outer"]["colors"]
+    bad = []
+    for i, (start, end) in enumerate(prof["chunks"]):
+        base = inner_c[i] if i < len(inner_c) else None
+        if not base:
+            bad.append("内层第%d扇区未单独设色" % (i + 1))
+            continue
+        for j in range(start, end):
+            sub = outer_c[j] if j < len(outer_c) else None
+            if not sub:
+                bad.append("外层第%d扇区未单独设色" % (j + 1))
+            elif not _same_color_family(base, sub):
+                bad.append("外层第%d扇区 #%s 与内层第%d扇区 #%s 非同色系"
+                           % (j + 1, sub, i + 1, base))
+    return (not bad, "；".join(bad[:3]) if bad else "内外层逐大类同色系")
+
+
+def _score_readability(ctx, profiles, emit):
+    """加分项 13~18：可读性与摆放。"""
+    # 13 内外层同色系
+    color = [_color_family_ok(p) for p in profiles]
+    emit(bool(color) and all(ok for ok, _ in color), RULES[12],
+         "；".join("%s：%s" % (p["sheet"], why) for p, (_, why) in zip(profiles, color)))
+    # 14 内外两层均显示数据标签
+    shown = [(p["sheet"], [item["shows_val"] for item in p["series"]]) for p in profiles]
+    emit(bool(profiles) and all(flags and all(flags) for _, flags in shown), RULES[13],
+         "各图逐系列标签显示：%s" % (dict(shown),))
+    # 15 扇区之间有描边
+    lines = [(p["sheet"], [item["outline"] for item in p["series"]]) for p in profiles]
+    emit(bool(profiles) and all(flags and all(flags) for _, flags in lines), RULES[14],
+         "各图逐系列描边：%s" % (dict(lines),))
+    # 16 图表带图例
+    emit(bool(profiles) and all(p["legend"] for p in profiles), RULES[15],
+         "各图图例：%s" % ({p["sheet"]: p["legend"] for p in profiles},))
+    # 17 尺寸不小于 15cm×10cm 且标签不重叠不截断
+    geo = {}
+    for prof in profiles:
+        widest = max([item["count"] for item in prof["series"]] or [0])
+        geo[prof["sheet"]] = ("%.1f×%.1fcm" % (prof["cx"] / EMU_PER_CM, prof["cy"] / EMU_PER_CM),
+                              "单圈最多%d个扇区" % widest)
+    size_ok = bool(profiles) and all(
+        p["cx"] >= MIN_CHART_CX and p["cy"] >= MIN_CHART_CY
+        and max([item["count"] for item in p["series"]] or [0]) <= MAX_READABLE_POINTS
+        for p in profiles)
+    emit(size_ok, RULES[16], "各图尺寸与扇区密度：%s" % (geo,))
+    # 18 与数据同表且未压盖数据表与汇总区
+    place = []
+    for prof in profiles:
+        summary = _bbox(_summary_cells(prof))
+        if prof["data_sheets"] - {prof["sheet"]}:
+            place.append("%s：图表与其数据源不在同一工作表" % prof["sheet"])
+        elif _rects_overlap(prof["rect"], (1, 1, DATA_COLS, DATA_ROWS)):
+            place.append("%s：图表压盖 A1:Q7" % prof["sheet"])
+        elif _rects_overlap(prof["rect"], summary):
+            place.append("%s：图表压盖汇总区域 %s" % (prof["sheet"], summary))
+    emit(bool(profiles) and not place, RULES[17],
+         "；".join(place) if place else "两图均与数据同表且未压盖数据表与汇总区")
+
+
+def _score_deductions(ctx, profiles, emit):
+    """减分项 19~39：指令未要求、却破坏成绩表本体与工作簿结构的多余修改。"""
+    def fmt(sheet, row, col):
+        return _style_of(ctx, _cell(ctx, sheet, row, col))
+
+    sheets = [n for n in SHEET_NAMES if n in ctx["sheets"]]
+    # 19 第 1 行六个合并区域全部单元格（含被覆盖格）的填充/字体/对齐/边框
+    bad = []
+    for name in sheets:
+        for col in range(2, DATA_COLS + 1):
+            got = fmt(name, 1, col)
+            want_l, want_r = ROW1_VERT[col]
+            why = []
+            if got["fill"] != ("solid", HEAD_FILL):
+                why.append("填充=%s" % (got["fill"],))
+            if got["font"] != HEAD_FONT:
+                why.append("字体=%s" % (got["font"],))
+            if got["align"] != ("center", "center"):
+                why.append("对齐=%s" % (got["align"],))
+            if (got["border"].get("left") != want_l or got["border"].get("right") != want_r
+                    or got["border"].get("top") != "thin"
+                    or got["border"].get("bottom") != "thin"):
+                why.append("边框=%s" % (got["border"],))
+            if why:
+                bad.append("%s!%s %s" % (name, _cell_addr(1, col), "、".join(why)))
+    emit(bool(bad), RULES[18],
+         "格式被重置的表头格（共%d个）：%s" % (len(bad), "；".join(bad[:2]) or "无"))
+    # 20 第 2 行 16 个能力层级单元格格式
+    bad = []
+    for name in sheets:
+        for col in range(2, DATA_COLS + 1):
+            got = fmt(name, 2, col)
+            want_l, want_r = ROW2_VERT[col]
+            if (got["font"] != ROW2_FONT or got["fill"] != ("solid", ROW2_FILL)
+                    or got["align"] != ("center", "center")
+                    or got["border"].get("left") != want_l
+                    or got["border"].get("right") != want_r
+                    or got["border"].get("top") != "thin"
+                    or got["border"].get("bottom") != "thin"):
+                bad.append("%s!%s" % (name, _cell_addr(2, col)))
+    emit(bool(bad), RULES[19],
+         "格式被改的能力层级格（共%d个）：%s" % (len(bad), bad[:8] or "无"))
+    # 21 A 列 7 个标签单元格格式
+    bad = []
+    for name in sheets:
+        for row, want in ACOL_EXPECT.items():
+            got = fmt(name, row, 1)
+            font, fill, horiz, vert, top, bottom = want
+            if (got["font"] != font or got["fill"] != ("solid", fill)
+                    or got["align"] != (horiz, vert)
+                    or got["border"].get("top") != top
+                    or got["border"].get("bottom") != bottom
+                    or got["border"].get("left") != "medium"
+                    or got["border"].get("right") != "medium"):
+                bad.append("%s!A%d" % (name, row))
+    emit(bool(bad), RULES[20],
+         "格式被改的 A 列标签格（共%d个）：%s" % (len(bad), bad[:8] or "无"))
+    # 22 第 1、2 行行高 15，第 3~7 行行高 25
+    bad = []
+    for name in sheets:
+        sheet = ctx["sheets"][name]
+        for row, want in ROW_HEIGHTS.items():
+            got = sheet["rows"].get(row, {}).get("ht")
+            got = sheet["default_height"] if got is None else got
+            if abs(got - want) > HEIGHT_TOL:
+                bad.append("%s!第%d行=%.4g（应%.4g）" % (name, row, got, want))
+    emit(bool(bad), RULES[21], "；".join(bad[:4]) if bad else "两表 1~7 行行高均为原值")
+    # 23 数据区以外空白行逐行自定义行高
+    counts = {}
+    for name in sheets:
+        sheet = ctx["sheets"][name]
+        counts[name] = sum(1 for row, info in sheet["rows"].items()
+                           if row > DATA_ROWS and info["custom"] and info["ht"] is not None)
+    emit(any(n >= 20 for n in counts.values()), RULES[22],
+         "各表数据区以外被逐行设置自定义行高的行数：%s" % (counts,))
+
+    def width_of(sheet, col):
+        for entry in sheet["cols"]:
+            if entry["min"] <= col <= entry["max"] and entry["width"] is not None:
+                return entry["width"]
+        return sheet["default_width"]
+
+    # 24 A 列列宽 24.17、B~Q 列列宽 8
+    bad = []
+    for name in sheets:
+        sheet = ctx["sheets"][name]
+        for col in range(1, DATA_COLS + 1):
+            want = COL_WIDTH_A if col == 1 else COL_WIDTH_BQ
+            got = width_of(sheet, col)
+            if abs(got - want) > WIDTH_TOL:
+                bad.append("%s!%s列=%.4g（应%.4g）" % (name, _col_name(col), got, want))
+    emit(bool(bad), RULES[23], "；".join(bad[:4]) if bad else "两表 A~Q 列列宽均为原值")
+    # 25 S~AB 等空白列新增自定义列宽
+    extra = {}
+    for name in sheets:
+        got = ["%s:%s=%.4g" % (_col_name(e["min"]), _col_name(e["max"]), e["width"])
+               for e in ctx["sheets"][name]["cols"]
+               if e["min"] > DATA_COLS and e["width"] is not None]
+        if got:
+            extra[name] = got
+    emit(bool(extra), RULES[24],
+         "数据表以外新增的自定义列宽：%s" % (extra or "无"))
+    # 26 A1:Q7 内文字或数值被增删改写
+    bad = []
+    starts = {span[0]: name for span, name in zip(CAT_SPANS, CATEGORIES)}
+    for name in sheets:
+        for row in range(1, DATA_ROWS + 1):
+            for col in range(1, DATA_COLS + 1):
+                cell = _cell(ctx, name, row, col)
+                text = (cell["text"] or "") if cell else ""
+                if col == 1:
+                    want = A_LABELS[row - 1]
+                elif row == 1:
+                    want = starts.get(col, "")
+                elif row == 2:
+                    want = ABILITY_NAMES[col - 2]
+                else:
+                    number = cell["number"] if cell else None
+                    want_n = DATA_BASELINE[name][row][col - 2]
+                    if number is None or abs(number - want_n) > 1e-9:
+                        bad.append("%s!%s=%r（应 %d）"
+                                   % (name, _cell_addr(row, col), text, want_n))
+                    continue
+                if _norm_text(text) != _norm_text(want):
+                    bad.append("%s!%s=%r（应 %r）"
+                               % (name, _cell_addr(row, col), text, want))
+    emit(bool(bad), RULES[25],
+         "被改写的单元格（共%d个）：%s" % (len(bad), bad[:4] or "无"))
+    # 27 六个合并单元格被取消或范围改变
+    bad = []
+    for name in sheets:
+        have = set(ctx["sheets"][name]["merges"])
+        missing = [ref for ref in MERGE_REFS if ref not in have]
+        if missing:
+            bad.append("%s 缺少 %s" % (name, missing))
+    emit(bool(bad), RULES[26], "；".join(bad) if bad else "两表六个合并表头区域完好")
+    # 28 删除工作表或改变名称与顺序
+    order = tuple(ctx["sheet_order"][:len(SHEET_NAMES)])
+    emit(order != SHEET_NAMES, RULES[27],
+         "工作表顺序=%s（应为 %s）" % (list(ctx["sheet_order"]), list(SHEET_NAMES)))
+    # 29 删除或破坏已有的其它图表/图片/批注等对象
+    emit(False, RULES[28],
+         "成绩表内不含图表、图片、批注等已有对象，无可破坏项，本项不计扣分")
+    # 30 "不显示网格线"被改为显示网格线
+    shown = [name for name in sheets if ctx["sheets"][name]["gridlines"]]
+    emit(bool(shown), RULES[29],
+         "网格线被改为显示的工作表：%s" % (shown or "无"))
+    # 31 单元格内新增与图表标题重复的文字标题
+    titles = [p["title"] for p in profiles if len(p["title"] or "") >= 6]
+    dup = []
+    for name in sheets:
+        for (row, col), cell in _new_cells_outside_data(ctx["sheets"][name]).items():
+            text = _norm_text(cell["text"])
+            if len(text) >= 6 and any(t in text or text in t for t in titles):
+                dup.append("%s!%s=%r" % (name, _cell_addr(row, col), cell["text"]))
+    emit(bool(dup), RULES[30],
+         "与图表标题重复的单元格文字：%s" % (dup[:4] or "无"))
+    # 32 中间计算区域铺开超过 30 行
+    spans = {}
+    for name in sheets:
+        rows = set(r for r, _ in _new_cells_outside_data(ctx["sheets"][name]))
+        spans[name] = len(rows)
+    emit(any(n > 30 for n in spans.values()), RULES[31],
+         "各表数据区以外写入内容的行数：%s" % (spans,))
+    # 33 图表压盖 A1:Q7 或压盖汇总区域
+    cover = []
+    for prof in profiles:
+        summary = _bbox(_summary_cells(prof))
+        if _rects_overlap(prof["rect"], (1, 1, DATA_COLS, DATA_ROWS)):
+            cover.append("%s：压盖 A1:Q7" % prof["sheet"])
+        elif _rects_overlap(prof["rect"], summary):
+            cover.append("%s：压盖汇总区域 %s" % (prof["sheet"], summary))
+    emit(bool(cover), RULES[32], "；".join(cover) if cover else "两图均未压盖表格与汇总区")
+    # 34 新增无关工作表、隐藏行列或定义名称
+    junk = []
+    spare = [n for n in ctx["sheet_order"] if n not in SHEET_NAMES]
+    if spare:
+        junk.append("新增工作表 %s" % spare)
+    hidden = [n for n in sheets if ctx["sheets"][n]["hidden_rc"]]
+    if hidden:
+        junk.append("存在隐藏行或隐藏列的工作表 %s" % hidden)
+    if ctx["defined_names"]:
+        junk.append("新增定义名称 %s" % ctx["defined_names"][:5])
+    emit(bool(junk), RULES[33], "；".join(junk) if junk else "无多余工作表、隐藏行列与定义名称")
 
 
 if __name__ == "__main__":
-    # 本地调试用：默认使用脚本所在目录；也可通过命令行覆盖。
-    import json
-
-    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+    # 仅本地调试用：正式评测由外部调用 evaluate(dir_path)，本模块自身不打印结果。
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

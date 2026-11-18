@@ -1,2888 +1,1704 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自动评估《电化学分析示意图》可编辑 PPT。
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingTypeStubs=false, reportPrivateUsage=false, reportUnknownParameterType=false, reportUnusedVariable=false
+"""053 电化学分析系统原理图 PPT 完成度评测。
 
-评估逻辑严格按题目要求分两层：
-1. 维度1为硬门槛，任一项不满足则直接 0 分并跳过维度2。
-2. 维度1通过后，维度2逐项检测；命中任一得分/扣分点即累计对应分值。
+按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。主结果统一由
+evaluate(dir_path) -> dict 返回；入参为“脚本所在目录的路径”，由脚本自己在该目录内
+定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为本地调试入口，才把 dict 序列化
+为 JSON 打印。
 
-用法：
-    python evaluate_ppt.py
-    python evaluate_ppt.py "电化学分析示意图_可编辑PPT.pptx"
+返回信息约定：
+  * status="error" 表示这份交付根本没能进入评分（目录不存在、目录中无 .pptx、脚本异常），
+    此时 dim1_pass 为空串 ""（未判定）、dim2_items 为 []、total_score 与 max_score 均为 0。
+  * dim1_pass 为 False 时 dim1_reason 必须带错误摘要；为 True 时 dim1_reason 为空串。
+  * dim2_items 每项只输出 rule / max_delta / delta / hit 四个键，rule 取细则原文，
+    delta 只取 0 或 max_delta 两个值。
 """
 
 from __future__ import annotations
 
 import json
-import math
+import os
 import re
 import sys
-import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Iterable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
-from pptx import Presentation
+SCRIPT_ID = "053"
+MAX_SCORE_TOTAL = 86
 
-EMU_PER_CM = 360_000
-EMU_PER_PT = 12_700
-DEFAULT_FILE = "电化学分析示意图_可编辑PPT.pptx"
+EMU_PER_CM = 360000.0
+EMU_PER_PT = 12700.0
+# <a:ln> 未显式给出 w 时，PowerPoint 按 1 磅（细线）渲染，评分须按 1.0 磅判定。
+DEFAULT_LINE_WIDTH_PT = 1.0
+# 未显式给出 sz 的 <a:rPr>，PowerPoint 按 18 磅默认字号渲染。
+DEFAULT_FONT_SIZE_PT = 18.0
+# 百分比区间容差：0.2 个百分点以内视为落在区间内的取整误差。
+PCT_TOL = 0.2
+# 颜色“近似”判定：RGB 三通道最大偏差阈值。
+RGB_TOL = 36
+RGB_TOL_LOOSE = 48
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
+A = "{%s}" % NS["a"]
+P = "{%s}" % NS["p"]
 
-SANS_FONTS = (
-    "微软雅黑",
-    "microsoft yahei",
-    "黑体",
-    "simhei",
-    "heiti",
-    "等线",
-    "dengxian",
-    "arial",
-    "calibri",
-    "noto sans",
-    "sans",
+# 维度2 细则：(满分, 细则原文)，顺序与《评测细则.txt》完全一致。
+_DIM2_RULES: list[tuple[int, str]] = [
+    (5, "幻灯片上全部图形与文字构成的整体内容区域宽高比为1.63–1.73（即近似1.68:1），未被拉伸为与16:9页面一致的1.78:1"),
+    (5, "幻灯片上全部图形与文字构成的整体内容区域在页面上居中放置：左右两侧留白差值不超过整体宽度的3%，上下两侧留白差值不超过整体高度的5%"),
+    (3, "幻灯片出现一个无填充的矩形边框：边线为蓝色单实线，线宽2–3.5磅；左边线位于页面从左至右1%–5%、右边线位于95%–99%，上边线位于页面从上至下0%–3%、下边线位于97%–101%"),
+    (3, "幻灯片在页面从左至右14%–36%、从上至下4%–14%的位置出现“分析物输入”文本：颜色为蓝色（近似#557CB6），字号19–23磅"),
+    (1, "幻灯片在页面从左至右19%–27%、从上至下10%–21%的位置出现一条竖直向下的蓝色虚线箭头：线型为虚线，末端带箭头"),
+    (5, "幻灯片在页面从左至右9%–33%、从上至下39%–74%的位置出现一个烧杯图形：由杯身轮廓、内部液体色块与气泡组成，整体宽度5.5–7.5cm，高度4.5–6.5cm"),
+    (3, "幻灯片在页面从左至右11%–30%、从上至下47%–72%的位置出现一块浅蓝色液体色块：为渐变或纯色浅蓝（近似#B6E2FD），顶部呈水平液面形态"),
+    (1, "幻灯片在页面从左至右13%–28%、从上至下56%–69%的范围内出现7个及以上圆形气泡形状：直径0.15–0.55cm，填充为白色至浅蓝的渐变或浅蓝色，位置分散不重叠堆叠"),
+    (3, "幻灯片在页面从左至右11%–19%、从上至下38%–62%的位置出现一根绿色电极杆图形：杆体高度3–4.5cm、宽度0.3–1.5cm；沿长度方向分为上、中、下三段及以上——上段为绿色帽套（近似#5EAD5F），中段为白色或灰白色的细杆（肉眼呈白色玻璃管质感，不是绿色的浅色调），下段末端收窄为尖端而非平直矩形端"),
+    (3, "幻灯片在页面从左至右17%–25%、从上至下23%–66%的位置出现一根竖直柱体形状：柱身为白色或浅色，顶端带深色帽盖（近似#2E3F58），帽盖位于页面从上至下23%–32%的位置"),
+    (3, "幻灯片在页面从左至右22%–30%、从上至下38%–62%的位置出现一根红色电极杆图形：杆体高度3–4.5cm、宽度0.3–1.5cm；沿长度方向分为上、中、下三段及以上——上段为红色帽套（近似#B90303或#EA0000），中段为白色或灰白色的细杆（肉眼呈白色玻璃管质感，不是红色的浅色调），下段末端收窄为尖端而非平直矩形端"),
+    (1, "幻灯片在页面从左至右2%–15%、从上至下47%–57%的位置出现“参比电极”文本：字号13–17磅"),
+    (1, "幻灯片在页面从左至右16%–30%、从上至下44%–53%的位置出现“工作电极”文本：字号13–17磅"),
+    (1, "幻灯片在页面从左至右28%–39%、从上至下47%–57%的位置出现“对电极”文本：字号13–17磅"),
+    (1, "幻灯片在页面从左至右12%–28%、从上至下62%–71%的位置出现“样品溶液”文本：字号13–17磅"),
+    (1, "幻灯片在页面从上至下49%–56%的位置出现两条水平的黑色实线箭头，长度均为0.5–1.5cm：一条位于页面从左至右10%–16%、箭头头部在其右端（自左向右指向电极），另一条位于页面从左至右26%–32%、箭头头部在其左端（自右向左指向电极）"),
+    (5, "幻灯片在页面从左至右37%–66%、从上至下44%–66%的位置出现一个斜视立体外观的机箱图形：由四块色块拼出厚度——浅灰色顶面（近似#C7D0E0）为高度不超过1.2cm的扁平斜置四边形，深蓝色前壳（近似#233959）为正面块，前壳之内叠放亮蓝色面板（近似#1777D5），前壳右边线以右另有一块颜色比顶面更深的灰蓝色右侧面色块、其高度在2.5cm以上；顶面右端与右侧面色块右端均比前壳右边线向右多伸出1cm以上"),
+    (3, "幻灯片在页面从左至右39%–48%、从上至下51%–62%的位置出现一个小屏幕矩形：为白色填充或白色边框，内部有波形折线"),
+    (1, "幻灯片在页面从左至右53%–59%、从上至下49%–62%的位置出现3个圆形指示灯：直径0.15–0.45cm，自上而下填充分别为绿色、深灰蓝色、红色"),
+    (1, "幻灯片在页面从左至右44%–58%、从上至下52%–60%的位置出现“电化学分析仪”文本：白色，字号11–13磅，非加粗"),
+    (3, "幻灯片在页面从左至右46%–65%、从上至下30%–40%的位置出现一个无填充、蓝色虚线边框的圆角矩形，其内为“信号采集与处理”文本：文本字号13–16磅"),
+    (3, "幻灯片在页面从左至右41%–58%、从上至下68%–79%的位置出现一个无填充、蓝色虚线边框的圆角矩形，其内为“电位/电流控制”文本：文本字号14–18磅"),
+    (3, "幻灯片在页面从左至右73%–93%、从上至下18%–31%的位置出现一个无填充、蓝色虚线边框的圆角矩形，其内为“数据分析与可视化”文本：文本字号13–19磅"),
+    (1, "幻灯片出现3条竖直的蓝色虚线箭头：分别位于页面从左至右47%–53%且从上至下63%–71%、从左至右53%–59%且从上至下38%–48%、从左至右80%–86%且从上至下26%–35%的位置；线型均为虚线且末端带箭头"),
+    (5, "幻灯片在页面从左至右9%–48%、从上至下21%–51%的区域内出现三条平滑弯曲的曲线：绿色曲线（近似#5EAD5F）位于页面从左至右9%–43%、从上至下32%–51%，红色曲线（近似#B90303）位于页面从左至右26%–46%、从上至下31%–49%，黑色曲线（近似#151310）位于页面从左至右20%–48%、从上至下21%–48%；三条曲线线宽均为1.5–3磅"),
+    (1, "幻灯片在页面从左至右62%–74%、从上至下50%–58%的位置出现一条水平的黑色线段及位于其右端的小矩形块：矩形块宽度0.4–1cm"),
+    (5, "幻灯片在页面从左至右65%–95%、从上至下32%–68%的位置出现一个笔记本电脑图形：由深蓝色屏幕外框（近似#2B415C）、白色屏幕区、下方底座与触控板构成，底座上出现键盘按键线条或按键形状"),
+    (3, "幻灯片在页面从左至右72%–83%、从上至下39%–54%的位置出现一条蓝色平滑曲线或折线（近似#3276C3）：该线由一个连续形状实现、可整体选中，未由多段各自独立的直线段首尾拼接而成，线条本身不出现断开的缺口；其外围有浅色矩形图表边框"),
+    (3, "幻灯片在页面从左至右81%–92%、从上至下40%–55%的位置出现一条红色平滑曲线或折线（近似#E56F6E或#E10D0D）：该线由一个连续形状实现、可整体选中，未由多段各自独立的直线段首尾拼接而成，线条本身不出现断开的缺口；其外围有浅色矩形图表边框"),
+    (1, "幻灯片在页面从左至右73%–85%、从上至下64%–72%的位置出现“计算机”文本：字号13–17磅"),
+    (3, "幻灯片在页面从左至右9%–91%、从上至下80%–96%的位置出现一个无填充的蓝色虚线圆角矩形：宽度25–30cm，高度2–3cm"),
+    (1, "幻灯片在页面从左至右12%–18%、从上至下84%–88%的位置出现一条水平的黑色短线段（线宽1.5–2.5磅），其右侧出现“工作电极连接线（信号输出）”文本：文本字号12–15磅"),
+    (1, "幻灯片在页面从左至右12%–18%、从上至下89%–93%的位置出现一条水平的绿色短线段（线宽1.5–2.5磅），其右侧出现“参比电极连接线（电位参照）”文本：文本字号12–15磅"),
+    (1, "幻灯片在页面从左至右41%–47%、从上至下85%–89%的位置出现一条水平的红色短线段（线宽1.5–2.5磅），其右侧出现“对电极连接线（电流通路）”文本：文本字号12–15磅"),
+    (1, "幻灯片在页面从左至右67%–74%、从上至下85%–89%的位置出现一条水平的蓝色虚线箭头（线宽2–3磅），其右侧出现“信号/控制/数据流向”文本：文本字号12–15磅"),
+    (1, "幻灯片内文字均完整显示在所属形状的可视区域之内，未被其他形状遮挡、未被裁切；未添加标题、页码、日期、说明性注释等要求之外的文字"),
+]
+
+_MAX_DELTAS_ORDER: list[int] = [d for d, _ in _DIM2_RULES]
+assert sum(_MAX_DELTAS_ORDER) == MAX_SCORE_TOTAL, (
+    "细则满分之和与 MAX_SCORE_TOTAL 不一致：%d vs %d" % (sum(_MAX_DELTAS_ORDER), MAX_SCORE_TOTAL)
 )
 
-# 直线/连接符类几何：line 是自由绘制的直线，straightConnector1 / bentConnectorN /
-# curvedConnectorN 是从形状端点拉出的连接符。所有这些都归为"线形"对象，
-# 只要满足箭头/线宽/颜色等要求都可作为箭头或连接线看待。
-LINE_LIKE_GEOMS = {
-    "line",
-    "straightConnector1",
-    "bentConnector2", "bentConnector3", "bentConnector4", "bentConnector5",
-    "curvedConnector2", "curvedConnector3", "curvedConnector4", "curvedConnector5",
-}
+# ---------------------------------------------------------------- 颜色工具 ----
 
-# 预设为箭头的形状（Office "块箭头" 分类）：本身即为一体箭头，
-# 无需再依赖 headEnd/tailEnd 判定。
-ARROW_PRESET_GEOMS = {
-    "rightArrow", "leftArrow", "upArrow", "downArrow",
-    "leftRightArrow", "upDownArrow", "quadArrow", "leftRightUpArrow",
-    "bentArrow", "uturnArrow", "circularArrow",
-    "curvedRightArrow", "curvedLeftArrow", "curvedUpArrow", "curvedDownArrow",
-    "stripedRightArrow", "notchedRightArrow", "homePlate", "chevron",
-    "bentUpArrow", "leftUpArrow",
-}
+def _hex2rgb(h: str) -> tuple[int, int, int]:
+    h = (h or "").strip().lstrip("#")
+    if len(h) != 6:
+        return (0, 0, 0)
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except ValueError:
+        return (0, 0, 0)
 
+
+def _rgb2hex(rgb: tuple[float, float, float]) -> str:
+    return "%02X%02X%02X" % tuple(max(0, min(255, int(round(c)))) for c in rgb)
+
+
+def _near(color: Optional[str], target: str, tol: int = RGB_TOL) -> bool:
+    """三通道最大偏差不超过 tol 即视为“近似”该颜色。"""
+    if not color:
+        return False
+    a, b = _hex2rgb(color), _hex2rgb(target)
+    return max(abs(a[i] - b[i]) for i in range(3)) <= tol
+
+
+def _near_any(colors: list[str], target: str, tol: int = RGB_TOL) -> bool:
+    return any(_near(c, target, tol) for c in colors)
+
+
+def _lum(color: str) -> float:
+    r, g, b = _hex2rgb(color)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _is_blue(color: Optional[str]) -> bool:
+    if not color:
+        return False
+    r, g, b = _hex2rgb(color)
+    return b >= 90 and b > r + 30 and b > g + 10
+
+
+def _is_green(color: Optional[str]) -> bool:
+    if not color:
+        return False
+    r, g, b = _hex2rgb(color)
+    return g > r + 15 and g > b + 15
+
+
+def _is_red(color: Optional[str]) -> bool:
+    if not color:
+        return False
+    r, g, b = _hex2rgb(color)
+    return r >= 120 and r > g + 50 and r > b + 50
+
+
+def _is_black(color: Optional[str]) -> bool:
+    if not color:
+        return False
+    r, g, b = _hex2rgb(color)
+    return max(r, g, b) <= 70
+
+
+def _is_whiteish(color: Optional[str]) -> bool:
+    """肉眼呈白色/灰白：三通道都很亮且彼此接近（浅色调彩色不算）。"""
+    if not color:
+        return False
+    r, g, b = _hex2rgb(color)
+    return min(r, g, b) >= 190 and (max(r, g, b) - min(r, g, b)) <= 45
+
+
+def _is_light(color: Optional[str]) -> bool:
+    if not color:
+        return False
+    return min(_hex2rgb(color)) >= 195
+
+
+def _is_dark_slate(color: Optional[str]) -> bool:
+    """深灰蓝：整体偏暗且蓝分量不低于红分量。"""
+    if not color:
+        return False
+    r, g, b = _hex2rgb(color)
+    return max(r, g, b) <= 150 and b >= r
+
+
+class ThemeColors:
+    """解析 theme1.xml 的 clrScheme 与 slideMaster 的 clrMap，用于还原 schemeClr。"""
+
+    def __init__(self, pptx_path: str) -> None:
+        self.scheme: dict[str, str] = {}
+        self.clr_map: dict[str, str] = {}
+        try:
+            with zipfile.ZipFile(pptx_path) as zf:
+                names = zf.namelist()
+                themes = sorted(n for n in names if re.match(r"ppt/theme/theme\d+\.xml$", n))
+                if themes:
+                    self._parse_scheme(zf.read(themes[0]).decode("utf-8", "ignore"))
+                masters = sorted(n for n in names if re.match(r"ppt/slideMasters/slideMaster\d+\.xml$", n))
+                if masters:
+                    self._parse_map(zf.read(masters[0]).decode("utf-8", "ignore"))
+        except Exception:
+            pass
+
+    def _parse_scheme(self, xml: str) -> None:
+        m = re.search(r"<a:clrScheme.*?</a:clrScheme>", xml, re.S)
+        if not m:
+            return
+        for blk in re.finditer(r"<a:(\w+)>(.*?)</a:\1>", m.group(0), re.S):
+            key, body = blk.group(1), blk.group(2)
+            srgb = re.search(r'<a:srgbClr val="([0-9A-Fa-f]{6})"', body)
+            if srgb:
+                self.scheme[key] = srgb.group(1).upper()
+                continue
+            sysc = re.search(r'<a:sysClr[^>]*lastClr="([0-9A-Fa-f]{6})"', body)
+            if sysc:
+                self.scheme[key] = sysc.group(1).upper()
+
+    def _parse_map(self, xml: str) -> None:
+        m = re.search(r"<p:clrMap([^>]*)/>", xml)
+        if not m:
+            return
+        for k, v in re.findall(r'(\w+)="(\w+)"', m.group(1)):
+            self.clr_map[k] = v
+
+    def resolve(self, val: str) -> Optional[str]:
+        key = self.clr_map.get(val, val)
+        if key == "phClr":
+            key = "accent1"
+        if key in ("tx1", "dk1"):
+            return self.scheme.get("dk1", "000000")
+        if key in ("bg1", "lt1"):
+            return self.scheme.get("lt1", "FFFFFF")
+        if key in ("tx2", "dk2"):
+            return self.scheme.get("dk2", "44546A")
+        if key in ("bg2", "lt2"):
+            return self.scheme.get("lt2", "E7E6E6")
+        return self.scheme.get(key)
+
+
+def _apply_mods(base: str, node: Any) -> str:
+    """按 lumMod/lumOff/shade/tint 近似换算最终 RGB（用于色系判定，非精确色管理）。"""
+    r, g, b = (float(c) for c in _hex2rgb(base))
+    for child in list(node):
+        tag = child.tag.split("}")[-1]
+        raw = child.get("val")
+        if raw is None:
+            continue
+        try:
+            v = int(raw) / 100000.0
+        except ValueError:
+            continue
+        if tag in ("lumMod", "shade"):
+            r, g, b = r * v, g * v, b * v
+        elif tag == "lumOff":
+            r = r + 255.0 * v
+            g = g + 255.0 * v
+            b = b + 255.0 * v
+        elif tag == "tint":
+            r = r * v + 255.0 * (1 - v)
+            g = g * v + 255.0 * (1 - v)
+            b = b * v + 255.0 * (1 - v)
+    return _rgb2hex((r, g, b))
+
+
+# ------------------------------------------------------------ 填充/线条解析 ----
+
+def _colors_of(node: Any, theme: ThemeColors) -> tuple[list[str], str, int]:
+    """返回 (颜色列表, 类型, 最小 alpha 千分比)。类型取 solid/grad/none/other/inherit。"""
+    if node is None:
+        return ([], "inherit", 100000)
+    grad = node.find(A + "gradFill")
+    if grad is not None:
+        cols: list[str] = []
+        alpha = 100000
+        for gs in grad.iter(A + "gs"):
+            c, a = _one_color(gs, theme)
+            if c:
+                cols.append(c)
+            alpha = min(alpha, a)
+        return (cols, "grad", alpha)
+    solid = node.find(A + "solidFill")
+    if solid is None and node.tag.endswith("solidFill"):
+        solid = node
+    if solid is not None:
+        c, a = _one_color(solid, theme)
+        return ([c] if c else [], "solid", a)
+    if node.find(A + "noFill") is not None:
+        return ([], "none", 0)
+    if node.find(A + "grpFill") is not None:
+        return ([], "grpFill", 100000)
+    if node.find(A + "blipFill") is not None or node.find(A + "pattFill") is not None:
+        return ([], "other", 100000)
+    return ([], "inherit", 100000)
+
+
+def _one_color(holder: Any, theme: ThemeColors) -> tuple[Optional[str], int]:
+    alpha = 100000
+    srgb = holder.find(".//" + A + "srgbClr")
+    scheme = holder.find(".//" + A + "schemeClr")
+    node = srgb if srgb is not None else scheme
+    if node is None:
+        return (None, alpha)
+    an = node.find(A + "alpha")
+    if an is not None and an.get("val"):
+        try:
+            alpha = int(an.get("val"))
+        except ValueError:
+            alpha = 100000
+    if srgb is not None:
+        return (_apply_mods(srgb.get("val") or "000000", srgb).upper(), alpha)
+    base = theme.resolve(scheme.get("val") or "")
+    if base is None:
+        return (None, alpha)
+    return (_apply_mods(base, scheme).upper(), alpha)
+
+
+def _style_ref_color(el: Any, ref_tag: str, theme: ThemeColors) -> Optional[str]:
+    """<p:style> 里 lnRef/fillRef 引用的主题色，作为 spPr 未显式给色时的回退。"""
+    style = el.find(P + "style")
+    if style is None:
+        return None
+    ref = style.find(A + ref_tag)
+    if ref is None:
+        return None
+    c, _ = _one_color(ref, theme)
+    return c
+
+
+# ---------------------------------------------------------------- 形状模型 ----
 
 @dataclass
-class Box:
-    left: float
-    top: float
-    width: float
-    height: float
-
-    @property
-    def right(self) -> float:
-        return self.left + self.width
-
-    @property
-    def bottom(self) -> float:
-        return self.top + self.height
-
-    @property
-    def x1(self) -> float:
-        return min(self.left, self.right)
-
-    @property
-    def x2(self) -> float:
-        return max(self.left, self.right)
-
-    @property
-    def y1(self) -> float:
-        return min(self.top, self.bottom)
-
-    @property
-    def y2(self) -> float:
-        return max(self.top, self.bottom)
-
-    @property
-    def cx(self) -> float:
-        return (self.x1 + self.x2) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.y1 + self.y2) / 2
-
-    @property
-    def area(self) -> float:
-        return max(0.0, self.x2 - self.x1) * max(0.0, self.y2 - self.y1)
+class RunInfo:
+    size_pt: float
+    bold: bool
+    color: Optional[str]
 
 
 @dataclass
 class ShapeInfo:
-    index: int
-    name: str
-    geom: str
-    box: Box
-    text: str
-    fill_colors: list[tuple[int, int, int]]
-    line_color: Optional[tuple[int, int, int]]
-    line_width: Optional[float]
-    dashed: bool
-    arrow: bool
-    font_name: Optional[str]
-    font_size: Optional[float]
-    text_color: Optional[tuple[int, int, int]]
-    text_align: Optional[str]
-    has_blip: bool
-    has_pattern_fill: bool
-    has_transparency: bool
-    # 形状本身的 a:xfrm 旋转(度)。PowerPoint 约定: 正值=顺时针(屏幕上 Y 向下),
-    # 未设置时为 0.0; 用于判定"向左倾斜"等方向性 rubric。
-    rotation: float = 0.0
+    z: int = 0
+    name: str = ""
+    prst: str = "-"
+    x0: float = 0.0
+    y0: float = 0.0
+    x1: float = 0.0
+    y1: float = 0.0
+    raw_cx: float = 0.0
+    raw_cy: float = 0.0
+    rot: float = 0.0
     flip_h: bool = False
     flip_v: bool = False
+    fill_colors: list[str] = field(default_factory=list)
+    fill_kind: str = "inherit"
+    fill_alpha: int = 100000
+    line_colors: list[str] = field(default_factory=list)
+    line_kind: str = "inherit"
+    line_w_pt: float = DEFAULT_LINE_WIDTH_PT
+    dash: str = "solid"
+    head_end: Optional[str] = None
+    tail_end: Optional[str] = None
+    seg_line: int = 0
+    seg_bez: int = 0
+    seg_move: int = 0
+    is_text: bool = False
+    text: str = ""
+    runs: list[RunInfo] = field(default_factory=list)
+    is_picture: bool = False
+
+    # --- 便捷属性（单位换算与形态判定）---
+    @property
+    def w(self) -> float:
+        return self.x1 - self.x0
 
     @property
-    def x1(self) -> float:
-        return self.box.x1
+    def h(self) -> float:
+        return self.y1 - self.y0
 
     @property
-    def x2(self) -> float:
-        return self.box.x2
+    def w_cm(self) -> float:
+        return self.w / EMU_PER_CM
 
     @property
-    def y1(self) -> float:
-        return self.box.y1
+    def h_cm(self) -> float:
+        return self.h / EMU_PER_CM
 
     @property
-    def y2(self) -> float:
-        return self.box.y2
+    def fill_main(self) -> Optional[str]:
+        return self.fill_colors[0] if self.fill_colors else None
 
     @property
-    def cx(self) -> float:
-        return self.box.cx
+    def line_main(self) -> Optional[str]:
+        return self.line_colors[0] if self.line_colors else None
 
     @property
-    def cy(self) -> float:
-        return self.box.cy
+    def opaque_fill(self) -> bool:
+        return self.fill_kind in ("solid", "grad", "other") and self.fill_alpha >= 60000
 
     @property
-    def w_abs(self) -> float:
-        return self.box.x2 - self.box.x1
+    def filled(self) -> bool:
+        return self.fill_kind in ("solid", "grad") and self.fill_alpha >= 20000
 
     @property
-    def h_abs(self) -> float:
-        return self.box.y2 - self.box.y1
+    def is_line_like(self) -> bool:
+        return self.prst in ("line", "straightConnector1", "bentConnector3", "curvedConnector3")
 
     @property
-    def length(self) -> float:
-        return math.hypot(self.box.width, self.box.height)
+    def has_arrow_end(self) -> bool:
+        return bool(self._end(self.head_end)) or bool(self._end(self.tail_end))
 
-    @property
-    def angle(self) -> float:
-        # PPT 坐标向下为正，因此这里使用原始 dy 判断走向即可。
-        return math.degrees(math.atan2(self.box.height, self.box.width))
-
-    @property
-    def is_text(self) -> bool:
-        return bool(norm_text(self.text))
-
-    @property
-    def is_line(self) -> bool:
-        # line、straightConnector 与其他 connector 都视为线；同时兼容手绘的极细矩形。
-        return (
-            self.geom in LINE_LIKE_GEOMS
-            or (self.length > 0.2 and (self.w_abs < 0.08 or self.h_abs < 0.08))
-        )
-
-    @property
-    def is_arrow_shape(self) -> bool:
-        """一体箭头：预设箭头几何 或 line/连接符设置了 head/tail 箭头。"""
-        if self.geom in ARROW_PRESET_GEOMS:
-            return True
-        return self.arrow and self.geom in LINE_LIKE_GEOMS
-
-    @property
-    def is_rect_like(self) -> bool:
-        return self.geom in {"rect", "roundRect", "parallelogram", "trapezoid"}
-
-    @property
-    def is_ellipse(self) -> bool:
-        return self.geom == "ellipse"
+    @staticmethod
+    def _end(v: Optional[str]) -> bool:
+        return bool(v) and v != "none"
 
 
 @dataclass
-class EvaluationContext:
-    path: Path
-    prs: object
-    slide_width: float
-    slide_height: float
-    slide_count: int
-    shapes: list[ShapeInfo]
-    open_error: Optional[str] = None
+class SlideModel:
+    page_w: float = 12192000.0
+    page_h: float = 6858000.0
+    shapes: list[ShapeInfo] = field(default_factory=list)
+    group_count: int = 0
+    slide_count: int = 0
 
-    @property
-    def text_shapes(self) -> list[ShapeInfo]:
-        return [s for s in self.shapes if s.is_text]
+    def px(self, v: float) -> float:
+        return v / self.page_w * 100.0
 
-    @property
-    def line_shapes(self) -> list[ShapeInfo]:
-        return [s for s in self.shapes if s.is_line]
+    def py(self, v: float) -> float:
+        return v / self.page_h * 100.0
 
-    @property
-    def rect_shapes(self) -> list[ShapeInfo]:
-        return [s for s in self.shapes if s.is_rect_like]
-
-    @property
-    def ellipse_shapes(self) -> list[ShapeInfo]:
-        return [s for s in self.shapes if s.is_ellipse]
+    def texts(self) -> list[ShapeInfo]:
+        return [s for s in self.shapes if s.is_text and s.text.strip()]
 
 
-@dataclass
-class RuleResult:
-    label: str
-    hit: bool
-    detail: str
-    points: int = 0
-    # 仅当该规则在执行时抛出异常才为 True；用于在输出中区分
-    # "正常命中/未命中" 与 "异常" 两种状态。
-    errored: bool = False
-
-
-@dataclass
-class ScoreItem:
-    points: int
-    label: str
-    checker: Callable[[EvaluationContext], RuleResult]
-
-
-def cm(value) -> float:
-    return float(value or 0) / EMU_PER_CM
-
-
-def pt(value) -> Optional[float]:
-    if value is None:
+def _grp_xfrm(el: Any) -> Optional[tuple[float, ...]]:
+    xf = el.find(P + "grpSpPr")
+    xf = xf.find(A + "xfrm") if xf is not None else None
+    if xf is None:
         return None
-    return float(value) / EMU_PER_PT
-
-
-def norm_text(text: str) -> str:
-    text = (text or "").replace(" ", " ")
-    text = text.replace("（", "(").replace("）", ")")
-    text = text.replace("／", "/").replace("—", "-").replace("–", "-")
-    return re.sub(r"\s+", "", text).strip().lower()
-
-
-def display_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
-
-
-def rgb_from_hex(value: str | None) -> Optional[tuple[int, int, int]]:
-    if not value:
+    off, ext = xf.find(A + "off"), xf.find(A + "ext")
+    coff, cext = xf.find(A + "chOff"), xf.find(A + "chExt")
+    if off is None or ext is None or coff is None or cext is None:
         return None
-    value = value.strip().lstrip("#")[-6:]
-    if len(value) != 6:
-        return None
-    try:
-        return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
-    except ValueError:
-        return None
-
-
-def color_distance(a: Optional[tuple[int, int, int]], b: tuple[int, int, int]) -> float:
-    if a is None:
-        return 999.0
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
-
-
-def near_color(color: Optional[tuple[int, int, int]], target: tuple[int, int, int], tol: float = 80) -> bool:
-    return color_distance(color, target) <= tol
-
-
-def any_near(colors: Iterable[Optional[tuple[int, int, int]]], target: tuple[int, int, int], tol: float = 80) -> bool:
-    return any(near_color(c, target, tol) for c in colors if c is not None)
-
-
-def is_whiteish(color: Optional[tuple[int, int, int]]) -> bool:
-    return color is not None and min(color) >= 230
-
-
-def is_blackish(color: Optional[tuple[int, int, int]]) -> bool:
-    return color is not None and max(color) <= 100
-
-
-def is_dark(color: Optional[tuple[int, int, int]]) -> bool:
-    return color is not None and sum(color) / 3 <= 110
-
-
-def is_grayish(color: Optional[tuple[int, int, int]]) -> bool:
-    # 判定为"灰色"只要 R/G/B 三通道差异较小即可，不再限定为主题灰的窄区间。
-    return color is not None and max(color) - min(color) <= 60
-
-
-def is_light_grayish(color: Optional[tuple[int, int, int]]) -> bool:
-    # 只要属于灰色家族即视为合规，不再强制"浅灰"这一具体色调。
-    return is_grayish(color)
-
-
-def is_blue(color: Optional[tuple[int, int, int]]) -> bool:
-    if color is None:
-        return False
-    r, g, b = color
-    return b >= 120 and b >= r + 30 and b >= g - 20
-
-
-def is_medium_blue(color: Optional[tuple[int, int, int]]) -> bool:
-    # 只要属于蓝色家族即视为合规，不再要求"中蓝"这一具体色调。
-    return is_blue(color)
-
-
-def is_dark_blue(color: Optional[tuple[int, int, int]]) -> bool:
-    # 只要属于蓝色家族即视为合规，不再要求"深蓝"这一具体色调。
-    return is_blue(color)
-
-
-def is_light_blue(color: Optional[tuple[int, int, int]]) -> bool:
-    # 只要属于蓝色家族即视为合规，不再要求"浅蓝"这一具体色调。
-    return is_blue(color)
-
-
-def is_green(color: Optional[tuple[int, int, int]]) -> bool:
-    if color is None:
-        return False
-    r, g, b = color
-    return g >= 100 and g >= r + 20 and g >= b + 5
-
-
-def is_red(color: Optional[tuple[int, int, int]]) -> bool:
-    if color is None:
-        return False
-    r, g, b = color
-    return r >= 130 and r >= g + 30 and r >= b + 30
-
-
-def is_cyan_or_whiteblue(color: Optional[tuple[int, int, int]]) -> bool:
-    # 青色/白蓝色只要属于蓝色家族或浅色/灰色即视为合规。
-    if color is None:
-        return False
-    return is_blue(color) or is_whiteish(color) or is_grayish(color)
-
-
-def in_range(value: float, low: float, high: float, tol: float = 0.0) -> bool:
-    return low - tol <= value <= high + tol
-
-
-# PPT 中若未显式设置线宽，默认按 1.0 磅处理（Office/PowerPoint 默认值）。
-DEFAULT_LINE_WIDTH_PT = 1.0
-
-
-def effective_line_width(width: Optional[float]) -> float:
-    """线宽取值：未显式设置时按默认 1.0 磅处理。"""
-    return DEFAULT_LINE_WIDTH_PT if width is None else width
-
-
-def line_width_in_range(width: Optional[float], low: float, high: float, tol: float = 0.0) -> bool:
-    """线宽范围判定：未显式设置线宽按默认 1.0 磅处理，只要 1.0 在范围内即视为通过。"""
-    return in_range(effective_line_width(width), low, high, tol)
-
-
-def center_in(s: ShapeInfo, left: float, top: float, right: float, bottom: float, tol: float = 0.25) -> bool:
-    return in_range(s.cx, left, right, tol) and in_range(s.cy, top, bottom, tol)
-
-
-def within_region(s: ShapeInfo, left: float, top: float, right: float, bottom: float, tol: float = 0.35) -> bool:
     return (
-        s.x1 >= left - tol
-        and s.y1 >= top - tol
-        and s.x2 <= right + tol
-        and s.y2 <= bottom + tol
+        float(off.get("x") or 0), float(off.get("y") or 0),
+        float(ext.get("cx") or 0), float(ext.get("cy") or 0),
+        float(coff.get("x") or 0), float(coff.get("y") or 0),
+        float(cext.get("cx") or 1), float(cext.get("cy") or 1),
     )
 
 
-def intersects_region(s: ShapeInfo, left: float, top: float, right: float, bottom: float, tol: float = 0.0) -> bool:
-    return not (s.x2 < left - tol or s.x1 > right + tol or s.y2 < top - tol or s.y1 > bottom + tol)
+def _compose(parent: Callable[..., tuple[float, float, float, float]], el: Any):
+    g = _grp_xfrm(el)
+    if g is None:
+        return parent
+    ox, oy, cx, cy, hx, hy, hcx, hcy = g
+    sx = cx / (hcx or 1.0)
+    sy = cy / (hcy or 1.0)
+
+    def mapper(x: float, y: float, w: float, h: float):
+        return parent(ox + (x - hx) * sx, oy + (y - hy) * sy, w * sx, h * sy)
+
+    return mapper
 
 
-def overlap_area(a: Box, b: Box) -> float:
-    w = max(0.0, min(a.x2, b.x2) - max(a.x1, b.x1))
-    h = max(0.0, min(a.y2, b.y2) - max(a.y1, b.y1))
-    return w * h
+def _identity(x: float, y: float, w: float, h: float):
+    return (x, y, w, h)
 
 
-def union_bbox(shapes: Iterable[ShapeInfo]) -> Optional[Box]:
-    vals = list(shapes)
-    if not vals:
-        return None
-    x1 = min(s.x1 for s in vals)
-    y1 = min(s.y1 for s in vals)
-    x2 = max(s.x2 for s in vals)
-    y2 = max(s.y2 for s in vals)
-    return Box(x1, y1, x2 - x1, y2 - y1)
+def _spPr_of(el: Any) -> Any:
+    node = el.find(P + "spPr")
+    if node is None:
+        node = el.find(P + "grpSpPr")
+    return node
 
 
-def first_xml_rgb(elem, theme: dict[str, tuple[int, int, int]] | None = None) -> tuple[int, int, int] | None:
-    """返回 elem 内首个可解析的颜色 RGB。
-    优先级：a:srgbClr → a:schemeClr(经 theme 反查) → None。
-    theme: {schemeName: (r,g,b)} 由 _load_theme_colors 生成; 传 None 时仅解析 srgbClr。
-    """
-    for clr in elem.iter():
-        tag = _local_tag(clr.tag)
-        if tag == "srgbClr":
-            rgb = rgb_from_hex(clr.get("val"))
-            if rgb is not None:
-                return _apply_shade_tint(rgb, clr)
-        elif tag == "schemeClr" and theme is not None:
-            name = clr.get("val")
-            base = theme.get(name)
-            if base is not None:
-                return _apply_shade_tint(base, clr)
-    return None
+def _read_shape(sh: Any, mapper: Any, theme: ThemeColors, grp_fill: tuple[list[str], str, int],
+                z: int) -> ShapeInfo:
+    el = sh._element
+    info = ShapeInfo(z=z, name=str(sh.name or ""))
+    left = float(sh.left or 0)
+    top = float(sh.top or 0)
+    width = float(sh.width or 0)
+    height = float(sh.height or 0)
+    x, y, w, h = mapper(left, top, width, height)
+    info.raw_cx, info.raw_cy = w, h
+    # ext 为负值不符合 ST_PositiveCoordinate，PowerPoint 会按绝对值修复后渲染，
+    # 故此处统一取规范化后的包围盒。
+    info.x0, info.x1 = min(x, x + w), max(x, x + w)
+    info.y0, info.y1 = min(y, y + h), max(y, y + h)
+
+    geom = el.find(".//" + A + "prstGeom")
+    if geom is not None:
+        info.prst = geom.get("prst") or "-"
+    elif el.find(".//" + A + "custGeom") is not None:
+        info.prst = "cust"
+    cg = el.find(".//" + A + "custGeom")
+    if cg is not None:
+        info.seg_line = len(list(cg.iter(A + "lnTo")))
+        info.seg_bez = len(list(cg.iter(A + "cubicBezTo"))) + len(list(cg.iter(A + "quadBezTo")))
+        info.seg_move = len(list(cg.iter(A + "moveTo")))
+
+    spPr = _spPr_of(el)
+    xf = spPr.find(A + "xfrm") if spPr is not None else None
+    if xf is not None:
+        if xf.get("rot"):
+            info.rot = int(xf.get("rot")) / 60000.0
+        info.flip_h = xf.get("flipH") in ("1", "true")
+        info.flip_v = xf.get("flipV") in ("1", "true")
+
+    cols, kind, alpha = _colors_of(spPr, theme)
+    if kind == "grpFill":
+        cols, kind, alpha = grp_fill[0], grp_fill[1], grp_fill[2]
+    if kind == "inherit":
+        ref = _style_ref_color(el, "fillRef", theme)
+        if ref:
+            cols, kind, alpha = [ref], "solid", 100000
+    info.fill_colors, info.fill_kind, info.fill_alpha = cols, kind, alpha
+
+    ln = spPr.find(A + "ln") if spPr is not None else None
+    if ln is not None:
+        lc, lk, la = _colors_of(ln, theme)
+        info.line_colors, info.line_kind = lc, lk
+        if ln.get("w"):
+            try:
+                info.line_w_pt = int(ln.get("w")) / EMU_PER_PT
+            except ValueError:
+                pass
+        d = ln.find(A + "prstDash")
+        if d is not None:
+            info.dash = d.get("val") or "solid"
+        for tag in ("headEnd", "tailEnd"):
+            node = ln.find(A + tag)
+            if node is not None:
+                if tag == "headEnd":
+                    info.head_end = node.get("type") or "none"
+                else:
+                    info.tail_end = node.get("type") or "none"
+    if info.line_kind in ("inherit",) and not info.line_colors:
+        ref = _style_ref_color(el, "lnRef", theme)
+        if ref:
+            info.line_colors, info.line_kind = [ref], "solid"
+
+    info.is_picture = el.tag == P + "pic"
+    if sh.has_text_frame:
+        info.is_text = True
+        info.text = sh.text_frame.text or ""
+        for para in sh.text_frame.paragraphs:
+            for run in para.runs:
+                rPr = run._r.find(A + "rPr")
+                size = DEFAULT_FONT_SIZE_PT
+                bold = False
+                color: Optional[str] = None
+                if rPr is not None:
+                    if rPr.get("sz"):
+                        size = int(rPr.get("sz")) / 100.0
+                    bold = rPr.get("b") in ("1", "true")
+                    rc, _, _ = _colors_of(rPr, theme)
+                    color = rc[0] if rc else None
+                info.runs.append(RunInfo(size, bold, color))
+    return info
 
 
-def all_xml_rgbs(elem, theme: dict[str, tuple[int, int, int]] | None = None) -> list[tuple[int, int, int]]:
-    """返回 elem 内全部可解析颜色 RGB(srgbClr + schemeClr, 顺序保留)。"""
-    colors: list[tuple[int, int, int]] = []
-    for clr in elem.iter():
-        tag = _local_tag(clr.tag)
-        if tag == "srgbClr":
-            rgb = rgb_from_hex(clr.get("val"))
-            if rgb is not None:
-                colors.append(_apply_shade_tint(rgb, clr))
-        elif tag == "schemeClr" and theme is not None:
-            name = clr.get("val")
-            base = theme.get(name)
-            if base is not None:
-                colors.append(_apply_shade_tint(base, clr))
-    return colors
-
-
-def _local_tag(tag: str) -> str:
-    """去掉命名空间前缀, 例如 '{http://.../main}srgbClr' → 'srgbClr'。"""
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-    return tag
-
-
-def _apply_shade_tint(rgb: tuple[int, int, int], clr_elem) -> tuple[int, int, int]:
-    """对 a:*Clr 子级的 a:lumMod / a:lumOff / a:shade / a:tint 做常见亮度调整。
-    数值均以千分数表示; 未识别的调整忽略。目的是让主题色反查后得到更接近实际渲染的 RGB。
-    """
-    r, g, b = rgb
-    for child in clr_elem:
-        tag = _local_tag(child.tag)
-        try:
-            val = int(child.get("val", "0"))
-        except (TypeError, ValueError):
+def _walk(shapes: Any, mapper: Any, theme: ThemeColors, grp_fill: tuple[list[str], str, int],
+          model: SlideModel) -> None:
+    for sh in shapes:
+        el = sh._element
+        if el.tag == P + "grpSp":
+            model.group_count += 1
+            own = _colors_of(_spPr_of(el), theme)
+            if own[1] in ("inherit", "grpFill"):
+                own = grp_fill
+            try:
+                _walk(sh.shapes, _compose(mapper, el), theme, own, model)
+            except Exception:
+                pass
             continue
-        v = val / 100000.0
-        if tag == "lumMod":
-            r = int(r * v); g = int(g * v); b = int(b * v)
-        elif tag == "lumOff":
-            add = int(255 * v)
-            r = min(255, r + add); g = min(255, g + add); b = min(255, b + add)
-        elif tag == "shade":
-            r = int(r * v); g = int(g * v); b = int(b * v)
-        elif tag == "tint":
-            # PowerPoint tint: mix toward white
-            r = int(r + (255 - r) * (1 - v))
-            g = int(g + (255 - g) * (1 - v))
-            b = int(b + (255 - b) * (1 - v))
-    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+        try:
+            model.shapes.append(_read_shape(sh, mapper, theme, grp_fill, len(model.shapes)))
+        except Exception:
+            continue
 
 
-# 主题 clrScheme 元素名 → dataclass 字段名(供 fallback / 别名映射用)
-_SCHEME_ALIASES = {
-    "bg1": "lt1",   # background 1 通常等价于 lt1
-    "tx1": "dk1",   # text 1 通常等价于 dk1
-    "bg2": "lt2",
-    "tx2": "dk2",
-}
+def build_model(pptx_path: str) -> SlideModel:
+    from pptx import Presentation  # 延迟导入，便于在缺依赖时由 evaluate 统一兜底报错
+
+    prs = Presentation(pptx_path)
+    model = SlideModel()
+    model.page_w = float(prs.slide_width or 12192000)
+    model.page_h = float(prs.slide_height or 6858000)
+    model.slide_count = len(prs.slides)
+    if model.slide_count:
+        theme = ThemeColors(pptx_path)
+        _walk(prs.slides[0].shapes, _identity, theme, ([], "inherit", 100000), model)
+    return model
 
 
-def _load_theme_colors(pptx_path: Path) -> dict[str, tuple[int, int, int]]:
-    """从 pptx 内的 ppt/theme/theme1.xml 里读 clrScheme, 返回 {schemeName: (r,g,b)}。
-    包含 dk1/lt1/dk2/lt2/accent1-6/hlink/folHlink 以及 bg1/tx1/bg2/tx2 别名映射。
-    读不到 / 解析失败时返回空 dict。
-    """
-    scheme: dict[str, tuple[int, int, int]] = {}
-    try:
-        with zipfile.ZipFile(str(pptx_path)) as zf:
-            theme_name = None
-            for n in zf.namelist():
-                if n.startswith("ppt/theme/") and n.endswith(".xml"):
-                    theme_name = n
-                    break
-            if theme_name is None:
-                return scheme
-            with zf.open(theme_name) as fh:
-                data = fh.read()
-        root = ET.fromstring(data)
-        # 找 a:clrScheme
-        for elem in root.iter():
-            if _local_tag(elem.tag) == "clrScheme":
-                for child in elem:
-                    name = _local_tag(child.tag)  # dk1 / lt1 / accent1 / hlink / folHlink
-                    # 每个 name 下应有一个 srgbClr 或 sysClr
-                    for c in child.iter():
-                        ctag = _local_tag(c.tag)
-                        if ctag == "srgbClr":
-                            rgb = rgb_from_hex(c.get("val"))
-                            if rgb is not None:
-                                scheme[name] = rgb
-                                break
-                        elif ctag == "sysClr":
-                            # sysClr 通常带 lastClr 属性作为回退 RGB
-                            last = c.get("lastClr")
-                            rgb = rgb_from_hex(last) if last else None
-                            if rgb is None:
-                                # 常见 sysClr val: windowText → 黑, window → 白
-                                sys_val = c.get("val", "").lower()
-                                if sys_val in ("windowtext",):
-                                    rgb = (0, 0, 0)
-                                elif sys_val in ("window",):
-                                    rgb = (255, 255, 255)
-                            if rgb is not None:
-                                scheme[name] = rgb
-                                break
-                break  # 只取第一个 clrScheme
-    except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError):
-        return scheme
-    # 别名兜底: bg1→lt1 等
-    for alias, target in _SCHEME_ALIASES.items():
-        if alias not in scheme and target in scheme:
-            scheme[alias] = scheme[target]
-        if target not in scheme and alias in scheme:
-            scheme[target] = scheme[alias]
-    return scheme
+# ------------------------------------------------------------------ 判定工具 ----
+
+def _rng(v: float, lo: float, hi: float, tol: float = PCT_TOL) -> bool:
+    return (lo - tol) <= v <= (hi + tol)
 
 
-def get_prst_geom(elem) -> str:
-    geom = elem.find(".//a:prstGeom", namespaces=NS)
-    return geom.get("prst", "") if geom is not None else ""
+def _span(lo_v: float, hi_v: float, lo: float, hi: float, tol: float = PCT_TOL) -> bool:
+    """整段（起止两端）都落在 [lo, hi] 内。"""
+    return _rng(lo_v, lo, hi, tol) and _rng(hi_v, lo, hi, tol)
 
 
-def get_name(elem) -> str:
-    c = elem.find(".//p:cNvPr", namespaces=NS)
-    return c.get("name", "") if c is not None else ""
+def _bbox(items: list[ShapeInfo]) -> tuple[float, float, float, float]:
+    return (min(s.x0 for s in items), min(s.y0 for s in items),
+            max(s.x1 for s in items), max(s.y1 for s in items))
 
 
-def get_text(elem) -> str:
-    tx_body = elem.find(".//p:txBody", namespaces=NS)
-    if tx_body is None:
-        return ""
-    paragraphs = []
-    for p in tx_body.findall(".//a:p", namespaces=NS):
-        chars = [t.text or "" for t in p.findall(".//a:t", namespaces=NS)]
-        para = "".join(chars).strip()
-        if para:
-            paragraphs.append(para)
-    return "\n".join(paragraphs)
+def _inter_area(a: ShapeInfo, b: ShapeInfo) -> float:
+    dx = min(a.x1, b.x1) - max(a.x0, b.x0)
+    dy = min(a.y1, b.y1) - max(a.y0, b.y0)
+    return dx * dy if dx > 0 and dy > 0 else 0.0
 
 
-def get_line_color(elem, theme: dict[str, tuple[int, int, int]] | None = None) -> tuple[int, int, int] | None:
-    ln = elem.find(".//a:ln", namespaces=NS)
-    if ln is None:
-        return None
-    return first_xml_rgb(ln, theme)
+def _inside(inner: ShapeInfo, outer: ShapeInfo, tol: float = 0.15 * EMU_PER_CM) -> bool:
+    return (inner.x0 >= outer.x0 - tol and inner.x1 <= outer.x1 + tol
+            and inner.y0 >= outer.y0 - tol and inner.y1 <= outer.y1 + tol)
 
 
-def get_line_width(elem) -> Optional[float]:
-    ln = elem.find(".//a:ln", namespaces=NS)
-    if ln is None:
-        return None
-    w = ln.get("w")
-    if w is None:
-        return None
-    return pt(int(w))
+def _sizes(s: ShapeInfo) -> list[float]:
+    return [r.size_pt for r in s.runs] or [DEFAULT_FONT_SIZE_PT]
 
 
-def get_fill_colors(elem, theme: dict[str, tuple[int, int, int]] | None = None) -> list[tuple[int, int, int]]:
-    sp_pr = elem.find(".//p:spPr", namespaces=NS)
-    if sp_pr is None:
-        return []
-    fills = []
-    for tag in ("solidFill", "gradFill"):
-        for fill in sp_pr.findall(f".//a:{tag}", namespaces=NS):
-            fills.extend(all_xml_rgbs(fill, theme))
-    # Do not let line/text colors dominate fill; if no explicit fill, return [].
-    return fills
+def _norm(t: str) -> str:
+    """比较文本时忽略空白（“电位 / 电流控制”与“电位/电流控制”视为同一文本）。"""
+    return re.sub(r"\s+", "", t or "")
 
 
-def has_dash(elem) -> bool:
-    ln = elem.find(".//a:ln", namespaces=NS)
-    if ln is None:
-        return False
-    prst = ln.find("a:prstDash", namespaces=NS)
-    if prst is not None and prst.get("val", "solid") not in {"solid", ""}:
+def _find_text(model: SlideModel, needle: str) -> list[ShapeInfo]:
+    key = _norm(needle)
+    return [s for s in model.texts() if key in _norm(s.text)]
+
+
+def _text_hit(model: SlideModel, needle: str, xr: tuple[float, float], yr: tuple[float, float],
+              sr: tuple[float, float]) -> tuple[bool, str]:
+    """文本内容 + 位置区间 + 字号区间 的通用判定。"""
+    cands = _find_text(model, needle)
+    if not cands:
+        return (False, "未找到包含“%s”的文本" % needle)
+    notes: list[str] = []
+    for s in cands:
+        x0, x1 = model.px(s.x0), model.px(s.x1)
+        y0, y1 = model.py(s.y0), model.py(s.y1)
+        szs = _sizes(s)
+        pos_ok = _span(x0, x1, xr[0], xr[1]) and _span(y0, y1, yr[0], yr[1])
+        sz_ok = any(sr[0] <= v <= sr[1] for v in szs)
+        if pos_ok and sz_ok:
+            return (True, "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 字号%s磅"
+                    % (s.name, x0, x1, y0, y1, "/".join("%.1f" % v for v in szs)))
+        notes.append("%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 字号%s磅（位置%s/字号%s）"
+                     % (s.name, x0, x1, y0, y1, "/".join("%.1f" % v for v in szs),
+                        "符合" if pos_ok else "不符", "符合" if sz_ok else "不符"))
+    return (False, "; ".join(notes))
+
+
+def _dashed(s: ShapeInfo) -> bool:
+    return s.dash not in ("solid", "") and s.dash is not None
+
+
+def _solid_line(s: ShapeInfo) -> bool:
+    return s.dash in ("solid", "")
+
+
+def _labeled(s: ShapeInfo) -> bool:
+    return bool(s.text.strip())
+
+
+def _content_items(m: SlideModel) -> list[ShapeInfo]:
+    return [s for s in m.shapes if s.w > 0 or s.h > 0]
+
+
+# =============================================================== 维度2 检查 ====
+
+def check_01_aspect(m: SlideModel) -> tuple[bool, str]:
+    items = _content_items(m)
+    if not items:
+        return (False, "幻灯片无任何形状")
+    x0, y0, x1, y1 = _bbox(items)
+    w_cm, h_cm = (x1 - x0) / EMU_PER_CM, (y1 - y0) / EMU_PER_CM
+    if h_cm <= 0:
+        return (False, "整体内容区域高度为 0")
+    ratio = w_cm / h_cm
+    ok = 1.63 <= ratio <= 1.73
+    return (ok, "整体内容区域 %.2fcm×%.2fcm，宽高比 %.3f（要求 1.63–1.73）" % (w_cm, h_cm, ratio))
+
+
+def check_02_centered(m: SlideModel) -> tuple[bool, str]:
+    items = _content_items(m)
+    if not items:
+        return (False, "幻灯片无任何形状")
+    x0, y0, x1, y1 = _bbox(items)
+    left, right = x0, m.page_w - x1
+    top, bottom = y0, m.page_h - y1
+    w, h = x1 - x0, y1 - y0
+    dx_ok = abs(left - right) <= 0.03 * w
+    dy_ok = abs(top - bottom) <= 0.05 * h
+    return (dx_ok and dy_ok,
+            "左留白%.2fcm/右留白%.2fcm（差%.2fcm，限%.2fcm）；上留白%.2fcm/下留白%.2fcm（差%.2fcm，限%.2fcm）"
+            % (left / EMU_PER_CM, right / EMU_PER_CM, abs(left - right) / EMU_PER_CM,
+               0.03 * w / EMU_PER_CM, top / EMU_PER_CM, bottom / EMU_PER_CM,
+               abs(top - bottom) / EMU_PER_CM, 0.05 * h / EMU_PER_CM))
+
+
+def check_03_outer_frame(m: SlideModel) -> tuple[bool, str]:
+    notes: list[str] = []
+    for s in m.shapes:
+        if s.prst != "rect" or _labeled(s):
+            continue
+        x0, x1 = m.px(s.x0), m.px(s.x1)
+        y0, y1 = m.py(s.y0), m.py(s.y1)
+        if not (_rng(x0, 1, 5) and _rng(x1, 95, 99) and _rng(y0, 0, 3) and _rng(y1, 97, 101)):
+            continue
+        reasons: list[str] = []
+        if s.fill_kind != "none":
+            reasons.append("非无填充(%s)" % s.fill_kind)
+        if not _is_blue(s.line_main):
+            reasons.append("边线非蓝色(%s)" % (s.line_main or "无"))
+        if not _solid_line(s):
+            reasons.append("边线非单实线(%s)" % s.dash)
+        if not (2.0 <= s.line_w_pt <= 3.5):
+            reasons.append("线宽%.2f磅不在2–3.5" % s.line_w_pt)
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 边线%s %.2f磅 %s" % (
+            s.name, x0, x1, y0, y1, s.line_main or "无", s.line_w_pt, s.dash)
+        if not reasons:
+            return (True, desc)
+        notes.append(desc + "（" + "、".join(reasons) + "）")
+    return (False, "; ".join(notes) or "未找到位置符合的矩形边框")
+
+
+def check_04_inlet_text(m: SlideModel) -> tuple[bool, str]:
+    ok, detail = _text_hit(m, "分析物输入", (14, 36), (4, 14), (19, 23))
+    if not ok:
+        return (False, detail)
+    for s in _find_text(m, "分析物输入"):
+        if any(_near(r.color, "557CB6", RGB_TOL_LOOSE) for r in s.runs):
+            return (True, detail + "，颜色近似#557CB6")
+    cols = [r.color or "-" for s in _find_text(m, "分析物输入") for r in s.runs]
+    return (False, detail + "，但文字颜色为 %s，非蓝色#557CB6" % "/".join(cols))
+
+
+def check_05_inlet_arrow(m: SlideModel) -> tuple[bool, str]:
+    notes: list[str] = []
+    for s in m.shapes:
+        if _labeled(s) or s.h <= s.w:
+            continue
+        x0, x1 = m.px(s.x0), m.px(s.x1)
+        y0, y1 = m.py(s.y0), m.py(s.y1)
+        if not (_span(x0, x1, 19, 27) and _span(y0, y1, 10, 21)):
+            continue
+        reasons: list[str] = []
+        if not _dashed(s):
+            reasons.append("线型非虚线(%s)" % s.dash)
+        if not s.has_arrow_end:
+            reasons.append("末端无箭头")
+        if not _is_blue(s.line_main):
+            reasons.append("线条非蓝色(%s)" % (s.line_main or "无"))
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% %s 箭头%s/%s 颜色%s" % (
+            s.name, x0, x1, y0, y1, s.dash, s.head_end or "-", s.tail_end or "-",
+            s.line_main or "无")
+        if not reasons:
+            return (True, desc)
+        notes.append(desc + "（" + "、".join(reasons) + "）")
+    return (False, "; ".join(notes[:4]) or "该区域未找到竖直线条")
+
+
+def _window(m: SlideModel, s: ShapeInfo, xr: tuple[float, float], yr: tuple[float, float]) -> bool:
+    return (_span(m.px(s.x0), m.px(s.x1), xr[0], xr[1])
+            and _span(m.py(s.y0), m.py(s.y1), yr[0], yr[1]))
+
+
+def _bubbles(m: SlideModel, xr: tuple[float, float], yr: tuple[float, float]) -> list[ShapeInfo]:
+    out: list[ShapeInfo] = []
+    for s in m.shapes:
+        if s.prst != "ellipse" or _labeled(s):
+            continue
+        d = max(s.w_cm, s.h_cm)
+        if not (0.15 <= d <= 0.55) or abs(s.w_cm - s.h_cm) > 0.15:
+            continue
+        if _window(m, s, xr, yr):
+            out.append(s)
+    return out
+
+
+def check_06_beaker(m: SlideModel) -> tuple[bool, str]:
+    parts = [s for s in m.shapes
+             if not _labeled(s) and not s.is_line_like and s.prst != "triangle"
+             and s.w_cm >= 3.0 and _window(m, s, (7, 35), (36, 77))]
+    if not parts:
+        return (False, "该区域未找到烧杯轮廓部件")
+    x0, y0, x1, y1 = _bbox(parts)
+    w_cm, h_cm = (x1 - x0) / EMU_PER_CM, (y1 - y0) / EMU_PER_CM
+    liquid = [s for s in parts if _near_any(s.fill_colors, "B6E2FD", RGB_TOL_LOOSE)]
+    body = [s for s in parts if s.h_cm >= 3.0]
+    bubbles = _bubbles(m, (13, 28), (56, 69))
+    reasons: list[str] = []
+    if not _span(m.px(x0), m.px(x1), 9, 33) or not _span(m.py(y0), m.py(y1), 39, 74):
+        reasons.append("整体位置越界")
+    if not (5.5 <= w_cm <= 7.5):
+        reasons.append("整体宽度%.2fcm不在5.5–7.5" % w_cm)
+    if not (4.5 <= h_cm <= 6.5):
+        reasons.append("整体高度%.2fcm不在4.5–6.5" % h_cm)
+    if not body:
+        reasons.append("无杯身轮廓（高度≥3cm的部件）")
+    if not liquid:
+        reasons.append("无内部浅蓝液体色块")
+    if len(bubbles) < 5:
+        reasons.append("气泡仅%d个" % len(bubbles))
+    desc = "烧杯部件%d个：x%.2f%%–%.2f%% y%.2f%%–%.2f%% %.2fcm×%.2fcm，液体%d块、气泡%d个" % (
+        len(parts), m.px(x0), m.px(x1), m.py(y0), m.py(y1), w_cm, h_cm, len(liquid), len(bubbles))
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def check_07_liquid(m: SlideModel) -> tuple[bool, str]:
+    notes: list[str] = []
+    flats = [s for s in m.shapes if s.w_cm >= 3.0 and s.h_cm <= 1.5
+             and _near_any(s.fill_colors, "B6E2FD", RGB_TOL_LOOSE)]
+    for s in m.shapes:
+        if _labeled(s) or s.w_cm < 3.0:
+            continue
+        if not _near_any(s.fill_colors, "B6E2FD", RGB_TOL_LOOSE):
+            continue
+        x0, x1 = m.px(s.x0), m.px(s.x1)
+        y0, y1 = m.py(s.y0), m.py(s.y1)
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 填充%s" % (
+            s.name, x0, x1, y0, y1, "/".join(s.fill_colors) or "无")
+        if not (_span(x0, x1, 11, 30) and _span(y0, y1, 47, 72)):
+            notes.append(desc + "（位置越界）")
+            continue
+        # 顶部水平液面：柱体(can)自带水平液面，或顶端另有一条扁平的浅蓝液面块
+        top_flat = s.prst in ("can", "rect", "roundRect")
+        if not top_flat:
+            top_flat = any(abs(f.y0 - s.y0) <= 1.0 * EMU_PER_CM and f is not s for f in flats)
+        if top_flat:
+            return (True, desc)
+        notes.append(desc + "（顶部未见水平液面形态）")
+    return (False, "; ".join(notes[:3]) or "未找到浅蓝色液体色块")
+
+
+def check_08_bubbles(m: SlideModel) -> tuple[bool, str]:
+    cands = _bubbles(m, (13, 28), (56, 69))
+    ok_fill = [s for s in cands
+               if _is_light(s.fill_main) or _near_any(s.fill_colors, "B6E2FD", RGB_TOL_LOOSE)
+               or s.fill_kind in ("inherit", "grpFill")]
+    stacked = 0
+    for i, a in enumerate(ok_fill):
+        for b in ok_fill[i + 1:]:
+            small = min(a.w * a.h, b.w * b.h)
+            if small > 0 and _inter_area(a, b) / small >= 0.5:
+                stacked += 1
+    reasons: list[str] = []
+    if len(ok_fill) < 7:
+        reasons.append("符合条件的气泡仅%d个（需≥7）" % len(ok_fill))
+    if stacked:
+        reasons.append("存在%d对气泡重叠堆叠" % stacked)
+    return (not reasons, "区域内圆形气泡%d个（尺寸/填充合规%d个）%s" % (
+        len(cands), len(ok_fill), "（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def _rod_parts(m: SlideModel, xr: tuple[float, float], yr: tuple[float, float],
+               w_max: float) -> list[ShapeInfo]:
+    """电极杆部件：有填充、非线条、非椭圆气泡，且完整落在给定窗口内。"""
+    out: list[ShapeInfo] = []
+    for s in m.shapes:
+        if _labeled(s) or s.is_line_like or s.prst == "ellipse":
+            continue
+        if not s.filled or s.w_cm > w_max or s.h_cm > 4.6:
+            continue
+        if _window(m, s, xr, yr):
+            out.append(s)
+    return out
+
+
+def _rod_check(m: SlideModel, xr: tuple[float, float], yr: tuple[float, float],
+               box_x: tuple[float, float], box_y: tuple[float, float],
+               w_rng: tuple[float, float], h_rng: tuple[float, float],
+               cap_hexes: tuple[str, ...], cap_test: Callable[[Optional[str]], bool],
+               cap_name: str) -> tuple[bool, str]:
+    parts = _rod_parts(m, xr, yr, 1.6)
+    if len(parts) < 3:
+        return (False, "该区域仅找到%d个电极部件（需≥3段：帽/杆/尖端）" % len(parts))
+    x0, y0, x1, y1 = _bbox(parts)
+    w_cm, h_cm = (x1 - x0) / EMU_PER_CM, (y1 - y0) / EMU_PER_CM
+    span_y = m.py(y1) - m.py(y0)
+    cap = [s for s in parts
+           if m.py(s.y1) <= m.py(y0) + 0.40 * span_y + PCT_TOL
+           and any(_near_any(s.fill_colors, h, RGB_TOL_LOOSE) for h in cap_hexes)
+           and any(cap_test(c) for c in s.fill_colors)]
+    mid_lo, mid_hi = m.py(y0) + 0.30 * span_y, m.py(y0) + 0.80 * span_y
+    shaft = [s for s in parts
+             if m.py(s.y1) >= mid_lo and m.py(s.y0) <= mid_hi
+             and any(_is_whiteish(c) for c in s.fill_colors)]
+    tip = [s for s in parts
+           if m.py(s.y1) >= m.py(y0) + 0.70 * span_y
+           and (s.prst in ("cust", "triangle") or s.seg_bez > 0 or s.seg_line >= 3)]
+    reasons: list[str] = []
+    if not _span(m.px(x0), m.px(x1), box_x[0], box_x[1]) or not _span(m.py(y0), m.py(y1), box_y[0], box_y[1]):
+        reasons.append("整体位置越界")
+    if not (w_rng[0] <= w_cm <= w_rng[1]):
+        reasons.append("宽度%.2fcm不在%.1f–%.1f" % (w_cm, w_rng[0], w_rng[1]))
+    if not (h_rng[0] <= h_cm <= h_rng[1]):
+        reasons.append("高度%.2fcm不在%.1f–%.1f" % (h_cm, h_rng[0], h_rng[1]))
+    if not cap:
+        reasons.append("顶部无%s帽（近似#%s）" % (cap_name, "或#".join(cap_hexes)))
+    if not shaft:
+        reasons.append("中段杆身非白色玻璃管质感")
+    if not tip:
+        reasons.append("底端无渐细尖端造型")
+    desc = "电极部件%d段：x%.2f%%–%.2f%% y%.2f%%–%.2f%% %.2fcm×%.2fcm，帽%d/白杆%d/尖端%d" % (
+        len(parts), m.px(x0), m.px(x1), m.py(y0), m.py(y1), w_cm, h_cm, len(cap), len(shaft), len(tip))
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def check_09_green_electrode(m: SlideModel) -> tuple[bool, str]:
+    return _rod_check(m, (10, 20), (37, 63), (11, 19), (38, 62),
+                      (0.3, 1.5), (3.0, 4.5), ("5EAD5F",), _is_green, "绿色")
+
+
+def check_10_working_column(m: SlideModel) -> tuple[bool, str]:
+    parts = _rod_parts(m, (17, 25), (23, 66), 2.0)
+    if len(parts) < 2:
+        return (False, "该区域仅找到%d个柱状部件" % len(parts))
+    x0, y0, x1, y1 = _bbox(parts)
+    w_cm, h_cm = (x1 - x0) / EMU_PER_CM, (y1 - y0) / EMU_PER_CM
+    shaft = [s for s in parts if s.h_cm >= 1.5 and any(_is_whiteish(c) for c in s.fill_colors)]
+    cap = [s for s in parts
+           if _near_any(s.fill_colors, "2E3F58", RGB_TOL_LOOSE)
+           and _span(m.py(s.y0), m.py(s.y1), 23, 32)]
+    reasons: list[str] = []
+    if not _span(m.px(x0), m.px(x1), 17, 25) or not _span(m.py(y0), m.py(y1), 23, 66):
+        reasons.append("整体位置越界")
+    if not shaft:
+        reasons.append("柱身非白色半透明质感")
+    if not cap:
+        reasons.append("顶端无位于23%–32%高度的深蓝灰接头（近似#2E3F58）")
+    desc = "柱状部件%d段：x%.2f%%–%.2f%% y%.2f%%–%.2f%% %.2fcm×%.2fcm，白柱%d/深蓝灰帽%d" % (
+        len(parts), m.px(x0), m.px(x1), m.py(y0), m.py(y1), w_cm, h_cm, len(shaft), len(cap))
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def check_11_red_electrode(m: SlideModel) -> tuple[bool, str]:
+    return _rod_check(m, (21, 31), (37, 63), (22, 30), (38, 62),
+                      (0.3, 1.5), (3.0, 4.5), ("B90303", "EA0000"), _is_red, "红色")
+
+
+def check_12_ref_label(m: SlideModel) -> tuple[bool, str]:
+    return _text_hit(m, "参比电极", (2, 15), (47, 57), (13, 17))
+
+
+def check_13_work_label(m: SlideModel) -> tuple[bool, str]:
+    return _text_hit(m, "工作电极", (16, 30), (44, 53), (13, 17))
+
+
+def check_14_counter_label(m: SlideModel) -> tuple[bool, str]:
+    return _text_hit(m, "对电极", (28, 39), (47, 57), (13, 17))
+
+
+def check_15_sample_label(m: SlideModel) -> tuple[bool, str]:
+    return _text_hit(m, "样品溶液", (12, 28), (62, 71), (13, 17))
+
+
+def check_16_label_arrows(m: SlideModel) -> tuple[bool, str]:
+    def pick(xr: tuple[float, float]) -> list[ShapeInfo]:
+        out: list[ShapeInfo] = []
+        for s in m.shapes:
+            if _labeled(s) or s.w <= s.h:
+                continue
+            if not (_span(m.px(s.x0), m.px(s.x1), xr[0], xr[1])
+                    and _span(m.py(s.y0), m.py(s.y1), 49, 56)):
+                continue
+            out.append(s)
+        return out
+
+    def judge(cands: list[ShapeInfo], want_right: bool, side: str) -> tuple[bool, str]:
+        if not cands:
+            return (False, "%s未找到水平线段" % side)
+        notes: list[str] = []
+        for s in cands:
+            # 端点箭头随 flipH 一同镜像，故按规范化后的渲染结果判断箭头朝向。
+            tail, head = ShapeInfo._end(s.tail_end), ShapeInfo._end(s.head_end)
+            at_right = (tail and not s.flip_h) or (head and s.flip_h)
+            at_left = (head and not s.flip_h) or (tail and s.flip_h)
+            reasons: list[str] = []
+            if not s.has_arrow_end:
+                reasons.append("无端点箭头")
+            elif not (at_right if want_right else at_left):
+                reasons.append("箭头头部不在%s端" % ("右" if want_right else "左"))
+            if not _is_black(s.line_main):
+                reasons.append("线条非黑色(%s)" % (s.line_main or "无"))
+            if not _solid_line(s):
+                reasons.append("线型非实线(%s)" % s.dash)
+            if not (0.5 <= s.w_cm <= 1.5):
+                reasons.append("长度%.2fcm不在0.5–1.5" % s.w_cm)
+            desc = "%s：x%.2f%%–%.2f%% y%.2f%% 长%.2fcm 箭头%s/%s flipH=%s" % (
+                s.name, m.px(s.x0), m.px(s.x1), m.py(s.y0), s.w_cm,
+                s.head_end or "-", s.tail_end or "-", s.flip_h)
+            if not reasons:
+                return (True, desc)
+            notes.append(desc + "（" + "、".join(reasons) + "）")
+        return (False, "%s%s" % (side, "; ".join(notes[:2])))
+
+    ok_l, d_l = judge(pick((10, 16)), True, "左侧箭头")
+    ok_r, d_r = judge(pick((26, 32)), False, "右侧箭头")
+    return (ok_l and ok_r, "%s | %s" % (d_l, d_r))
+
+
+def check_17_chassis(m: SlideModel) -> tuple[bool, str]:
+    parts = [s for s in m.shapes
+             if not _labeled(s) and not s.is_line_like and s.filled and _window(m, s, (37, 66), (44, 66))]
+    if not parts:
+        return (False, "该区域未找到机箱色块")
+    top_col = [s for s in parts if _near_any(s.fill_colors, "C7D0E0", RGB_TOL_LOOSE) and s.w_cm >= 4.0]
+    top = [s for s in top_col if s.h_cm <= 1.2]
+    front = [s for s in parts if _near_any(s.fill_colors, "233959", RGB_TOL_LOOSE) and s.w_cm >= 3.0]
+    reasons: list[str] = []
+    if not top_col:
+        reasons.append("无浅灰色顶面色块（近似#C7D0E0）")
+    elif not top:
+        reasons.append("顶面高度%.2fcm超过1.2cm，非扁平斜置四边形" % min(s.h_cm for s in top_col))
+    if not front:
+        reasons.append("无深蓝色前壳色块（近似#233959）")
+    if reasons:
+        return (False, "机箱色块%d块（%s）" % (len(parts), "、".join(reasons)))
+    fr = max(front, key=lambda s: s.w)
+    panel = [s for s in parts if _near_any(s.fill_colors, "1777D5", RGB_TOL_LOOSE) and _inside(s, fr)]
+    side = [s for s in parts
+            if all(s is not t for t in top) and s is not fr and s.h_cm >= 2.5 and s.fill_colors
+            and s.x1 >= fr.x1 + 1.0 * EMU_PER_CM
+            and min(_lum(c) for c in s.fill_colors) < min(_lum(c) for c in top[0].fill_colors)]
+    top_over = (max(s.x1 for s in top) - fr.x1) / EMU_PER_CM
+    if not panel:
+        reasons.append("前壳内未叠放亮蓝色面板（近似#1777D5）")
+    if not side:
+        reasons.append("前壳右侧无更深的灰蓝色侧面色块（高度≥2.5cm）")
+    if top_over < 1.0:
+        reasons.append("顶面右端仅比前壳右边线外伸%.2fcm（需≥1cm）" % top_over)
+    if side:
+        side_over = (max(s.x1 for s in side) - fr.x1) / EMU_PER_CM
+        if side_over < 1.0:
+            reasons.append("侧面右端仅比前壳右边线外伸%.2fcm（需≥1cm）" % side_over)
+    desc = "顶面%s(%.2fcm高)/前壳%s(右边线%.2f%%)/面板%d块/侧面%d块，顶面外伸%.2fcm" % (
+        top[0].name, top[0].h_cm, fr.name, m.px(fr.x1), len(panel), len(side), top_over)
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def check_18_screen(m: SlideModel) -> tuple[bool, str]:
+    notes: list[str] = []
+    for s in m.shapes:
+        if _labeled(s) or s.is_line_like:
+            continue
+        if not _window(m, s, (39, 48), (51, 62)) or s.w_cm < 0.8 or s.h_cm < 0.5:
+            continue
+        white = _is_whiteish(s.fill_main) or _is_whiteish(s.line_main)
+        inner = [t for t in m.shapes if t is not s and _inside(t, s, 0.10 * EMU_PER_CM)]
+        wave_one = [t for t in inner if t.seg_bez > 0 or t.seg_line >= 2]
+        wave_seg = [t for t in inner if t.is_line_like or (t.w > 0 and t.h_cm <= 0.20)]
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 填充%s 边框%s，内部波形%d段" % (
+            s.name, m.px(s.x0), m.px(s.x1), m.py(s.y0), m.py(s.y1),
+            s.fill_main or s.fill_kind, s.line_main or "无", len(wave_one) + len(wave_seg))
+        reasons: list[str] = []
+        if not white:
+            reasons.append("既非白色填充也非白色边框")
+        if not wave_one and len(wave_seg) < 3:
+            reasons.append("内部无波形折线")
+        if not reasons:
+            return (True, desc)
+        notes.append(desc + "（" + "、".join(reasons) + "）")
+    return (False, "; ".join(notes[:3]) or "该区域未找到小屏幕矩形")
+
+
+def check_19_leds(m: SlideModel) -> tuple[bool, str]:
+    cands = [s for s in m.shapes
+             if s.prst == "ellipse" and not _labeled(s)
+             and 0.15 <= max(s.w_cm, s.h_cm) <= 0.45 and _window(m, s, (53, 59), (49, 62))]
+    cands.sort(key=lambda s: s.y0)
+    if len(cands) != 3:
+        return (False, "该区域圆形指示灯为%d个（需3个，直径0.15–0.45cm）" % len(cands))
+    tests: list[tuple[Callable[[Optional[str]], bool], str]] = [
+        (_is_green, "绿色"), (_is_dark_slate, "深灰蓝色"), (_is_red, "红色")]
+    reasons: list[str] = []
+    for s, (fn, nm) in zip(cands, tests):
+        if not any(fn(c) for c in s.fill_colors):
+            reasons.append("%s填充%s非%s" % (s.name, s.fill_main or "无", nm))
+    desc = "指示灯自上而下：%s" % "、".join(
+        "%s(%.2fcm,%s)" % (s.name, max(s.w_cm, s.h_cm), s.fill_main or "无") for s in cands)
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def check_20_analyzer_text(m: SlideModel) -> tuple[bool, str]:
+    ok, detail = _text_hit(m, "电化学分析仪", (44, 58), (52, 60), (11, 13))
+    if not ok:
+        return (False, detail)
+    notes: list[str] = []
+    for s in _find_text(m, "电化学分析仪"):
+        white = any(_is_whiteish(r.color) for r in s.runs)
+        bold = any(r.bold for r in s.runs)
+        if white and not bold:
+            return (True, detail + "，白色非加粗")
+        bad: list[str] = []
+        if not white:
+            bad.append("文字颜色%s非白色" % "/".join(r.color or "-" for r in s.runs))
+        if bold:
+            bad.append("文字加粗")
+        notes.append("%s（%s）" % (s.name, "、".join(bad)))
+    return (False, detail + "，但 " + "; ".join(notes))
+
+
+def _panel_check(m: SlideModel, needle: str, xr: tuple[float, float], yr: tuple[float, float],
+                 sr: tuple[float, float]) -> tuple[bool, str]:
+    """无填充蓝色虚线圆角矩形 + 框内指定文本 + 文本字号。"""
+    boxes = [s for s in m.shapes
+             if s.prst in ("roundRect", "round2SameRect", "round1Rect", "rect", "cust")
+             and s.w_cm >= 1.5 and s.h_cm >= 0.5 and _window(m, s, xr, yr)]
+    txts = _find_text(m, needle)
+    if not txts:
+        return (False, "未找到“%s”文本" % needle)
+    if not boxes:
+        return (False, "该区域未找到框形（“%s”文本位于 x%.2f%%–%.2f%% y%.2f%%–%.2f%%）"
+                % (needle, m.px(txts[0].x0), m.px(txts[0].x1), m.py(txts[0].y0), m.py(txts[0].y1)))
+    notes: list[str] = []
+    for b in boxes:
+        reasons: list[str] = []
+        if b.fill_kind != "none":
+            reasons.append("非无填充(%s)" % b.fill_kind)
+        if not _dashed(b):
+            reasons.append("边框非虚线(%s)" % b.dash)
+        if not _is_blue(b.line_main):
+            reasons.append("边框非蓝色(%s)" % (b.line_main or "无"))
+        # 文本框自身高度常大于可见文字，故按“文本主体落在框内”判定（面积过半或中心在框内）
+        inner: list[ShapeInfo] = []
+        for t in txts:
+            if t is b:
+                inner.append(t)
+                continue
+            area = t.w * t.h
+            cx, cy = (t.x0 + t.x1) / 2.0, (t.y0 + t.y1) / 2.0
+            center_in = (b.x0 <= cx <= b.x1) and (b.y0 <= cy <= b.y1)
+            if (area > 0 and _inter_area(t, b) / area >= 0.5) or center_in:
+                inner.append(t)
+        if not inner:
+            reasons.append("框内无“%s”文本" % needle)
+            szs: list[float] = []
+        else:
+            szs = _sizes(inner[0])
+            if not any(sr[0] <= v <= sr[1] for v in szs):
+                reasons.append("文本字号%s磅不在%g–%g" % ("/".join("%.1f" % v for v in szs), sr[0], sr[1]))
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 填充%s 边框%s %s 文本字号%s磅" % (
+            b.name, m.px(b.x0), m.px(b.x1), m.py(b.y0), m.py(b.y1), b.fill_kind,
+            b.line_main or "无", b.dash, "/".join("%.1f" % v for v in szs) or "-")
+        if not reasons:
+            return (True, desc)
+        notes.append(desc + "（" + "、".join(reasons) + "）")
+    return (False, "; ".join(notes[:3]))
+
+
+def check_21_acq_box(m: SlideModel) -> tuple[bool, str]:
+    return _panel_check(m, "信号采集与处理", (46, 65), (30, 40), (13, 16))
+
+
+def check_22_ctrl_box(m: SlideModel) -> tuple[bool, str]:
+    return _panel_check(m, "电位/电流控制", (41, 58), (68, 79), (14, 18))
+
+
+def check_23_viz_box(m: SlideModel) -> tuple[bool, str]:
+    return _panel_check(m, "数据分析与可视化", (73, 93), (18, 31), (13, 19))
+
+
+def check_24_flow_arrows(m: SlideModel) -> tuple[bool, str]:
+    wins = [((47.0, 53.0), (63.0, 71.0)), ((53.0, 59.0), (38.0, 48.0)), ((80.0, 86.0), (26.0, 35.0))]
+    hits: list[str] = []
+    bad: list[str] = []
+    for xr, yr in wins:
+        found = ""
+        notes: list[str] = []
+        for s in m.shapes:
+            if _labeled(s) or s.h <= s.w or not _window(m, s, xr, yr):
+                continue
+            desc = "%s(x%.2f%%–%.2f%% y%.2f%%–%.2f%% %s 箭头%s/%s %s)" % (
+                s.name, m.px(s.x0), m.px(s.x1), m.py(s.y0), m.py(s.y1), s.dash,
+                s.head_end or "-", s.tail_end or "-", s.line_main or "无")
+            reasons: list[str] = []
+            if not _dashed(s):
+                reasons.append("非虚线")
+            if not s.has_arrow_end:
+                reasons.append("末端无箭头")
+            if not _is_blue(s.line_main):
+                reasons.append("非蓝色")
+            if not reasons:
+                found = desc
+                break
+            notes.append(desc + "（" + "、".join(reasons) + "）")
+        if found:
+            hits.append(found)
+        else:
+            bad.append("x%g%%–%g%%/y%g%%–%g%% 处：%s"
+                       % (xr[0], xr[1], yr[0], yr[1], "; ".join(notes[:2]) or "未找到竖直线条"))
+    return (len(hits) == 3, "命中%d/3条虚线箭头%s" % (
+        len(hits), "（" + "；".join(bad) + "）" if bad else "：" + "、".join(hits)))
+
+
+def check_25_curves(m: SlideModel) -> tuple[bool, str]:
+    specs = [("5EAD5F", (9.0, 43.0), (32.0, 51.0), "绿色"),
+             ("B90303", (26.0, 46.0), (31.0, 49.0), "红色"),
+             ("151310", (20.0, 48.0), (21.0, 48.0), "黑色")]
+    hits: list[str] = []
+    bad: list[str] = []
+    for hexc, xr, yr, nm in specs:
+        found = ""
+        notes: list[str] = []
+        for s in m.shapes:
+            if _labeled(s) or not _near_any(s.line_colors, hexc, RGB_TOL):
+                continue
+            if s.w_cm < 1.0 or s.h_cm < 0.3:
+                continue
+            desc = "%s(x%.2f%%–%.2f%% y%.2f%%–%.2f%% %s %.2f磅 曲线段%d)" % (
+                s.name, m.px(s.x0), m.px(s.x1), m.py(s.y0), m.py(s.y1),
+                s.line_main or "无", s.line_w_pt, s.seg_bez)
+            reasons: list[str] = []
+            if not _window(m, s, xr, yr):
+                reasons.append("位置越界")
+            if s.seg_bez <= 0:
+                reasons.append("非平滑弯曲曲线")
+            if not (1.5 <= s.line_w_pt <= 3.0):
+                reasons.append("线宽%.2f磅不在1.5–3" % s.line_w_pt)
+            if not reasons:
+                found = desc
+                break
+            notes.append(desc + "（" + "、".join(reasons) + "）")
+        if found:
+            hits.append(nm + found)
+        else:
+            bad.append("%s曲线（近似#%s）：%s" % (nm, hexc, "; ".join(notes[:2]) or "未找到"))
+    return (len(hits) == 3, "命中%d/3条曲线%s" % (
+        len(hits), "（" + "；".join(bad) + "）" if bad else "：" + "、".join(hits)))
+
+
+def check_26_host_link(m: SlideModel) -> tuple[bool, str]:
+    cands = [s for s in m.shapes
+             if not _labeled(s) and s.w >= s.h and _is_black(s.line_main)
+             and _window(m, s, (62, 74), (50, 58))]
+    lines = [s for s in cands if s.w_cm >= 1.0]
+    blocks = [s for s in m.shapes
+              if not _labeled(s) and s.filled and 0.4 <= s.w_cm <= 1.0
+              and _window(m, s, (62, 74), (50, 58))]
+    if not lines:
+        if len(cands) >= 3:
+            return (False, "该处黑色水平线由%d段碎片拼接（最长%.2fcm），未由一条线段实现"
+                    % (len(cands), max(s.w_cm for s in cands)))
+        return (False, "该区域未找到长度≥1cm的黑色水平线段")
+    ln = max(lines, key=lambda s: s.w)
+    right = [b for b in blocks if b.x0 >= ln.x1 - 0.30 * EMU_PER_CM]
+    reasons: list[str] = []
+    if len(cands) >= 3:
+        reasons.append("该处另有%d段同色碎片" % (len(cands) - 1))
+    if not right:
+        reasons.append("线段右端无宽度0.4–1cm的小矩形块（该区域候选块%d个）" % len(blocks))
+    desc = "%s：x%.2f%%–%.2f%% y%.2f%% 长%.2fcm %s%s" % (
+        ln.name, m.px(ln.x0), m.px(ln.x1), m.py(ln.y0), ln.w_cm, ln.line_main or "无",
+        "，右端矩形块%s宽%.2fcm" % (right[0].name, right[0].w_cm) if right else "")
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def _cluster(m: SlideModel, xr: tuple[float, float], yr: tuple[float, float],
+             frac: float = 0.5) -> list[ShapeInfo]:
+    """取“主体落在给定区域内”的有填充部件：超出区域的部件也会被纳入，便于发现越界。"""
+    ax0, ax1 = xr[0] / 100.0 * m.page_w, xr[1] / 100.0 * m.page_w
+    ay0, ay1 = yr[0] / 100.0 * m.page_h, yr[1] / 100.0 * m.page_h
+    out: list[ShapeInfo] = []
+    for s in m.shapes:
+        if _labeled(s) or not s.filled:
+            continue
+        ox = min(s.x1, ax1) - max(s.x0, ax0)
+        oy = min(s.y1, ay1) - max(s.y0, ay0)
+        if ox < 0 or oy < 0:
+            continue
+        fx = ox / s.w if s.w > 0 else (1.0 if ax0 <= s.x0 <= ax1 else 0.0)
+        fy = oy / s.h if s.h > 0 else (1.0 if ay0 <= s.y0 <= ay1 else 0.0)
+        if fx >= frac and fy >= frac:
+            out.append(s)
+    return out
+
+
+def check_27_laptop(m: SlideModel) -> tuple[bool, str]:
+    parts = _cluster(m, (65, 95), (32, 68))
+    if len(parts) < 4:
+        return (False, "该区域仅找到%d个部件，未构成笔记本电脑图形" % len(parts))
+    x0, y0, x1, y1 = _bbox(parts)
+    frame = [s for s in parts
+             if _near_any(s.fill_colors, "2B415C", RGB_TOL_LOOSE) and s.w_cm >= 3.0 and s.h_cm >= 1.5]
+    fr = max(frame, key=lambda s: s.w * s.h) if frame else None
+    below = (fr.y1 - 0.5 * EMU_PER_CM) if fr is not None else y0
+    screen = [s for s in parts
+              if any(_is_whiteish(c) for c in s.fill_colors) and s.w_cm >= 2.0 and s.h_cm >= 1.0]
+    base = [s for s in parts if s.w_cm >= 4.0 and s.y0 >= (below if fr is None else (fr.y0 + fr.y1) / 2)]
+    pad = [s for s in parts if 1.2 <= s.w_cm <= 4.5 and s.h_cm <= 1.5 and s.y0 >= below]
+    keys = [s for s in parts if s.y0 >= below and s.w_cm <= 2.5 and s.h_cm <= 0.9
+            and all(s is not p for p in pad)]
+    key_lines = [s for s in m.shapes
+                 if not _labeled(s) and s.line_colors and s.y0 >= below
+                 and s.w_cm <= 2.5 and s.h_cm <= 0.9 and _window(m, s, (65, 95), (32, 68))]
+    reasons: list[str] = []
+    if not _span(m.px(x0), m.px(x1), 65, 95) or not _span(m.py(y0), m.py(y1), 32, 68):
+        reasons.append("整体位置越界")
+    if not frame:
+        reasons.append("无深蓝色屏幕外框（近似#2B415C）")
+    if not screen:
+        reasons.append("无白色屏幕区")
+    if not base:
+        reasons.append("屏幕下方无底座色块")
+    if not pad:
+        reasons.append("底座上无触控板色块")
+    if len(keys) + len(key_lines) < 5:
+        reasons.append("底座上键盘按键线条/形状仅%d个（需≥5）" % (len(keys) + len(key_lines)))
+    desc = "笔记本部件%d个：x%.2f%%–%.2f%% y%.2f%%–%.2f%%，外框%d/屏幕%d/底座%d/触控板%d/按键%d" % (
+        len(parts), m.px(x0), m.px(x1), m.py(y0), m.py(y1),
+        len(frame), len(screen), len(base), len(pad), len(keys) + len(key_lines))
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def _chart_frame(m: SlideModel, cur: ShapeInfo) -> tuple[bool, str]:
+    pad = 1.5 * EMU_PER_CM
+    rects = [s for s in m.shapes
+             if s is not cur and s.prst in ("rect", "roundRect")
+             and (_is_light(s.line_main) or _is_light(s.fill_main))
+             and _inside(cur, s, 0.5 * EMU_PER_CM)]
+    if rects:
+        return (True, "浅色矩形边框%s" % rects[0].name)
+    near = [s for s in m.shapes
+            if s is not cur and _is_light(s.line_main)
+            and s.x0 <= cur.x1 + pad and s.x1 >= cur.x0 - pad
+            and s.y0 <= cur.y1 + pad and s.y1 >= cur.y0 - pad]
+    vert = [s for s in near if s.w_cm <= 0.15 and s.h_cm >= 0.5]
+    horiz = [s for s in near if s.h_cm <= 0.15 and s.w_cm >= 0.5]
+    if vert and horiz:
+        return (True, "浅色边框线%d竖%d横" % (len(vert), len(horiz)))
+    return (False, "外围无浅色矩形图表边框（浅色边线%d竖%d横）" % (len(vert), len(horiz)))
+
+
+def _chart_curve(m: SlideModel, hexes: tuple[str, ...], xr: tuple[float, float],
+                 yr: tuple[float, float], name: str) -> tuple[bool, str]:
+    same = [s for s in m.shapes
+            if not _labeled(s)
+            and any(_near_any(s.line_colors, h, RGB_TOL_LOOSE) for h in hexes)
+            and _window(m, s, xr, yr)]
+    cands = [s for s in same if s.w_cm >= 0.5 and s.h_cm >= 0.3]
+    if not cands:
+        if len(same) >= 3:
+            return (False, "该处%s线由%d段各自独立的线段首尾拼接而成，未由一个连续形状实现"
+                    % (name, len(same)))
+        return (False, "该区域未找到%s曲线（近似#%s）" % (name, "或#".join(hexes)))
+    if len(cands) > 1:
+        return (False, "该处%s线由%d段独立形状拼接而成，未由一个连续形状实现" % (name, len(cands)))
+    c = cands[0]
+    reasons: list[str] = []
+    if len(same) > 1:
+        reasons.append("同色另有%d段独立线段" % (len(same) - 1))
+    if c.seg_move > 1:
+        reasons.append("路径含%d个起点，线条存在断开缺口" % c.seg_move)
+    if c.seg_bez <= 0 and c.seg_line < 2:
+        reasons.append("非连续曲线或折线形状")
+    ok_frame, fdesc = _chart_frame(m, c)
+    if not ok_frame:
+        reasons.append(fdesc)
+    desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% 线%s 路径(直线%d/曲线%d/起点%d)%s" % (
+        c.name, m.px(c.x0), m.px(c.x1), m.py(c.y0), m.py(c.y1), c.line_main or "无",
+        c.seg_line, c.seg_bez, c.seg_move, "，" + fdesc if ok_frame else "")
+    return (not reasons, desc + ("（" + "、".join(reasons) + "）" if reasons else ""))
+
+
+def check_28_blue_chart(m: SlideModel) -> tuple[bool, str]:
+    return _chart_curve(m, ("3276C3",), (72, 83), (39, 54), "蓝色")
+
+
+def check_29_red_chart(m: SlideModel) -> tuple[bool, str]:
+    return _chart_curve(m, ("E56F6E", "E10D0D"), (81, 92), (40, 55), "红色")
+
+
+def check_30_computer_label(m: SlideModel) -> tuple[bool, str]:
+    return _text_hit(m, "计算机", (73, 85), (64, 72), (13, 17))
+
+
+def check_31_legend_box(m: SlideModel) -> tuple[bool, str]:
+    notes: list[str] = []
+    for s in m.shapes:
+        if s.prst not in ("roundRect", "round1Rect", "round2SameRect"):
+            continue
+        if not _window(m, s, (9, 91), (80, 96)) or s.w_cm < 10.0:
+            continue
+        reasons: list[str] = []
+        if s.fill_kind != "none":
+            reasons.append("非无填充(%s)" % s.fill_kind)
+        if not _dashed(s):
+            reasons.append("边框非虚线(%s)" % s.dash)
+        if not _is_blue(s.line_main):
+            reasons.append("边框非蓝色(%s)" % (s.line_main or "无"))
+        if not (25.0 <= s.w_cm <= 30.0):
+            reasons.append("宽度%.2fcm不在25–30" % s.w_cm)
+        if not (2.0 <= s.h_cm <= 3.0):
+            reasons.append("高度%.2fcm不在2–3" % s.h_cm)
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%%–%.2f%% %.2fcm×%.2fcm 填充%s 边框%s %s" % (
+            s.name, m.px(s.x0), m.px(s.x1), m.py(s.y0), m.py(s.y1), s.w_cm, s.h_cm,
+            s.fill_kind, s.line_main or "无", s.dash)
+        if not reasons:
+            return (True, desc)
+        notes.append(desc + "（" + "、".join(reasons) + "）")
+    return (False, "; ".join(notes[:3]) or "该区域未找到宽度≥10cm的圆角矩形")
+
+
+def _legend_row(m: SlideModel, xr: tuple[float, float], yr: tuple[float, float],
+                ctest: Callable[[Optional[str]], bool], cname: str, needle: str,
+                sr: tuple[float, float], w_rng: tuple[float, float],
+                want_dash: bool = False) -> tuple[bool, str]:
+    lines = [s for s in m.shapes
+             if not _labeled(s) and s.w > s.h and s.line_colors and _window(m, s, xr, yr)]
+    txts = _find_text(m, needle)
+    if not txts:
+        return (False, "未找到“%s”文本" % needle)
+    if not lines:
+        return (False, "该区域未找到水平线段（“%s”文本已出现）" % needle)
+    notes: list[str] = []
+    for ln in lines:
+        reasons: list[str] = []
+        if not ctest(ln.line_main):
+            reasons.append("线段非%s(%s)" % (cname, ln.line_main or "无"))
+        if not (w_rng[0] <= ln.line_w_pt <= w_rng[1]):
+            reasons.append("线宽%.2f磅不在%g–%g" % (ln.line_w_pt, w_rng[0], w_rng[1]))
+        if want_dash and not _dashed(ln):
+            reasons.append("线型非虚线(%s)" % ln.dash)
+        if want_dash and not ln.has_arrow_end:
+            reasons.append("末端无箭头")
+        cy = (m.py(ln.y0) + m.py(ln.y1)) / 2.0
+        right = [t for t in txts
+                 if t.x0 >= ln.x1 - 0.5 * EMU_PER_CM
+                 and abs((m.py(t.y0) + m.py(t.y1)) / 2.0 - cy) <= 4.0]
+        szs = _sizes(right[0]) if right else []
+        if not right:
+            reasons.append("线段右侧未见“%s”文本" % needle)
+        elif not any(sr[0] <= v <= sr[1] for v in szs):
+            reasons.append("文本字号%s磅不在%g–%g" % ("/".join("%.1f" % v for v in szs), sr[0], sr[1]))
+        desc = "%s：x%.2f%%–%.2f%% y%.2f%% %s %.2f磅 %s，右侧文本字号%s磅" % (
+            ln.name, m.px(ln.x0), m.px(ln.x1), cy, ln.line_main or "无", ln.line_w_pt,
+            ln.dash, "/".join("%.1f" % v for v in szs) or "-")
+        if not reasons:
+            return (True, desc)
+        notes.append(desc + "（" + "、".join(reasons) + "）")
+    return (False, "; ".join(notes[:2]))
+
+
+def check_32_legend_work(m: SlideModel) -> tuple[bool, str]:
+    return _legend_row(m, (12, 18), (84, 88), _is_black, "黑色",
+                       "工作电极连接线（信号输出）", (12, 15), (1.5, 2.5))
+
+
+def check_33_legend_ref(m: SlideModel) -> tuple[bool, str]:
+    return _legend_row(m, (12, 18), (89, 93), _is_green, "绿色",
+                       "参比电极连接线（电位参照）", (12, 15), (1.5, 2.5))
+
+
+def check_34_legend_counter(m: SlideModel) -> tuple[bool, str]:
+    return _legend_row(m, (41, 47), (85, 89), _is_red, "红色",
+                       "对电极连接线（电流通路）", (12, 15), (1.5, 2.5))
+
+
+def check_35_legend_flow(m: SlideModel) -> tuple[bool, str]:
+    return _legend_row(m, (67, 74), (85, 89), _is_blue, "蓝色",
+                       "信号/控制/数据流向", (12, 15), (2.0, 3.0), want_dash=True)
+
+
+_EXPECTED_TEXTS: list[str] = [
+    "分析物输入", "参比电极", "工作电极", "对电极", "样品溶液", "电化学分析仪",
+    "信号采集与处理", "电位/电流控制", "数据分析与可视化", "计算机",
+    "工作电极连接线（信号输出）", "参比电极连接线（电位参照）",
+    "对电极连接线（电流通路）", "信号/控制/数据流向",
+]
+
+
+def _expected_like(txt: str) -> bool:
+    """是否属于要求之内的文字。错字/多空格等按“写错”处理，不在本条重复计分。"""
+    t = _norm(txt)
+    if not t:
         return True
-    return ln.find("a:custDash", namespaces=NS) is not None
-
-
-def has_arrow(elem) -> bool:
-    for tag in ("headEnd", "tailEnd"):
-        end = elem.find(f".//a:{tag}", namespaces=NS)
-        if end is not None and end.get("type", "none") not in {"none", ""}:
+    for e in _EXPECTED_TEXTS:
+        k = _norm(e)
+        if k in t or t in k:
+            return True
+        if len(set(t) & set(k)) >= max(2, int(0.5 * len(k))):
             return True
     return False
 
 
-def has_blip(elem) -> bool:
-    return elem.find(".//a:blip", namespaces=NS) is not None
+def check_36_text_integrity(m: SlideModel) -> tuple[bool, str]:
+    problems: list[str] = []
+    for t in m.texts():
+        label = t.text.strip().replace("\n", " ")
+        area = t.w * t.h
+        cov, worst = 0.0, None
+        for s in m.shapes:
+            # 注意：自动图形即使没有文字也带文本框，故此处按“是否叠放在文字之上且不透明”判断
+            if s is t or s.z <= t.z or not s.opaque_fill:
+                continue
+            ia = _inter_area(t, s)
+            if ia > cov:
+                cov, worst = ia, s
+        if area > 0 and cov / area >= 0.15 and worst is not None:
+            problems.append("“%s”被%s遮挡约%.1f%%" % (label[:12], worst.name, cov / area * 100.0))
+        tol = 0.2 * EMU_PER_CM
+        if t.x0 < -tol or t.y0 < -tol or t.x1 > m.page_w + tol or t.y1 > m.page_h + tol:
+            problems.append("“%s”超出页面边界被裁切" % label[:12])
+        if not _expected_like(t.text):
+            problems.append("出现要求之外的文字“%s”" % label[:16])
+    if problems:
+        return (False, "; ".join(problems[:5]))
+    return (True, "共%d处文本，均完整显示且无多余文字" % len(m.texts()))
 
 
-def has_pattern_fill(elem) -> bool:
-    return elem.find(".//a:pattFill", namespaces=NS) is not None
+_CHECKS: list[Callable[[SlideModel], tuple[bool, str]]] = [
+    check_01_aspect,            # +5 整体宽高比 1.63–1.73
+    check_02_centered,          # +5 整体居中放置
+    check_03_outer_frame,       # +3 蓝色实线外框
+    check_04_inlet_text,        # +3 “分析物输入”文本
+    check_05_inlet_arrow,       # +1 竖直蓝色虚线箭头
+    check_06_beaker,            # +5 烧杯整体
+    check_07_liquid,            # +3 浅蓝液体色块
+    check_08_bubbles,           # +1 气泡≥7个
+    check_09_green_electrode,   # +3 绿色电极杆
+    check_10_working_column,    # +3 竖直柱体与深色帽盖
+    check_11_red_electrode,     # +3 红色电极杆
+    check_12_ref_label,         # +1 “参比电极”
+    check_13_work_label,        # +1 “工作电极”
+    check_14_counter_label,     # +1 “对电极”
+    check_15_sample_label,      # +1 “样品溶液”
+    check_16_label_arrows,      # +1 两条黑色实线箭头
+    check_17_chassis,           # +5 斜视立体机箱
+    check_18_screen,            # +3 小屏幕与波形
+    check_19_leds,              # +1 三个指示灯
+    check_20_analyzer_text,     # +1 “电化学分析仪”
+    check_21_acq_box,           # +3 “信号采集与处理”虚线框
+    check_22_ctrl_box,          # +3 “电位/电流控制”虚线框
+    check_23_viz_box,           # +3 “数据分析与可视化”虚线框
+    check_24_flow_arrows,       # +1 三条竖直虚线箭头
+    check_25_curves,            # +5 三条平滑曲线
+    check_26_host_link,         # +1 主机连线与小矩形块
+    check_27_laptop,            # +5 笔记本电脑图形
+    check_28_blue_chart,        # +3 蓝色图表曲线
+    check_29_red_chart,         # +3 红色图表曲线
+    check_30_computer_label,    # +1 “计算机”
+    check_31_legend_box,        # +3 图例虚线框
+    check_32_legend_work,       # +1 图例·工作电极连接线
+    check_33_legend_ref,        # +1 图例·参比电极连接线
+    check_34_legend_counter,    # +1 图例·对电极连接线
+    check_35_legend_flow,       # +1 图例·信号/控制/数据流向
+    check_36_text_integrity,    # +1 文字完整可见且无多余文字
+]
+
+assert len(_CHECKS) == len(_DIM2_RULES), (
+    "检查函数个数与细则条数不一致：%d vs %d" % (len(_CHECKS), len(_DIM2_RULES))
+)
 
 
-def has_transparency(elem) -> bool:
-    return elem.find(".//a:alpha", namespaces=NS) is not None
+# ================================================================ 维度1 判定 ====
+
+def _dim1_gate(file_path: str, m: SlideModel) -> list[str]:
+    fails: list[str] = []
+    if not file_path.lower().endswith(".pptx"):
+        fails.append("交付文件格式为%s，不是.pptx" % (os.path.splitext(file_path)[1] or "无扩展名"))
+    if m.slide_count != 1:
+        fails.append("幻灯片页数为%d页（要求1页）" % m.slide_count)
+    page = m.page_w * m.page_h
+    pics = [s for s in m.shapes if s.is_picture]
+    editable = [s for s in m.shapes if not s.is_picture]
+    big = [p for p in pics if page > 0 and (p.w * p.h) / page >= 0.60]
+    if big and len(editable) < 10:
+        fails.append("以整张位图充当版面（位图%s覆盖页面%.0f%%，可编辑对象仅%d个）"
+                     % (big[0].name, (big[0].w * big[0].h) / page * 100.0, len(editable)))
+    return fails
 
 
-def get_xfrm_rotation(elem) -> tuple[float, bool, bool]:
-    """返回形状 (rotation_deg, flipH, flipV)。
-    从 p:spPr/a:xfrm 读 rot(EMU 单位 60000/度), flipH/flipV。未设置返回 (0.0, False, False)。
-    """
-    xfrm = elem.find(".//p:spPr/a:xfrm", namespaces=NS)
-    if xfrm is None:
-        # 部分连接符/组合的 xfrm 直接在 spPr 之外; 兜底再找一次
-        xfrm = elem.find(".//a:xfrm", namespaces=NS)
-    if xfrm is None:
-        return 0.0, False, False
-    rot_attr = xfrm.get("rot")
+# ================================================================== 主流程 ====
+
+def _dim1_fail(result: dict[str, Any], reason: str) -> dict[str, Any]:
+    """维度一未通过：完成度总分记 0，不再逐条罗列（未真正逐条评过）。
+
+    status 保持 "ok"（文件确实找到了，只是维度一不达标），dim1_reason 必须非空。"""
+    result["dim1_pass"] = False
+    result["dim1_reason"] = reason or "维度一未通过（未给出具体原因）"
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def _evaluate_impl(file_path: str, result: dict[str, Any]) -> dict[str, Any]:
+    # 文件已找到但打不开（损坏 / 需修复 / 实际不是 pptx 包）属于维度一未通过，
+    # 而不是"没评上"：status 仍为 ok，按维度一记 0 分并写错误摘要。
     try:
-        rot = (int(rot_attr) / 60000.0) if rot_attr else 0.0
-    except ValueError:
-        rot = 0.0
-    # 归一化到 (-180, 180]
-    rot = ((rot + 180.0) % 360.0) - 180.0
-    flip_h = xfrm.get("flipH") in ("1", "true")
-    flip_v = xfrm.get("flipV") in ("1", "true")
-    return rot, flip_h, flip_v
-
-
-def slide_background_colors(slide, theme: dict[str, tuple[int, int, int]] | None = None) -> list[tuple[int, int, int]]:
-    bg = slide._element.find(".//p:bg", namespaces=NS)
-    if bg is None:
-        return []
-    return all_xml_rgbs(bg, theme)
-
-
-def get_font_info(elem, theme: dict[str, tuple[int, int, int]] | None = None) -> tuple[Optional[str], Optional[float], Optional[tuple[int, int, int]]]:
-    rpr = elem.find(".//a:rPr", namespaces=NS)
-    if rpr is None:
-        return None, None, None
-    size = None
-    if rpr.get("sz"):
-        try:
-            size = int(rpr.get("sz")) / 100.0
-        except ValueError:
-            size = None
-    latin = rpr.find("a:latin", namespaces=NS)
-    ea = rpr.find("a:ea", namespaces=NS)
-    name = None
-    if ea is not None and ea.get("typeface"):
-        name = ea.get("typeface")
-    elif latin is not None and latin.get("typeface"):
-        name = latin.get("typeface")
-    return name, size, first_xml_rgb(rpr, theme)
-
-
-def get_text_align(elem) -> Optional[str]:
-    """Return paragraph alignment: 'ctr', 'l', 'r', 'just', or None."""
-    tx_body = elem.find(".//p:txBody", namespaces=NS)
-    if tx_body is None:
-        return None
-    # Check body-level default (bodyPr / lstStyle) — paragraph overrides take precedence
-    for p in tx_body.findall(".//a:p", namespaces=NS):
-        ppr = p.find("a:pPr", namespaces=NS)
-        if ppr is not None and ppr.get("algn"):
-            return ppr.get("algn")
-    return None
-
-
-def build_context(path: Path) -> EvaluationContext:
-    try:
-        prs = Presentation(str(path))
-        slide_count = len(prs.slides)
-        slide_width = cm(prs.slide_width)
-        slide_height = cm(prs.slide_height)
-        # 一次性加载 theme1.xml 里的 clrScheme, 供后续所有颜色解析反查 schemeClr
-        theme = _load_theme_colors(path)
-        shapes: list[ShapeInfo] = []
-        if slide_count:
-            slide = prs.slides[0]
-            for idx, raw in enumerate(slide.shapes, start=1):
-                elem = raw._element
-                b = Box(cm(raw.left), cm(raw.top), cm(raw.width), cm(raw.height))
-                font_name, font_size, text_color = get_font_info(elem, theme)
-                rot, flip_h, flip_v = get_xfrm_rotation(elem)
-                shapes.append(
-                    ShapeInfo(
-                        index=idx,
-                        name=get_name(elem),
-                        geom=get_prst_geom(elem),
-                        box=b,
-                        text=get_text(elem),
-                        fill_colors=get_fill_colors(elem, theme),
-                        line_color=get_line_color(elem, theme),
-                        line_width=get_line_width(elem),
-                        dashed=has_dash(elem),
-                        arrow=has_arrow(elem),
-                        font_name=font_name,
-                        font_size=font_size,
-                        text_color=text_color,
-                        text_align=get_text_align(elem),
-                        has_blip=has_blip(elem),
-                        has_pattern_fill=has_pattern_fill(elem),
-                        has_transparency=has_transparency(elem),
-                        rotation=rot,
-                        flip_h=flip_h,
-                        flip_v=flip_v,
-                    )
-                )
-        return EvaluationContext(path, prs, slide_width, slide_height, slide_count, shapes)
+        model = build_model(file_path)
     except Exception as exc:
-        return EvaluationContext(path, None, 0, 0, 0, [], f"{type(exc).__name__}: {exc}")
-
-
-def text_matches(s: ShapeInfo, expected: str | list[str] | tuple[str, ...]) -> bool:
-    vals = expected if isinstance(expected, (list, tuple)) else [expected]
-    n = norm_text(s.text)
-    return any(norm_text(v) in n for v in vals)
-
-
-def find_text(ctx: EvaluationContext, expected: str | list[str] | tuple[str, ...]) -> list[ShapeInfo]:
-    return [s for s in ctx.text_shapes if text_matches(s, expected)]
-
-
-def find_text_in(ctx: EvaluationContext, expected, left: float, top: float, right: float, bottom: float, tol: float = 0.45) -> list[ShapeInfo]:
-    return [s for s in find_text(ctx, expected) if center_in(s, left, top, right, bottom, tol)]
-
-
-def has_text_style(s: ShapeInfo, size_min: float, size_max: float, color_pred: Callable[[Optional[tuple[int, int, int]]], bool] | None = None, size_tol: float = 1.2) -> bool:
-    size_ok = s.font_size is not None and in_range(s.font_size, size_min, size_max, size_tol)
-    font_ok = True
-    if s.font_name:
-        font_ok = any(k in s.font_name.lower() for k in SANS_FONTS) or any(k in s.font_name for k in ("微软雅黑", "黑体", "等线"))
-    color_ok = True if color_pred is None else (s.text_color is not None and color_pred(s.text_color))
-    return size_ok and font_ok and color_ok
-
-
-def count_shapes(region: tuple[float, float, float, float], shapes: Iterable[ShapeInfo], pred: Callable[[ShapeInfo], bool] = lambda s: True) -> int:
-    l, t, r, b = region
-    return sum(1 for s in shapes if pred(s) and intersects_region(s, l, t, r, b, 0.15))
-
-
-def line_in_region(ctx: EvaluationContext, left: float, top: float, right: float, bottom: float, color_pred=None, width_range: Optional[tuple[float, float]] = None, dashed=None, arrow=None, horizontal=None, vertical=None, min_len: float = 0.0, max_len: Optional[float] = None, width_tol: float = 0.45, region_tol: float = 0.25, direction: Optional[str] = None) -> list[ShapeInfo]:
-    vals = []
-    # 当筛选"一体箭头"时，把预设箭头形状（rightArrow/downArrow 等 box 状的箭头）
-    # 也纳入候选池；否则仅遍历 line/连接符 等线形对象。
-    if arrow is True:
-        candidates = [s for s in ctx.shapes if s.is_line or s.is_arrow_shape]
-    else:
-        candidates = ctx.line_shapes
-    for s in candidates:
-        if not intersects_region(s, left, top, right, bottom, region_tol):
-            continue
-        if color_pred and not color_pred(s.line_color):
-            continue
-        if width_range and not line_width_in_range(s.line_width, width_range[0], width_range[1], width_tol):
-            continue
-        if dashed is not None and s.dashed != dashed:
-            continue
-        if arrow is True:
-            # 一体箭头：line/连接符带 head/tail，或者预设几何本身即为箭头形状
-            if not s.is_arrow_shape:
-                continue
-        elif arrow is False:
-            if s.is_arrow_shape:
-                continue
-        if horizontal is True and not (s.h_abs <= max(0.12, s.w_abs * 0.25)):
-            continue
-        if vertical is True and not (s.w_abs <= max(0.12, s.h_abs * 0.25)):
-            continue
-        if direction == "right" and s.box.width <= 0:
-            continue
-        if direction == "left" and s.box.width >= 0:
-            continue
-        if direction == "down" and s.box.height <= 0:
-            continue
-        if direction == "up" and s.box.height >= 0:
-            continue
-        if s.length < min_len:
-            continue
-        if max_len is not None and s.length > max_len:
-            continue
-        vals.append(s)
-    return vals
-
-
-def rect_in_region(ctx: EvaluationContext, left: float, top: float, right: float, bottom: float, *, dashed=None, color_pred=None, fill_pred=None, min_w=0.0, min_h=0.0) -> list[ShapeInfo]:
-    vals = []
-    for s in ctx.rect_shapes:
-        if not center_in(s, left, top, right, bottom, 0.45):
-            continue
-        if dashed is not None and s.dashed != dashed:
-            continue
-        if color_pred and not color_pred(s.line_color):
-            continue
-        if fill_pred and not any(fill_pred(c) for c in s.fill_colors):
-            continue
-        if s.w_abs < min_w or s.h_abs < min_h:
-            continue
-        vals.append(s)
-    return vals
-
-
-def ellipses_in_region(ctx: EvaluationContext, left: float, top: float, right: float, bottom: float, *, fill_pred=None, line_pred=None, min_w=0.0, max_h=99.0) -> list[ShapeInfo]:
-    vals = []
-    for s in ctx.ellipse_shapes:
-        if not center_in(s, left, top, right, bottom, 0.45):
-            continue
-        if fill_pred and not any(fill_pred(c) for c in s.fill_colors):
-            continue
-        if line_pred and not line_pred(s.line_color):
-            continue
-        if s.w_abs < min_w or s.h_abs > max_h:
-            continue
-        vals.append(s)
-    return vals
-
-
-def segmented_blue_border(ctx: EvaluationContext, left: float, top: float, right: float, bottom: float, min_segments: int = 16) -> tuple[bool, int]:
-    """Detect editable dashed boxes drawn as many short blue line segments."""
-    segments = line_in_region(ctx, left, top, right, bottom, color_pred=is_blue, width_range=(0.7, 1.8), min_len=0.08)
-    short_segments = [s for s in segments if s.length <= 0.55]
-    if not short_segments:
-        return False, 0
-    horizontals = [s for s in short_segments if s.h_abs <= max(0.08, s.w_abs * 0.35)]
-    verticals = [s for s in short_segments if s.w_abs <= max(0.08, s.h_abs * 0.35)]
-    x_span = max(s.x2 for s in short_segments) - min(s.x1 for s in short_segments)
-    y_span = max(s.y2 for s in short_segments) - min(s.y1 for s in short_segments)
-    expected_w = right - left
-    expected_h = bottom - top
-    spans_region = x_span >= expected_w * 0.90 and y_span >= expected_h * 0.80
-    has_box_sides = len(horizontals) >= max(4, min_segments // 3) and len(verticals) >= 2
-    hit = len(short_segments) >= min_segments and spans_region and has_box_sides
-    return hit, len(short_segments)
-
-
-def result(label: str, hit: bool, detail: str, points: int = 0) -> RuleResult:
-    return RuleResult(label=label, hit=hit, detail=detail, points=points)
-
-
-# ───────────────────────── 维度1 ─────────────────────────
-
-def dimension1_checks(ctx: EvaluationContext) -> list[RuleResult]:
-    checks: list[RuleResult] = []
-
-    ext_ok = ctx.path.suffix.lower() == ".pptx"
-    checks.append(result("交付文件为 .pptx 格式", ext_ok, f"扩展名：{ctx.path.suffix or '无'}"))
-
-    open_ok = ctx.open_error is None and ctx.prs is not None
-    checks.append(result("文件可正常打开", open_ok, "已成功读取 PPT" if open_ok else f"无法打开：{ctx.open_error}"))
-    if not open_ok:
-        return checks
-
-    one_slide = ctx.slide_count == 1
-    checks.append(result("交付PPT只包含1页幻灯片", one_slide, f"检测到 {ctx.slide_count} 页"))
-
-    # 按用户指示已删除以下 rubric 项对应的检查(仅保留扩展名/文件可打开/幻灯片数量)：
-    #   - 第1页所有可见元素均为可编辑对象(editable_count/text_count/picture_area 判定 → 已删除)
-    #   - 第1页页面比例为横向16:9 / 无整体拉伸压缩旋转裁切(ratio + bbox 越界判定 → 已删除)
-    #   - 无 >50% 空白 / 文字大面积重叠 / 对象越界(content_ratio + text_overlaps → 已删除)
-    #   - "关键文本均为可编辑文本对象"锚点(14 组核心标签存在性 → 已删除)
-
-    return checks
-
-
-# ───────────────────────── 维度2规则 ─────────────────────────
-
-def check_background(ctx: EvaluationContext) -> RuleResult:
-    page_area = ctx.slide_width * ctx.slide_height
-    full_page_shapes = [
-        s for s in ctx.shapes
-        if s.x1 <= 0.25 and s.y1 <= 0.25
-        and s.x2 >= ctx.slide_width - 0.25 and s.y2 >= ctx.slide_height - 0.25
-    ]
-    full_page_rects = [s for s in full_page_shapes if s.is_rect_like]
-    slide_bg_colors = slide_background_colors(ctx.prs.slides[0]) if ctx.prs is not None and ctx.slide_count else []
-
-    full_page_picture_backgrounds = [s for s in full_page_shapes if s.has_blip]
-    non_white_full_page_fills = [
-        s for s in full_page_rects
-        if s.fill_colors and not any(is_whiteish(c) for c in s.fill_colors)
-    ]
-    large_pattern_or_watermark_shapes = [
-        s for s in ctx.shapes
-        if s.box.area >= page_area * 0.55 and (s.has_pattern_fill or s.has_transparency)
-    ]
-    has_white_page_background = (
-        not non_white_full_page_fills
-        and (
-            not slide_bg_colors
-            or any(is_whiteish(c) for c in slide_bg_colors)
-            or any(any(is_whiteish(c) for c in s.fill_colors) for s in full_page_rects)
-        )
-    )
-    hit = has_white_page_background and not full_page_picture_backgrounds and not large_pattern_or_watermark_shapes
-    return result(
-        "第1页白色页面背景",
-        hit,
-        f"白/极浅灰白背景={'是' if has_white_page_background else '否'}，整页图片背景 {len(full_page_picture_backgrounds)} 个，大面积底纹/水印 {len(large_pattern_or_watermark_shapes)} 个",
-    )
-
-
-def check_outer_border(ctx: EvaluationContext) -> RuleResult:
-    # rubric 修改后: 位于页面四周边缘, 蓝色单实线矩形, 线宽 0.5–3磅.
-    # 相较原细则删除了"距页面四边 0–0.2cm 范围内"的硬约束,
-    # 但仍需体现"位于页面四周边缘"—— 采用较宽松的边距容差 (≤1.0cm)
-    # 以区分位于页面中部的普通蓝色矩形.
-    EDGE_TOL = 1.0
-    candidates = []
-    for s in ctx.rect_shapes:
-        if not s.is_rect_like:
-            continue
-        left_margin = s.x1
-        top_margin = s.y1
-        right_margin = ctx.slide_width - s.x2
-        bottom_margin = ctx.slide_height - s.y2
-        margins_ok = all(in_range(v, 0.0, EDGE_TOL, 0.0) for v in (left_margin, right_margin, top_margin, bottom_margin))
-        line_ok = (
-            not s.dashed
-            and is_blue(s.line_color)
-            and line_width_in_range(s.line_width, 0.5, 3.0, 0.0)
-        )
-        if margins_ok and line_ok:
-            candidates.append(s)
-    return result(
-        "第1页外侧蓝色矩形边框",
-        bool(candidates),
-        f"符合位于页面四周边缘(边距≤{EDGE_TOL}cm)/蓝色单实线/0.5-3磅的外框 {len(candidates)} 个",
-    )
-
-
-def check_beaker_outline(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左4.5–17cm，距上8–19.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 4.5, 8.0, 17.0, 19.5
-    region_cx = (REGION_L + REGION_R) / 2
-    region_h = REGION_B - REGION_T
-    top_y_hi = REGION_T + region_h * 0.4     # 顶部椭圆允许出现的最深 y
-    bottom_y_lo = REGION_T + region_h * 0.6  # 底部椭圆允许出现的最浅 y
-    # 边线颜色：浅灰蓝色 —— 只要属于蓝色或灰色家族即视为合规
-    def is_light_grey_blue(c: tuple[int, int, int] | None) -> bool:
-        return is_blue(c) or is_grayish(c)
-    # 填充：无填充、白色、或极浅蓝（透明效果）
-    def is_no_or_light_fill(s: ShapeInfo):
-        if not s.fill_colors:
-            return True  # 无填充
-        return all(
-            is_whiteish(c) or (c[2] >= 200 and c[1] >= 200)
-            for c in s.fill_colors
-        )
-    # 边线线宽在0.5–2磅内，非虚线单实线
-    def has_outline_line(s: ShapeInfo):
-        return (
-            line_width_in_range(s.line_width, 0.5, 2.0, 0.0)
-            and not s.dashed
-            and is_light_grey_blue(s.line_color)
-        )
-    # 1. 上沿椭圆口：椭圆，中心在区域上部（占区域高 0–40%），宽>高（横向扁）
-    top_ellipses = [
-        s for s in ctx.ellipse_shapes
-        if center_in(s, REGION_L, REGION_T, REGION_R, top_y_hi, tol=0.35)
-        and s.w_abs > s.h_abs * 1.5
-        and s.w_abs >= 4.0
-        and has_outline_line(s)
-    ]
-    # 2. 斜壁筛选：位于区域内、颜色/线宽合规、且为"斜向"（既非纯水平也非纯垂直）
-    #    - length >= 2cm
-    #    - w_abs >= 0.15cm 且 h_abs >= 0.8cm 排除水平/极短竖线
-    #    - 斜率 |h/w| ∈ [0.5, 15]（≈30°–86°），排除近水平/近垂直
-    def is_slanted_wall(s: ShapeInfo) -> bool:
-        if not (s.is_line or s.is_rect_like):
-            return False
-        if s.length < 2.0:
-            return False
-        if s.w_abs < 0.15 or s.h_abs < 0.8:
-            return False
-        slope = s.h_abs / max(s.w_abs, 1e-6)
-        if not (0.5 <= slope <= 15.0):
-            return False
-        return has_outline_line(s)
-    slanted_walls = [
-        s for s in ctx.shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.2)
-        and is_slanted_wall(s)
-    ]
-    # 3. 拆分左/右杯壁：以区域水平中线为界
-    left_walls = [s for s in slanted_walls if s.cx < region_cx]
-    right_walls = [s for s in slanted_walls if s.cx >= region_cx]
-    # 4. 底部弧形：椭圆，中心在区域下部（占区域高 60%–100%），宽>高
-    bottom_ellipses = [
-        s for s in ctx.ellipse_shapes
-        if center_in(s, REGION_L, bottom_y_lo, REGION_R, REGION_B, tol=0.4)
-        and s.w_abs > s.h_abs
-        and s.w_abs >= 3.0
-        and has_outline_line(s)
-    ]
-    # 5. 上宽下窄验证：
-    #    (a) 主路径 — 用左右壁 bbox 端点近似端口开口宽度。
-    #        物理约束：左壁形似 "\"（上外下内），右壁形似 "/"（上外下内）,
-    #        因此上开口宽 ≈ right_wall.x2 - left_wall.x1，
-    #             下开口宽 ≈ right_wall.x1 - left_wall.x2。
-    #        取每侧 length 最大的一条为代表；要求 top_gap ≥ bottom_gap + 0.3cm。
-    #    (b) 退化路径 — 若主路径未成立(缺壁/形态异常), 用上/下椭圆宽度比较,
-    #        top_ellipse.w_abs ≥ bottom_ellipse.w_abs + 0.3cm 亦视为通过。
-    top_wider = False
-    top_wider_detail = ""
-    if left_walls and right_walls:
-        lw = max(left_walls, key=lambda s: s.length)
-        rw = max(right_walls, key=lambda s: s.length)
-        top_gap = rw.x2 - lw.x1
-        bottom_gap = rw.x1 - lw.x2
-        if top_gap > 0 and bottom_gap > 0 and top_gap >= bottom_gap + 0.3:
-            top_wider = True
-            top_wider_detail = f"壁端口 上{top_gap:.2f}cm>下{bottom_gap:.2f}cm"
-    if not top_wider and top_ellipses and bottom_ellipses:
-        top_w = max(e.w_abs for e in top_ellipses)
-        bot_w = max(e.w_abs for e in bottom_ellipses)
-        if top_w >= bot_w + 0.3:
-            top_wider = True
-            top_wider_detail = f"椭圆 上{top_w:.2f}cm>下{bot_w:.2f}cm"
-    if not top_wider and not top_wider_detail:
-        top_wider_detail = "上宽下窄未验证"
-    # 6. 整体填充检查：杯身主体形状（大面积）应无填充或极浅蓝透明
-    body_shapes = [
-        s for s in ctx.shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.2)
-        and s.is_rect_like
-        and s.w_abs >= 4.0 and s.h_abs >= 3.0
-    ]
-    fill_ok = not body_shapes or any(is_no_or_light_fill(s) for s in body_shapes)
-    hit = (
-        bool(top_ellipses)
-        and bool(left_walls) and bool(right_walls)
-        and bool(bottom_ellipses)
-        and fill_ok
-        and top_wider
-    )
-    return result(
-        "第1页左侧烧杯外轮廓",
-        hit,
-        (
-            f"上沿椭圆 {len(top_ellipses)}，左斜壁 {len(left_walls)}，"
-            f"右斜壁 {len(right_walls)}，底部弧形 {len(bottom_ellipses)}，"
-            f"填充合规={'是' if fill_ok else '否'}，"
-            f"上宽下窄={'是' if top_wider else '否'}({top_wider_detail})"
-        ),
-    )
-
-
-def check_beaker_top_ellipse(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左3–18cm，距上7.2–13cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 3.0, 7.2, 18.0, 13.0
-    # 边线颜色：浅蓝色 —— 蓝色家族即视为合规
-    def is_light_blue(c: tuple[int, int, int] | None) -> bool:
-        return is_blue(c)
-    vals = []
-    for s in ctx.ellipse_shapes:
-        # 中心在指定区域内
-        if not center_in(s, REGION_L, REGION_T, REGION_R, REGION_B, tol=0.35):
-            continue
-        # 横向扁椭圆：宽明显大于高
-        if s.w_abs <= s.h_abs:
-            continue
-        # 边线为浅蓝色单实线
-        if not is_light_blue(s.line_color):
-            continue
-        if s.dashed:
-            continue
-        # 线宽0.5磅–2磅（未显式设置按默认1.0磅处理）
-        if not line_width_in_range(s.line_width, 0.5, 2.0, 0.0):
-            continue
-        vals.append(s)
-    return result("第1页左侧烧杯顶部开口椭圆", bool(vals), f"符合横向扁椭圆 {len(vals)} 个")
-
-
-def check_liquid_and_bubbles(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左4–14.5cm，距上10–19cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 4.0, 10.0, 14.5, 19.0
-
-    # 液体填充色：浅蓝色或淡青蓝色 —— 只要属于蓝色家族即视为合规
-    def is_light_cyan_blue_fill(c: tuple[int, int, int] | None) -> bool:
-        return is_blue(c) or is_cyan_or_whiteblue(c)
-
-    # 1. 液体填充：在区域内，填充为浅蓝/淡青蓝，半透明（has_transparency），面积>=0.5
-    fills = [
-        s for s in ctx.shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.2)
-        and s.has_transparency
-        and any(is_light_cyan_blue_fill(c) for c in s.fill_colors)
-        and s.box.area >= 0.5
-    ]
-
-    # 液面上沿边线颜色：浅蓝色 —— 只要属于蓝色家族即视为合规
-    def is_surface_blue(c: tuple[int, int, int] | None) -> bool:
-        return is_blue(c)
-
-    # 2. 液面上沿：椭圆弧线，中心在区域上部(REGION_T 上下 ~2cm 范围)，横向扁，边线浅蓝色
-    surface = [
-        s for s in ctx.ellipse_shapes
-        if center_in(s, REGION_L - 0.5, REGION_T - 2.0, REGION_R + 0.5, REGION_T + 1.5, tol=0.4)
-        and s.w_abs > s.h_abs
-        and s.w_abs >= 4.0
-        and is_surface_blue(s.line_color)
-    ]
-
-    # 3. 气泡：在液体区域内（偏中下部），小椭圆/圆，填充为浅白或浅蓝白，直径<=0.5cm
-    #    按 rubric 原文 "浅白色 或 浅蓝白色", 收窄判定:
-    #      (a) 浅白  = 高亮度近白 (is_whiteish: min(RGB) ≥ 230);
-    #      (b) 浅蓝白 = 高亮度浅蓝调 (三通道 ≥ 200 且 B 略高于 R, 允许极轻微蓝调).
-    #    显式排除任意灰色 (原来 is_grayish 会把中/深灰误判为气泡, 已删除).
-    def is_high_brightness_bluewhite(c: tuple[int, int, int] | None) -> bool:
-        if c is None:
-            return False
-        r, g, b = c
-        return min(r, g, b) >= 200 and b >= r and b >= g - 10
-
-    def is_white_or_light_bluewhite(c: tuple[int, int, int] | None) -> bool:
-        return is_whiteish(c) or is_high_brightness_bluewhite(c)
-
-    bubbles = [
-        s for s in ctx.ellipse_shapes
-        if center_in(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.2)
-        and s.w_abs <= 0.5 and s.h_abs <= 0.5
-        and (
-            not s.fill_colors
-            or any(is_white_or_light_bluewhite(c) for c in s.fill_colors)
-        )
-    ]
-
-    hit = bool(fills) and bool(surface) and len(bubbles) >= 3
-    return result(
-        "第1页左侧烧杯内部液面与液体填充",
-        hit,
-        f"浅蓝半透明液体形状 {len(fills)}，液面椭圆弧 {len(surface)}，气泡圆点 {len(bubbles)} 个",
-    )
-
-
-def check_sample_text(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左3–9cm，距上9–13.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 3.0, 9.0, 9.0, 13.5
-    # 1. 文本内容为"样品溶液"，中心在指定区域内
-    vals = find_text_in(ctx, "样品溶液", REGION_L, REGION_T, REGION_R, REGION_B, tol=0.15)
-    matched = []
-    for s in vals:
-        # 2. 字体：黑体、微软雅黑或相近中文字体（无衬线中文字体）
-        font_ok = True  # 细则允许"相近中文字体"，有font_name时才做限制
-        if s.font_name:
-            fn_lower = s.font_name.lower()
-            font_ok = any(k in fn_lower for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        # 3. 字号：14–16磅（严格，无额外容差）
-        size_ok = s.font_size is not None and in_range(s.font_size, 14.0, 16.0, 0.0)
-        # 4. 颜色：黑色或深灰色。
-        #    要求 text_color 明确可解析(非 None) 且属于黑/深灰家族；
-        #    未显式设置(a:srgbClr 缺失)的文本不再默认放行。
-        #    build_context 已通过 _load_theme_colors 将 a:schemeClr(如 tx1/dk1) 反查
-        #    theme1.xml 的 clrScheme 得到 RGB (纯 XML 解析, 无需 COM/LibreOffice)，
-        #    因此使用主题色的文本也可正确解析为具体 RGB 再判定。
-        color_ok = s.text_color is not None and (
-            is_blackish(s.text_color) or is_dark(s.text_color)
-        )
-        # 5. 水平居中要求已从 rubric 中删除, 不再校验 text_align
-        if font_ok and size_ok and color_ok:
-            matched.append(s)
-    hit = bool(matched)
-    return result(
-        "第1页左侧烧杯底部文本",
-        hit,
-        f"区域内样品溶液文本 {len(vals)} 个，全条件符合 {len(matched)} 个",
-    )
-
-
-def check_reference_electrode(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左3.5–8.5cm，距上6–16.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 3.5, 6.0, 8.5, 16.5
-
-    # 边线/填充颜色：绿色 —— 只要属于绿色家族即视为合规
-    def is_green_shade(c: tuple[int, int, int] | None) -> bool:
-        return is_green(c)
-
-    # 向左倾斜判定:
-    #   顶部在右、底部在左 → 电极从上到下向左倾斜。
-    #   PowerPoint 中 xfrm@rot 正值=顺时针(屏幕 Y 向下), 因此对一个"本来竖直"的形状,
-    #   rot<0 (逆时针) 表示顶端偏右、底端偏左, 即"向左倾斜"。反之 rot>0 表示向右倾斜。
-    #   flipH 会反转左右, flipV 会反转上下, 二者叠加旋转的实际视觉倾斜方向。
-    #   容差: 允许 -0.5° 以上(数值噪声)不算左倾, 上限-45°以内认为是"细长电极的合理左倾"。
-    def tilts_left(s: ShapeInfo) -> tuple[bool, str]:
-        r = s.rotation
-        # flipH 反转水平, 相当于旋转方向翻转; flipV 反转垂直, 对左右倾斜方向也翻转
-        eff = r
-        if s.flip_h:
-            eff = -eff
-        if s.flip_v:
-            eff = -eff
-        # 归一化到 (-180, 180]
-        eff = ((eff + 180.0) % 360.0) - 180.0
-        # 对近 180° 的情况(整体上下颠倒但角度接近 180 而非 0), 折算等价倾角
-        if eff > 90.0:
-            eff -= 180.0
-        elif eff < -90.0:
-            eff += 180.0
-        # eff∈(-90,90); <0 表示顶端偏右、底端偏左, 视觉上"向左倾斜"
-        ok = -45.0 <= eff <= -0.5
-        return ok, f"rot={r:.1f}°(等效{eff:.1f}°){',flipH' if s.flip_h else ''}{',flipV' if s.flip_v else ''}"
-
-    # 主体：细长矩形，向左倾斜的近竖向, 在区域内, 绿色填充+绿色单实线, 线宽0.5–2磅
-    body_shapes: list[ShapeInfo] = []
-    body_debug: list[str] = []
-    for s in ctx.rect_shapes:
-        if not intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.3):
-            continue
-        if s.h_abs < 1.5:                       # 细长: 高度明显
-            continue
-        if s.h_abs <= s.w_abs * 2:              # 竖向为主
-            continue
-        if s.w_abs > 1.0:                        # 宽度细
-            continue
-        if s.dashed:
-            continue
-        if not is_green_shade(s.line_color):
-            continue
-        if not line_width_in_range(s.line_width, 0.5, 2.0, 0.0):
-            continue
-        if not any(is_green_shade(c) for c in s.fill_colors):
-            continue
-        left_ok, tag = tilts_left(s)
-        if not left_ok:
-            body_debug.append(f"#{s.index}非左倾({tag})")
-            continue
-        body_debug.append(f"#{s.index}左倾({tag})")
-        body_shapes.append(s)
-
-    # 顶部绿色连接头：在区域上部（y < 9cm），矩形或小方形，绿色填充+绿色边线
-    top_connector = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, 9.0, 0.3)
-        and s.box.area >= 0.05
-        and s.box.area <= 0.8
-        and is_green_shade(s.line_color)
-        and any(is_green_shade(c) for c in s.fill_colors)
-    ]
-
-    # 底部伸入液体：主体下端（y > 10cm）有绿色对象（矩形或线段）
-    bottom_part = [
-        s for s in ctx.shapes
-        if (s.is_rect_like or s.is_line)
-        and intersects_region(s, REGION_L, 10.0, REGION_R, REGION_B, 0.3)
-        and (is_green_shade(s.line_color) or any(is_green_shade(c) for c in s.fill_colors))
-    ]
-
-    # 如果没有旋转的矩形符合左倾, 尝试用"线段端点"兜底: 找区域内的绿色线, 顶端 x > 底端 x
-    tilted_line_fallback: list[ShapeInfo] = []
-    if not body_shapes:
-        for s in ctx.line_shapes:
-            if not intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.3):
-                continue
-            if not is_green_shade(s.line_color):
-                continue
-            if s.h_abs < 1.0:                   # 至少 1cm 的竖向跨度
-                continue
-            # 端点: 依据 flipV 决定顶端在 y1 还是 y2 (line 的 bbox 覆盖整根线,
-            # 无 flipV 时约定顶端-左下, 但仅凭 bbox 无法确知斜率符号;
-            # 用 flipH 作为斜率反转标识: OOXML 中 line 默认从左上到右下,
-            # flipH=true 时变为从右上到左下, 即"向左倾斜")
-            if s.h_abs <= s.w_abs:              # 需要竖向为主
-                continue
-            left_lean = s.flip_h != s.flip_v    # 顶端在右下端在左
-            if left_lean:
-                tilted_line_fallback.append(s)
-
-    body_ok = bool(body_shapes) or bool(tilted_line_fallback)
-    hit = body_ok and bool(top_connector) and bool(bottom_part)
-    return result(
-        "第1页左侧绿色参比电极",
-        hit,
-        (
-            f"左倾主体 {len(body_shapes)} 个"
-            f"{'(+线段兜底 ' + str(len(tilted_line_fallback)) + ')' if tilted_line_fallback else ''}, "
-            f"顶部连接头 {len(top_connector)}, 底部入液 {len(bottom_part)}"
-            f"{'; 未采纳: ' + '; '.join(body_debug[:3]) if not body_shapes and body_debug else ''}"
-        ),
-    )
-
-
-def check_working_electrode(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左6–12cm，距上3.6–17.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 6.0, 3.6, 12.0, 17.5
-
-    def is_dark_blue_black(c: tuple[int, int, int] | None) -> bool:
-        """深蓝黑色 —— 只要属于深色（黑/深灰/深蓝）即视为合规"""
-        return is_blackish(c) or is_dark(c) or is_blue(c) and is_dark(c)
-
-    def is_blackish_grey(c: tuple[int, int, int] | None) -> bool:
-        """黑色或深灰色 —— 只要属于黑色/深色/灰色家族即视为合规"""
-        return is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    def is_white_rod(c: tuple[int, int, int] | None) -> bool:
-        """白色杆体"""
-        return is_whiteish(c)
-
-    def is_light_blue_sleeve(c: tuple[int, int, int] | None) -> bool:
-        """浅蓝色透明套筒 —— 只要属于蓝色家族即视为合规"""
-        return is_blue(c) or is_cyan_or_whiteblue(c)
-
-    all_in = [s for s in ctx.shapes if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.3)]
-    rects_in = [s for s in all_in if s.is_rect_like]
-
-    # 1. 近垂直整体：细长竖向矩形，h>=4cm，h>w*3
-    vertical_body = [
-        s for s in rects_in
-        if s.h_abs >= 4.0 and s.h_abs > s.w_abs * 3
-    ]
-
-    # 2. 顶部深蓝黑色圆柱头：区域上部（y<6.5cm），深色填充矩形
-    top_head = [
-        s for s in rects_in
-        if s.cy <= 6.5
-        and any(is_dark_blue_black(c) for c in s.fill_colors)
-    ]
-
-    # 3. 黑色固定环：深色填充小矩形，在中部（y 6–8cm），宽度比主体略宽
-    dark_ring = [
-        s for s in rects_in
-        if 6.0 <= s.cy <= 8.5
-        and any(is_blackish_grey(c) for c in s.fill_colors)
-        and s.w_abs >= 0.3
-    ]
-
-    # 4. 白色杆体
-    white_rod = [
-        s for s in rects_in
-        if s.h_abs >= 2.0
-        and any(is_white_rod(c) for c in s.fill_colors)
-    ]
-
-    # 5. 浅蓝色套筒（透明效果）：浅蓝填充，在中下部
-    blue_sleeve = [
-        s for s in rects_in
-        if (s.has_transparency or any(is_light_blue_sleeve(c) for c in s.fill_colors))
-        and any(is_light_blue_sleeve(c) for c in s.fill_colors)
-        and s.h_abs >= 0.5
-    ]
-
-    # 6. 边线深灰或黑色单实线，线宽0.5–2磅
-    has_valid_outline = any(
-        s for s in rects_in
-        if not s.dashed
-        and is_blackish_grey(s.line_color)
-        and line_width_in_range(s.line_width, 0.5, 2.0, 0.0)
-    )
-
-    # 7. 下端伸入液体: rubric 明确要求"下端伸入液体中"。液面在 y≈9cm(参考液体检查区域上沿),
-    #    要求主体或套筒的底端 y2 至少达到 9cm, 即末端进入液体区。
-    #    优先看主体(vertical_body)/套筒(blue_sleeve); 若都缺, 兜底看整个 rects_in 内最深 y2。
-    LIQUID_Y = 9.0
-    dip_candidates = vertical_body + blue_sleeve + white_rod
-    if dip_candidates:
-        max_bottom = max(s.y2 for s in dip_candidates)
-    elif rects_in:
-        max_bottom = max(s.y2 for s in rects_in)
-    else:
-        max_bottom = -1.0
-    dips_into_liquid = max_bottom >= LIQUID_Y - 0.15  # 0.15cm 容差
-
-    hit = (
-        bool(vertical_body) and bool(top_head) and bool(dark_ring)
-        and bool(white_rod) and bool(blue_sleeve)
-        and has_valid_outline and dips_into_liquid
-    )
-    return result(
-        "第1页左侧中间白蓝工作电极",
-        hit,
-        (
-            f"竖向主体 {len(vertical_body)}，深蓝黑圆柱头 {len(top_head)}，黑色固定环 {len(dark_ring)}，"
-            f"白色杆 {len(white_rod)}，浅蓝套筒 {len(blue_sleeve)}，"
-            f"边线合规={'是' if has_valid_outline else '否'}，"
-            f"下端入液(y2max={max_bottom:.2f}cm≥{LIQUID_Y}cm)={'是' if dips_into_liquid else '否'}"
-        ),
-    )
-
-
-
-def check_counter_electrode(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左8.5–13.5cm，距上6.5–16.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 8.5, 6.5, 13.5, 16.5
-
-    # 边线/填充颜色：红色到深红色 —— 只要属于红色家族即视为合规
-    def is_red_shade(c: tuple[int, int, int] | None) -> bool:
-        return is_red(c)
-
-    # 向右倾斜判定:
-    #   顶部在左、底部在右 → 电极从上到下向右倾斜。
-    #   PowerPoint xfrm@rot 正值=顺时针(屏幕 Y 向下), 对本来竖直的形状:
-    #     rot>0 (顺时针) 表示顶端偏左、底端偏右 → 视觉"向右倾斜"。
-    #   flipH / flipV 各自等价于旋转方向取反。
-    #   容差: eff∈(-90,90), 认为 +0.5° ≤ eff ≤ +45° 是合规右倾。
-    def tilts_right(s: ShapeInfo) -> tuple[bool, str]:
-        r = s.rotation
-        eff = r
-        if s.flip_h:
-            eff = -eff
-        if s.flip_v:
-            eff = -eff
-        eff = ((eff + 180.0) % 360.0) - 180.0
-        if eff > 90.0:
-            eff -= 180.0
-        elif eff < -90.0:
-            eff += 180.0
-        ok = 0.5 <= eff <= 45.0
-        return ok, f"rot={r:.1f}°(等效{eff:.1f}°){',flipH' if s.flip_h else ''}{',flipV' if s.flip_v else ''}"
-
-    # 主体：细长矩形，向右倾斜的近竖向, 在区域内, 红色填充+红色单实线, 线宽0.5–2磅
-    body_shapes: list[ShapeInfo] = []
-    body_debug: list[str] = []
-    for s in ctx.rect_shapes:
-        if not intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.3):
-            continue
-        if s.h_abs < 1.5:
-            continue
-        if s.h_abs <= s.w_abs * 2:
-            continue
-        if s.w_abs > 1.0:
-            continue
-        if s.dashed:
-            continue
-        if not is_red_shade(s.line_color):
-            continue
-        if not line_width_in_range(s.line_width, 0.5, 2.0, 0.0):
-            continue
-        if not any(is_red_shade(c) for c in s.fill_colors):
-            continue
-        right_ok, tag = tilts_right(s)
-        if not right_ok:
-            body_debug.append(f"#{s.index}非右倾({tag})")
-            continue
-        body_debug.append(f"#{s.index}右倾({tag})")
-        body_shapes.append(s)
-
-    # 顶部红色连接头：在区域上部（y < 8.5cm），矩形或小方形，红色填充+红色边线，线宽0.5–2磅
-    top_connector = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, 8.5, 0.3)
-        and 0.05 <= s.box.area <= 0.8
-        and not s.dashed
-        and is_red_shade(s.line_color)
-        and line_width_in_range(s.line_width, 0.5, 2.0, 0.0)
-        and any(is_red_shade(c) for c in s.fill_colors)
-    ]
-
-    # 底部伸入液体：区域下部（y > 10cm）有红色矩形或线段
-    bottom_part = [
-        s for s in ctx.shapes
-        if (s.is_rect_like or s.is_line)
-        and intersects_region(s, REGION_L, 10.0, REGION_R, REGION_B, 0.3)
-        and (is_red_shade(s.line_color) or any(is_red_shade(c) for c in s.fill_colors))
-    ]
-
-    # 线段兜底: 若无右倾矩形, 找区域内红色 line, 依据 flipH/flipV 判断斜率符号
-    tilted_line_fallback: list[ShapeInfo] = []
-    if not body_shapes:
-        for s in ctx.line_shapes:
-            if not intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.3):
-                continue
-            if not is_red_shade(s.line_color):
-                continue
-            if s.h_abs < 1.0:
-                continue
-            if s.h_abs <= s.w_abs:
-                continue
-            # OOXML line 默认左上→右下(顶端在左, 底端在右) = "向右倾斜";
-            # flipH XOR flipV 为 True 时反转为左倾, 因此右倾即 flip_h == flip_v。
-            right_lean = s.flip_h == s.flip_v
-            if right_lean:
-                tilted_line_fallback.append(s)
-
-    body_ok = bool(body_shapes) or bool(tilted_line_fallback)
-    hit = body_ok and bool(top_connector) and bool(bottom_part)
-    return result(
-        "第1页右侧红色对电极",
-        hit,
-        (
-            f"右倾主体 {len(body_shapes)} 个"
-            f"{'(+线段兜底 ' + str(len(tilted_line_fallback)) + ')' if tilted_line_fallback else ''}, "
-            f"顶部连接头 {len(top_connector)}, 底部入液 {len(bottom_part)}"
-            f"{'; 未采纳: ' + '; '.join(body_debug[:3]) if not body_shapes and body_debug else ''}"
-        ),
-    )
-
-
-
-def check_reference_label_arrow(ctx: EvaluationContext) -> RuleResult:
-    """第1页左侧"参比电极"文本 + 右侧黑色水平单箭头。
-    rubric:
-      文本区域: 距左 2–4.4cm, 距上 9.2–10.4cm; 内容 "参比电极"(兼容"参考电极");
-      字号:    13–15 磅(严格, 无额外容差);
-      字体:    黑体/微软雅黑/相近中文字体;
-      颜色:    黑色或深灰色 —— text_color 必须明确可解析。
-      箭头区域: 距左 4.2–6.2cm, 距上 9.4–9.8cm;
-      箭头:    黑色水平单箭头, 长度 1.4–1.6cm, 线宽 1–1.5 磅, 箭头朝右, 末端指向绿色参比电极。
-    """
-    # 文本区域：距左2–4.4cm, 距上9.2–10.4cm; 文本为"参比电极"(兼容"参考电极")
-    texts: list[ShapeInfo] = find_text_in(ctx, ["参比电极", "参考电极"], 2.0, 9.2, 4.4, 10.4, tol=0.15)
-    valid_texts: list[ShapeInfo] = []
-    for s in texts:
-        # 字体: 黑体/微软雅黑或相近中文字体 —— 无 font_name 时允许(细则允许"相近中文字体")
-        font_ok = True
-        if s.font_name:
-            fn = s.font_name.lower()
-            font_ok = any(k in fn for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        # 字号: 13–15 磅
-        size_ok = s.font_size is not None and in_range(s.font_size, 13.0, 15.0, 0.0)
-        # 颜色: 明确可解析 且 黑色/深灰
-        color_ok = s.text_color is not None and (
-            is_blackish(s.text_color) or is_dark(s.text_color)
-        )
-        if font_ok and size_ok and color_ok:
-            valid_texts.append(s)
-
-    # 箭头：区域 4.2–6.2cm × 9.4–9.8cm, 黑色水平单箭头, 长度 1.4–1.6cm, 线宽 1–1.5 磅, 朝右
-    def _is_black_line(c: Optional[tuple[int, int, int]]) -> bool:
-        return is_blackish(c) or is_dark(c)
-
-    arrows = line_in_region(
-        ctx, 4.2, 9.4, 6.2, 9.8,
-        color_pred=_is_black_line,
-        width_range=(1.0, 1.5), width_tol=0.0,
-        dashed=False, arrow=True, horizontal=True, direction="right",
-        min_len=1.4, max_len=1.6,
-    )
-
-    hit = bool(valid_texts) and bool(arrows)
-    return result(
-        '第1页左侧"参比电极"文本',
-        hit,
-        f"区域内文本 {len(texts)} 个，全条件符合 {len(valid_texts)} 个，右向箭头 {len(arrows)} 条",
-    )
-
-
-def check_working_label(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左6.4–13cm，距上9–14cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 6.4, 9.0, 13.0, 14.0
-    texts: list[ShapeInfo] = find_text_in(ctx, "工作电极", REGION_L, REGION_T, REGION_R, REGION_B, tol=0.15)
-    matched: list[ShapeInfo] = []
-    for s in texts:
-        # 字体：黑体、微软雅黑或相近中文字体
-        font_ok = True
-        if s.font_name:
-            fn = s.font_name.lower()
-            font_ok = any(k in fn for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        # 字号14–22磅（严格无容差）
-        size_ok = s.font_size is not None and in_range(s.font_size, 14.0, 22.0, 0.0)
-        # 颜色黑色或深灰色 —— 明确可解析(theme 已在 build_context 反查); 无颜色不再默认放行
-        color_ok = s.text_color is not None and (
-            is_blackish(s.text_color) or is_dark(s.text_color)
-        )
-        # rubric 已删除"水平居中", 不再校验 text_align
-        if font_ok and size_ok and color_ok:
-            matched.append(s)
-    hit = bool(matched)
-    return result('第1页中部"工作电极"文本', hit, f"区域内文本 {len(texts)} 个，全条件符合 {len(matched)} 个")
-
-
-def check_counter_label_arrow(ctx: EvaluationContext) -> RuleResult:
-    """第1页右侧"对电极"文本 + 左侧黑色水平单箭头。
-    rubric:
-      文本区域: 距左 10.5–12.7cm, 距上 9.1–10.3cm; 内容 "对电极";
-      字号:    14–16 磅(严格, 无额外容差);
-      字体:    黑体/微软雅黑/相近中文字体;
-      颜色:    黑色或深灰色 —— text_color 必须明确可解析。
-      箭头区域: 距左 9.2–11.2cm, 距上 9.4–9.9cm;
-      箭头:    黑色水平单箭头, 长度 1.4–1.6cm, 线宽 1–1.5 磅, 箭头朝右, 末端指向红色对电极。
-    """
-    # 文本区域：距左10.5–12.7cm, 距上9.1–10.3cm; 文本为"对电极"
-    TEXT_L, TEXT_T, TEXT_R, TEXT_B = 10.5, 9.1, 12.7, 10.3
-    texts: list[ShapeInfo] = find_text_in(ctx, "对电极", TEXT_L, TEXT_T, TEXT_R, TEXT_B, tol=0.15)
-    valid_texts: list[ShapeInfo] = []
-    for s in texts:
-        # 字体：黑体、微软雅黑或相近中文字体
-        font_ok = True
-        if s.font_name:
-            fn = s.font_name.lower()
-            font_ok = any(k in fn for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        # 字号14–16 磅（严格无容差）
-        size_ok = s.font_size is not None and in_range(s.font_size, 14.0, 16.0, 0.0)
-        # 颜色: 明确可解析 且 黑/深灰
-        color_ok = s.text_color is not None and (
-            is_blackish(s.text_color) or is_dark(s.text_color)
-        )
-        if font_ok and size_ok and color_ok:
-            valid_texts.append(s)
-
-    # 箭头：区域 9.2–11.2cm × 9.4–9.9cm, 黑色水平单箭头, 长度 1.4–1.6cm, 线宽 1–1.5 磅, 朝右
-    def _is_black_line(c: Optional[tuple[int, int, int]]) -> bool:
-        return is_blackish(c) or is_dark(c)
-
-    arrows = line_in_region(
-        ctx, 9.2, 9.4, 11.2, 9.9,
-        color_pred=_is_black_line,
-        width_range=(1.0, 1.5), width_tol=0.0,
-        dashed=False, arrow=True, horizontal=True, direction="right",
-        min_len=1.4, max_len=1.6,
-    )
-
-    hit = bool(valid_texts) and bool(arrows)
-    return result(
-        '第1页右侧"对电极"文本',
-        hit,
-        f"区域内文本 {len(texts)} 个，全条件符合 {len(valid_texts)} 个，右向箭头 {len(arrows)} 条",
-    )
-
-
-
-def check_analyte_input(ctx: EvaluationContext) -> RuleResult:
-    """第1页顶部"分析物输入"文本 + 下方蓝色竖向虚线箭头。
-    rubric:
-      文本区域: 距左 7–10.3cm, 距上 1.0–1.8cm; 内容 "分析物输入";
-      字号:    14–16 磅(严格, 无额外容差);
-      字体:    黑体/微软雅黑/相近中文字体;
-      颜色:    蓝色 —— text_color 必须明确可解析。
-      箭头区域: 距左 7.2–8.4cm, 距上 1.5–3.8cm;
-      箭头:    蓝色竖向虚线单箭头, 线宽 1–1.5 磅, 箭头朝下, 末端指向工作电极顶部。
-    箭头支持两条判定路径 (rubric 只要求视觉上的"虚线单箭头", 具体绘制方式不限):
-      1) 原生箭头: line/连接符设置 headEnd/tailEnd 并设为虚线, 由 line_in_region 校验;
-      2) 分段虚线: 多段蓝色短竖线 + 下方三角/downArrow 组合(与 check_signal_box 同构),
-         分段短竖线线宽 1.0–1.5 磅, 三角/downArrow 必须"朝下"且位于短竖线组下方。
-    """
-    # 文本区域：距左7–10.3cm, 距上1.0–1.8cm; 文本为"分析物输入"
-    TEXT_L, TEXT_T, TEXT_R, TEXT_B = 7.0, 1.0, 10.3, 1.8
-    texts: list[ShapeInfo] = find_text_in(ctx, "分析物输入", TEXT_L, TEXT_T, TEXT_R, TEXT_B, tol=0.15)
-    valid_texts: list[ShapeInfo] = []
-    for s in texts:
-        # 字体：黑体、微软雅黑或相近中文字体
-        font_ok = True
-        if s.font_name:
-            fn = s.font_name.lower()
-            font_ok = any(k in fn for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        # 字号14–16 磅（严格无容差）
-        size_ok = s.font_size is not None and in_range(s.font_size, 14.0, 16.0, 0.0)
-        # 颜色为蓝色 —— 明确可解析(schemeClr 已在 first_xml_rgb 里反查为 RGB)
-        color_ok = s.text_color is not None and is_blue(s.text_color)
-        if font_ok and size_ok and color_ok:
-            valid_texts.append(s)
-
-    # 箭头区域：7.2–8.4cm × 1.5–3.8cm
-    ARROW_L, ARROW_T, ARROW_R, ARROW_B = 7.2, 1.5, 8.4, 3.8
-
-    # 路径 1: 原生蓝色竖向虚线单箭头, 线宽 1–1.5 磅, 朝下
-    native_arrows = line_in_region(
-        ctx, ARROW_L, ARROW_T, ARROW_R, ARROW_B,
-        color_pred=is_blue,
-        width_range=(1.0, 1.5), width_tol=0.0,
-        dashed=True, arrow=True, vertical=True, direction="down",
-    )
-
-    # 路径 2: 分段虚线 —— 多段蓝色短竖线 + 下方三角/downArrow 组合
-    # 短竖线线宽严格 1.0–1.5 磅(与 rubric 一致, 不放宽到 1.8)
-    blue_vsegs = [
-        s for s in ctx.line_shapes
-        if intersects_region(s, ARROW_L, ARROW_T, ARROW_R, ARROW_B, 0.05)
-        and is_blue(s.line_color)
-        and s.w_abs <= 0.05 and s.h_abs >= 0.05
-        and line_width_in_range(s.line_width, 1.0, 1.5, 0.0)
-    ]
-    # 竖线组底端 y (无竖线时用 ARROW_T 兜底)
-    vseg_bottom_y = max((s.y2 for s in blue_vsegs), default=ARROW_T)
-
-    def tip_points_down(t: ShapeInfo) -> bool:
-        """三角尖朝下判定:
-          - downArrow 预设几何默认朝下, 允许 rot 偏离 ≤ 45°;
-          - triangle 默认尖角朝上, 需 flipV=True 或 |rot| ≥ 135° 才朝下;
-          - 其他几何一律视为不朝下。
-        """
-        r = getattr(t, "rotation", 0.0) or 0.0
-        flip_v = getattr(t, "flip_v", False)
-        eff = ((r + 180.0) % 360.0) - 180.0  # 归一化到 (-180, 180]
-        if t.geom == "downArrow":
-            return abs(eff) <= 45.0
-        if t.geom == "triangle":
-            if flip_v:
-                return True
-            return abs(eff) >= 135.0
-        return False
-
-    raw_tips = [
-        s for s in ctx.shapes
-        if s.geom in ("triangle", "downArrow")
-        # 三角/箭头允许略越 ARROW_B (箭尖伸到工作电极顶部之上，工作电极顶 y≈3.6cm)
-        and intersects_region(s, ARROW_L, ARROW_T, ARROW_R, ARROW_B + 0.4, 0.1)
-        and (is_blue(s.line_color) or any(is_blue(c) for c in s.fill_colors))
-    ]
-    arrow_tips = [
-        s for s in raw_tips
-        if tip_points_down(s)
-        # 箭尖 y (下沿) 位于短竖线组底端之下(容差 0.35cm)
-        and s.y2 >= vseg_bottom_y - 0.35
-    ]
-    seg_arrow_ok = len(blue_vsegs) >= 2 and bool(arrow_tips)
-
-    arrows_ok = bool(native_arrows) or seg_arrow_ok
-    hit = bool(valid_texts) and arrows_ok
-    return result(
-        '第1页顶部"分析物输入"文本',
-        hit,
-        f"区域内文本 {len(texts)} 个，全条件符合 {len(valid_texts)} 个，"
-        + f"原生向下箭头 {len(native_arrows)}，分段竖线 {len(blue_vsegs)}/朝下箭尖 {len(arrow_tips)}",
-    )
-
-
-
-def check_electrode_connection_lines(ctx: EvaluationContext) -> RuleResult:
-    # 三条连接线均由多段短实线组成弧形曲线（Office中曲线离散化），颜色各异
-    # 细则要求：各自区域内，对应颜色，单实线（非虚线），线宽0.5–3磅
-
-    def collect_arc_segs(region, color_pred):
-        """收集区域内指定颜色的弧形线段（单实线，线宽0.5–3磅）"""
-        return [
-            s for s in ctx.line_shapes
-            if e_intersects(s, region)
-            and color_pred(s.line_color)
-            and not s.dashed
-            and line_width_in_range(s.line_width, 0.5, 3.0, 0.0)
-        ]
-
-    def e_intersects(s, region):
-        l, t, r, b = region
-        return intersects_region(s, l, t, r, b, 0.1)
-
-    # 绿色参比电极连接线：距左3.5–22cm，距上5.2–15cm，绿色弧形单实线
-    green_region = (3.5, 5.2, 22.0, 15.0)
-    green_segs = collect_arc_segs(green_region, is_green)
-    # 起点在参比电极顶部附近（x∈[3.5,8.5], y∈[5.2,11]，与参比电极新区域一致）
-    green_start = [s for s in green_segs if intersects_region(s, 3.5, 5.2, 8.5, 11.0, 0.2)]
-    # 终点在仪器左上/左后侧（x∈[12,22], y∈[7,15]）
-    green_end = [s for s in green_segs if intersects_region(s, 12.0, 7.0, 22.0, 15.0, 0.2)]
-    green_ok = len(green_segs) >= 3 and bool(green_start) and bool(green_end)
-
-    # 黑色工作电极连接线：距左7–22cm，距上3–14cm，黑色弧形单实线
-    black_region = (7.0, 3.0, 22.0, 14.0)
-    black_segs = collect_arc_segs(black_region, lambda c: is_blackish(c) or is_dark(c))
-    # 起点在工作电极顶部附近（x∈[6,12], y∈[3,6]，与工作电极新区域顶部一致）
-    black_start = [s for s in black_segs if intersects_region(s, 6.0, 3.0, 12.0, 6.0, 0.2)]
-    # 终点在仪器左上/左后侧（x∈[12,22], y∈[7,14]）
-    black_end = [s for s in black_segs if intersects_region(s, 12.0, 7.0, 22.0, 14.0, 0.2)]
-    black_ok = len(black_segs) >= 3 and bool(black_start) and bool(black_end)
-
-    # 红色对电极连接线：距左9.5–22cm，距上5.2–14cm，红色弧形单实线
-    red_region = (9.5, 5.2, 22.0, 14.0)
-    red_segs = collect_arc_segs(red_region, is_red)
-    # 起点在对电极顶部附近（x∈[8.5,13.5], y∈[5.2,10]，与对电极新区域顶部一致）
-    red_start = [s for s in red_segs if intersects_region(s, 8.5, 5.2, 13.5, 10.0, 0.2)]
-    # 终点在仪器左上/左后侧（x∈[12,22], y∈[7,14]）
-    red_end = [s for s in red_segs if intersects_region(s, 12.0, 7.0, 22.0, 14.0, 0.2)]
-    red_ok = len(red_segs) >= 3 and bool(red_start) and bool(red_end)
-
-    hit = green_ok and black_ok and red_ok
-    return result(
-        "第1页三条电极连接线",
-        hit,
-        f"绿色线段 {len(green_segs)}(起{len(green_start)}/终{len(green_end)})，"
-        f"黑色线段 {len(black_segs)}(起{len(black_start)}/终{len(black_end)})，"
-        f"红色线段 {len(red_segs)}(起{len(red_start)}/终{len(red_end)})",
-    )
-
-
-def check_analyzer_shell(ctx: EvaluationContext) -> RuleResult:
-    """第1页中部电化学分析仪外壳。
-    修订后 rubric 要素:
-      区域: 距左 13.0–31cm, 距上 8.5–18cm;
-      形态: 三个及以上的四边形及其他图形组合而成 或 整体为带透视效果的长方体仪器;
-      前面: 蓝色;
-      顶/侧面: 浅灰蓝到灰白色渐变 或 单纯浅灰蓝/灰白;
-      底部: 深色底座阴影;
-      边线: 深蓝色或灰蓝色单实线, 线宽 0.5–3 磅。
-    透视路径必须同时确认 "顶面" 与 "侧面" 都存在(真实透视几何: parallelogram / trapezoid),
-    不能靠普通矩形凑数; 若达不成, 走图形组合兜底(3 个及以上的合规四边形/椭圆等)。
-    """
-    # 细则区域：距左13.0–31cm，距上8.5–18cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 13.0, 8.5, 31.0, 18.0
-
-    def is_grey_blue_or_grey_white(c: tuple[int, int, int] | None) -> bool:
-        # 灰蓝/灰白 —— 只要属于蓝色/灰色/白色家族即视为合规
-        return is_blue(c) or is_grayish(c) or is_whiteish(c)
-
-    def is_deep_blue_or_grey_blue(c: tuple[int, int, int] | None) -> bool:
-        # 深蓝/灰蓝 —— 只要属于蓝色或灰色家族即视为合规
-        return is_blue(c) or is_grayish(c)
-
-    def has_shell_outline(s: ShapeInfo) -> bool:
-        # 线宽 0.5–3 磅, 单实线, 边线为深蓝/灰蓝
-        return (
-            not s.dashed
-            and line_width_in_range(s.line_width, 0.5, 3.0, 0.0)
-            and is_deep_blue_or_grey_blue(s.line_color)
-        )
-
-    region_shapes = [s for s in ctx.shapes if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.15)]
-
-    # 前面板：蓝色长方形/圆角矩形，位于仪器正面
-    front_panel = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.15)
-        and s.w_abs >= 4.5
-        and s.h_abs >= 2.0
-        and any(is_blue(c) for c in s.fill_colors)
-        and has_shell_outline(s)
-    ]
-
-    # 透视面 (真实透视几何: parallelogram / trapezoid) —— 浅灰蓝/灰白填充, 合规边线
-    perspective_faces = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.15)
-        and s.geom in {"parallelogram", "trapezoid"}
-        and any(is_grey_blue_or_grey_white(c) for c in s.fill_colors)
-        and has_shell_outline(s)
-    ]
-
-    # 分别判定 "顶面" 与 "侧面":
-    #   顶面: 位于前面板上方 —— cy 明显低于前面板 cy(y 坐标向下为正, 故 cy 更小),
-    #         或底沿接近前面板顶沿 (y2 与前面板 y1 相近, ±1.2cm 容差)。
-    #   侧面: 位于前面板左侧或右侧 —— cx 明显偏出前面板一侧,
-    #         或其一竖直边接近前面板的左右边 (±1.2cm 容差)。
-    #   若无 front_panel, 退化为按位置相对 REGION 中心分类。
-    def is_top_face(face: ShapeInfo, panels: list[ShapeInfo]) -> bool:
-        if panels:
-            for fp in panels:
-                # 底沿贴合前面板顶沿
-                if abs(face.y2 - fp.y1) <= 1.2:
-                    return True
-                # 中心明显在前面板中心之上, 且横向有重叠
-                if face.cy + 0.5 <= fp.cy and not (face.x2 < fp.x1 or face.x1 > fp.x2):
-                    return True
-            return False
-        # 无前面板时: 面中心 y 在区域上半 (相对 REGION 中心线)
-        return face.cy <= (REGION_T + REGION_B) / 2
-
-    def is_side_face(face: ShapeInfo, panels: list[ShapeInfo]) -> bool:
-        if panels:
-            for fp in panels:
-                # 竖直边贴合前面板左右边
-                if abs(face.x1 - fp.x2) <= 1.2 or abs(face.x2 - fp.x1) <= 1.2:
-                    return True
-                # 中心明显在前面板中心之外, 且竖向有重叠
-                horiz_off = (face.cx > fp.x2 + 0.5) or (face.cx < fp.x1 - 0.5)
-                if horiz_off and not (face.y2 < fp.y1 or face.y1 > fp.y2):
-                    return True
-            return False
-        # 无前面板: 面中心 x 偏出区域中心
-        cx_mid = (REGION_L + REGION_R) / 2
-        return abs(face.cx - cx_mid) >= 3.0
-
-    top_faces = [f for f in perspective_faces if is_top_face(f, front_panel)]
-    side_faces = [f for f in perspective_faces if is_side_face(f, front_panel)]
-
-    # 底部深色底座阴影：位于仪器底部，深色，横向较宽
-    shadow = [
-        s for s in region_shapes
-        if intersects_region(s, REGION_L, REGION_B - 3.5, REGION_R, REGION_B + 0.5, 0.15)
-        and s.w_abs >= 3.0
-        and s.h_abs <= 1.2
-        and (is_dark(s.line_color) or any(is_dark(c) for c in s.fill_colors))
-    ]
-
-    # rubric 新增: "三个及以上的四边形及其他图形组合而成" —— 作为长方体/透视之外的兜底判据
-    # 组合体判定: 边线合规的多边形/矩形/椭圆等在区域内累计 >= 3 个即视为"图形组合"
-    combo_shapes = [
-        s for s in region_shapes
-        if (s.is_rect_like or s.is_ellipse)
-        and has_shell_outline(s)
-    ]
-    combo_ok = len(combo_shapes) >= 3
-
-    # 长方体透视判据: 蓝色前面板 + 同时具备真实"顶面"与"侧面"透视几何。
-    #   不再接受普通矩形作 grey_body_faces 凑数。
-    perspective_ok = bool(front_panel) and bool(top_faces) and bool(side_faces)
-
-    # 满足两种形态之一 + 底部阴影 即视为通过
-    hit = (perspective_ok or combo_ok) and bool(shadow)
-    return result(
-        "第1页中部电化学分析仪外壳",
-        hit,
-        (
-            f"蓝色前面板 {len(front_panel)}，透视面 {len(perspective_faces)}"
-            f"(顶面 {len(top_faces)}/侧面 {len(side_faces)})，"
-            f"图形组合 {len(combo_shapes)}，底座阴影 {len(shadow)}"
-        ),
-    )
-
-
-def check_analyzer_screen(ctx: EvaluationContext) -> RuleResult:
-    """第1页中部电化学分析仪前屏幕。
-    修订后 rubric:
-      区域: 距左 16–28cm, 距上 10–18cm;
-      形状: 蓝色矩形;
-      边框: 白色或浅灰白色, 单实线, 线宽 0.5–3 磅;
-      内部: 白色坐标轴+白色折线图 或 组合图形 或 图片。
-    """
-    # 细则区域：距左16–28cm，距上10–18cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 16.0, 10.0, 28.0, 18.0
-
-    def is_white_or_light(c: tuple[int, int, int] | None) -> bool:
-        return is_whiteish(c) or is_grayish(c)
-
-    # 蓝色矩形显示屏：蓝色填充，边框为白色或浅灰白，线宽0.5–3磅，单实线
-    screens = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.15)
-        and s.w_abs >= 1.5 and s.h_abs >= 1.0
-        and any(is_blue(c) for c in s.fill_colors)
-        and (s.line_color is None or is_white_or_light(s.line_color))
-        and not s.dashed
-        and line_width_in_range(s.line_width, 0.5, 3.0, 0.0)
-    ]
-
-    # 内部内容: 三种来源之一
-    #   (a) 白色/浅色 "坐标轴 + 折线图" 组合:
-    #        · 至少 1 条水平坐标轴 (h_abs≈0, w_abs≥0.4cm)
-    #        · 至少 1 条竖直坐标轴 (w_abs≈0, h_abs≥0.4cm)
-    #        · 至少 1 条折线/曲线段 (斜线: 非纯水平且非纯竖直, 或多段离散化短线共 ≥2 段)
-    #   (b) 组合图形: 屏幕区域内除屏幕本身外, 有 >=2 个可见形状 (rect_like / ellipse / line);
-    #   (c) 图片: 屏幕区域内有 has_blip=True 的形状。
-    inner_L = REGION_L + 0.2
-    inner_T = REGION_T + 0.2
-    inner_R = REGION_R - 0.1
-    inner_B = REGION_B - 0.2
-    white_lines = line_in_region(
-        ctx,
-        inner_L, inner_T, inner_R, inner_B,
-        color_pred=lambda c: is_whiteish(c) or is_cyan_or_whiteblue(c),
-        width_range=(0.5, 3.0),
-        dashed=False,
-        min_len=0.1,
-        width_tol=0.0,
-        region_tol=0.05,
-    )
-    # 分类: 水平轴 / 竖直轴 / 折线段
-    axis_thresh = 0.06  # cm, 视为"纯水平/纯竖直"的偏差容差
-    h_axes = [s for s in white_lines if s.h_abs <= axis_thresh and s.w_abs >= 0.4]
-    v_axes = [s for s in white_lines if s.w_abs <= axis_thresh and s.h_abs >= 0.4]
-    diag_segs = [
-        s for s in white_lines
-        if s.w_abs > axis_thresh and s.h_abs > axis_thresh
-    ]
-    # 折线判据: 至少 1 条明确的斜线段, 或水平/竖直短碎段各有一些且总数 ≥ 2 段视为离散化折线
-    non_axis_segs = [
-        s for s in white_lines
-        if s not in h_axes and s not in v_axes
-    ]
-    polyline_ok = bool(diag_segs) or len(non_axis_segs) >= 2
-    lines_ok = bool(h_axes) and bool(v_axes) and polyline_ok
-
-    screen_ids = {id(s) for s in screens}
-    combo_inner = [
-        s for s in ctx.shapes
-        if id(s) not in screen_ids
-        and intersects_region(s, inner_L, inner_T, inner_R, inner_B, 0.1)
-        and (s.is_rect_like or s.is_ellipse or s.is_line)
-    ]
-    combo_ok = len(combo_inner) >= 2
-
-    pictures = [
-        s for s in ctx.shapes
-        if s.has_blip
-        and intersects_region(s, inner_L, inner_T, inner_R, inner_B, 0.1)
-    ]
-    picture_ok = bool(pictures)
-
-    inner_ok = lines_ok or combo_ok or picture_ok
-
-    hit = bool(screens) and inner_ok
-    return result(
-        "第1页中部电化学分析仪前屏幕",
-        hit,
-        (
-            f"蓝色显示区 {len(screens)}，"
-            f"水平轴 {len(h_axes)}/竖直轴 {len(v_axes)}/折线段 {len(diag_segs)}(+短碎 {len(non_axis_segs)})，"
-            f"组合形状 {len(combo_inner)}，图片 {len(pictures)}"
-        ),
-    )
-
-
-def check_analyzer_name(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左15.4–18.8cm，距上10.5–11.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 15.4, 10.5, 18.8, 11.5
-    texts = find_text_in(ctx, "电化学分析仪", REGION_L, REGION_T, REGION_R, REGION_B, tol=0.15)
-    matched = []
-    for s in texts:
-        # 字体：黑体、微软雅黑或相近中文字体
-        font_ok = True
-        if s.font_name:
-            fn = s.font_name.lower()
-            font_ok = any(k in fn for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        # 字号12–14磅（严格无容差）
-        size_ok = s.font_size is not None and in_range(s.font_size, 12.0, 14.0, 0.0)
-        # 颜色为白色 —— 明确可解析(schemeClr 已在 first_xml_rgb 中反查为 RGB)
-        color_ok = s.text_color is not None and is_whiteish(s.text_color)
-        if font_ok and size_ok and color_ok:
-            matched.append(s)
-    hit = bool(matched)
-    return result("第1页中部电化学分析仪名称文本", hit, f"区域内文本 {len(texts)} 个，全条件符合 {len(matched)} 个")
-
-
-
-def check_indicator_lights(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左18.5–19.5cm，距上10–12cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 18.5, 10.0, 19.5, 12.0
-    # 直径0.15–0.28cm（宽和高均在此范围内）；椭圆形圆点
-    # 注：实际PPT中三个圆点cy分别约9.99/10.53/11.06，略超出细则上边界10cm
-    # 用intersects_region并给0.1cm容差以覆盖临界情况
-    lights = [
-        s for s in ctx.ellipse_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.1)
-        and 0.15 <= s.w_abs <= 0.28
-        and 0.15 <= s.h_abs <= 0.28
-    ]
-
-    # 三灯竖向排列：按cy排序后判断上/中/下颜色
-    lights_sorted = sorted(lights, key=lambda s: s.cy)
-    three_lights = lights_sorted[:3] if len(lights_sorted) >= 3 else lights_sorted
-
-    # 上灯绿色、中灯蓝色、下灯红色
-    top_green = bool(three_lights) and any(is_green(c) for c in three_lights[0].fill_colors) if len(three_lights) >= 1 else False
-    mid_blue = bool(three_lights) and any(is_blue(c) for c in three_lights[1].fill_colors) if len(three_lights) >= 2 else False
-    bot_red = bool(three_lights) and any(is_red(c) for c in three_lights[2].fill_colors) if len(three_lights) >= 3 else False
-
-    hit = len(lights) >= 3 and top_green and mid_blue and bot_red
-    return result(
-        "第1页中部电化学分析仪指示灯组",
-        hit,
-        f"圆灯 {len(lights)} 个，上绿/中蓝/下红={top_green}/{mid_blue}/{bot_red}",
-    )
-
-
-def check_signal_box(ctx: EvaluationContext) -> RuleResult:
-    # 虚线框区域：距左16.3–21.7cm，距上6–7.5cm
-    BOX_L, BOX_T, BOX_R, BOX_B = 16.3, 6.0, 21.7, 7.5
-
-    # 方式1：原生蓝色虚线圆角矩形，尺寸4.8–5.2cm × 1.2–1.6cm
-    native_boxes = [
-        s for s in ctx.rect_shapes
-        if center_in(s, BOX_L, BOX_T, BOX_R, BOX_B, 0.3)
-        and s.geom == "roundRect"
-        and s.dashed
-        and is_blue(s.line_color)
-        and line_width_in_range(s.line_width, 1.0, 1.5, 0.0)
-        and in_range(s.w_abs, 4.8, 5.2, 0.0)
-        and in_range(s.h_abs, 1.2, 1.6, 0.0)
-        and (not s.fill_colors or any(is_whiteish(c) for c in s.fill_colors))
-    ]
-
-    # 方式2：多段蓝色短线组成的虚线边框（用segmented_blue_border已检测，复用即可）
-    box_hit, box_segments = segmented_blue_border(ctx, BOX_L, BOX_T, BOX_R, BOX_B, min_segments=14)
-    # 进一步验证线段线宽1–1.5磅
-    seg_lines = line_in_region(ctx, BOX_L, BOX_T, BOX_R, BOX_B,
-                               color_pred=is_blue, width_range=(1.0, 1.5),
-                               width_tol=0.0, region_tol=0.1)
-    box_width_ok = len(seg_lines) >= 14
-
-    # 文本"信号采集与处理"：在框内，字体、字号14–16磅、颜色深蓝色
-    raw_texts = find_text_in(ctx, "信号采集与处理", BOX_L, BOX_T, BOX_R, BOX_B, tol=0.15)
-    valid_texts = []
-    for s in raw_texts:
-        font_ok = True
-        if s.font_name:
-            fn = s.font_name.lower()
-            font_ok = any(k in fn for k in (
-                "黑体", "微软雅黑", "simhei", "microsoft yahei",
-                "等线", "dengxian", "思源黑体", "noto sans sc",
-                "heiti", "pingfang",
-            ))
-        size_ok = s.font_size is not None and in_range(s.font_size, 14.0, 16.0, 0.0)
-        color_ok = s.text_color is not None and is_dark_blue(s.text_color)
-        if font_ok and size_ok and color_ok:
-            valid_texts.append(s)
-
-    # 箭头区域：距左18–19cm，距上7.3–9cm；蓝色竖向虚线单箭头，线宽1–1.5磅，朝下
-    ARROW_L, ARROW_T, ARROW_R, ARROW_B = 18.0, 7.3, 19.0, 9.0
-
-    # 原生虚线箭头
-    native_arrows = line_in_region(
-        ctx, ARROW_L, ARROW_T, ARROW_R, ARROW_B,
-        color_pred=is_blue, width_range=(1.0, 1.5),
-        dashed=True, arrow=True, vertical=True,
-        width_tol=0.0, region_tol=0.05,
-    )
-    # 分段虚线：多段蓝色短竖线 + 三角形箭尖
-    #   - 短竖线线宽 1.0–1.5 磅(与 rubric 一致, 不再放宽到 1.8);
-    #   - 三角尖必须位于短竖线组的下方, 且形状本身"朝下"(downArrow 或 三角形 rotation ≈ 0°/180°);
-    blue_vsegs = [
-        s for s in ctx.line_shapes
-        if intersects_region(s, ARROW_L, ARROW_T, ARROW_R, ARROW_B, 0.05)
-        and is_blue(s.line_color)
-        and s.w_abs <= 0.05 and s.h_abs >= 0.05
-        and line_width_in_range(s.line_width, 1.0, 1.5, 0.0)
-    ]
-    # 计算竖线组底端 y (若无竖线, 用 ARROW_T 兜底, 便于后续与三角尖比较)
-    vseg_bottom_y = max((s.y2 for s in blue_vsegs), default=ARROW_T)
-
-    def tip_points_down(t: ShapeInfo) -> bool:
-        """三角尖朝下判定:
-          - downArrow 预设几何默认朝下, 视 rot 是否偏转 >45° 决定;
-          - triangle 默认尖角朝上, 需 rot≈180°(即 flipV 或 |rot|>=135°) 才朝下;
-          - 未取到 rotation 属性时保守放行(避免误伤)。
-        """
-        r = getattr(t, "rotation", 0.0) or 0.0
-        flip_v = getattr(t, "flip_v", False)
-        eff = ((r + 180.0) % 360.0) - 180.0  # (-180,180]
-        if t.geom == "downArrow":
-            # 默认朝下, 允许 ±45° 内的旋转
-            return abs(eff) <= 45.0
-        if t.geom == "triangle":
-            # 默认朝上, 需通过 flipV 或旋转 ≈180° 才朝下
-            if flip_v:
-                return True
-            return abs(eff) >= 135.0
-        return False
-
-    raw_tips = [
-        s for s in ctx.shapes
-        if s.geom in ("triangle", "downArrow")
-        and intersects_region(s, ARROW_L, 7.8, ARROW_R, ARROW_B + 0.4, 0.1)
-        and (is_blue(s.line_color) or any(is_blue(c) for c in s.fill_colors))
-    ]
-    arrow_tips = [
-        s for s in raw_tips
-        if tip_points_down(s)
-        # 箭尖位于短竖线组下方(容差 0.35cm): 用尖端 y (三角形/箭头的 y2) 与竖线组底端比较
-        and s.y2 >= vseg_bottom_y - 0.35
-    ]
-    seg_arrow_ok = len(blue_vsegs) >= 2 and bool(arrow_tips)
-
-    # 末端指向仪器顶面（y ≈ 8.5–9.5cm）
-    analyzer_top = [
-        s for s in ctx.shapes
-        if intersects_region(s, 13.0, 8.5, 22.0, 10.0, 0.2)
-        and (s.is_rect_like or s.geom == "parallelogram")
-        and s.w_abs >= 3.0
-    ]
-    tip_near_top = False
-    for a in native_arrows:
-        tip_y = a.y2 if a.box.height >= 0 else a.y1
-        if any(abs(tip_y - g.y1) <= 0.6 for g in analyzer_top):
-            tip_near_top = True
-    for tip in arrow_tips:
-        if any(abs(tip.y2 - g.y1) <= 0.6 for g in analyzer_top):
-            tip_near_top = True
-
-    box_ok = bool(native_boxes) or (box_hit and box_width_ok)
-    arrows_ok = (bool(native_arrows) or seg_arrow_ok) and tip_near_top
-    hit = box_ok and bool(valid_texts) and arrows_ok
-    return result(
-        "第1页中部上方虚线框及向下箭头",
-        hit,
-        f"原生虚线框 {len(native_boxes)}，分段框线 {box_segments}段，文本 {len(valid_texts)}/{len(raw_texts)}，"
-        f"原生箭头 {len(native_arrows)}，分段箭头线{len(blue_vsegs)}/尖{len(arrow_tips)}，末端指向仪器={'是' if tip_near_top else '否'}",
-    )
-
-
-
-def check_control_box(ctx: EvaluationContext) -> RuleResult:
-    box_hit, box_segments = segmented_blue_border(ctx, 14.4, 13.1, 19.4, 15.0, min_segments=12)
-    boxes = [s for s in rect_in_region(ctx, 14.4, 13.1, 19.4, 15.0, dashed=True, color_pred=is_blue, min_w=4.2, min_h=1.3) if s.geom == "roundRect" and 4.2 <= s.w_abs <= 4.7 and 1.3 <= s.h_abs <= 1.7]
-    texts = [s for s in find_text_in(ctx, ["电位/电流控制", "电位 / 电流控制"], 14.4, 13.1, 19.4, 15.0, tol=0.1) if has_text_style(s, 14, 16, is_dark_blue)]
-    arrows = line_in_region(ctx, 16.0, 11.8, 17.6, 13.7, color_pred=is_blue, width_range=(1.0, 1.5), vertical=True, arrow=True, width_tol=0.0, direction="up")
-    hit = (bool(boxes) or box_hit) and bool(texts) and bool(arrows)
-    return result("第1页中部下方虚线框及向上箭头", hit, f"虚线框短线 {box_segments} 段，文本 {len(texts)}，箭头 {len(arrows)}")
-
-
-def check_analyzer_to_computer_line(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左21.2–24.8cm，距上9.8–11cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 21.2, 9.8, 24.8, 11.0
-
-    def is_black_solid_line(s: ShapeInfo) -> bool:
-        """黑色单实线，线宽 1.5–2.5 磅。"""
-        return (
-            (is_blackish(s.line_color) or is_dark(s.line_color))
-            and not s.dashed
-            and line_width_in_range(s.line_width, 1.5, 2.5, 0.0)
-        )
-
-    # 主路径：单条原生线 / 弧形连接符横跨全区域（rubric "黑色弧形或近水平单实线"）
-    single_line_candidates: list[ShapeInfo] = [
-        s for s in ctx.line_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.15)
-        and is_black_solid_line(s)
-        and s.w_abs >= 2.5                # 跨度至少 2.5cm（覆盖分析仪右缘→笔记本左缘的大部分）
-        and s.x1 <= 22.5                  # 起点位于区域左段（分析仪右侧）
-        and s.x2 >= 24.0                  # 终点位于区域右段（笔记本左侧接口）
-        and s.h_abs <= max(1.2, s.w_abs)  # 弧形允许一定高度但整体不高于宽度，且不超出区域高度 1.2cm
-    ]
-    single_line_ok = bool(single_line_candidates)
-
-    # 兼容分支：多段近水平短线拼接。段数门槛下调至 2，避免误判合规单线
-    line_segs: list[ShapeInfo] = [
-        s for s in ctx.line_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, REGION_B, 0.1)
-        and is_black_solid_line(s)
-        and s.h_abs <= max(0.08, s.w_abs * 0.35)
-    ]
-    start_near_analyzer = [
-        s for s in line_segs
-        if intersects_region(s, 21.2, REGION_T, 22.0, REGION_B, 0.15)
-    ]
-    end_near_computer = [
-        s for s in line_segs
-        if intersects_region(s, 24.0, REGION_T, 24.8, REGION_B, 0.15)
-    ]
-    multi_span_ok = bool(line_segs) and (max(s.x2 for s in line_segs) - min(s.x1 for s in line_segs) >= 3.0)
-    multi_ok = (
-        len(line_segs) >= 2
-        and bool(start_near_analyzer)
-        and bool(end_near_computer)
-        and multi_span_ok
-    )
-
-    # 笔记本电脑左侧接口块：仅作为辅助信号，不作硬约束（单实线主路径不依赖接口块）
-    computer_ports = [
-        s for s in ctx.shapes
-        if intersects_region(s, 24.2, 9.7, 25.1, 10.6, 0.1)
-        and (s.is_rect_like or s.is_line)
-        and (is_blackish(s.line_color) or is_dark(s.line_color) or any(is_blackish(c) or is_dark(c) for c in s.fill_colors))
-    ]
-
-    hit = single_line_ok or multi_ok
-    return result(
-        "第1页中部右侧连接线",
-        hit,
-        f"单实线/弧形 {len(single_line_candidates)}，多段线 {len(line_segs)}（起点 {len(start_near_analyzer)}，终点 {len(end_near_computer)}，跨度合规={'是' if multi_span_ok else '否'}），接口块 {len(computer_ports)}",
-    )
-
-
-def check_laptop_outline(ctx: EvaluationContext) -> RuleResult:
-    # 细则区域：距左22.5–32cm，距上6.2–12.5cm
-    REGION_L, REGION_T, REGION_R, REGION_B = 22.5, 6.2, 32.0, 12.5
-
-    def is_deep_blue_or_bluegrey_or_blueblack(c: tuple[int, int, int] | None) -> bool:
-        """机身颜色：深蓝色、深灰蓝色或蓝黑色 —— 只要属于蓝色/黑色/深色/灰色家族即视为合规"""
-        return is_blue(c) or is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    def has_laptop_outline(s: ShapeInfo) -> bool:
-        """边线深蓝或黑色单实线，线宽0.75–1.25磅（未显式设置按默认1.0磅处理）"""
-        is_dark_line = (
-            is_blue(s.line_color)
-            or is_blackish(s.line_color)
-            or is_dark(s.line_color)
-            or is_grayish(s.line_color)
-        )
-        return (
-            not s.dashed
-            and is_dark_line
-            and line_width_in_range(s.line_width, 0.75, 1.25, 0.0)
-        )
-
-    # 屏幕（包含屏幕框体）：在区域上部，大面积矩形/圆角矩形，机身深蓝/蓝黑色填充，边线合规
-    screen_parts = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, REGION_T, REGION_R, 12.0, 0.2)
-        and s.w_abs >= 5.0 and s.h_abs >= 3.0
-        and any(is_deep_blue_or_bluegrey_or_blueblack(c) for c in s.fill_colors)
-        and has_laptop_outline(s)
-    ]
-
-    # 键盘底座：在区域下部（y>11cm），较宽扁矩形或梯形，机身深色填充，边线合规
-    base_parts = [
-        s for s in ctx.shapes
-        if intersects_region(s, REGION_L, 11.0, REGION_R, REGION_B, 0.2)
-        and (s.is_rect_like or s.geom == "trapezoid")
-        and s.w_abs >= 5.0 and s.h_abs <= 2.5
-        and any(is_deep_blue_or_bluegrey_or_blueblack(c) for c in s.fill_colors)
-    ]
-
-    # 后侧折叠连接部（合页处）：介于屏幕底部和底座之间，小宽矩形/弧形，深色
-    hinge_parts = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, REGION_L, 11.5, REGION_R, 13.0, 0.2)
-        and s.w_abs >= 3.0 and s.h_abs <= 1.5
-        and any(is_deep_blue_or_bluegrey_or_blueblack(c) for c in s.fill_colors)
-    ]
-
-    hit = bool(screen_parts) and bool(base_parts) and bool(hinge_parts)
-    return result(
-        "第1页右侧笔记本电脑外轮廓",
-        hit,
-        f"屏幕框体 {len(screen_parts)}，键盘底座 {len(base_parts)}，折叠连接 {len(hinge_parts)}",
-    )
-
-
-def check_laptop_screen_charts(ctx: EvaluationContext) -> RuleResult:
-    # 屏幕整体区域：距左22.5–31.8cm，距上6.4–11cm
-    SCR_L, SCR_T, SCR_R, SCR_B = 22.5, 6.4, 31.8, 11.0
-
-    # 屏幕：白色或极浅灰白填充，深蓝色边框，尺寸足够大
-    screen = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, SCR_L, SCR_T, SCR_R, SCR_B, 0.15)
-        and s.w_abs >= 6.0 and s.h_abs >= 3.0
-        and any(is_whiteish(c) or is_light_grayish(c) for c in s.fill_colors)
-        and is_dark_blue(s.line_color)
-        and not s.dashed
-    ]
-
-    # 屏幕内上方浅灰色界面横条：浅灰/白色填充，宽>=5cm，高<=0.7cm
-    ui_bar = [
-        s for s in ctx.rect_shapes
-        if intersects_region(s, SCR_L, SCR_T, SCR_R, 7.8, 0.1)
-        and s.w_abs >= 5.0 and s.h_abs <= 0.7
-        and any(is_light_grayish(c) or is_whiteish(c) for c in s.fill_colors)
-    ]
-
-    # 小圆点装饰：在上方横条左侧区域，小椭圆，直径0.08–0.25cm
-    ui_dots = [
-        s for s in ctx.ellipse_shapes
-        if intersects_region(s, 22.7, SCR_T, 24.5, 7.6, 0.1)
-        and 0.08 <= s.w_abs <= 0.25 and 0.08 <= s.h_abs <= 0.25
-        and any(is_light_grayish(c) or is_whiteish(c) or is_blue(c) for c in s.fill_colors)
-    ]
-
-    # 左半屏幕蓝色折线图：距左25–28 × 7.3–10.5cm，蓝色曲线线宽0.75–1.25磅
-    CHART_L_L, CHART_T, CHART_L_R, CHART_B = 25.0, 7.3, 28.0, 10.5
-    blue_lines = line_in_region(
-        ctx, CHART_L_L, CHART_T, CHART_L_R, CHART_B,
-        color_pred=is_blue, width_range=(0.75, 1.25),
-        min_len=0.15, width_tol=0.0, region_tol=0.05,
-    )
-    # 左半浅灰色坐标轴，线宽0.75–1.25磅
-    left_axes = line_in_region(
-        ctx, CHART_L_L, CHART_T, CHART_L_R, CHART_B,
-        color_pred=is_light_grayish, width_range=(0.75, 1.25),
-        min_len=0.3, width_tol=0.0, region_tol=0.05,
-    )
-
-    # 右半屏幕红色分布曲线图：距左27.8–30.2 × 7.3–10.5cm，红色曲线线宽0.75–1.25磅
-    CHART_R_L, CHART_R_R = 27.8, 30.2
-    red_lines = line_in_region(
-        ctx, CHART_R_L, CHART_T, CHART_R_R, CHART_B,
-        color_pred=is_red, width_range=(0.75, 1.25),
-        min_len=0.15, width_tol=0.0, region_tol=0.05,
-    )
-    # 右半浅灰色坐标轴，线宽0.75–1.25磅
-    right_axes = line_in_region(
-        ctx, CHART_R_L, CHART_T, CHART_R_R, CHART_B,
-        color_pred=is_light_grayish, width_range=(0.75, 1.25),
-        min_len=0.3, width_tol=0.0, region_tol=0.05,
-    )
-
-    hit = (
-        bool(screen)
-        and bool(ui_bar)
-        and len(ui_dots) >= 2
-        and len(blue_lines) >= 2
-        and len(left_axes) >= 2
-        and len(red_lines) >= 2
-        and len(right_axes) >= 2
-    )
-    return result(
-        "第1页右侧笔记本电脑屏幕区域",
-        hit,
-        f"屏幕 {len(screen)}，界面横条 {len(ui_bar)}，圆点 {len(ui_dots)}，"
-        f"蓝线 {len(blue_lines)}/左轴 {len(left_axes)}，红线 {len(red_lines)}/右轴 {len(right_axes)}",
-    )
-
-
-
-def check_computer_text(ctx: EvaluationContext) -> RuleResult:
-    # 细则：位于笔记本电脑下方中央，距左25.0–27.4cm、距上12.4–13.8cm
-    # 用 tol=0.3 允许文本框中心在给定范围内有合理偏移
-    texts = find_text_in(ctx, "计算机", 25.0, 12.4, 27.4, 13.8, tol=0.3)
-
-    def is_black_or_dark_grey(c: tuple[int, int, int] | None) -> bool:
-        """黑色或深灰色 —— 只要属于黑色/深色/灰色家族即视为合规"""
-        return is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    # 细则：字体黑体/微软雅黑或相近中文字体；字号13–15磅；颜色黑色或深灰色
-    # size_tol=0.0 严格匹配13–15磅；字体通过 has_text_style 内 SANS_FONTS 覆盖
-    hit = any(has_text_style(s, 13, 15, is_black_or_dark_grey, size_tol=0.0) for s in texts)
-    return result("第1页右侧笔记本电脑下方文本", hit, f"指定区域文本 {len(texts)} 个")
-
-
-def check_data_box(ctx: EvaluationContext) -> RuleResult:
-    # 细则：蓝色虚线圆角矩形，位于距左25.2–31.4cm、距上3.4–5.2cm
-    # 线宽1–1.5磅，填充白色或无填充，宽5.2–5.6cm，高1.3–1.7cm
-    _, box_segments = segmented_blue_border(ctx, 25.2, 3.4, 31.4, 5.2, min_segments=14)
-    boxes = [
-        s for s in rect_in_region(ctx, 25.2, 3.4, 31.4, 5.2, dashed=True, color_pred=is_blue, min_w=5.2, min_h=1.3)
-        if s.geom == "roundRect"
-        and 5.2 <= s.w_abs <= 5.6
-        and 1.3 <= s.h_abs <= 1.7
-        and line_width_in_range(s.line_width, 1.0, 1.5, 0.0)  # 细则：线宽1–1.5磅（未显式设置按默认1.0磅处理）
-        and (not s.fill_colors or any(is_whiteish(c) for c in s.fill_colors))  # 细则：填充白色或无填充
-    ]
-    box_hit = bool(boxes)
-
-    # 细则：内部文本"数据分析与可视化"，字体黑体/微软雅黑等，字号18–24磅，颜色深蓝色
-    texts = [
-        s for s in find_text_in(ctx, "数据分析与可视化", 25.2, 3.4, 31.4, 5.2, tol=0.3)
-        if has_text_style(s, 18, 24, is_dark_blue, size_tol=0.0)
-    ]
-
-    # 细则：蓝色竖向虚线单箭头，线宽1–1.5磅，箭头朝下
-    # 位于距左27.5–28.8cm、距上4.8–6.7cm
-    arrows = line_in_region(
-        ctx, 27.5, 4.8, 28.8, 6.7,
-        color_pred=is_blue,
-        width_range=(1.0, 1.5),
-        dashed=True,
-        arrow=True,
-        vertical=True,
-        width_tol=0.0,
-        region_tol=0.3,
-        direction="down",
-    )
-
-    hit = box_hit and bool(texts) and bool(arrows)
-    return result("第1页右上虚线框及向下箭头", hit, f"虚线框短线 {box_segments} 段，原生框 {len(boxes)}，文本 {len(texts)}，向下虚线箭头 {len(arrows)}")
-
-
-def check_legend_frame(ctx: EvaluationContext) -> RuleResult:
-    # 细则：蓝色虚线圆角矩形，位于距左3.6–30.3cm、距上15.3–18.2cm
-    # 宽26–27cm，高2.2–2.5cm，填充白色或无填充，边线蓝色虚线，线宽1–1.5磅
-    _, box_segments = segmented_blue_border(ctx, 3.6, 15.3, 30.3, 18.2, min_segments=40)
-    boxes = [
-        s for s in rect_in_region(ctx, 3.6, 15.3, 30.3, 18.2, dashed=True, color_pred=is_blue, min_w=26.0, min_h=2.2)
-        if s.geom == "roundRect"
-        and within_region(s, 3.6, 15.3, 30.3, 18.2, 0.3)  # 细则：位于指定范围内
-        and 26.0 <= s.w_abs <= 27.0          # 细则：宽26–27cm
-        and 2.2 <= s.h_abs <= 2.5            # 细则：高2.2–2.5cm
-        and line_width_in_range(s.line_width, 1.0, 1.5, 0.0)  # 细则：线宽1–1.5磅（未显式设置按默认1.0磅处理）
-        and (not s.fill_colors or any(is_whiteish(c) for c in s.fill_colors))  # 细则：填充白色或无填充
-    ]
-    hit = bool(boxes)
-    return result("第1页底部图例外框", hit, f"底部蓝色虚线短线 {box_segments} 段，原生虚线框 {len(boxes)} 个")
-
-
-def check_legend_black(ctx: EvaluationContext) -> RuleResult:
-    # 细则：黑色水平单实线，位于距左4.4–6.1cm、距上16.0–16.7cm
-    # 长度0.9–1.5cm，线宽1.5–2.5磅
-    lines = [
-        s for s in line_in_region(
-            ctx, 4.4, 16.0, 6.1, 16.7,
-            color_pred=is_blackish,
-            width_range=(1.5, 2.5),
-            dashed=False,
-            arrow=False,
-            horizontal=True,
-            min_len=0.9,
-            max_len=1.5,
-            width_tol=0.0,
-            region_tol=0.2,
-        )
-        if within_region(s, 4.4, 16.0, 6.1, 16.7, 0.2)
-    ]
-
-    def is_black_or_dark_grey(c: tuple[int, int, int] | None) -> bool:
-        """黑色或深灰色 —— 只要属于黑色/深色/灰色家族即视为合规。"""
-        return is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    # 细则：文本位于黑色线段右侧，距左6.0–12.2cm、距上16.0–16.7cm
-    # 内容为“工作电极连接线（信号输出）”，字体黑体/微软雅黑等，字号11–13磅，颜色黑色或深灰色
-    texts = [
-        s for s in find_text_in(ctx, "工作电极连接线（信号输出）", 6.0, 16.0, 12.2, 16.7, tol=0.2)
-        if has_text_style(s, 11, 13, is_black_or_dark_grey, size_tol=0.0)
-    ]
-
-    hit = bool(lines) and bool(texts)
-    return result("第1页底部图例黑色线段", hit, f"黑色水平单实线 {len(lines)}，文本 {len(texts)}")
-
-
-def check_legend_green(ctx: EvaluationContext) -> RuleResult:
-    # 细则：绿色水平单实线，位于距左4.4–6.1cm、距上16.5–17.8cm
-    # 长度0.9–1.5cm，线宽1.5–2.5磅
-    lines = [
-        s for s in line_in_region(
-            ctx, 4.4, 16.5, 6.1, 17.8,
-            color_pred=is_green,
-            width_range=(1.5, 2.5),
-            dashed=False,
-            arrow=False,
-            horizontal=True,
-            min_len=0.9,
-            max_len=1.5,
-            width_tol=0.0,
-            region_tol=0.2,
-        )
-        if within_region(s, 4.4, 16.5, 6.1, 17.8, 0.2)
-    ]
-
-    def is_black_or_dark_grey(c: tuple[int, int, int] | None) -> bool:
-        """黑色或深灰色 —— 只要属于黑色/深色/灰色家族即视为合规。"""
-        return is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    # 细则：文本位于绿色线段右侧，距左6.0–12.2cm、距上16.5–17.8cm
-    # 内容为"参比电极连接线（电位参照）"，字体黑体/微软雅黑等，字号11–13磅，颜色黑色或深灰色
-    texts = [
-        s for s in find_text_in(
-            ctx, ["参比电极连接线（电位参照）"],
-            6.0, 16.5, 12.2, 17.8, tol=0.2,
-        )
-        if has_text_style(s, 11, 13, is_black_or_dark_grey, size_tol=0.0)
-    ]
-
-    hit = bool(lines) and bool(texts)
-    return result("第1页底部图例绿色线段", hit, f"绿色水平单实线 {len(lines)}，文本 {len(texts)}")
-
-
-def check_legend_red(ctx: EvaluationContext) -> RuleResult:
-    # 细则：红色水平单实线，位于距左14.0–16.0cm、距上16.0–17.0cm
-    # 长度0.9–1.5cm，线宽1.5–2.5磅
-    lines = [
-        s for s in line_in_region(
-            ctx, 14.0, 16.0, 16.0, 17.0,
-            color_pred=is_red,
-            width_range=(1.5, 2.5),
-            dashed=False,
-            arrow=False,
-            horizontal=True,
-            min_len=0.9,
-            max_len=1.5,
-            width_tol=0.0,
-            region_tol=0.2,
-        )
-        if within_region(s, 14.0, 16.0, 16.0, 17.0, 0.2)
-    ]
-
-    def is_black_or_dark_grey(c: tuple[int, int, int] | None) -> bool:
-        """黑色或深灰色 —— 只要属于黑色/深色/灰色家族即视为合规。"""
-        return is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    # 细则：文本位于红色线段右侧，距左15.8–21.4cm、距上16.0–17.0cm
-    # 内容为"对电极连接线（电流通路）"，字体黑体/微软雅黑等，字号11–13磅，颜色黑色或深灰色
-    texts = [
-        s for s in find_text_in(ctx, "对电极连接线（电流通路）", 15.8, 16.0, 21.4, 17.0, tol=0.2)
-        if has_text_style(s, 11, 13, is_black_or_dark_grey, size_tol=0.0)
-    ]
-
-    hit = bool(lines) and bool(texts)
-    return result("第1页底部图例红色线段", hit, f"红色水平单实线 {len(lines)}，文本 {len(texts)}")
-
-
-def check_legend_blue_arrow(ctx: EvaluationContext) -> RuleResult:
-    # 细则：蓝色水平虚线单箭头，位于距左23.2–25.0cm、距上16.4–17.1cm
-    # 线宽1–1.5磅，箭头朝右
-    arrows = [
-        s for s in line_in_region(
-            ctx, 23.2, 16.4, 25.0, 17.1,
-            color_pred=is_blue,
-            width_range=(1.0, 1.5),
-            dashed=True,
-            arrow=True,
-            horizontal=True,
-            width_tol=0.0,
-            region_tol=0.2,
-            direction="right",
-        )
-        if within_region(s, 23.2, 16.4, 25.0, 17.1, 0.2)
-    ]
-
-    def is_black_or_dark_grey(c: tuple[int, int, int] | None) -> bool:
-        """黑色或深灰色 —— 只要属于黑色/深色/灰色家族即视为合规。"""
-        return is_blackish(c) or is_dark(c) or is_grayish(c)
-
-    # 细则：文本位于蓝色虚线箭头右侧，距左24.9–29.3cm、距上16.4–17.1cm
-    # 内容为"信号/控制/数据流向"，字体黑体/微软雅黑等，字号11–13磅，颜色黑色或深灰色
-    texts = [
-        s for s in find_text_in(ctx, "信号/控制/数据流向", 24.9, 16.4, 29.3, 17.1, tol=0.2)
-        if has_text_style(s, 11, 13, is_black_or_dark_grey, size_tol=0.0)
-    ]
-
-    hit = bool(arrows) and bool(texts)
-    return result("第1页底部图例蓝色虚线箭头", hit, f"蓝色水平虚线单箭头 {len(arrows)}，文本 {len(texts)}")
-
-
-def check_overall_layout(ctx: EvaluationContext) -> RuleResult:
-    # 细则：以下各区域均须在页面可视范围内有对象
-    # 1. 外侧蓝色边框 — 贴近页面四边
-    PAGE_W = ctx.slide_width
-    PAGE_H = ctx.slide_height
-
-    # 外侧蓝色边框
-    border_in_view = any(
-        s for s in ctx.rect_shapes
-        if s.x1 <= 0.4 and s.y1 <= 0.4
-        and s.x2 >= PAGE_W - 0.4 and s.y2 >= PAGE_H - 0.4
-    )
-
-    # 左侧烧杯与三根电极（左区有足够对象）
-    left_objects = count_shapes((3.0, 3.5, 12.5, 14.5), ctx.shapes)
-    left_ok = left_objects >= 15
-
-    # 三条彩色连接线（黑/绿/红，横跨中左区域）
-    black_lines = line_in_region(ctx, 7.0, 3.5, 14.0, 7.5, color_pred=lambda c: is_blackish(c) or is_dark(c), min_len=1.0)
-    green_lines = line_in_region(ctx, 7.0, 3.5, 14.0, 12.5, color_pred=is_green, min_len=1.0)
-    red_lines   = line_in_region(ctx, 7.0, 3.5, 14.0, 12.5, color_pred=is_red,   min_len=1.0)
-    connection_lines_ok = bool(black_lines) and bool(green_lines) and bool(red_lines)
-
-    # 中部电化学分析仪
-    center_objects = count_shapes((13.0, 5.5, 22.5, 15.5), ctx.shapes)
-    center_ok = center_objects >= 15
-
-    # 右侧笔记本电脑
-    right_objects = count_shapes((22.5, 3.0, 32.5, 14.5), ctx.shapes)
-    right_ok = right_objects >= 15
-
-    # 顶部与中部三个蓝色虚线标注框（顶右、中上、中下）
-    blue_dashed_boxes = [
-        s for s in ctx.rect_shapes
-        if s.dashed and is_blue(s.line_color)
-        and intersects_region(s, 3.0, 3.0, 32.0, 15.5, 0.3)
-    ]
-    annotation_boxes_ok = len(blue_dashed_boxes) >= 3
-
-    # 底部图例框及四组图例均在页面内
-    legend_objects = count_shapes((3.4, 15.0, 30.8, 18.5), ctx.shapes)
-    legend_box_in_view = any(
-        s for s in ctx.rect_shapes
-        if s.dashed and is_blue(s.line_color)
-        and intersects_region(s, 3.0, 14.5, 31.5, 18.5, 0.3)
-        and s.w_abs >= 20.0
-    )
-    legend_ok = legend_objects >= 8 and legend_box_in_view
-
-    # 所有对象不超出页面可视范围
-    in_view_ok = not any(
-        s for s in ctx.shapes
-        if s.x2 < -0.3 or s.y2 < -0.3
-        or s.x1 > PAGE_W + 0.3 or s.y1 > PAGE_H + 0.3
-    )
-
-    # 文本未超出对应框体（文本中心须在页面内）
-    text_overflow = [
-        s for s in ctx.text_shapes
-        if s.cx < 0 or s.cy < 0 or s.cx > PAGE_W or s.cy > PAGE_H
-    ]
-    text_in_view_ok = len(text_overflow) == 0
-
-    # 主要图形之间没有明显重叠导致无法阅读
-    # （文本框与文本框之间重叠面积超过较小框50%视为严重重叠）
-    text_overlaps = 0
-    texts = ctx.text_shapes
-    for i, a in enumerate(texts):
-        for b in texts[i + 1:]:
-            if overlap_area(a.box, b.box) > min(a.box.area, b.box.area) * 0.50:
-                text_overlaps += 1
-    no_bad_overlap = text_overlaps <= 2
-
-    hit = (
-        border_in_view
-        and left_ok
-        and connection_lines_ok
-        and center_ok
-        and right_ok
-        and annotation_boxes_ok
-        and legend_ok
-        and in_view_ok
-        and text_in_view_ok
-        and no_bad_overlap
-    )
-    return result(
-        "第1页整体排版",
-        hit,
-        (
-            f"蓝框={'有' if border_in_view else '无'}，"
-            f"左区{left_objects}个，连接线(黑{len(black_lines)}/绿{len(green_lines)}/红{len(red_lines)})，"
-            f"中区{center_objects}个，右区{right_objects}个，"
-            f"蓝色虚线标注框{len(blue_dashed_boxes)}个，"
-            f"图例区{legend_objects}个(框={'有' if legend_box_in_view else '无'})，"
-            f"越界={'无' if in_view_ok else '有'}，文本越框={'无' if text_in_view_ok else f'{len(text_overflow)}处'}，"
-            f"文本严重重叠{text_overlaps}处"
-        ),
-    )
-
-
-def dimension2_items() -> list[ScoreItem]:
-    return [
-        ScoreItem(1, "第1页白色页面背景", check_background),
-        ScoreItem(1, "第1页外侧蓝色矩形边框", check_outer_border),
-        ScoreItem(1, "第1页左侧烧杯外轮廓", check_beaker_outline),
-        ScoreItem(1, "第1页左侧烧杯顶部开口椭圆", check_beaker_top_ellipse),
-        ScoreItem(3, "第1页左侧烧杯内部液面与液体填充", check_liquid_and_bubbles),
-        ScoreItem(1, "第1页左侧烧杯底部文本", check_sample_text),
-        ScoreItem(3, "第1页左侧绿色参比电极", check_reference_electrode),
-        ScoreItem(3, "第1页左侧中间白蓝工作电极", check_working_electrode),
-        ScoreItem(3, "第1页右侧红色对电极", check_counter_electrode),
-        ScoreItem(1, '第1页左侧"参比电极"文本', check_reference_label_arrow),
-        ScoreItem(1, '第1页中部"工作电极"文本', check_working_label),
-        ScoreItem(1, '第1页右侧"对电极"文本', check_counter_label_arrow),
-        ScoreItem(1, '第1页顶部"分析物输入"文本', check_analyte_input),
-        ScoreItem(3, "第1页三条电极连接线", check_electrode_connection_lines),
-        ScoreItem(5, "第1页中部电化学分析仪外壳", check_analyzer_shell),
-        ScoreItem(3, "第1页中部电化学分析仪前屏幕", check_analyzer_screen),
-        ScoreItem(1, "第1页中部电化学分析仪名称文本", check_analyzer_name),
-        ScoreItem(1, "第1页中部电化学分析仪指示灯组", check_indicator_lights),
-        ScoreItem(1, "第1页中部上方虚线框及向下箭头", check_signal_box),
-        ScoreItem(1, "第1页中部下方虚线框及向上箭头", check_control_box),
-        ScoreItem(1, "第1页中部右侧连接线", check_analyzer_to_computer_line),
-        ScoreItem(5, "第1页右侧笔记本电脑外轮廓", check_laptop_outline),
-        ScoreItem(5, "第1页右侧笔记本电脑屏幕区域", check_laptop_screen_charts),
-        ScoreItem(1, "第1页右侧笔记本电脑下方文本", check_computer_text),
-        ScoreItem(1, "第1页右上虚线框及向下箭头", check_data_box),
-        ScoreItem(1, "第1页底部图例外框", check_legend_frame),
-        ScoreItem(1, "第1页底部图例黑色线段", check_legend_black),
-        ScoreItem(1, "第1页底部图例绿色线段", check_legend_green),
-        ScoreItem(1, "第1页底部图例红色线段", check_legend_red),
-        ScoreItem(1, "第1页底部图例蓝色虚线箭头", check_legend_blue_arrow),
-        ScoreItem(3, "第1页整体排版", check_overall_layout),
-    ]
-
-
-def run_dimension2(ctx: EvaluationContext) -> list[RuleResult]:
-    results = []
-    for item in dimension2_items():
+        return _dim1_fail(result, "交付文件无法正常打开（损坏或需修复）：%s: %s"
+                                  % (type(exc).__name__, exc))
+
+    gate = _dim1_gate(file_path, model)
+    if gate:
+        # 维度一未通过：完成度总分记 0，不再逐条罗列（未真正逐条评过）。
+        return _dim1_fail(result, "; ".join(gate))
+
+    result["dim1_pass"] = True
+    # 约定：维度一通过时 dim1_reason 保持空串，只有未通过才写错误摘要。
+    result["dim1_reason"] = ""
+
+    results: list[str] = []
+    for fn, (md, rule) in zip(_CHECKS, _DIM2_RULES):
         try:
-            rr = item.checker(ctx)
-            rr.label = item.label
-            rr.points = item.points
-        except Exception as exc:
-            rr = RuleResult(
-                item.label,
-                False,
-                f"检测异常：{type(exc).__name__}: {exc}",
-                item.points,
-                errored=True,
-            )
-        results.append(rr)
-    return results
+            hit, _evidence = fn(model)
+        except Exception:  # 单条检查异常不影响整体评测，按未命中计
+            hit = False
+        results.append("+%d：%s" % (md if hit else 0, rule))
+
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+
+    dim2_items: list[dict[str, Any]] = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta > 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total_score += (max_delta if hit else 0)
+
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
-SCRIPT_ID = "053"
-
-# 被评估文档的扩展名 —— 仅支持 .pptx (python-pptx + xml.etree + zipfile 静态解析)
-SUPPORTED_EXTS = (".pptx",)
-
-
-def _locate_document(dir_path: Path) -> Optional[Path]:
-    """在脚本所在目录内定位待评估的 .pptx 文件。"""
-    # 优先使用与默认文件名一致的目标文件
-    preferred = dir_path / DEFAULT_FILE
-    if preferred.is_file() and preferred.suffix.lower() == ".pptx":
-        return preferred
-    # 否则扫描目录，取第一个 .pptx 文件
-    candidates: list[Path] = []
-    for ext in SUPPORTED_EXTS:
-        candidates.extend(sorted(p for p in dir_path.glob(f"*{ext}") if p.is_file()))
-    return candidates[0] if candidates else None
+def _locate_pptx(dir_path: str) -> str:
+    """返回目录内首个 .pptx 的完整路径；目录中没有时返回空串。"""
+    names = [f for f in os.listdir(dir_path)
+             if f.lower().endswith(".pptx") and not f.startswith("~$")]
+    if not names:
+        return ""
+    return os.path.join(dir_path, sorted(names)[0])
 
 
-def _build_dim2_items(d2: Optional[list[RuleResult]], all_items: list[ScoreItem]) -> list[dict]:
-    """将维度2逐项检测结果转为统一约定的字典列表；未跑维度2时全部记为未命中。
-
-    ``detail`` 字段一律返回空字符串（不暴露内部检测细节或异常信息），
-    评分与命中判定仍按原有逻辑基于 ``RuleResult`` 计算，不受影响。
-    """
-    if d2 is None:
-        return [
-            {
-                "rule": item.label,
-                "max_delta": item.points,
-                "delta": 0,
-                "hit": False,
-                "detail": "",
-            }
-            for item in all_items
-        ]
-    items: list[dict] = []
-    for r in d2:
-        items.append(
-            {
-                "rule": r.label,
-                "max_delta": r.points,
-                "delta": r.points if r.hit else 0,
-                "hit": bool(r.hit),
-                "detail": "",
-            }
-        )
-    return items
-
-
-def evaluate(dir_path: str) -> dict:
-    """统一入口：接收脚本所在目录路径，脚本自行在该目录内定位并评估 PPT。"""
-    all_items = dimension2_items()
-    max_score = sum(item.points for item in all_items)
-    result_base = {
+def evaluate(dir_path: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": "",
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": max_score,
+        "max_score": 0,
     }
-
     try:
-        base_dir = Path(dir_path)
-        if not base_dir.is_dir():
-            result_base["status"] = "error"
-            result_base["error"] = f"目录不存在或不是文件夹：{dir_path}"
-            result_base["dim2_items"] = _build_dim2_items(None, all_items)
-            return result_base
-
-        doc_path = _locate_document(base_dir)
-        if doc_path is None:
-            result_base["status"] = "error"
-            result_base["error"] = f"目录中未找到 .pptx 文件：{dir_path}"
-            result_base["dim2_items"] = _build_dim2_items(None, all_items)
-            return result_base
-
-        result_base["file_name"] = doc_path.name
-
-        ctx = build_context(doc_path)
-        d1 = dimension1_checks(ctx)
-        dim1_pass = all(r.hit for r in d1)
-        result_base["dim1_pass"] = dim1_pass
-        if not dim1_pass:
-            failed = [r for r in d1 if not r.hit]
-            result_base["dim1_reason"] = "；".join(f"{r.label}：{r.detail}" for r in failed)
-            result_base["dim2_items"] = _build_dim2_items(None, all_items)
-            result_base["total_score"] = 0
-            return result_base
-
-        d2 = run_dimension2(ctx)
-        result_base["dim2_items"] = _build_dim2_items(d2, all_items)
-        result_base["total_score"] = sum(r.points for r in d2 if r.hit)
-        return result_base
+        if not dir_path or not os.path.isdir(dir_path):
+            result["status"] = "error"
+            result["error"] = "目录不存在：%s" % dir_path
+            return result
+        file_path = _locate_pptx(dir_path)
+        if not file_path:
+            result["status"] = "error"
+            result["error"] = "目录中未找到 .pptx 文件：%s" % dir_path
+            return result
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
     except Exception as exc:
-        result_base["status"] = "error"
-        result_base["error"] = f"{type(exc).__name__}: {exc}"
-        if not result_base["dim2_items"]:
-            result_base["dim2_items"] = _build_dim2_items(None, all_items)
-        return result_base
+        # 脚本异常同样视为"没评上"：维度一未判定，两项分数归零。
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
 
 
 if __name__ == "__main__":
-    # 本地自测：默认使用脚本所在目录；也可通过命令行参数传入其它目录
-    debug_dir = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).parent)
-    print(json.dumps(evaluate(debug_dir), ensure_ascii=False, indent=2))
+    _dir = sys.argv[1] if len(sys.argv) >= 2 else os.path.dirname(os.path.abspath(__file__))
+    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

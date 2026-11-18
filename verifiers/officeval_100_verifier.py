@@ -1,1684 +1,1293 @@
-﻿  # -*- coding: utf-8 -*-
-"""
-自动评估器 —— 评估"堆叠柱状图对比"作答 xlsx/xlsm 文件。
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-评分模型（与"打分细则"一致）：
-  维度1（可用与可修改性，门槛项）：不满足 -> 直接 0 分，不再检查维度2。
-  维度2（完成度）：得分点（满足全部子点才加分）+ 扣分点（满足任一子点即扣分）累加。
-
-实现说明：
-  - 仅依赖 Python 标准库（zipfile + xml）解析 xlsx 内部 XML，无需 openpyxl。
-  - 对"不可编辑/截图代替"等通过结构判断：存在原生 chart part 即视为可编辑图表对象。
-  - 颜色判断：取系列填充色，按 RGB 距离归类到 蓝/绿/橙。
-  - 标签、坐标轴刻度等通过 chartXML 中对应节点判定。
-  - 对难以严格量化的几何项（柱间距 0-0.1cm）用堆叠/重叠/间隙参数做近似推断，并在结果中说明。
-
-对外接口：
-  evaluate(dir_path: str) -> dict
-    传入"脚本所在目录的路径"，函数自己在该目录内定位并打开被评估的 xlsx/xlsm 文档，
-    返回结构化字典（含维度一通过与否、维度二逐项得分、总分等），
-    不 print 主结果、不改 sys.stdout、不 sys.exit。总分为所有命中的加分项之和。
-
-  本文件 __main__ 仅用于本地自测：
-    python officeval_100_verifier.py <脚本所在目录>
-"""
-
-import sys
 import os
 import re
+import sys
 import json
 import math
+import posixpath
 import zipfile
+import warnings
+import traceback
 import xml.etree.ElementTree as ET
 
-# ---------- XML 命名空间 ----------
-NS = {
-    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
-    "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
-    "s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+warnings.filterwarnings("ignore")
+import openpyxl
+
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为“脚本所在目录的路径”，
+# 由脚本自己在该目录内定位并打开被评估的 .xlsx / .xlsm（忽略以 ~$ 打头的临时锁文件）。
+# 本文件仅在 __main__ 下作为本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 与 008 号脚本的差异：本任务（教学资源管理台账·登记/核验对比堆叠柱状图）细则同时
+# 含“加分项”（指令要求的图表制作任务）与“减分项”（指令未涉及、却改动已有台账与汇总
+# 区而造成破坏或麻烦的多余修改）。故 dim2 项的 max_delta 允许为负：正值=加分项
+# （命中记满分，未命中记 0）；负值=减分项（触发“破坏”记该负分，未触发记 0）。
+# total_score 为全部 delta 之和，取值区间 [-29, +45]；max_score 仍为所有加分项满分
+# 之和（+45），作为完成度上限。图表“做了但没做好”的质量问题（占位 0、穿柱网格线、
+# 拼接标签、位图截图、工作表锁定等）只体现为相应加分项不得分，不另计减分项；
+# 维度1 只判“交付物是否为一个能正常打开的 Excel 工作簿（.xlsx/.xlsm）”，
+# 文件损坏或需修复时直接判 0，其余问题一律回落到 dim2 计分，不重复判 0。
+#
+# 图表侧一律直接解析包内 chart XML（含第三方写出的 xl/drawings/charts/*.xml）：
+# openpyxl 对某些写法的 c:externalData 关系会整张图表跳过，不能作为判据；
+# 单元格取值、字体填充边框、合并、列宽行高、视图与保护仍走 openpyxl。
+
+SCRIPT_ID = "100"
+
+# —— 加分项按“结果追加顺序”的 max_delta（正值）——
+_ADD_DELTAS_ORDER = [
+    3,  # A01 新增 1 个柱形图图表对象，用于登记/核验对比
+    5,  # A02 登记侧为“综管科/服务科”上下堆叠的堆积柱形图
+    3,  # A03 横轴 5 个资源类别，每类别只 1 个分类标签
+    3,  # A04 “核验数量”为独立柱体，与登记堆叠柱同刻度左右并排
+    3,  # A05 综管科 6/22/18/12/5、服务科 9/8/6/3/2
+    3,  # A06 核验数量 13/27/22/14/6
+    1,  # A07 堆叠柱总高 = 15/30/24/15/7
+    5,  # A08 系列名/分类轴/数值均为单元格区域引用（非常量数组）
+    3,  # A09 规整绘图数据表（5 行 × 类别/综管科/服务科/核验数量）
+    1,  # A10 各系列取值均为真实数据，不含拼并列用的占位 0
+    1,  # A11 可逐系列调整、非单一图形对象，且工作表未被保护锁定
+    1,  # A12 图表标题含登记（综管科+服务科）与核验对比信息
+    1,  # A13 纵坐标轴标题“数量（台）”
+    3,  # A14 综管科/服务科两段数据标签居中显示于各段柱体内部
+    3,  # A15 堆叠柱顶显示登记合计标签、核验柱顶显示核验标签
+    1,  # A16 图例含三项且不显示承载合计标签的辅助系列名
+    1,  # A17 综管科/服务科/核验数量三色明显互不相同
+    1,  # A18 纵轴最大刻度不小于 30，柱体与标签无截断
+    1,  # A19 同类别两根柱紧邻成组，组内间距明显小于类别间距
+    1,  # A20 图表摆放不遮挡台账主表与汇总辅助区
+    1,  # A21 网格线只在数值轴，柱体不被竖向网格线穿过，标签不重叠
+]
+
+# —— 减分项按“结果追加顺序”的 max_delta（负值）——
+_DED_DELTAS_ORDER = [
+    -3,  # D01 台账主表数据被删除/改写/移位
+    -3,  # D02 主表区域插入或删除行/列致数据与合并错位
+    -1,  # D03 A1 标题格式
+    -1,  # D04 表头行 A2:F2 格式
+    -1,  # D05 数据行 A3:F16 格式
+    -1,  # D06 “合计”行（5/8/11/14/17 行）格式
+    -1,  # D07 主表 20 处纵向/跨列合并被取消或范围被改
+    -1,  # D08 列宽 A/B/C/D/F 或行高（1/2/3 行及以下）被改动
+    -1,  # D09 主表表头文字被改写为图表字段名
+    -3,  # D10 H2:M7 汇总表被删除或数值被改写
+    -3,  # D11 H10:M15 转置汇总表被删除或数值被改写
+    -1,  # D12 H2:M2 与 H10:M10 表头格式
+    -1,  # D13 H13:M14“合计”“核验数量”两行格式
+    -1,  # D14 H15:M15“辅助列”行被删除或填充/边框被改
+    -1,  # D15 Sheet1 被改名/隐藏/删除/非首个工作表
+    -1,  # D16 绘图数据表覆盖写入 A1:F17 或 H2:M15
+    -1,  # D17 残留与任务无关的多余工作表或空白工作表
+    -1,  # D18 残留未完成的中间图表或功能重复的第二个对比图
+    -1,  # D19 绘图数据表出现指令未要求的自造内容
+    -1,  # D20 默认打开视图被改动（冻结/网格线/缩放/活动表）
+    -1,  # D21 台账与汇总区新增公式/批注/条件格式/数据验证
+]
+
+MAX_SCORE_TOTAL = sum(_ADD_DELTAS_ORDER)               # +45：完成度上限
+_MIN_TOTAL = MAX_SCORE_TOTAL + sum(_DED_DELTAS_ORDER)  # +16：全部命中且全部踩坑
+assert MAX_SCORE_TOTAL == 45
+assert sum(_DED_DELTAS_ORDER) == -29
+
+# 结果追加顺序 = 先加分项、后减分项
+_MAX_DELTAS_ORDER = _ADD_DELTAS_ORDER + _DED_DELTAS_ORDER
+_ADD_COUNT = len(_ADD_DELTAS_ORDER)
+assert len(_MAX_DELTAS_ORDER) == 42
+
+# ================= 任务基准数据（细则中逐项写明的、应保持不变/应正确的取值）=================
+
+_TITLE_TEXT = "教学资源管理汇总台账"
+_CATS = ["便携学习终端", "智能显示设备", "网络接入设备", "多功能文印设备", "移动采集设备"]
+_ZG = [6.0, 22.0, 18.0, 12.0, 5.0]     # 综管科
+_FW = [9.0, 8.0, 6.0, 3.0, 2.0]        # 服务科
+_HY = [13.0, 27.0, 22.0, 14.0, 6.0]    # 核验数量
+_TOT = [15.0, 30.0, 24.0, 15.0, 7.0]   # 登记合计
+
+# 台账主表 A1:F17 应有取值（键为单元格坐标）
+_MAIN_TITLE_CELL = "A1"
+_MAIN_HEADER = {
+    "A2": "序号", "B2": "资源类别", "C2": "所属单元",
+    "D2": "登记数量（件）", "E2": "核验数量（件）", "F2": "备注",
+}
+_MAIN_DATA = {
+    "A3": 1, "B3": "便携学习终端", "C3": "综管科", "D3": 6, "E3": 13,
+    "C4": "服务科", "D4": 9,
+    "A5": "合计", "D5": 15,
+    "A6": 2, "B6": "智能显示设备", "C6": "综管科", "D6": 22, "E6": 27,
+    "C7": "服务科", "D7": 8,
+    "A8": "合计", "D8": 30,
+    "A9": 3, "B9": "网络接入设备", "C9": "综管科", "D9": 18, "E9": 22,
+    "C10": "服务科", "D10": 6,
+    "A11": "合计", "D11": 24,
+    "A12": 4, "B12": "多功能文印设备", "C12": "综管科", "D12": 12, "E12": 14,
+    "C13": "服务科", "D13": 3,
+    "A14": "合计", "D14": 15,
+    "A15": 5, "B15": "移动采集设备", "C15": "综管科", "D15": 5, "E15": 6,
+    "C16": "服务科", "D16": 2,
+    "A17": "合计", "D17": 7,
+}
+# 右侧汇总辅助区 H2:M7 应有取值
+_HELP_TOP = {
+    "H2": "资源类别", "I2": "综管科", "J2": "服务科", "K2": "合计",
+    "L2": "核验数量", "M2": "辅助列",
+    "H3": "便携学习终端", "I3": 6, "J3": 9, "K3": 15, "L3": 13,
+    "H4": "智能显示设备", "I4": 22, "J4": 8, "K4": 30, "L4": 27,
+    "H5": "网络接入设备", "I5": 18, "J5": 6, "K5": 24, "L5": 22,
+    "H6": "多功能文印设备", "I6": 12, "J6": 3, "K6": 15, "L6": 14,
+    "H7": "移动采集设备", "I7": 5, "J7": 2, "K7": 7, "L7": 6,
 }
 
-# 期望的资源类别与数据（来自原表与细则）
-CATEGORIES = ["便携学习终端", "智能显示设备", "网络接入设备", "多功能文印设备", "移动采集设备"]
-EXP_ZG = [6, 22, 18, 12, 5]        # 综管科 登记
-EXP_FW = [9, 8, 6, 3, 2]           # 服务科 登记
-EXP_TOTAL = [15, 30, 24, 15, 7]    # 合计登记
-EXP_VERIFY = [13, 27, 22, 14, 6]   # 核验数量
+# 右侧转置汇总表 H10:M15 应有取值
+_HELP_BOT = {
+    "H10": "资源类别", "I10": "便携学习终端", "J10": "智能显示设备",
+    "K10": "网络接入设备", "L10": "多功能文印设备", "M10": "移动采集设备",
+    "H11": "综管科", "I11": 6, "J11": 22, "K11": 18, "L11": 12, "M11": 5,
+    "H12": "服务科", "I12": 9, "J12": 8, "K12": 6, "L12": 3, "M12": 2,
+    "H13": "合计", "I13": 15, "J13": 30, "K13": 24, "L13": 15, "M13": 7,
+    "H14": "核验数量", "I14": 13, "J14": 27, "K14": 22, "L14": 14, "M14": 6,
+    "H15": "辅助列",
+}
+
+# 主表应保持的 20 处合并（A1:F1 归入 A1 标题项判定）
+_MAIN_MERGES = (
+    "A3:A4", "A6:A7", "A9:A10", "A12:A13", "A15:A16",
+    "B3:B4", "B6:B7", "B9:B10", "B12:B13", "B15:B16",
+    "A5:C5", "A8:C8", "A11:C11", "A14:C14", "A17:C17",
+    "E3:E5", "E6:E8", "E9:E11", "E12:E14", "E15:E17",
+)
+# 列宽与行高（细则给出的显示值；比较时留 0.1 字符 / 0.6 磅容差）
+_COL_WIDTHS = {"A": 4.875, "B": 16.125, "C": 21.5, "D": 16.375, "F": 9.0,
+               "H": 12.0, "I": 9.0, "K": 13.875, "L": 9.0}
+_ROW_HEIGHTS = {1: 28.5, 2: 27.0}
+_ROW_HEIGHT_BODY = 26.0
+_SHEET_NAME = "Sheet1"
+
+# 配色（细则逐项写明）
+_C_TITLE_FILL = "1F4E5F"
+_C_HEAD_FILL = "6FA8A0"
+_C_BODY_FILL = "E9F4F2"
+_C_SUM_FILL = "D8EBE8"
+_C_SUM_FONT = "1F2933"
+_C_WHITE = "FFFFFF"
+_TITLE_FONT = "方正小标宋简体"
+
+# 受保护矩形（1 起的 行1,列1,行2,列2）：台账主表 A1:F17、汇总辅助区 H2:M15
+_RECT_MAIN = (1, 1, 17, 6)
+_RECT_HELP = (2, 8, 15, 13)
+
+# 绘图数据表允许出现的文字（超出即视为自造内容）
+_ALLOWED_TEXT = set(_CATS) | {
+    "资源类别", "类别", "序号", "所属单元", "备注", "辅助列",
+    "综管科", "服务科", "合计", "核验数量", "登记数量", "登记合计",
+    "综管科+服务科", "登记数量（件）", "核验数量（件）", "数量（台）",
+    "绘图数据", "绘图数据表", "图表数据源", "数据源", "登记合计（综管科+服务科）",
+}
+_ALLOWED_NUMS = set(_ZG) | set(_FW) | set(_HY) | set(_TOT) | {1.0, 2.0, 3.0, 4.0, 5.0}
+# ================= 通用小工具 =================
+
+NS_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+NS_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
-# ============================================================
-#  基础工具
-# ============================================================
-def q(tag):
-    """把 'c:ser' 这种带前缀的标签转成 ElementTree 的 {ns}local 形式。"""
-    pre, local = tag.split(":")
-    return "{%s}%s" % (NS[pre], local)
+def _q(ns, tag):
+    return "{%s}%s" % (ns, tag)
 
 
-def findall(el, path):
-    return el.findall(path, NS)
+def _norm(s):
+    """文字规范化：去空白、半角括号转全角，便于与细则字面比对。"""
+    if s is None:
+        return ""
+    t = str(s).replace("(", "（").replace(")", "）").replace("＋", "+")
+    return re.sub(r"\s+", "", t).strip()
 
 
-def find(el, path):
-    return el.find(path, NS)
+def _ext_of(path):
+    """取小写扩展名（含点），用于维度1 说明中回显交付格式。"""
+    return os.path.splitext(path or "")[1].lower()
 
 
-class ZipBundle:
-    """加载 xlsx 内部各 XML，提供按需访问。"""
-
-    def __init__(self, path):
-        self.path = path
-        self.ok = False
-        self.error = None
-        self.names = []
-        self._cache = {}
-        try:
-            self.zf = zipfile.ZipFile(path, "r")
-            self.names = self.zf.namelist()
-            self.ok = True
-        except Exception as e:  # 损坏 / 非 zip / 打不开
-            self.error = str(e)
-
-    def read(self, name):
-        if name in self._cache:
-            return self._cache[name]
-        try:
-            data = self.zf.read(name)
-        except KeyError:
-            data = None
-        self._cache[name] = data
-        return data
-
-    def read_text(self, name):
-        data = self.read(name)
-        if data is None:
-            return None
-        return data.decode("utf-8", errors="replace")
-
-    def xml(self, name):
-        data = self.read(name)
-        if data is None:
-            return None
-        try:
-            return ET.fromstring(data)
-        except ET.ParseError:
-            return None
-
-
-def hex_to_rgb(h):
-    h = h.strip().lstrip("#")
-    if len(h) != 6:
+def _num(v):
+    """取数值；文本型数字一并接受，非数字返回 None。"""
+    if isinstance(v, bool):
         return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _same_value(got, want):
+    """单元格取值比对：数值按数值比，文字按规范化后比。"""
+    if isinstance(want, (int, float)) and not isinstance(want, bool):
+        g = _num(got)
+        return g is not None and abs(g - float(want)) < 1e-9
+    return _norm(got) == _norm(want)
+
+
+def _nz(seq):
+    """去掉 0 值占位后的数值序列（用于容忍“靠 0 值拼并列”的实现）。"""
+    return [v for v in seq if v is not None and abs(v) > 1e-9]
+def _rgb6(color):
+    """openpyxl 颜色 -> 6 位十六进制大写；解析不出返回 None。"""
     try:
-        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
-    except ValueError:
+        if color is None:
+            return None
+        rgb = getattr(color, "rgb", None)
+        if isinstance(rgb, str) and re.fullmatch(r"[0-9A-Fa-f]{6,8}", rgb):
+            return rgb[-6:].upper()
+    except Exception:
+        pass
+    return None
+
+
+def _fill6(cell):
+    """单元格实心填充色（6 位十六进制），非实心填充返回 None。"""
+    try:
+        f = cell.fill
+        if f is None or f.fill_type != "solid":
+            return None
+        return _rgb6(f.start_color)
+    except Exception:
         return None
 
 
-def classify_color(rgb):
-    """把一个 RGB 颜色归类为 blue/green/orange/other（用主导通道+简单规则）。"""
-    if rgb is None:
-        return "unknown"
-    r, g, b = rgb
-    # 橙色：红高、绿中、蓝低
-    if r >= 180 and 90 <= g <= 200 and b <= 110 and r > b:
-        return "orange"
-    # 蓝色：蓝为主导
-    if b >= 130 and b >= r + 25 and b >= g:
-        return "blue"
-    # 绿色：绿为主导
-    if g >= 120 and g >= r and g >= b - 10 and not (r >= 180 and b <= 110):
-        return "green"
-    # 兜底：按最大通道
-    mx = max(r, g, b)
-    if mx == b and b - max(r, g) > 15:
-        return "blue"
-    if mx == g and g - max(r, b) > 15:
-        return "green"
-    if mx == r and r - b > 60:
-        return "orange"
+def _borders(cell):
+    """四边线型元组 (左,右,上,下)。"""
+    b = cell.border
+    if b is None:
+        return (None, None, None, None)
+    return tuple(
+        (getattr(b, side).style if getattr(b, side) is not None else None)
+        for side in ("left", "right", "top", "bottom")
+    )
+
+
+def _thin4(cell):
+    return all(s == "thin" for s in _borders(cell))
+
+
+def _centered(cell):
+    a = cell.alignment
+    return (a is not None and a.horizontal == "center" and a.vertical == "center")
+
+
+def _wrap_ok(cell):
+    """自动换行：显式关闭才算被改动（重存后 None 与 True 视觉一致）。"""
+    a = cell.alignment
+    return not (a is not None and a.wrap_text is False)
+def _merged_map(ws):
+    """返回 (合并区字符串集合, 被合并覆盖但非左上角的坐标集合)。"""
+    ranges = set()
+    covered = set()
+    for mr in ws.merged_cells.ranges:
+        ranges.add(str(mr))
+        for row in ws[str(mr)]:
+            for c in row:
+                if c.coordinate != mr.coord.split(":")[0]:
+                    covered.add(c.coordinate)
+    return ranges, covered
+
+
+def _iter_rect(ws, rect):
+    """遍历矩形区域 (r1,c1,r2,c2) 内的单元格对象。"""
+    r1, c1, r2, c2 = rect
+    for row in ws.iter_rows(min_row=r1, max_row=r2, min_col=c1, max_col=c2):
+        for c in row:
+            yield c
+
+
+def _in_rect(row, col, rect):
+    r1, c1, r2, c2 = rect
+    return r1 <= row <= r2 and c1 <= col <= c2
+
+
+def _rect_overlap(a, b):
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+_REF_RE = re.compile(r"^(?:'([^']+)'|([^!]+))!\$?([A-Z]{1,3})\$?(\d+)"
+                     r"(?::\$?([A-Z]{1,3})\$?(\d+))?$")
+
+
+def _parse_ref(f):
+    """解析 c:f 形如 Sheet1!$B$20:$B$24 -> (sheet, r1, c1, r2, c2)；失败返回 None。"""
+    if not f:
+        return None
+    m = _REF_RE.match(f.strip())
+    if not m:
+        return None
+    sheet = m.group(1) or m.group(2)
+    from openpyxl.utils import column_index_from_string
+    c1 = column_index_from_string(m.group(3))
+    r1 = int(m.group(4))
+    c2 = column_index_from_string(m.group(5)) if m.group(5) else c1
+    r2 = int(m.group(6)) if m.group(6) else r1
+    return (sheet, min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2))
+# ================= 包内 XML：图表 / 绘图 / 关系 =================
+
+
+def _val_of(el, default=None):
+    if el is None:
+        return default
+    v = el.get("val")
+    return v if v is not None else default
+
+
+def _rich_text(el):
+    if el is None:
+        return ""
+    return "".join(t.text or "" for t in el.iter(_q(NS_A, "t"))).strip()
+
+
+def _ser_fill(sp):
+    """系列填充：'none' 表示无填充（承载合计标签的辅助系列），否则 6 位色值。"""
+    if sp is None:
+        return None
+    if sp.find(_q(NS_A, "noFill")) is not None:
+        return "none"
+    sf = sp.find(_q(NS_A, "solidFill"))
+    if sf is None:
+        return None
+    c = sf.find(_q(NS_A, "srgbClr"))
+    if c is not None:
+        return (c.get("val") or "").upper()
+    c = sf.find(_q(NS_A, "schemeClr"))
+    if c is not None:
+        return "scheme:" + (c.get("val") or "")
     return "other"
 
 
-def rgb_to_hex(rgb):
-    if rgb is None:
-        return None
-    return "%02X%02X%02X" % tuple(max(0, min(255, int(round(c)))) for c in rgb)
+def _dlbls(el):
+    """返回 (showVal, dLblPos 集合)：合并 c:dLbls 与逐点 c:dLbl 的设置。"""
+    d = el.find(_q(NS_C, "dLbls"))
+    if d is None:
+        return (None, set())
+    show = _val_of(d.find(_q(NS_C, "showVal")))
+    for sub in d.findall(_q(NS_C, "dLbl")):
+        s2 = sub.find(_q(NS_C, "showVal"))
+        if s2 is not None and s2.get("val") == "1":
+            show = "1"
+    poss = set(p.get("val") for p in d.iter(_q(NS_C, "dLblPos")))
+    return (show, set(p for p in poss if p))
+def _pts_num(holder):
+    """c:val -> (引用公式 or None, 数值列表, 是否常量数组)。"""
+    if holder is None:
+        return (None, [], False)
+    ref = holder.find(_q(NS_C, "numRef"))
+    lit = holder.find(_q(NS_C, "numLit"))
+    src, is_lit = (ref, False) if ref is not None else (lit, True)
+    if src is None:
+        return (None, [], False)
+    f = src.find(_q(NS_C, "f"))
+    formula = f.text if f is not None else None
+    cache = src if is_lit else src.find(_q(NS_C, "numCache"))
+    vals = []
+    if cache is not None:
+        for pt in cache.findall(_q(NS_C, "pt")):
+            v = pt.find(_q(NS_C, "v"))
+            vals.append(_num(v.text) if v is not None else None)
+    return (formula, vals, is_lit)
 
 
-DEFAULT_THEME_COLORS = {
-    # Office 默认主题常见色；实际文件存在 xl/theme/theme1.xml 时会被真实主题覆盖。
-    "dk1": (0, 0, 0),
-    "lt1": (255, 255, 255),
-    "dk2": (31, 78, 121),
-    "lt2": (238, 236, 225),
-    "accent1": (68, 114, 196),   # 蓝
-    "accent2": (237, 125, 49),   # 橙
-    "accent3": (112, 173, 71),   # 绿（兼容旧模板里把accent3用作绿色）
-    "accent4": (255, 192, 0),
-    "accent5": (91, 155, 213),
-    "accent6": (112, 173, 71),   # 绿
-    "hlink": (5, 99, 193),
-    "folHlink": (149, 79, 114),
-}
-
-THEME_ALIASES = {
-    "bg1": "lt1",
-    "tx1": "dk1",
-    "bg2": "lt2",
-    "tx2": "dk2",
-}
+def _pts_str(holder):
+    """c:cat -> (引用公式 or None, 文字列表, 是否常量数组)；数值型分类回退到 _pts_num。"""
+    if holder is None:
+        return (None, [], False)
+    ref = holder.find(_q(NS_C, "strRef"))
+    lit = holder.find(_q(NS_C, "strLit"))
+    if ref is None and lit is None:
+        f, vals, is_lit = _pts_num(holder)
+        return (f, ["" if v is None else str(v) for v in vals], is_lit)
+    src, is_lit = (ref, False) if ref is not None else (lit, True)
+    f = src.find(_q(NS_C, "f"))
+    formula = f.text if f is not None else None
+    cache = src if is_lit else src.find(_q(NS_C, "strCache"))
+    vals = []
+    if cache is not None:
+        for pt in cache.findall(_q(NS_C, "pt")):
+            v = pt.find(_q(NS_C, "v"))
+            vals.append((v.text or "").strip() if v is not None else "")
+    return (formula, vals, is_lit)
 
 
-def _local_name(tag):
-    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
-
-
-def _apply_color_transform(rgb, kind, val):
-    try:
-        factor = int(val) / 100000.0
-    except (TypeError, ValueError):
-        return rgb
-    r, g, b = rgb
-    if kind in ("lumMod", "shade"):
-        return (r * factor, g * factor, b * factor)
-    if kind in ("lumOff", "tint"):
-        return (r + (255 - r) * factor,
-                g + (255 - g) * factor,
-                b + (255 - b) * factor)
-    return rgb
-
-
-def _apply_color_transforms(rgb, color_el):
-    if rgb is None or color_el is None:
-        return rgb
-    out = rgb
-    for child in list(color_el):
-        kind = _local_name(child.tag)
-        if kind in ("lumMod", "lumOff", "tint", "shade"):
-            out = _apply_color_transform(out, kind, child.get("val"))
-    return tuple(max(0, min(255, int(round(c)))) for c in out)
-
-
-def load_theme_colors(bundle):
-    """读取 workbook 主题色，返回 {schemeName: (r,g,b)}；取不到则用常见 Office 主题兜底。"""
-    colors = dict(DEFAULT_THEME_COLORS)
-    theme_paths = [n for n in bundle.names if re.search(r"^xl/theme/theme\d+\.xml$", n)]
-    root = bundle.xml(theme_paths[0]) if theme_paths else None
-    clr_scheme = root.find(".//a:clrScheme", NS) if root is not None else None
-    if clr_scheme is not None:
-        for node in list(clr_scheme):
-            key = _local_name(node.tag)
-            srgb = find(node, "a:srgbClr")
-            sysclr = find(node, "a:sysClr")
-            raw = None
-            if srgb is not None and srgb.get("val"):
-                raw = srgb.get("val")
-            elif sysclr is not None and sysclr.get("lastClr"):
-                raw = sysclr.get("lastClr")
-            rgb = hex_to_rgb(raw) if raw else None
-            if rgb is not None:
-                colors[key] = rgb
-    for alias, target in THEME_ALIASES.items():
-        if target in colors:
-            colors[alias] = colors[target]
-    return colors
-
-
-# ============================================================
-#  读取工作簿结构（sheet 名、Sheet1 单元格、共享字符串）
-# ============================================================
-def load_shared_strings(bundle):
-    root = bundle.xml("xl/sharedStrings.xml")
-    out = []
-    if root is None:
-        return out
-    for si in findall(root, "s:si"):
-        # 拼接 si 下所有 <t> 文本（含富文本 run）
-        texts = [t.text or "" for t in si.iter(q("s:t"))]
-        out.append("".join(texts))
-    return out
-
-
-def get_sheet_targets(bundle):
-    """返回 {sheet显示名: worksheet xml 路径}。"""
-    wb = bundle.xml("xl/workbook.xml")
-    rels = bundle.xml("xl/_rels/workbook.xml.rels")
-    if wb is None or rels is None:
-        return {}
-    rid_to_target = {}
-    for rel in findall(rels, "pr:Relationship"):
-        rid_to_target[rel.get("Id")] = rel.get("Target")
-    result = {}
-    for sh in findall(wb, "s:sheets/s:sheet"):
-        name = sh.get("name")
-        rid = sh.get("{%s}id" % NS["r"])
-        tgt = rid_to_target.get(rid, "")
-        if tgt:
-            # Target 可能是 '/xl/worksheets/sheet1.xml'（绝对，含 xl）
-            # 或 'worksheets/sheet1.xml'（相对于 xl/）
-            t = tgt.lstrip("/")
-            if t.startswith("xl/"):
-                tgt = t
-            else:
-                tgt = "xl/" + t
-        result[name] = tgt
-    return result
-
-
-def col_letter_to_idx(letters):
-    n = 0
-    for ch in letters:
-        n = n * 26 + (ord(ch.upper()) - ord("A") + 1)
-    return n
-
-
-def parse_cell_ref(ref):
-    m = re.match(r"([A-Za-z]+)(\d+)", ref)
-    if not m:
-        return None, None
-    return col_letter_to_idx(m.group(1)), int(m.group(2))
-
-
-def read_sheet_cells(bundle, sheet_path, shared):
-    """读取一个 worksheet 的单元格 {(col,row): value_str} 与合并单元格列表。"""
-    root = bundle.xml(sheet_path)
-    cells = {}
-    merges = []
-    if root is None:
-        return cells, merges
-    for c in root.iter(q("s:c")):
-        ref = c.get("r")
-        if not ref:
-            continue
-        col, row = parse_cell_ref(ref)
-        t = c.get("t")
-        v_el = find(c, "s:v")
-        is_el = find(c, "s:is")
-        val = None
-        if t == "s" and v_el is not None and v_el.text is not None:
-            idx = int(v_el.text)
-            val = shared[idx] if 0 <= idx < len(shared) else ""
-        elif t == "inlineStr" and is_el is not None:
-            val = "".join(x.text or "" for x in is_el.iter(q("s:t")))
-        elif v_el is not None:
-            val = v_el.text
-        cells[(col, row)] = "" if val is None else str(val)
-    mc = find(root, "s:mergeCells")
-    if mc is not None:
-        for m in findall(mc, "s:mergeCell"):
-            merges.append(m.get("ref"))
-    return cells, merges
-
-
-# ============================================================
-#  解析图表（chart part）
-# ============================================================
-def find_chart_paths(bundle):
-    """从 [Content_Types].xml 找出所有 chartN.xml。"""
-    paths = []
-    ct = bundle.xml("[Content_Types].xml")
-    if ct is not None:
-        for ov in findall(ct, "ct:Override"):
-            pn = ov.get("PartName", "")
-            if "/charts/chart" in pn and pn.endswith(".xml"):
-                paths.append(pn.lstrip("/"))
-    if not paths:
-        # 兜底：直接按命名扫描
-        paths = [n for n in bundle.names
-                 if re.search(r"charts/chart\d+\.xml$", n)]
-    return sorted(set(paths))
-
-
-def _norm_part(target, base_dir):
-    """把 rels 里的 Target 规整成包内绝对路径（去掉前导/，相对路径接 base_dir）。"""
-    if not target:
-        return ""
-    t = target.replace("\\", "/")
-    if t.startswith("/"):
-        return t.lstrip("/")
-    # 相对路径：相对 base_dir 解析（处理 ../）
-    parts = (base_dir.split("/") + t.split("/")) if base_dir else t.split("/")
-    stack = []
-    for p in parts:
-        if p in ("", "."):
-            continue
-        if p == "..":
-            if stack:
-                stack.pop()
-        else:
-            stack.append(p)
-    return "/".join(stack)
-
-
-def find_chart_host_sheets(bundle):
-    """
-    反查每个 worksheet 通过 drawing 关联了哪些 chart。
-    返回 [{sheet_path, drawing_path, charts:[chartPath...]}], 供遮挡检测定位
-    "图表所在的那个 sheet"。
-    """
-    result = []
-    for name in bundle.names:
-        m = re.match(r"xl/worksheets/(sheet\d+\.xml)$", name)
-        if not m:
-            continue
-        sheet_path = name
-        rels_path = "xl/worksheets/_rels/%s.rels" % m.group(1)
-        rels = bundle.xml(rels_path)
-        if rels is None:
-            continue
-        drawing_targets = []
-        for rel in findall(rels, "pr:Relationship"):
-            if rel.get("Type", "").endswith("/drawing"):
-                drawing_targets.append(
-                    _norm_part(rel.get("Target", ""), "xl/worksheets"))
-        for dpath in drawing_targets:
-            ddir = dpath.rsplit("/", 1)[0] if "/" in dpath else ""
-            drels = bundle.xml("%s/_rels/%s.rels" % (
-                ddir, dpath.rsplit("/", 1)[-1]))
-            chart_parts = []
-            if drels is not None:
-                for rel in findall(drels, "pr:Relationship"):
-                    if rel.get("Type", "").endswith("/chart"):
-                        chart_parts.append(
-                            _norm_part(rel.get("Target", ""), ddir))
-            if chart_parts:
-                result.append({
-                    "sheet_path": sheet_path,
-                    "drawing_path": dpath,
-                    "charts": chart_parts,
-                })
-    return result
-
-
-EMU_PER_CM = 360000.0
-EMU_PER_COL = 640080   # 默认列宽 ~8.43 字符 ≈ 0.7in 的近似 EMU
-EMU_PER_ROW = 190500   # 默认行高 15pt = 0.2in 的 EMU
-
-
-def _xml_child_int(parent, path, default=0):
-    el = find(parent, path) if parent is not None else None
-    if el is None or el.text is None:
-        return default
-    try:
-        return int(el.text)
-    except (TypeError, ValueError):
-        return default
-
-
-def _anchor_extent_emu(anchor):
-    """从 drawing anchor 取图表尺寸（EMU）。优先读 xdr:ext；twoCellAnchor 则按默认行列尺寸估算。"""
-    ext = find(anchor, "xdr:ext")
-    if ext is not None and ext.get("cx") and ext.get("cy"):
-        try:
-            return int(ext.get("cx")), int(ext.get("cy")), "xdr:ext"
-        except (TypeError, ValueError):
-            pass
-
-    from_el = find(anchor, "xdr:from")
-    to_el = find(anchor, "xdr:to")
-    if from_el is None or to_el is None:
-        return None, None, "无xdr:ext/to"
-    c1 = _xml_child_int(from_el, "xdr:col")
-    c1o = _xml_child_int(from_el, "xdr:colOff")
-    r1 = _xml_child_int(from_el, "xdr:row")
-    r1o = _xml_child_int(from_el, "xdr:rowOff")
-    c2 = _xml_child_int(to_el, "xdr:col")
-    c2o = _xml_child_int(to_el, "xdr:colOff")
-    r2 = _xml_child_int(to_el, "xdr:row")
-    r2o = _xml_child_int(to_el, "xdr:rowOff")
-    cx = (c2 - c1) * EMU_PER_COL + (c2o - c1o)
-    cy = (r2 - r1) * EMU_PER_ROW + (r2o - r1o)
-    if cx <= 0 or cy <= 0:
-        return None, None, "twoCellAnchor尺寸无效"
-    return cx, cy, "twoCellAnchor默认行列估算"
-
-
-def chart_anchor_extent(bundle, chart_path):
-    """按 drawing rels 将 chart part 定位到对应锚点，返回尺寸与来源说明。"""
-    target_chart = (chart_path or "").replace("\\", "/").lstrip("/")
-    candidates = []
-    for name in bundle.names:
-        if not re.search(r"drawings/drawing\d+\.xml$", name):
-            continue
-        ddir = name.rsplit("/", 1)[0] if "/" in name else ""
-        rels = bundle.xml("%s/_rels/%s.rels" % (ddir, name.rsplit("/", 1)[-1]))
-        if rels is None:
-            continue
-        rid_to_chart = {}
-        for rel in findall(rels, "pr:Relationship"):
-            if rel.get("Type", "").endswith("/chart"):
-                rid_to_chart[rel.get("Id")] = _norm_part(rel.get("Target", ""), ddir)
-        if not rid_to_chart:
-            continue
-        root = bundle.xml(name)
-        if root is None:
-            continue
-        anchors = []
-        for tag in ("xdr:twoCellAnchor", "xdr:oneCellAnchor", "xdr:absoluteAnchor"):
-            anchors.extend(findall(root, tag))
-        for anchor in anchors:
-            for chart_ref in anchor.findall(".//c:chart", NS):
-                rid = chart_ref.get(q("r:id"))
-                cpath = rid_to_chart.get(rid)
-                if not cpath:
-                    continue
-                cx, cy, source = _anchor_extent_emu(anchor)
-                item = {
-                    "chart_path": cpath,
-                    "drawing_path": name,
-                    "cx": cx,
-                    "cy": cy,
-                    "source": source,
-                }
-                if target_chart and cpath == target_chart:
-                    return item
-                candidates.append(item)
-    if not target_chart and len(candidates) == 1:
-        return candidates[0]
-    if target_chart:
-        for item in candidates:
-            if item["chart_path"] == target_chart:
-                return item
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def sheet_used_range(bundle, sheet_path, shared):
-    """
-    读取一个 worksheet 的"已用区域"：返回 (max_col, max_row)（1-based），
-    依据是有值或有边框样式（s 属性，近似当作有内容/边框）的单元格。
-    无内容则返回 (0, 0)。
-    """
-    cells, _merges = read_sheet_cells(bundle, sheet_path, shared)
-    max_col = max_row = 0
-    for (c, r), v in cells.items():
-        if v != "":
-            if c > max_col:
-                max_col = c
-            if r > max_row:
-                max_row = r
-    return max_col, max_row
-
-
-
-def series_color_hex(ser, theme_colors=None):
-    """取系列填充色，解析 srgbClr / schemeClr(+tint/shade/lum*) 为实际 RGB hex。"""
-    sppr = find(ser, "c:spPr")
-    if sppr is None:
-        return None
-    fill = find(sppr, "a:solidFill")
-    if fill is None:
-        return None
-    clr = find(fill, "a:srgbClr")
-    if clr is not None and clr.get("val"):
-        rgb = hex_to_rgb(clr.get("val"))
-        return rgb_to_hex(_apply_color_transforms(rgb, clr)) if rgb else None
-    schemeclr = find(fill, "a:schemeClr")
-    if schemeclr is not None and schemeclr.get("val"):
-        theme_colors = theme_colors or DEFAULT_THEME_COLORS
-        key = schemeclr.get("val")
-        key = THEME_ALIASES.get(key, key)
-        rgb = theme_colors.get(key)
-        return rgb_to_hex(_apply_color_transforms(rgb, schemeclr)) if rgb else None
-    return None
-
-
-def num_vals(parent_val_el):
-    """从 c:val 节点提取数值列表（numRef/numLit 均支持），按 idx 排序补 0。"""
-    if parent_val_el is None:
-        return []
-    container = find(parent_val_el, "c:numRef/c:numCache")
-    if container is None:
-        container = find(parent_val_el, "c:numLit")
-    if container is None:
-        return []
-    cnt_el = find(container, "c:ptCount")
-    cnt = int(cnt_el.get("val")) if cnt_el is not None else 0
-    arr = [0.0] * cnt
-    for pt in findall(container, "c:pt"):
-        idx = int(pt.get("idx"))
-        v = find(pt, "c:v")
-        if v is not None and v.text not in (None, ""):
-            try:
-                if 0 <= idx < cnt:
-                    arr[idx] = float(v.text)
-            except ValueError:
-                pass
-    return arr
-
-
-def ref_formula(parent_el):
-    """从 c:val/c:cat 节点下取 numRef 或 strRef 里的 c:f 公式引用文本
-    （形如 'Sheet1!$D$3:$D$17'），取不到则返回 None。"""
-    if parent_el is None:
-        return None
-    for path in ("c:numRef/c:f", "c:strRef/c:f"):
-        f_el = find(parent_el, path)
-        if f_el is not None and f_el.text:
-            return f_el.text.strip()
-    return None
-
-
-def parse_sheet_ref(formula):
-    """解析形如 'Sheet1!$D$3:$D$17' 或 "'Sheet 1'!D3:D17" 的公式引用，
-    返回 (sheet_name, col_start, row_start, col_end, row_end)；解析失败返回 None。
-    列/行以数字（1-based）表示；单值引用（无冒号）col_end/row_end 与起点相同。"""
-    if not formula:
-        return None
-    m = re.match(r"^(?:'([^']+)'|([^'!]+))!(.+)$", formula.strip())
-    if not m:
-        return None
-    sheet_name = m.group(1) if m.group(1) is not None else m.group(2)
-    rng = m.group(3).replace("$", "")
-    parts = rng.split(":")
-    cell_re = re.compile(r"^([A-Za-z]+)(\d+)$")
-    m1 = cell_re.match(parts[0])
-    if not m1:
-        return None
-    col_start = col_letter_to_idx(m1.group(1))
-    row_start = int(m1.group(2))
-    if len(parts) > 1:
-        m2 = cell_re.match(parts[1])
-        if not m2:
-            return None
-        col_end = col_letter_to_idx(m2.group(1))
-        row_end = int(m2.group(2))
-    else:
-        col_end, row_end = col_start, row_start
-    return sheet_name, col_start, row_start, col_end, row_end
-
-
-INNER_DLBL_POS = ("ctr", "inBase", "inEnd")
-OUTER_DLBL_POS = ("outEnd",)
-
-
-def _dlbl_text(dlbl_el):
-    """取单个 c:dLbl 的自定义文本（c:tx/c:rich 下所有 a:t 拼接），
-    没有自定义文本（走默认显示值）则返回 None。"""
-    tx = find(dlbl_el, "c:tx")
+def _ser_name(ser):
+    """系列名称 -> (名称文字, 引用公式 or None)。"""
+    tx = ser.find(_q(NS_C, "tx"))
     if tx is None:
-        return None
-    texts = [t.text or "" for t in tx.iter(q("a:t"))]
-    if not texts:
-        return None
-    return "".join(texts)
+        return ("", None)
+    sref = tx.find(_q(NS_C, "strRef"))
+    if sref is not None:
+        f = sref.find(_q(NS_C, "f"))
+        name = ""
+        cache = sref.find(_q(NS_C, "strCache"))
+        if cache is not None:
+            p = cache.find(_q(NS_C, "pt"))
+            if p is not None and p.find(_q(NS_C, "v")) is not None:
+                name = (p.find(_q(NS_C, "v")).text or "").strip()
+        return (name, f.text if f is not None else None)
+    v = tx.find(_q(NS_C, "v"))
+    return (((v.text or "").strip() if v is not None else ""), None)
+def _int_of(el, default):
+    """取 val 属性并转 int；缺失或非数字返回默认值（0 值不可被 or 吞掉）。"""
+    v = _num(_val_of(el))
+    return int(v) if v is not None else default
 
 
-def series_dlbl_info(ser, vals):
-    """解析一个系列的数据标签信息：
-    - pos: 标签位置（c:dLbls/c:dLblPos 的 val，取不到则 None）；
-    - point_pos: 每个数据点各自的位置覆盖（c:dLbl/c:dLblPos），按 idx -> val；
-    - point_text: 每个数据点实际显示的文本；若该点有自定义 c:tx 文本则用它，
-      否则若整体/该点 showVal 开启则用该点数值（保留原始数值精度的字符串），
-      标签被单独删除（c:delete）或未开启显示则为 None。
-    """
-    dlbls = find(ser, "c:dLbls")
-    pos = None
-    show_val = False
-    point_pos = {}
-    point_deleted = set()
-    point_text = {}
-    if dlbls is not None:
-        dp = find(dlbls, "c:dLblPos")
-        pos = dp.get("val") if dp is not None else None
-        sv = find(dlbls, "c:showVal")
-        show_val = sv is not None and sv.get("val") in ("1", "true")
-        for dlbl in findall(dlbls, "c:dLbl"):
-            idx_el = find(dlbl, "c:idx")
-            if idx_el is None or idx_el.get("val") is None:
-                continue
-            try:
-                idx = int(idx_el.get("val"))
-            except ValueError:
-                continue
-            del_el = find(dlbl, "c:delete")
-            if del_el is not None and del_el.get("val") in ("1", "true"):
-                point_deleted.add(idx)
-                continue
-            dp_pt = find(dlbl, "c:dLblPos")
-            if dp_pt is not None and dp_pt.get("val"):
-                point_pos[idx] = dp_pt.get("val")
-            custom_text = _dlbl_text(dlbl)
-            if custom_text is not None:
-                point_text[idx] = custom_text
-            else:
-                pt_show_val = find(dlbl, "c:showVal")
-                if (pt_show_val is not None and pt_show_val.get("val") in ("1", "true")
-                        and idx < len(vals)):
-                    point_text[idx] = "%g" % vals[idx]
-    # 每个数据点最终显示的文本：自定义文本/单点 showVal 优先；否则若未被单独删除且
-    # （该系列整体 showVal 开启），用该点的实际数值（去掉多余的浮点小数位）。
-    resolved_text = {}
-    for idx, v in enumerate(vals):
-        if idx in point_deleted:
-            continue
-        if idx in point_text:
-            resolved_text[idx] = point_text[idx]
-        elif show_val:
-            resolved_text[idx] = ("%g" % v) if v is not None else None
-    return {
-        "pos": pos,
-        "point_pos": point_pos,
-        "point_deleted": point_deleted,
-        "text": resolved_text,
-    }
-
-
-def str_vals(cat_el):
-    """从 c:cat 节点提取分类文本列表。"""
-    if cat_el is None:
-        return []
-    container = find(cat_el, "c:strRef/c:strCache")
-    if container is None:
-        container = find(cat_el, "c:strLit")
-    if container is None:
-        container = find(cat_el, "c:numRef/c:numCache")
-    if container is None:
-        container = find(cat_el, "c:numLit")
-    if container is None:
-        return []
-    cnt_el = find(container, "c:ptCount")
-    cnt = int(cnt_el.get("val")) if cnt_el is not None else 0
-    arr = [""] * cnt
-    for pt in findall(container, "c:pt"):
-        idx = int(pt.get("idx"))
-        v = find(pt, "c:v")
-        if v is not None and 0 <= idx < cnt:
-            arr[idx] = v.text or ""
-    return arr
-
-
-def parse_chart(root, theme_colors=None):
-    """把一个 chart xml 解析成结构化 dict。"""
+def _parse_chart(xml_bytes):
+    """解析一个 chartSpace，返回结构化图表信息（不依赖 openpyxl 的图表读取）。"""
     info = {
-        "raw": ET.tostring(root, encoding="unicode"),
-        "path": None,
-        "title": "",
-        "bar_dir": None,
-        "grouping": None,
-        "gap_width": None,
-        "overlap": None,
-        "plot_manual_w": None,
-        "plot_layout_target": None,
-        "series": [],          # [{name, color_hex, color_class, vals, cats, formulas, has_dlbl}]
-        "legend_pos": None,
-        "cat_axis_present": False,
-        "val_axis_present": False,
-        "cat_axis_labels": [],
-        "cat_axis_rot": None,
-        "cat_axis_pos": None,
-        "cat_axis_lbl_pos": None,
-        "val_axis_title": "",
-        "val_axis_min": None,
-        "val_axis_max": None,
-        "val_axis_unit": None,
-        "val_axis_num_cache": [],
+        "title": "", "auto_title_deleted": None, "groups": [], "other_types": [],
+        "catAx": [], "valAx": [], "legend": False, "legend_pos": None,
+        "legend_deleted": [], "n_series": 0, "all_have_spPr": True,
     }
-    # 标题
-    title_el = find(root, "c:chart/c:title")
-    if title_el is not None:
-        info["title"] = "".join(t.text or "" for t in title_el.iter(q("a:t")))
-
-    bar = find(root, "c:chart/c:plotArea/c:barChart")
-    if bar is not None:
-        bd = find(bar, "c:barDir")
-        info["bar_dir"] = bd.get("val") if bd is not None else None
-        gr = find(bar, "c:grouping")
-        info["grouping"] = gr.get("val") if gr is not None else None
-        gw = find(bar, "c:gapWidth")
-        info["gap_width"] = int(gw.get("val")) if gw is not None and gw.get("val") else None
-        ov = find(bar, "c:overlap")
-        info["overlap"] = int(ov.get("val")) if ov is not None and ov.get("val") else None
-        for ser in findall(bar, "c:ser"):
-            tx = find(ser, "c:tx")
-            name = ""
-            if tx is not None:
-                name = "".join(t.text or "" for t in tx.iter(q("c:v"))) or \
-                       "".join(t.text or "" for t in tx.iter(q("a:t")))
-            chx = series_color_hex(ser, theme_colors)
-            rgb = hex_to_rgb(chx) if chx and re.fullmatch(r"[0-9A-Fa-f]{6}", chx) else None
-            dlbls = find(ser, "c:dLbls")
-            has_dlbl = False
-            if dlbls is not None:
-                sv = find(dlbls, "c:showVal")
-                has_dlbl = sv is not None and sv.get("val") in ("1", "true")
-            val_el = find(ser, "c:val")
-            cat_el = find(ser, "c:cat")
-            vals = num_vals(val_el)
-            dlbl_info = series_dlbl_info(ser, vals)
-            has_dlbl = has_dlbl or bool(dlbl_info["text"])
-            info["series"].append({
-                "name": name,
-                "color_hex": chx,
-                "color_class": classify_color(rgb),
-                "vals": vals,
-                "cats": str_vals(cat_el),
-                "val_formula": ref_formula(val_el),
-                "cat_formula": ref_formula(cat_el),
-                "has_dlbl": has_dlbl,
-                "dlbl_pos": dlbl_info["pos"],
-                "dlbl_point_pos": dlbl_info["point_pos"],
-                "dlbl_text": dlbl_info["text"],
-            })
-        # 图表级 dLbls（整体显示数值；位置若系列级未单独指定，沿用图表级 dLblPos）
-        chart_dlbls = find(bar, "c:dLbls")
-        if chart_dlbls is not None:
-            chart_pos_el = find(chart_dlbls, "c:dLblPos")
-            chart_pos = chart_pos_el.get("val") if chart_pos_el is not None else None
-            sv = find(chart_dlbls, "c:showVal")
-            if sv is not None and sv.get("val") in ("1", "true"):
-                series_list = info["series"] if isinstance(info["series"], list) else []
-                for s in series_list:
-                    s["has_dlbl"] = True
-                    if s["dlbl_pos"] is None:
-                        s["dlbl_pos"] = chart_pos
-                    vals = s["vals"]
-                    text_map = s["dlbl_text"]
-                    for idx, v in enumerate(vals):
-                        if idx not in text_map:
-                            text_map[idx] = "%g" % v
-
-    # 图例
-    legend = find(root, "c:chart/c:plotArea/c:legend") or find(root, "c:chart/c:legend")
-    if legend is not None:
-        lp = find(legend, "c:legendPos")
-        info["legend_pos"] = lp.get("val") if lp is not None else "present"
-        # 图例条目删除项：c:legendEntry/c:idx 对应系列顺序索引（0-based），
-        # c:delete val="1" 表示该系列条目被从图例中隐藏（不显示）。
-        deleted_idx = set()
-        for entry in findall(legend, "c:legendEntry"):
-            idx_el = find(entry, "c:idx")
-            del_el = find(entry, "c:delete")
-            if idx_el is None or idx_el.get("val") is None:
-                continue
-            if del_el is not None and del_el.get("val") in ("1", "true"):
-                try:
-                    deleted_idx.add(int(idx_el.get("val")))
-                except ValueError:
-                    pass
-        info["legend_deleted_idx"] = deleted_idx
-    else:
-        info["legend_deleted_idx"] = set()
-
-    # plotArea 手动布局（c:manualLayout）：若存在，可精确得到绘图区占图表区的
-    # 宽度比例（w，fraction），用于把柱间距从"占柱宽百分比"换算到 EMU/厘米。
-    # 无手动布局时 Excel 走自动布局算法，XML 里没有该信息，只能退回近似。
-    plot_area = find(root, "c:chart/c:plotArea")
-    if plot_area is not None:
-        layout = find(plot_area, "c:layout")
-        manual = find(layout, "c:manualLayout") if layout is not None else None
-        if manual is not None:
-            w_el = find(manual, "c:w")
-            target_el = find(manual, "c:layoutTarget")
-            if w_el is not None and w_el.get("val"):
-                try:
-                    info["plot_manual_w"] = float(w_el.get("val"))
-                except ValueError:
-                    pass
-            info["plot_layout_target"] = (
-                target_el.get("val") if target_el is not None else None)
-
-    # 坐标轴
-    cat_ax = find(root, "c:chart/c:plotArea/c:catAx")
-    if cat_ax is not None:
-        info["cat_axis_present"] = True
-        info["cat_axis_labels"] = str_vals(find(cat_ax, "c:cat"))
-        # 轴位置（b=bottom/底部，须为底部才谈得上"标签位于柱形组合下方"）
-        ax_pos = find(cat_ax, "c:axPos")
-        info["cat_axis_pos"] = ax_pos.get("val") if ax_pos is not None else None
-        # 标签相对轴线的位置（low/high/nextTo；nextTo=紧贴轴线，即柱形组合下方；
-        # low/high 会把标签挪到绘图区边缘，不是"柱形组合下方"）
-        tick_lbl_pos = find(cat_ax, "c:tickLblPos")
-        info["cat_axis_lbl_pos"] = (
-            tick_lbl_pos.get("val") if tick_lbl_pos is not None else None)
-        # 轴文字旋转
-        txpr = find(cat_ax, "c:txPr")
-        if txpr is not None:
-            bodypr = find(txpr, "a:bodyPr")
-            if bodypr is not None and bodypr.get("rot"):
-                info["cat_axis_rot"] = int(bodypr.get("rot"))
-    val_ax = find(root, "c:chart/c:plotArea/c:valAx")
-    if val_ax is not None:
-        info["val_axis_present"] = True
-        tt = find(val_ax, "c:title")
-        if tt is not None:
-            info["val_axis_title"] = "".join(t.text or "" for t in tt.iter(q("a:t")))
-        # 数值轴刻度范围（scaling/min、scaling/max）
-        scaling = find(val_ax, "c:scaling")
-        if scaling is not None:
-            mn = find(scaling, "c:min")
-            if mn is not None and mn.get("val"):
-                try:
-                    info["val_axis_min"] = float(mn.get("val"))
-                except ValueError:
-                    pass
-            mx = find(scaling, "c:max")
-            if mx is not None and mx.get("val"):
-                try:
-                    info["val_axis_max"] = float(mx.get("val"))
-                except ValueError:
-                    pass
-        # 主刻度间隔（majorUnit）
-        mu = find(val_ax, "c:majorUnit")
-        if mu is not None and mu.get("val"):
-            try:
-                info["val_axis_unit"] = float(mu.get("val"))
-            except ValueError:
-                pass
-        # 数值轴系列缓存值（c:numCache，Excel 打开并保存过后会写入实际渲染用到
-        # 的数据点数值——不是刻度值，但用于在 c:max 缺失（自动最大值）时，
-        # 结合系列真实最大值倒推 Excel 大概率会自动取整到的坐标上限）。
-        num_cache_vals = []
-        for ser_val in root.iter(q("c:val")):
-            num_cache_vals.extend(num_vals(ser_val))
-        info["val_axis_num_cache"] = num_cache_vals
-
+    root = ET.fromstring(xml_bytes)
+    chart = root.find(_q(NS_C, "chart"))
+    if chart is None:
+        return info
+    info["title"] = _rich_text(chart.find(_q(NS_C, "title")))
+    info["auto_title_deleted"] = _val_of(chart.find(_q(NS_C, "autoTitleDeleted")))
+    pa = chart.find(_q(NS_C, "plotArea"))
+    if pa is None:
+        return info
+    for child in pa:
+        tag = child.tag.split("}")[-1]
+        if tag == "barChart":
+            grp = {
+                "grouping": _val_of(child.find(_q(NS_C, "grouping"))),
+                "barDir": _val_of(child.find(_q(NS_C, "barDir"))),
+                "gapWidth": _int_of(child.find(_q(NS_C, "gapWidth")), 150),
+                "overlap": _int_of(child.find(_q(NS_C, "overlap")), 0),
+                "axIds": [a.get("val") for a in child.findall(_q(NS_C, "axId"))],
+                "series": [],
+            }
+            g_show, g_pos = _dlbls(child)
+            for ser in child.findall(_q(NS_C, "ser")):
+                name, name_ref = _ser_name(ser)
+                cat_ref, cats, cat_lit = _pts_str(ser.find(_q(NS_C, "cat")))
+                val_ref, vals, val_lit = _pts_num(ser.find(_q(NS_C, "val")))
+                s_show, s_pos = _dlbls(ser)
+                sp = ser.find(_q(NS_C, "spPr"))
+                if sp is None:
+                    info["all_have_spPr"] = False
+                grp["series"].append({
+                    "name": name, "name_ref": name_ref,
+                    "cats": cats, "cat_ref": cat_ref, "cat_lit": cat_lit,
+                    "vals": vals, "val_ref": val_ref, "val_lit": val_lit,
+                    "fill": _ser_fill(sp),
+                    "idx": _int_of(ser.find(_q(NS_C, "idx")), 0),
+                    "order": _int_of(ser.find(_q(NS_C, "order")), 0),
+                    "show": s_show if s_show is not None else g_show,
+                    "pos": s_pos or g_pos,
+                })
+                info["n_series"] += 1
+            info["groups"].append(grp)
+        elif tag.endswith("Chart"):
+            info["other_types"].append(tag)
+        elif tag in ("catAx", "valAx"):
+            ax = {
+                "axId": _val_of(child.find(_q(NS_C, "axId"))),
+                "delete": _val_of(child.find(_q(NS_C, "delete"))),
+                "grid": child.find(_q(NS_C, "majorGridlines")) is not None,
+                "title": _rich_text(child.find(_q(NS_C, "title"))),
+                "max": None,
+            }
+            sc = child.find(_q(NS_C, "scaling"))
+            if sc is not None:
+                mx = sc.find(_q(NS_C, "max"))
+                ax["max"] = _num(mx.get("val")) if mx is not None else None
+            info[tag].append(ax)
+    lg = chart.find(_q(NS_C, "legend"))
+    if lg is not None:
+        info["legend"] = True
+        info["legend_pos"] = _val_of(lg.find(_q(NS_C, "legendPos")))
+        for le in lg.findall(_q(NS_C, "legendEntry")):
+            if _val_of(le.find(_q(NS_C, "delete"))) == "1":
+                info["legend_deleted"].append(_int_of(le.find(_q(NS_C, "idx")), -1))
     return info
 
 
-PLACEHOLDER = "<<APPEND>>"
+def _resolve(part, target):
+    """按 OPC 规则把关系 Target 解析成包内绝对部件名。"""
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
 
 
-# ============================================================
-#  辅助匹配：把 chart 中 5 类资源的 综管科/服务科/核验 值对齐到顺序
-# ============================================================
-def map_series_values_by_category(chart):
-    """
-    cat 形如 '便携学习终端 登记' / '便携学习终端 核验'（10项）；
-    series 名含 综管科/服务科/核验数量。
-    返回 {'zg':[5],'fw':[5],'verify':[5]}（按 CATEGORIES 顺序），缺则 None。
-    """
-    out = {"zg": [None] * 5, "fw": [None] * 5, "verify": [None] * 5}
-
-    def cat_index(t):
-        for i, name in enumerate(CATEGORIES):
-            if name in t:
-                return i
+def _rels_of(z, part):
+    """读取某部件的关系表：返回 [(Id, Type, 解析后的部件名 or 外部 URI, 是否外部)]。"""
+    rels_name = posixpath.join(posixpath.dirname(part), "_rels",
+                               posixpath.basename(part) + ".rels")
+    out = []
+    if rels_name not in z.namelist():
+        return out
+    try:
+        root = ET.fromstring(z.read(rels_name))
+    except Exception:
+        return out
+    for r in root:
+        rid = r.get("Id")
+        rtype = r.get("Type") or ""
+        tgt = r.get("Target") or ""
+        ext = (r.get("TargetMode") == "External")
+        out.append((rid, rtype, tgt if ext else _resolve(part, tgt), ext))
+    return out
+def _anchor_pos(el):
+    """读取 xdr:from / xdr:to 的 (行, 列)，均转成 1 起。"""
+    if el is None:
+        return None
+    c = el.find(_q(NS_XDR, "col"))
+    r = el.find(_q(NS_XDR, "row"))
+    try:
+        return (int(r.text) + 1, int(c.text) + 1)
+    except Exception:
         return None
 
-    def role_of(n):
-        if "综管" in n:
-            return "zg"
-        if "服务" in n:
-            return "fw"
-        if "核验" in n:
-            return "verify"
-        return None
 
-    for s in chart["series"]:
-        role = role_of(s["name"])
-        if role is None:
-            continue
-        for j, cv in enumerate(s["cats"]):
-            ci = cat_index(cv)
-            if ci is None or j >= len(s["vals"]):
-                continue
-            v = s["vals"][j]
-            if v and v != 0:
-                out[role][ci] = v
+def _anchor_info(an, drels):
+    """解析一个锚点：返回 (rect, 是否图表, 是否图片, 图表部件名 or None)。
+       rect = (r1, c1, r2, c2)，oneCellAnchor 依据 xdr:ext 估算占位大小。"""
+    frm = _anchor_pos(an.find(_q(NS_XDR, "from")))
+    to = _anchor_pos(an.find(_q(NS_XDR, "to")))
+    if to is None and frm is not None:
+        ext = an.find(_q(NS_XDR, "ext"))
+        dr, dc = 15, 8
+        if ext is not None:
+            try:
+                dc = max(1, int(round(int(ext.get("cx")) / 640080.0)))
+                dr = max(1, int(round(int(ext.get("cy")) / 190500.0)))
+            except Exception:
+                pass
+        to = (frm[0] + dr, frm[1] + dc)
+    rect = (frm[0], frm[1], to[0], to[1]) if (frm and to) else None
+    is_pic = an.find(".//" + _q(NS_XDR, "pic")) is not None
+    cpart = None
+    gf = an.find(".//" + _q(NS_XDR, "graphicFrame"))
+    if gf is not None:
+        for ch in gf.iter():
+            rid = ch.get(_q(NS_R, "id"))
+            if rid and rid in drels:
+                cpart = drels[rid]
+                break
+    return (rect, gf is not None, is_pic, cpart)
+
+
+def _sheet_parts(z):
+    """按 workbook.xml 中的顺序返回 [(工作表名, 部件名)]。"""
+    out = []
+    try:
+        wbx = ET.fromstring(z.read("xl/workbook.xml"))
+    except Exception:
+        return out
+    rels = {rid: tgt for rid, _t, tgt, ext in _rels_of(z, "xl/workbook.xml") if not ext}
+    sheets = wbx.find(_q(NS_S, "sheets"))
+    if sheets is None:
+        return out
+    for sh in sheets:
+        rid = sh.get(_q(NS_R, "id"))
+        out.append((sh.get("name") or "", rels.get(rid, "")))
     return out
 
 
-def count_match(got, expected, tol=0.5):
-    return sum(1 for g, e in zip(got, expected)
-               if g is not None and abs(g - e) <= tol)
+def _collect_charts(z):
+    """收集包内全部图表：
+       返回 (charts, anchors, pic_count)
+       charts  = [{part, info, sheet}]
+       anchors = [{sheet, rect(行列 1 起), is_chart, is_pic}]"""
+    charts = []
+    anchors = []
+    pic_count = 0
+    names = set(z.namelist())
+    chart_sheet = {}
+    for sname, spart in _sheet_parts(z):
+        if not spart or spart not in names:
+            continue
+        for _rid, rtype, tgt, ext in _rels_of(z, spart):
+            if ext or not rtype.endswith("/drawing"):
+                continue
+            if tgt not in names:
+                continue
+            drels = {rid: t for rid, _ty, t, e in _rels_of(z, tgt) if not e}
+            try:
+                droot = ET.fromstring(z.read(tgt))
+            except Exception:
+                continue
+            for an in list(droot):
+                rect, is_chart, is_pic, cpart = _anchor_info(an, drels)
+                if is_pic:
+                    pic_count += 1
+                anchors.append({"sheet": sname, "rect": rect,
+                                "is_chart": is_chart, "is_pic": is_pic})
+                if cpart:
+                    chart_sheet[cpart] = sname
+    for n in sorted(names):
+        if re.search(r"chart\d*\.xml$", n) and "/colors" not in n and "/style" not in n:
+            try:
+                charts.append({"part": n, "info": _parse_chart(z.read(n)),
+                               "sheet": chart_sheet.get(n)})
+            except Exception:
+                charts.append({"part": n, "info": None, "sheet": chart_sheet.get(n)})
+    return charts, anchors, pic_count
+def _package_broken(z):
+    """包结构完整性：返回问题描述列表（空表示结构正常、能被 Office 正常打开）。"""
+    bad = []
+    try:
+        if z.testzip() is not None:
+            bad.append("压缩包存在损坏条目")
+    except Exception as exc:
+        bad.append("压缩包无法校验：%s" % exc)
+    names = set(z.namelist())
+    if "[Content_Types].xml" not in names:
+        bad.append("缺少 [Content_Types].xml")
+        return bad
+    try:
+        ct = ET.fromstring(z.read("[Content_Types].xml"))
+    except Exception as exc:
+        bad.append("[Content_Types].xml 无法解析：%s" % exc)
+        return bad
+    declared = set()
+    for ov in ct.iter():
+        pn = ov.get("PartName")
+        if pn:
+            declared.add(pn.lstrip("/"))
+    defaults = set()
+    for de in ct.iter():
+        ex = de.get("Extension")
+        if ex:
+            defaults.add(ex.lower())
+    for n in sorted(names):
+        if n.endswith("/") or "_rels/" in n:
+            continue
+        ext = n.rsplit(".", 1)[-1].lower() if "." in n else ""
+        if n not in declared and ext not in defaults:
+            bad.append("部件 %s 未在 [Content_Types].xml 中声明" % n)
+    for n in sorted(names):
+        if not n.endswith(".rels"):
+            continue
+        base = posixpath.dirname(posixpath.dirname(n))
+        try:
+            rroot = ET.fromstring(z.read(n))
+        except Exception:
+            continue
+        for rel in rroot:
+            tgt = rel.get("Target") or ""
+            if (rel.get("TargetMode") or "") == "External" or "://" in tgt:
+                continue
+            full = tgt.lstrip("/") if tgt.startswith("/") \
+                else posixpath.normpath(posixpath.join(base, tgt))
+            if full not in names:
+                bad.append("关系 %s 指向缺失部件 %s" % (rel.get("Id"), full))
+    for n in sorted(names):
+        if n.endswith(".xml") or n.endswith(".rels"):
+            try:
+                ET.fromstring(z.read(n))
+            except Exception as exc:
+                bad.append("部件 %s XML 非法：%s" % (n, exc))
+    return bad
+# ================= 入口 =================
 
+def evaluate(dir_path):
+    """评测指定目录下的输出文件，返回统一结构的评分结果字典。
 
-# ============================================================
-#  维度2：完成度（得分点 + 扣分点）
-# ============================================================
-def eval_dimension2(bundle, sheet_targets, sheet1_cells, sheet1_raw_text,
-                    charts, drawing_text, sheet1_merges, shared):
-    """返回 (total, hits)；hits=[(score, hit_bool, label, detail)]。"""
-    hits = []
-
-    # 选主图：第一个二维堆叠柱图
-    main = None
-    for ch in charts:
-        if ch["bar_dir"] == "col" and ch["grouping"] == "stacked":
-            main = ch
-            break
-    if main is None and charts:
-        main = charts[0]
-
-    mapped = map_series_values_by_category(main) if main else \
-        {"zg": [None] * 5, "fw": [None] * 5, "verify": [None] * 5}
-
-    # ---------- +3 图表对象 ----------
-    # 细则：新增1个可编辑图表；类型为二维堆叠柱状图/柱形图；
-    #       用于比较"综管科+服务科+合计的登记数量"与"实际核验数量"；
-    #       图表覆盖5类资源（便携学习终端/智能显示设备/网络接入设备/
-    #       多功能文印设备/移动采集设备）；数据来自原表3-17行的登记数量与核验数量。
-    def chk_chart_object():
-        # 新增1个可编辑图表（存在原生 chart part 即视为可编辑），且数量恰好为1个：
-        # 排除 percentStacked（百分比堆叠不是"二维堆叠柱状图/柱形图"），
-        # 只统计 barDir=col 且 grouping=stacked 的图表数量。
-        qualifying = [ch for ch in charts
-                      if ch["bar_dir"] == "col" and ch["grouping"] == "stacked"]
-        count_ok = len(qualifying) == 1
-        if main is None or not count_ok:
-            return False, "无可编辑图表对象" if main is None else \
-                "二维堆叠柱状图数量=%d（须恰好为1，percentStacked不计入）" % len(qualifying)
-        chart = main
-        # 二维堆叠柱状图/柱形图：barDir=col + grouping=stacked（percentStacked 不认可）
-        is_2d_stacked = chart["bar_dir"] == "col" and chart["grouping"] == "stacked"
-        # 用于比较"综管科+服务科+合计的登记数量"与"实际核验数量"：
-        # 图表系列须含登记侧（综管科/服务科，二者堆叠即为合计）与核验侧（核验数量）
-        names = [s["name"] for s in chart["series"]]
-        has_zg = any("综管" in n for n in names)
-        has_fw = any("服务" in n for n in names)
-        has_verify = any("核验" in n for n in names)
-        compare_ok = has_zg and has_fw and has_verify
-        # 覆盖5类资源（且类别正是细则指定的5个名称）
-        cats_all = set()
-        for s in chart["series"]:
-            for cv in s["cats"]:
-                for name in CATEGORIES:
-                    if name in cv:
-                        cats_all.add(name)
-        cover = len(cats_all)
-        cover_ok = cover == 5
-        # 数据来自原表3-17行：登记数量取自 Sheet1 D 列(D3:D17)，核验数量取自
-        # Sheet1 E 列(E3:E17)。校验综管科/服务科(登记)系列与核验数量系列的
-        # c:val 公式引用（c:f）落在 Sheet1!D3:D17 / Sheet1!E3:E17 范围内。
-        def series_ref_in_range(role_names, col_letter):
-            col_idx = col_letter_to_idx(col_letter)
-            matched = 0
-            for s in chart["series"]:
-                if not any(k in s["name"] for k in role_names):
-                    continue
-                matched += 1
-                parsed = parse_sheet_ref(s.get("val_formula"))
-                if parsed is None:
-                    return False
-                sheet_name, c1, r1, c2, r2 = parsed
-                if sheet_name != "Sheet1":
-                    return False
-                if not (c1 == col_idx and c2 == col_idx):
-                    return False
-                if not (r1 >= 3 and r2 <= 17):
-                    return False
-            return matched > 0
-        source_ok = (series_ref_in_range(("综管",), "D")
-                     and series_ref_in_range(("服务",), "D")
-                     and series_ref_in_range(("核验",), "E"))
-        ok = is_2d_stacked and count_ok and compare_ok and cover_ok and source_ok
-        return ok, ("二维堆叠柱图=%s(数量=%d), 比较登记(综管=%s/服务=%s)与核验(=%s), "
-                    "覆盖资源类别=%d/5 %s, 系列公式引用Sheet1原表3-17行(D/E列)=%s") % (
-            is_2d_stacked, len(qualifying), has_zg, has_fw, has_verify,
-            cover, sorted(cats_all), source_ok)
-    ok, det = chk_chart_object()
-    hits.append((3, ok, "图表对象", det))
-
-
-    # ---------- +5 服务科+综管科堆叠柱 与 核验柱相连(距离0-0.1cm) ----------
-    # 细则：服务科和综管科的堆叠柱形，与核验数量的柱形相连在一起，
-    #       两个柱形之间距离为 0-0.1 厘米。
-    # "两个柱形之间的距离"指 登记堆叠柱 与 核验柱 之间的横向间距，到底由
-    # gapWidth 还是 overlap 控制，取决于图表的数据结构：
-    #
-    #   结构A（同分类点、不同系列）：每类资源是 1 个分类点，登记(综管+服务堆叠)
-    #     与核验是该分类点下的两个并列系列。此时两柱间距由 overlap 控制，
-    #     overlap=100 表示完全重叠贴合（间距≈0）。
-    #
-    #   结构B（相邻分类点）：把每类资源拆成"X 登记""X 核验"两个相邻分类点，
-    #     登记柱与核验柱分属相邻的两个分类点。此时两柱间距由 gapWidth 控制
-    #     （类别间间隙，占柱宽的百分比），overlap 只影响同一分类点内系列的重叠、
-    #     对登记↔核验间距无作用。要"相连/间距 0-0.1cm"需 gapWidth 接近 0。
-    #
-    # 通过分类标签是否成对出现"登记/核验"来区分结构 B；否则按结构 A 处理。
-    def chk_adjacent():
-        if main is None:
-            return False, "无图表"
-        ov = main["overlap"]
-        gw = main["gap_width"]
-        # 判断是否为"结构B"：分类标签里同时出现"登记"和"核验"后缀
-        cat_labels = []
-        for s in main["series"]:
-            if s["cats"]:
-                cat_labels = s["cats"]
-                break
-        has_reg_cat = any("登记" in c for c in cat_labels)
-        has_ver_cat = any("核验" in c for c in cat_labels)
-        structure_b = has_reg_cat and has_ver_cat
-
-        # 分类点个数：取任一系列的类别数；取不到则退回 5（CATEGORIES 数量）。
-        n_cats = len(cat_labels) if cat_labels else 5
-        # 每个分类点内并列的系列数（结构A: 综管科+服务科堆叠 与 核验 两组并列；
-        # 结构B: 每个分类点只有1组柱，登记/核验各占一个分类点）。
-        series_per_cat = 1 if structure_b else 2
-
-        # ---- 取图表实际渲染尺寸（EMU）：按 drawing rels 精确关联到本 chart part ----
-        anchor = chart_anchor_extent(bundle, main.get("path"))
-        chart_cx = anchor["cx"] if anchor else None
-        anchor_src = anchor["source"] if anchor else "未找到锚点"
-
-        if chart_cx is None or n_cats <= 0:
-            # 没有可用的图表尺寸，无法做几何换算，退回不达标（无法验证≠达标）。
-            return False, ("无法定位图表锚点尺寸，无法计算实际柱间距厘米"
-                           "（结构%s，gapWidth=%s, overlap=%s）"
-                           % ("B" if structure_b else "A", gw, ov))
-
-        # ---- 绘图区宽度（EMU）：优先用 c:manualLayout 的精确比例，
-        #      否则用"图表区宽度 - 估算的坐标轴/图例/标题边距"做近似。----
-        manual_w = main.get("plot_manual_w")
-        if manual_w is not None:
-            plot_w_emu = chart_cx * manual_w
-            plot_src = "manualLayout精确宽度比例=%.4f" % manual_w
-        else:
-            # 无手动布局：Excel 走自动布局，XML 未暴露具体算法，只能近似。
-            # 经验估算：图例/数值轴占用图表宽度的一部分，扣除后取 0.86 作图表区
-            # 转绘图区宽度比例的近似系数（存在图例时更保守地扣 0.78）。
-            approx_ratio = 0.78 if main.get("legend_pos") else 0.86
-            plot_w_emu = chart_cx * approx_ratio
-            plot_src = "无manualLayout，按图表宽度近似系数%.2f估算" % approx_ratio
-
-        # ---- 分类槏宽（每个分类点占用的绘图区宽度，EMU）----
-        cat_slot_emu = plot_w_emu / n_cats
-
-        # ---- 由 gapWidth/overlap 换算柱宽与柱间距 ----
-        # OOXML: gapWidth=类别簇之间的间隙，占"柱宽"的百分比；
-        #        overlap=同一分类点内相邻系列的重叠百分比（100=完全重叠贴合，
-        #        0=并列不重叠，负值=系列间有间隙）。
-        # 单个分类槏 = 簇宽(cluster_w) + 间隙(gap)；gap = cluster_w * gw/100
-        #   => cat_slot = cluster_w * (1 + gw/100)  => cluster_w = cat_slot/(1+gw/100)
-        gw_frac = (gw or 0) / 100.0
-        cluster_w_emu = cat_slot_emu / (1 + gw_frac) if (1 + gw_frac) > 0 else cat_slot_emu
-
-        if structure_b:
-            # 结构B：登记柱与核验柱分属相邻两个分类点，每个分类点内只有1根柱
-            # （簇宽即柱宽），两柱间距 = 分类间隙 = cluster_w * gw/100。
-            bar_w_emu = cluster_w_emu
-            gap_emu = cluster_w_emu * gw_frac
-            structure_desc = "结构B(登记/核验为相邻分类点)"
-        else:
-            # 结构A：同一分类点内综管+服务堆叠柱 与 核验柱 并列，重叠由 overlap 控制。
-            # overlap 为相邻系列宽度的重叠百分比：两柱中心距 = bar_w*(1-overlap/100)，
-            # 单柱宽 bar_w = cluster_w / (series - (series-1)*overlap/100)（series=2时）。
-            ov_frac = (ov or 0) / 100.0
-            denom = series_per_cat - (series_per_cat - 1) * ov_frac
-            bar_w_emu = cluster_w_emu / denom if denom > 0 else cluster_w_emu
-            # 两柱边缘间距 = 中心距 - 柱宽 = bar_w*(1-ov_frac) - bar_w = -bar_w*ov_frac
-            # overlap<100 时两柱有缝隙；>=100 时完全贴合/重叠，间距记为0（不为负）。
-            gap_emu = max(0.0, bar_w_emu * (1 - ov_frac))
-            structure_desc = "结构A(登记/核验为同分类点系列)"
-
-        gap_cm = gap_emu / EMU_PER_CM
-        ok = 0 <= gap_cm <= 0.1
-        return ok, ("%s：图表尺寸cx=%s(%s)，绘图区宽度≈%.0fEMU(%s)，"
-                    "分类槏宽≈%.0fEMU(共%d类)，柱宽≈%.0fEMU，"
-                    "gapWidth=%s/overlap=%s，实际柱间距≈%.4f厘米（要求0-0.1厘米）"
-                    % (structure_desc, chart_cx, anchor_src, plot_w_emu, plot_src,
-                       cat_slot_emu, n_cats, bar_w_emu, gw, ov, gap_cm))
-    ok, det = chk_adjacent()
-    hits.append((5, ok, "柱形相邻", det))
-
-
-    # ---------- +3 图表分类轴/数值轴 ----------
-    # 细则：
-    #  · 横轴依次显示"便携学习终端""智能显示设备""网络接入设备"
-    #    "多功能文印设备""移动采集设备"5个资源类别；
-    #  · 文本水平显示于柱形组合下方，不可出现文字倾斜显示；
-    #  · 纵轴分类依次显示 0、5、10、15、20、25、30、35、40 数字
-    #    （即范围 0-40、主刻度间隔 5）；
-    #  · 数字左侧有纵轴坐标单位"数量（台）"。
-    def chk_axes():
-        if main is None:
-            return False, "无图表"
-        # —— 横轴：依次覆盖细则指定的 5 个资源类别 ——
-        axis_labels = list(main["cat_axis_labels"])
-        # 若 catAx 自身无 cat（图表用系列 cat），退而取系列 cat 作为横轴文本
-        if not any(any(name in lab for name in CATEGORIES) for lab in axis_labels):
-            for s in main["series"]:
-                if s["cats"]:
-                    axis_labels = list(s["cats"])
-                    break
-        # "依次"显示：按出现顺序提取类别，需与 CATEGORIES 顺序一致且齐 5 类
-        seq = []
-        for lab in axis_labels:
-            for name in CATEGORIES:
-                if name in lab and name not in seq:
-                    seq.append(name)
-        cats_ok = seq == CATEGORIES
-
-        # —— 横轴文本水平、不倾斜：rot 为 None 或 0 视为水平 ——
-        rot = main["cat_axis_rot"]
-        horiz_ok = rot in (None, 0)
-
-        # —— 横轴标签须位于"柱形组合下方"：轴位置为底部（b），
-        #    且标签位置为 nextTo（紧贴轴线/柱形下方）；low/high 会把标签
-        #    挪到绘图区上下边缘，不满足"柱形组合下方"。两者缺省值均为
-        #    Excel 默认（b / nextTo），XML 中省略该节点时按默认值处理。
-        ax_pos = main["cat_axis_pos"]
-        lbl_pos = main["cat_axis_lbl_pos"]
-        pos_ok = ax_pos in (None, "b") and lbl_pos in (None, "nextTo")
-
-        # —— 纵轴刻度 0,5,10,...,40：范围 0-40、主刻度间隔 5 ——
-        # c:max 缺失 = Excel 用自动最大值：不能直接判 None 为不合格，也不能
-        # 直接判 None 为合格——需结合系列真实数据的最大值来推断"自动算出的
-        # 上限是否等于 40"。Excel 的自动轴算法会把上限取整到"比数据最大值大
-        # 且是主刻度间隔整数倍"的最小值；已知细则要求主刻度间隔为 5，故当
-        # c:max 缺失时，用 数据最大值 与 majorUnit（若也缺失则按细则要求的 5
-        # 兜底）推算：ceil(数据最大值 / unit) * unit 是否等于 40。
-        vmin = main["val_axis_min"]
-        vmax = main["val_axis_max"]
-        vunit = main["val_axis_unit"]
-        data_vals = [v for v in main["val_axis_num_cache"] if v is not None]
-        unit_for_calc = vunit if vunit else 5
-        if vmax is not None:
-            # 写死了 c:max：必须恰好是 40
-            vmax_ok = vmax == 40
-            vmax_src = "显式c:max=%s" % vmax
-        elif data_vals:
-            # 未写 c:max（自动最大值）：按数据最大值向上取整到 unit 的整数倍推算
-            data_max = max(data_vals)
-            auto_vmax = math.ceil(data_max / unit_for_calc) * unit_for_calc
-            vmax_ok = auto_vmax == 40
-            vmax_src = "自动最大值(数据最大值=%s,按步长%s取整推算)=%s" % (
-                data_max, unit_for_calc, auto_vmax)
-        else:
-            # 既无 c:max 也无系列数据缓存可用：无法验证，判不合格（不可"无法验证即达标"）
-            vmax_ok = False
-            vmax_src = "无c:max且无数据缓存，无法推算自动最大值"
-        vmin_ok = vmin in (0, 0.0, None)
-        vunit_ok = vunit == 5
-        scale_ok = vmin_ok and vmax_ok and vunit_ok
-
-        # —— 纵轴坐标单位"数量（台）"（数字左侧的轴标题）——
-        vtitle = main["val_axis_title"]
-        unit_ok = ("数量" in vtitle) and ("台" in vtitle)
-
-        ok = cats_ok and horiz_ok and pos_ok and scale_ok and unit_ok
-        return ok, ("横轴依次5类=%s(%s), 文本水平=%s(rot=%s), "
-                    "轴位置=%s/标签位置=%s(柱形组合下方=%s), "
-                    "纵轴范围=%s~%s(%s) 间隔=%s(0-40步长5=%s), "
-                    "纵轴单位'数量(台)'=%s") % (
-            cats_ok, seq, horiz_ok, rot, ax_pos, lbl_pos, pos_ok,
-            vmin, vmax, vmax_src, vunit, scale_ok, unit_ok)
-    ok, det = chk_axes()
-    hits.append((3, ok, "分类轴/数值轴", det))
-
-    # ---------- +1 图表标题 ----------
-    # 细则：图表标题包含"固定资产登记数量（综管科+服务科）与核验数量对比"等关键信息，
-    #       能够明确表达登记数量与核验数量的对比关系。
-    # 判定：标题须体现"登记数量"与"核验数量"两侧，并表达出二者的"对比"关系。
-    def chk_title():
-        if main is None:
-            return False, "无图表"
-        t = main["title"]
-        has_reg = "登记" in t            # 登记数量
-        has_verify = "核验" in t         # 核验数量
-        has_compare = "对比" in t        # 明确的对比关系
-        ok = has_reg and has_verify and has_compare
-        return ok, "标题=「%s」(含登记=%s/核验=%s/对比=%s)" % (
-            t, has_reg, has_verify, has_compare)
-    ok, det = chk_title()
-    hits.append((1, ok, "图表标题", det))
-
-    # ---------- +1 图表图例 ----------
-    # 细则：图例包含"综管科""服务科""核验数量"3个系列名称；
-    #       图例内容及颜色与图表系列一一对应。
-    # 问题：仅检查 legend_pos 非空和系列名包含综管/服务/核验，未解析
-    #       c:legendEntry/c:delete（图例条目可被单独隐藏，即使系列本身存在，
-    #       图例里也可能看不到该条目），也未核对图例实际显示文本与颜色是否
-    #       与对应系列一一对应。
-    # 措施：解析 c:legendEntry 的删除标记，排除被隐藏的图例条目后，
-    #       确认"综管科""服务科""核验数量"三项均实际显示在图例中，
-    #       且各自图例条目（按系列索引对应）的颜色与该系列本身颜色一致
-    #       （OOXML 图例条目默认继承对应系列颜色，一一对应由结构保证，
-    #       这里显式核对 color_hex 避免系列被单独改色导致图例与图形不一致）。
-    def chk_legend():
-        if main is None:
-            return False, "无图表"
-        legend_on = main["legend_pos"] is not None
-        if not legend_on:
-            return False, "图例不存在"
-        deleted_idx = main.get("legend_deleted_idx") or set()
-        # 实际显示的图例条目：系列列表中排除被 c:legendEntry/c:delete 隐藏的项
-        visible = [(i, s) for i, s in enumerate(main["series"]) if i not in deleted_idx]
-        need = [("综管", "综管科"), ("服务", "服务科"), ("核验", "核验数量")]
-        found = {}
-        for key, _ in need:
-            for i, s in visible:
-                if key in s["name"]:
-                    found[key] = (i, s)
-                    break
-        present = all(key in found for key, _ in need)
-        # 颜色一一对应：图例条目颜色即所关联系列自身的 color_hex（结构上保证），
-        # 这里核对该系列确有可辨识的填充色（否则图例色块与图形对不上/无法比对）。
-        color_ok = present and all(found[key][1]["color_hex"] for key, _ in need)
-        ok = present and color_ok
-        return ok, ("图例存在=%s, 隐藏条目idx=%s, 实际显示系列=%s, "
-                    "综管科/服务科/核验数量三项均显示=%s, "
-                    "各自图例颜色与系列颜色一致(存在有效填充色)=%s") % (
-            legend_on, sorted(deleted_idx),
-            [s["name"] for _, s in visible], present, color_ok)
-    ok, det = chk_legend()
-    hits.append((1, ok, "图表图例", det))
-
-    # ---------- +3 图表颜色 ----------
-    # 细则：综管科系列使用蓝色或近似蓝色，服务科系列使用绿色或近似绿色，
-    #       核验数量系列使用橙色或近似橙色；三类系列颜色彼此易于区分。
-    def chk_colors():
-        if main is None:
-            return False, "无图表"
-        role_color = {}
-        role_hex = {}
-        for s in main["series"]:
-            n = s["name"]
-            if "综管" in n:
-                role_color["zg"] = s["color_class"]
-                role_hex["zg"] = s["color_hex"]
-            elif "服务" in n:
-                role_color["fw"] = s["color_class"]
-                role_hex["fw"] = s["color_hex"]
-            elif "核验" in n:
-                role_color["verify"] = s["color_class"]
-                role_hex["verify"] = s["color_hex"]
-        zg = role_color.get("zg")
-        fw = role_color.get("fw")
-        verify = role_color.get("verify")
-        # 综管=蓝(近似)、服务=绿(近似)、核验=橙(近似)
-        color_ok = (zg == "blue" and fw == "green" and verify == "orange")
-        # 三类系列颜色彼此易于区分：三者已识别且互不相同
-        got = [c for c in (zg, fw, verify) if c is not None]
-        distinct_ok = len(got) == 3 and len(set(got)) == 3
-        ok = color_ok and distinct_ok
-        return ok, ("综管=%s(蓝,hex=%s), 服务=%s(绿,hex=%s), 核验=%s(橙,hex=%s), "
-                    "三色互异=%s") % (
-            zg, role_hex.get("zg"), fw, role_hex.get("fw"),
-            verify, role_hex.get("verify"), distinct_ok)
-    ok, det = chk_colors()
-    hits.append((3, ok, "图表颜色", det))
-
-    # ---------- +5 图表堆叠内部标签 ----------
-    # 细则：综管科和服务科两个堆叠系列的柱段内部显示各自数值标签；
-    #       5类资源中能识别出"综管科"数据 6/22/18/12/5 和
-    #       "服务科"数据 9/8/6/3/2。
-    # 问题：原代码只看 showVal 是否开启和系列值是否匹配，不检查标签位置是否为
-    #       "内部"（ctr/inBase/inEnd），也不验证实际标签文本是否等于这些数值。
-    # 措施：解析 dLblPos（系列级/单点级）是否为内部位置，并结合
-    #       series_dlbl_info 推断出的每个数据点实际显示文本，逐类核对文本值。
-    def chk_inner_labels():
-        if main is None:
-            return False, "无图表"
-
-        def role_series(role_key):
-            for s in main["series"]:
-                if role_key in s["name"]:
-                    return s
-            return None
-
-        zg_ser = role_series("综管")
-        fw_ser = role_series("服务")
-
-        def point_pos(s, idx):
-            """取该系列第idx个数据点实际生效的标签位置：单点覆盖优先，否则用系列级 dlbl_pos。"""
-            if s is None:
-                return None
-            return s["dlbl_point_pos"].get(idx, s["dlbl_pos"])
-
-        def inner_ok_for(s):
-            """该系列是否开启显示且每个仍显示的数据点标签位置都在柱段内部。"""
-            if s is None or not s["has_dlbl"]:
-                return False
-            text_map = s["dlbl_text"] or {}
-            if not text_map:
-                return False
-            return all(point_pos(s, idx) in INNER_DLBL_POS for idx in text_map)
-
-        zg_inner_ok = inner_ok_for(zg_ser)
-        fw_inner_ok = inner_ok_for(fw_ser)
-        dlbl_on = zg_inner_ok and fw_inner_ok
-
-        def label_text_match(s, cat_names, expected):
-            """按 CATEGORIES 顺序，核对该系列每个分类点实际显示的标签文本
-            （dlbl_text）是否等于期望数值（允许 6 / 6.0 / "6" 等常见数值文本形式）。"""
-            if s is None:
-                return 0
-            matched = 0
-            for j, cv in enumerate(cat_names):
-                ci = None
-                for i, name in enumerate(CATEGORIES):
-                    if name in cv:
-                        ci = i
-                        break
-                if ci is None:
-                    continue
-                txt = s["dlbl_text"].get(j)
-                if txt is None:
-                    continue
-                try:
-                    if abs(float(txt) - expected[ci]) <= 0.5:
-                        matched += 1
-                except ValueError:
-                    continue
-            return matched
-
-        zg_text_match = label_text_match(zg_ser, zg_ser["cats"] if zg_ser else [], EXP_ZG)
-        fw_text_match = label_text_match(fw_ser, fw_ser["cats"] if fw_ser else [], EXP_FW)
-
-        # 5类资源能识别出综管科 6/22/18/12/5、服务科 9/8/6/3/2
-        # ——同时要求：系列数值本身对应（mapped，兼容无自定义文本、走缓存数值的常见情况）
-        #             以及 标签实际显示文本 也核对一致（避免自定义文本被改写成与数值不符的内容）。
-        zg_match = count_match(mapped["zg"], EXP_ZG)
-        fw_match = count_match(mapped["fw"], EXP_FW)
-        ok = (dlbl_on and zg_match == 5 and fw_match == 5
-              and zg_text_match == 5 and fw_text_match == 5)
-        return ok, ("综管标签内部位置=%s/服务标签内部位置=%s, "
-                    "综管数值识别 %d/5(%s) 标签文本核对 %d/5, "
-                    "服务数值识别 %d/5(%s) 标签文本核对 %d/5") % (
-            zg_inner_ok, fw_inner_ok, zg_match, mapped["zg"], zg_text_match,
-            fw_match, mapped["fw"], fw_text_match)
-    ok, det = chk_inner_labels()
-    hits.append((5, ok, "堆叠内部标签", det))
-
-    # ---------- +5 图表柱顶合计标签 ----------
-    # 细则：每个堆叠柱顶部显示合计登记数量标签 15、30、24、15、7；
-    #       核验数量柱顶部显示 13、27、22、14、6。
-    # 问题：原代码用综管+服务系列值计算合计，并把任一堆叠系列 showVal 当作
-    #       堆叠柱顶标签；这不能证明图表顶部实际显示合计15/30/24/15/7，普通
-    #       堆叠内部标签（+5 那一条细则的场景）也会被误判为柱顶合计标签。
-    # 措施：检查是否存在合计系列/自定义标签，或数据标签位置确实在柱顶
-    #       （堆叠图中柱顶标签只能来自堆叠顶层系列且位置为 outEnd，或来自
-    #       独立的"合计"系列/图表级顶部标签），并核对实际显示的标签文本
-    #       是否等于期望的合计/核验柱顶数值。
-    def chk_top_labels():
-        if main is None:
-            return False, "无图表"
-        series_list = main["series"]
-
-        def role_series(role_key):
-            for s in series_list:
-                if role_key in s["name"]:
-                    return s
-            return None
-
-        # 堆叠顶层系列：图表系列列表中最后一个"综管"或"服务"系列（堆叠图里
-        # 排在后面的系列画在上层，其 outEnd 标签位置才对应堆叠柱的顶部）。
-        stack_roles = [s for s in series_list
-                       if "综管" in s["name"] or "服务" in s["name"]]
-        top_stack_ser = stack_roles[-1] if stack_roles else None
-        total_ser = role_series("合计")
-        verify_ser = role_series("核验")
-
-        def point_pos(s, idx):
-            if s is None:
-                return None
-            return s["dlbl_point_pos"].get(idx, s["dlbl_pos"])
-
-        def top_ok_for(s, require_outer):
-            """该系列是否开启显示标签，且（若要求外部位置）每个仍显示的
-            数据点标签位置都在柱顶外部（outEnd）。"""
-            if s is None or not s["has_dlbl"]:
-                return False
-            text_map = s["dlbl_text"] or {}
-            if not text_map:
-                return False
-            if not require_outer:
-                return True
-            return all(point_pos(s, idx) in OUTER_DLBL_POS for idx in text_map)
-
-        def label_text_match(s, expected):
-            """核对该系列每个分类点实际显示的标签文本是否等于期望数值。"""
-            if s is None:
-                return 0
-            matched = 0
-            for j, cv in enumerate(s["cats"]):
-                ci = None
-                for i, name in enumerate(CATEGORIES):
-                    if name in cv:
-                        ci = i
-                        break
-                if ci is None:
-                    continue
-                txt = s["dlbl_text"].get(j)
-                if txt is None:
-                    continue
-                try:
-                    if abs(float(txt) - expected[ci]) <= 0.5:
-                        matched += 1
-                except ValueError:
-                    continue
-            return matched
-
-        # 合计标签的来源：独立"合计"系列（自定义文本/showVal 均可，不要求
-        # outEnd 位置，因为该系列本身即代表合计）；否则要求堆叠顶层系列
-        # 在 outEnd 位置显示（堆叠柱顶=该点标签，实际数值等于累计高度）。
-        if total_ser is not None:
-            total_dlbl_ok = top_ok_for(total_ser, require_outer=False)
-            total_text_match = label_text_match(total_ser, EXP_TOTAL)
-        else:
-            total_dlbl_ok = top_ok_for(top_stack_ser, require_outer=True)
-            total_text_match = label_text_match(top_stack_ser, EXP_TOTAL)
-        # 核验柱顶部显示标签：核验系列开启显示，且标签位置在柱外顶部。
-        verify_dlbl_ok = top_ok_for(verify_ser, require_outer=True)
-        verify_text_match = label_text_match(verify_ser, EXP_VERIFY)
-
-        ok = (total_dlbl_ok and verify_dlbl_ok
-              and total_text_match == 5 and verify_text_match == 5)
-        return ok, ("合计柱顶标签=%s(有合计系列=%s) 文本核对 %d/5, "
-                    "核验柱顶标签=%s 文本核对 %d/5") % (
-            total_dlbl_ok, total_ser is not None, total_text_match,
-            verify_dlbl_ok, verify_text_match)
-    ok, det = chk_top_labels()
-    hits.append((5, ok, "柱顶合计标签", det))
-
-    total = sum(score for score, hit, _, _ in hits if hit)
-    return total, hits
-
-
-# 评分细则文本（按 label 对应到完整细则内容，用于结果打印）
-RUBRIC_TEXT = {
-    "图表对象": "图表对象：新增1个可编辑图表，图表类型为二维堆叠柱状图或二维堆叠柱形图，用于比较“综管科+服务科+合计的登记数量”与“实际核验数量”。图表覆盖5类资源，类别分别为“便携学习终端”“智能显示设备”“网络接入设备”“多功能文印设备”“移动采集设备”，对应数据来自原表3-17行中的登记数量与核验数量。",
-    "柱形相邻": "服务科和综管科的堆叠柱形与核验数量的柱形相连在一起，两个柱形之间距离为0-0.1厘米。",
-    "分类轴/数值轴": "图表分类轴：横轴依次显示“便携学习终端”“智能显示设备”“网络接入设备”“多功能文印设备”“移动采集设备”5个资源类别，文本水平显示于柱形组合下方，不可出现文字倾斜显示；纵轴分类依次显示0、5、10、15、20、25、30、35、40数字，数字左侧有纵轴坐标单位“数量（台）”。",
-    "图表标题": "图表标题：图表标题包含“固定资产登记数量（综管科+服务科）与核验数量对比”等关键信息，能够明确表达登记数量与核验数量对比关系。",
-    "图表图例": "图表图例：图例包含“综管科”“服务科”“核验数量”3个系列名称，图例内容及颜色与图表系列一一对应。",
-    "图表颜色": "图表颜色：综管科系列使用蓝色或近似蓝色，服务科系列使用绿色或近似绿色，核验数量系列使用橙色或近似橙色，三类系列颜色彼此易于区分。",
-    "堆叠内部标签": "图表堆叠内部标签：综管科和服务科两个堆叠系列的柱段内部显示各自数值标签，5类资源中能识别出”综管科“数据6/22/18/12/5和”服务科“数据9/8/6/3/2。",
-    "柱顶合计标签": "图表柱顶合计标签：每个堆叠柱顶部显示合计登记数量标签15、30、24、15、7；核验数量柱顶部显示13、27、22、14、6。",
-}
-
-
-# ============================================================
-#  对外接口：evaluate(dir_path)
-# ============================================================
-SCRIPT_ID = "100"
-
-
-def _find_target_file(dir_path):
-    """在指定目录内定位被评估的 xlsx/xlsm 文档。
-    优先匹配默认名"工作簿1_堆叠对比图_可编辑.xlsx"，否则取目录下第一个 .xlsx/.xlsm。
-    """
-    if not os.path.isdir(dir_path):
-        return None
-    preferred = os.path.join(dir_path, "工作簿1_堆叠对比图_可编辑.xlsx")
-    if os.path.isfile(preferred):
-        return preferred
-    candidates = []
-    for name in os.listdir(dir_path):
-        low = name.lower()
-        if low.endswith((".xlsx", ".xlsm")) and not name.startswith("~$"):
-            candidates.append(os.path.join(dir_path, name))
-    candidates.sort()
-    return candidates[0] if candidates else None
-
-
-# ============================================================
-#  维度1：可用与可修改性（门槛）
-# ============================================================
-def eval_dimension1(path, bundle):
-    """细则：交付文件为xlsx或.xlsm格式，文件可正常打开。"""
-    d = []
-    ext_ok = path.lower().endswith((".xlsx", ".xlsm"))
-    c1 = ext_ok and bundle.ok
-    d.append((c1, "交付文件为xlsx或.xlsm格式，文件可正常打开" if c1
-              else "格式不符或无法打开（扩展名ok=%s, 打开ok=%s）" % (ext_ok, bundle.ok)))
-    return all(ok for ok, _ in d), d
-
-
-def _build_error_result(file_name, error_msg, rubric_items):
-    """脚本自身错误 / 文件不存在等：status=error。
-    契约：维度一未通过（或未评估）时 dim2_items 恒为 []，不返回任何维度二
-    条目（即使全部标记为未命中）。"""
-    max_score = sum(md for _, md in rubric_items if md > 0)
-    return {
+    未找到待评文件（目录不存在或目录内没有工作簿）时，返回 status='error'、
+    file_name 与 dim1_pass/dim1_reason 均留空、dim2_items 为空、分值全 0；
+    其他运行异常则给出“脚本运行异常：…”摘要，并按维度一未通过计 0 分。"""
+    result = {
         "id": SCRIPT_ID,
-        "file_name": file_name or "",
-        "status": "error",
-        "error": error_msg,
+        "file_name": "",
+        "status": "ok",
+        "error": None,
         "dim1_pass": False,
-        "dim1_reason": error_msg,
+        "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": max_score,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
-
-# 维度二评分项定义（顺序与 eval_dimension2 内一致，含扣分项）
-_RUBRIC_ITEMS = [
-    ("图表对象", 3),
-    ("柱形相邻", 5),
-    ("分类轴/数值轴", 3),
-    ("图表标题", 1),
-    ("图表图例", 1),
-    ("图表颜色", 3),
-    ("堆叠内部标签", 5),
-    ("柱顶合计标签", 5),
-]
-
-
-def evaluate(dir_path: str) -> dict:
-    """评估入口：接收脚本所在目录路径，返回结构化评分字典。
-
-    总分 = dim2_items 所有条目 delta 之和。
-    """
-    file_path = _find_target_file(dir_path)
-    if file_path is None:
-        return _build_error_result(
-            "", "目录不存在或未找到 .xlsx/.xlsm 文件：%s" % dir_path, _RUBRIC_ITEMS)
-
-    file_name = os.path.basename(file_path)
-
     try:
-        bundle = ZipBundle(file_path)
-        if not bundle.ok:
-            return {
-                "id": SCRIPT_ID,
-                "file_name": file_name,
-                "status": "ok",
-                "error": None,
-                "dim1_pass": False,
-                "dim1_reason": "文件无法作为 xlsx 打开：%s" % (bundle.error or ""),
-                "dim2_items": [],
-                "total_score": 0,
-                "max_score": sum(md for _, md in _RUBRIC_ITEMS if md > 0),
-            }
-
-        shared = load_shared_strings(bundle)
-        sheet_targets = get_sheet_targets(bundle)
-        sheet1_path = sheet_targets.get("Sheet1")
-        if sheet1_path:
-            sheet1_cells, sheet1_merges = read_sheet_cells(
-                bundle, sheet1_path, shared)
-        else:
-            sheet1_cells = {}
-            sheet1_merges = []
-        sheet1_raw_text = "".join(shared)
-        sheet1_raw_text += "".join(sheet1_cells.values())
-
-        theme_colors = load_theme_colors(bundle)
-        chart_paths = find_chart_paths(bundle)
-        charts = []
-        for cp in chart_paths:
-            root = bundle.xml(cp)
-            if root is not None:
-                ch = parse_chart(root, theme_colors)
-                ch["path"] = cp
-                charts.append(ch)
-
-        drawing_text = ""
-        for n in bundle.names:
-            if re.search(r"drawings/drawing\d+\.xml$", n):
-                drawing_text += bundle.read_text(n) or ""
-
-        # 维度一
-        passed, d1 = eval_dimension1(file_path, bundle)
-        dim1_reason = "" if passed else "; ".join(
-            msg for ok, msg in d1 if not ok)
-
-        if not passed:
-            dim2_items = [
-                {
-                    "rule": RUBRIC_TEXT.get(label, label),
-                    "max_delta": md,
-                    "delta": 0,
-                    "hit": False,
-                    "detail": "",
-                }
-                for label, md in _RUBRIC_ITEMS
-            ]
-            return {
-                "id": SCRIPT_ID,
-                "file_name": file_name,
-                "status": "ok",
-                "error": None,
-                "dim1_pass": False,
-                "dim1_reason": dim1_reason,
-                "dim2_items": dim2_items,
-                "total_score": 0,
-                "max_score": sum(md for _, md in _RUBRIC_ITEMS if md > 0),
-            }
-
-        # 维度二
-        _total, hits = eval_dimension2(
-            bundle, sheet_targets, sheet1_cells, sheet1_raw_text,
-            charts, drawing_text, sheet1_merges, shared)
-
-        dim2_items = []
-        for score, hit, label, det in hits:
-            dim2_items.append({
-                "rule": RUBRIC_TEXT.get(label, label),
-                "max_delta": score,
-                "delta": score if hit else 0,
-                "hit": bool(hit),
-                "detail": "",
-            })
-
-        # 脚本契约：total_score = sum(item.delta)，扣分项命中时 delta 为负数
-        # 并计入总分。
-        total_score = sum(it["delta"] for it in dim2_items)
-        max_score = sum(it["max_delta"] for it in dim2_items if it["max_delta"] > 0)
-
-        return {
-            "id": SCRIPT_ID,
-            "file_name": file_name,
-            "status": "ok",
-            "error": None,
-            "dim1_pass": True,
-            "dim1_reason": "",
-            "dim2_items": dim2_items,
-            "total_score": total_score,
-            "max_score": max_score,
-        }
-
-    except Exception as e:
-        return _build_error_result(file_name, "脚本执行异常：%s" % e, _RUBRIC_ITEMS)
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError("目录不存在或不是目录：%s" % dir_path)
+        names = sorted(f for f in os.listdir(dir_path)
+                       if not f.startswith("~$")
+                       and os.path.isfile(os.path.join(dir_path, f)))
+        # 交付格式：.xlsx（首选）与 .xlsm（启用宏的工作簿）均按 OOXML 解析
+        cands = ([f for f in names if f.lower().endswith(".xlsx")]
+                 + [f for f in names if f.lower().endswith(".xlsm")])
+        if not cands:
+            legacy = [f for f in names if f.lower().endswith(".xls")]
+            if legacy:
+                result["file_name"] = legacy[0]
+                raise ValueError("交付文件为 .xls 二进制格式，无法按 OOXML 解析：%s" % legacy[0])
+            raise FileNotFoundError("目录中未找到 .xlsx 文件：%s" % dir_path)
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = cands[0]
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 未找到待评文件：不进入维度判定，dim1_pass 留空，分值一并归零
+        result["file_name"] = ""
+        result["status"] = "error"
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = "脚本运行异常：%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = False
+        # dim1_reason 统一带上「维度一未通过：…」前缀与计分后果，便于直接作为错误摘要展示
+        result["dim1_reason"] = ("维度一未通过：文件无法打开或解析（%s: %s），完成度总分记 0"
+                                % (type(exc).__name__, exc))
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
 
 
-# ============================================================
-#  本地调试入口（不作为主输出通道）
-# ============================================================
+# ================= 证据采集 =================
+
+def _find_main_ws(wb):
+    """定位台账主表所在工作表：优先按 A1 标题命中，其次按原名，最后取第一张。"""
+    for ws in wb.worksheets:
+        if _norm(ws["A1"].value) == _TITLE_TEXT:
+            return ws
+    if _SHEET_NAME in wb.sheetnames:
+        return wb[_SHEET_NAME]
+    return wb.worksheets[0]
+
+
+def _bar_groups(charts):
+    """把所有图表的柱形图组摊平：[(chart_index, info, group)]。"""
+    out = []
+    for i, ch in enumerate(charts):
+        info = ch.get("info")
+        if not info:
+            continue
+        for g in info.get("groups", []):
+            out.append((i, info, g))
+    return out
+
+
+def _main_chart(charts):
+    """挑选“主图表”：优先柱形图系列数最多者，其次部件名靠前者。"""
+    best = None
+    for ch in charts:
+        info = ch.get("info")
+        if not info:
+            continue
+        n = sum(len(g.get("series", [])) for g in info.get("groups", []))
+        if n <= 0:
+            continue
+        key = (n, -len(info.get("other_types", [])))
+        if best is None or key > best[0]:
+            best = (key, ch)
+    if best:
+        return best[1]
+    return charts[0] if charts else None
+
+
+def _series_by_name(charts, *keys):
+    """在全部柱形图组中按系列名关键字查找：返回 [(group, series)]。"""
+    hits = []
+    for _i, _info, g in _bar_groups(charts):
+        for s in g.get("series", []):
+            nm = _norm(s.get("name"))
+            if any(k in nm for k in keys):
+                hits.append((g, s))
+    return hits
+def _evaluate_impl(file_path, result):
+    """按细则逐项判定；results 内每条形如 "+N：说明" / "-N：说明"。"""
+    results = []
+
+    # ---------- 证据采集：包内 XML（图表、绘图锚点、包结构） ----------
+    with zipfile.ZipFile(file_path) as z:
+        broken = _package_broken(z)
+        charts, anchors, pic_count = _collect_charts(z) if not broken else ([], [], 0)
+    if broken:
+        result["dim1_pass"] = False
+        # dim1_reason 统一带上「维度一未通过：…」前缀与计分后果，便于直接作为错误摘要展示
+        result["dim1_reason"] = ("维度一未通过：文件包结构异常，Excel 打开时会提示需要修复"
+                                "（%s），完成度总分记 0" % broken[0])
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+    live = [c for c in charts if c.get("info")]
+    groups = _bar_groups(charts)
+    mc = _main_chart(charts)
+    minfo = mc.get("info") if mc else None
+    n_series = sum(len(g.get("series", [])) for _i, _f, g in groups)
+    # 有效图表：至少含 1 个系列（柱形或其它类型）
+    real_charts = [c for c in live
+                   if sum(len(g.get("series", [])) for g in c["info"]["groups"]) > 0
+                   or c["info"]["other_types"]]
+    has_chart_frame = any(a["is_chart"] for a in anchors) or bool(real_charts)
+
+    # ---------- 证据采集：单元格 ----------
+    try:
+        wb = openpyxl.load_workbook(file_path)
+        ws = _find_main_ws(wb)
+    except Exception as exc:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = ("维度一未通过：工作簿无法正常读取（%s: %s），完成度总分记 0"
+                                % (type(exc).__name__, exc))
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+    merges, covered = _merged_map(ws)
+    base_coords = set(_MAIN_DATA) | set(_MAIN_HEADER) | set(_HELP_TOP) | set(_HELP_BOT)
+    base_coords.add(_MAIN_TITLE_CELL)
+
+    def cell(coord):
+        return ws[coord]
+
+    def ok_value(coord, want):
+        return _same_value(ws[coord].value, want)
+
+    # 主表 / 汇总区取值一致性
+    main_bad = [c for c, v in _MAIN_DATA.items() if not ok_value(c, v)]
+    if not _same_value(ws[_MAIN_TITLE_CELL].value, _TITLE_TEXT):
+        main_bad.append(_MAIN_TITLE_CELL)
+    head_bad = [c for c, v in _MAIN_HEADER.items() if not ok_value(c, v)]
+    htop_bad = [c for c, v in _HELP_TOP.items() if not ok_value(c, v)]
+    hbot_bad = [c for c, v in _HELP_BOT.items() if not ok_value(c, v)]
+
+    # ---------- 维度1：可用与可修改性 ----------
+    # 只判“交付物是否为一个能正常打开的 Excel 工作簿”；图表可编辑性、版面错乱等
+    # 已分别由加分项（A01/A02/A11 等）与减分项（D01/D02 等）计分，此处不重复判 0。
+    if broken:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = ("维度一未通过：文件包结构异常，Excel 打开时会提示需要修复"
+                                "（%s），完成度总分记 0" % broken[0])
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        wb.close()
+        return result
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "交付物为 1 个可正常打开的 Excel 工作簿（%s）" % _ext_of(file_path)
+    # ---------- 图表侧派生事实 ----------
+    cats_n = [_norm(c) for c in _CATS]
+    col_groups = [g for _i, _f, g in groups if (g.get("barDir") or "col") == "col"]
+    stacked = [g for g in col_groups if (g.get("grouping") or "") == "stacked"]
+    all_ser = [s for _i, _f, g in groups for s in g.get("series", [])]
+    minfo_ser = [s for g in ((minfo or {}).get("groups") or []) for s in g.get("series", [])]
+    zg = _series_by_name(charts, "综管")
+    fw = _series_by_name(charts, "服务")
+    hy = _series_by_name(charts, "核验")
+    gaps = [g.get("gapWidth") for _i, _f, g in groups]
+
+    def cats_of(s):
+        return [_norm(c) for c in (s.get("cats") or [])]
+
+    def vals_of(s):
+        return _nz(s.get("vals") or [])
+
+    def shown(s):
+        return s.get("show") == "1"
+
+    def pos_of(s):
+        return set(p for p in (s.get("pos") or set()) if p)
+
+    def _tidy_source(info):
+        """图表引用是否落在一张规整的绘图数据表上（5 行 × 每系列 1 列，表头紧邻上一行）。"""
+        rows, cols, cat_cols, heads = set(), set(), set(), []
+        for g in info.get("groups", []):
+            for s in g.get("series", []):
+                vr = _parse_ref(s.get("val_ref"))
+                cr = _parse_ref(s.get("cat_ref"))
+                nr = _parse_ref(s.get("name_ref"))
+                if not vr or not cr or not nr or vr[2] != vr[4]:
+                    return False
+                rows.add((vr[0], vr[1], vr[3]))
+                cols.add((vr[0], vr[2]))
+                cat_cols.add((cr[0], cr[2], cr[1], cr[3]))
+                heads.append((nr, vr))
+        if len(rows) != 1 or len(cols) < 3 or len(cat_cols) != 1:
+            return False
+        sh, r1, r2 = rows.pop()
+        if r2 - r1 + 1 != len(_CATS):
+            return False
+        csh, ccol, cr1, cr2 = cat_cols.pop()
+        if csh != sh or (cr1, cr2) != (r1, r2) or (sh, ccol) in cols:
+            return False
+        for nr, vr in heads:
+            if nr[0] != sh or nr[1] != r1 - 1 or nr[2] != vr[2]:
+                return False
+        return True
+    def add(delta, hit, text):
+        """加分项：命中记满分，未命中记 0。"""
+        results.append("+%d：%s" % (delta if hit else 0, text))
+
+    def ded(delta, trig, text):
+        """减分项：触发破坏记该负分，未触发记 0。"""
+        results.append("-%d：%s" % (delta if trig else 0, text))
+
+    # ========== 维度2：完成度评分 —— 一、加分项 ==========
+
+    # A01 新增柱形图图表对象
+    add(3, bool(real_charts) and any(g.get("series") for g in col_groups),
+        "工作簿中新增 1 个柱形图图表对象，用于登记数量与核验数量的对比展示")
+
+    # A02 登记侧为综管科/服务科上下堆叠
+    a02 = any(
+        any("综管" in _norm(s.get("name")) for s in g.get("series", []))
+        and any("服务" in _norm(s.get("name")) for s in g.get("series", []))
+        for g in stacked)
+    add(5, a02, "登记侧柱体为“综管科”“服务科”两段上下堆叠的堆积柱形图"
+                "（非簇状并列、非百分比堆积、非条形图/折线图）")
+
+    # A03 横轴 5 个类别、每类别 1 个标签
+    #     要求所有带分类的系列都用这 5 项；出现拼接标签或重复类别文字即不得分
+    ser_cats = [cats_of(s) for s in all_ser if cats_of(s)]
+    a03 = bool(ser_cats) and all(cl == cats_n for cl in ser_cats)
+    add(3, a03, "横轴分类为 5 个资源类别（便携学习终端/智能显示设备/网络接入设备/"
+                "多功能文印设备/移动采集设备），每个类别只对应 1 个分类标签")
+
+    # A04 核验数量为同刻度内并排的独立柱体
+    a04 = bool(stacked) and any(
+        all(g is not t for t in stacked)
+        and (g.get("barDir") or "col") == "col"
+        and (g.get("grouping") or "") != "stacked"
+        and cats_of(s) == cats_n
+        for g, s in hy)
+    add(3, a04, "“核验数量”为独立柱体，与该类别的登记堆叠柱位于同一分类刻度内左右并排，"
+                "且不叠加进堆叠柱内部")
+
+    # A05 / A06 / A07 数据正确性
+    a05 = (any(vals_of(s) == _ZG for _g, s in zg)
+           and any(vals_of(s) == _FW for _g, s in fw))
+    add(3, a05, "堆叠柱“综管科”段取值依次为 6、22、18、12、5，“服务科”段取值依次为 9、8、6、3、2")
+    add(3, any(vals_of(s) == _HY for _g, s in hy),
+        "“核验数量”柱取值依次为 13、27、22、14、6")
+    a07 = False
+    for g in stacked:
+        cols5 = [vals_of(s) for s in g.get("series", [])
+                 if ("综管" in _norm(s.get("name")) or "服务" in _norm(s.get("name")))]
+        if len(cols5) >= 2 and all(len(c) == len(_CATS) for c in cols5):
+            if [sum(c[i] for c in cols5) for i in range(len(_CATS))] == _TOT:
+                a07 = True
+    add(1, a07, "每根堆叠柱的总高度等于该类别登记合计 15、30、24、15、7")
+    # A08 全部取数来自单元格区域引用
+    a08 = bool(all_ser) and all(
+        s.get("val_ref") and not s.get("val_lit")
+        and s.get("cat_ref") and not s.get("cat_lit") and s.get("name_ref")
+        for s in all_ser)
+    add(5, a08, "图表的系列名称、分类轴、数值均通过单元格区域引用取数，修改数据源单元格后"
+                "图表随之更新（系列数据以常量数组写死在图表内部则不得分）")
+
+    # A09 规整绘图数据表
+    a09 = bool(minfo) and _tidy_source(minfo)
+    add(3, a09, "图表数据源为一张规整的绘图数据表（5 行数据 × 类别/综管科/服务科/核验数量各列），"
+                "行列与图表系列一一对应，便于用户增删类别或系列")
+
+    # A10 各系列取值均为真实数据，无拼并列用的占位 0
+    a10 = bool(real_charts) and not any(
+        sum(1 for v in (s.get("vals") or []) if v is not None and abs(v) < 1e-9) >= 2
+        for s in all_ser)
+    add(1, a10, "绘图数据源中各系列取值均为真实数据，不含为拼出并列效果而填入的占位 0，"
+                "图例与数据标签中不出现无意义的 0")
+
+    # A11 可逐系列调整（位图截图、单一图形对象、工作表锁定均不得分）
+    locked = any(bool(w.protection.sheet) for w in wb.worksheets)
+    a11 = has_chart_frame and n_series >= 2 and pic_count == 0 and not locked
+    add(1, a11, "图表可直接选中并逐系列调整（可单独设置某一系列的填充色、标签、图表类型），"
+                "非合并为单一图形对象，且工作表未被保护/锁定，用户可随时改动图表与数据源")
+
+    # A12 图表标题
+    title = _norm(minfo.get("title")) if minfo else ""
+    a12 = bool(title) and "登记" in title and "核验" in title \
+        and ("对比" in title or "对照" in title)
+    add(1, a12, "图表标题为“固定资产登记数量（综管科+服务科）与核验数量对比”或含相同信息的中文标题")
+
+    # A13 纵坐标轴标题
+    ax_titles = [_norm(a.get("title")) for a in ((minfo or {}).get("valAx") or [])]
+    add(1, any("数量" in t and "台" in t for t in ax_titles), "纵坐标轴带轴标题“数量（台）”")
+
+    # A14 两段标签居中显示于柱体内部
+    a14 = bool(zg) and bool(fw) and all(
+        shown(s) and "ctr" in pos_of(s) for _g, s in zg + fw)
+    add(3, a14, "“综管科”“服务科”两段均显示数据标签且标签位于各段柱体内部"
+                "（居中显示 6/22/18/12/5 与 9/8/6/3/2）")
+
+    # A15 堆叠柱顶合计标签 + 核验柱顶标签
+    a15 = (any(shown(s) and vals_of(s) == _TOT for s in all_ser)
+           and any(shown(s) and vals_of(s) == _HY for _g, s in hy))
+    add(3, a15, "堆叠柱顶端显示登记合计标签 15、30、24、15、7，"
+                "“核验数量”柱顶端显示 13、27、22、14、6")
+
+    # A16 图例三项、不显示辅助系列
+    #     c:legendEntry 的 idx 取“图例项出现顺序”，与 c:ser 的 idx 不一定一致，两者都接受
+    deleted = set(minfo.get("legend_deleted") or []) if minfo else set()
+    helper_hidden = True
+    for pos, s in enumerate(minfo_ser):
+        if s.get("fill") == "none" or "合计" in _norm(s.get("name")):
+            if pos not in deleted and s.get("idx") not in deleted:
+                helper_hidden = False
+    a16 = (bool(minfo) and minfo.get("legend") and bool(zg) and bool(fw) and bool(hy)
+           and helper_hidden)
+    add(1, a16, "图例包含“综管科”“服务科”“核验数量”三项，"
+                "且不显示仅用于承载合计标签的辅助系列名称")
+
+    # A17 三色互不相同
+    tri_fills = []
+    for pairs in (zg, fw, hy):
+        tri_fills.append(next((s.get("fill") for _g, s in pairs
+                               if s.get("fill") not in (None, "none", "?")), None))
+    a17 = all(tri_fills) and len(set(tri_fills)) == 3
+    add(1, a17, "“综管科”“服务科”“核验数量”三者填充色明显互不相同，同类别两根柱可一眼区分")
+
+    # A18 纵轴最大刻度
+    ax_max = [a.get("max") for a in ((minfo or {}).get("valAx") or [])]
+    a18 = bool(real_charts) and all(m is None or m >= 30 for m in ax_max)
+    add(1, a18, "纵坐标轴最大刻度不小于 30（建议 40），所有柱体与数据标签完整显示、无截断")
+
+    # A19 组内间距明显小于类别间距
+    a19 = a04 and len(gaps) >= 2 and max(gaps) >= 100 and min(gaps) <= max(gaps) / 2.0
+    add(1, a19, "同一类别的两根柱紧邻成组，组内间距明显小于类别之间的间距，成对比对关系可辨")
+
+    # A20 摆放不遮挡台账与汇总区
+    a20 = bool(real_charts)
+    for an in anchors:
+        if an["sheet"] != ws.title or not an["is_chart"] or not an["rect"]:
+            continue
+        if _rect_overlap(an["rect"], _RECT_MAIN) or _rect_overlap(an["rect"], _RECT_HELP):
+            a20 = False
+    add(1, a20, "图表尺寸与摆放位置不遮挡台账主表与汇总区的单元格内容，图表整体可完整查看")
+
+    # A21 网格线只在数值轴（分类轴网格线在柱形图中是穿过柱体的竖线）
+    a21 = bool(real_charts) and not any(
+        ax.get("grid") for c in real_charts for ax in c["info"]["catAx"])
+    add(1, a21, "网格线仅保留数值轴的横向刻度线用于读数，柱体不被分类轴的竖向网格线穿过遮挡，"
+                "数据标签互不重叠、不压住柱体")
+
+    # ========== 维度2：完成度评分 —— 二、减分项 ==========
+
+    sum_rows = (5, 8, 11, 14, 17)
+    idx_rows = (3, 6, 9, 12, 15)
+
+    # D01 主表数据被删除/改写/移位
+    ded(3, bool(main_bad), "主表中任一数据被删除、改写或移位（序号 1—5、5 个资源类别名称、"
+                           "“综管科/服务科/合计”所属单元行、登记数量 6/9/22/8/18/6/12/3/5/2、"
+                           "各类合计 15/30/24/15/7、核验数量 13/27/22/14/6）")
+
+    # D02 主表区域插入或删除行/列（按行列位置形态判定，与表头文字改写互不重复）
+    struct_ok = (all(_norm(ws.cell(r, 1).value) == "合计" for r in sum_rows)
+                 and all(_num(ws.cell(r, 1).value) == float(i + 1)
+                         for i, r in enumerate(idx_rows))
+                 and all(_norm(ws.cell(r, 3).value) == "综管科" for r in idx_rows)
+                 and all(_norm(ws.cell(r + 1, 3).value) == "服务科" for r in idx_rows)
+                 and all(ws.cell(2, ci).value is not None for ci in range(1, 7)))
+    ded(3, not struct_ok, "在主表区域插入或删除行/列，导致数据与合并单元格错位")
+
+    # D03 A1 标题格式
+    a1 = ws["A1"]
+    d03 = not ((a1.font.name or "") == _TITLE_FONT and _num(a1.font.sz) == 22.0
+               and bool(a1.font.b) and _rgb6(a1.font.color) == _C_WHITE
+               and _fill6(a1) == _C_TITLE_FILL and "A1:F1" in merges and _centered(a1))
+    ded(1, d03, "A1 标题“教学资源管理汇总台账”不满足——方正小标宋简体、22 磅、加粗、白色字、"
+                "填充色 1F4E5F、A1:F1 合并且水平垂直居中")
+
+    # D04 表头行 A2:F2 格式
+    d04 = False
+    for coord in sorted(_MAIN_HEADER):
+        c = ws[coord]
+        if not (bool(c.font.b) and _rgb6(c.font.color) == _C_WHITE
+                and _fill6(c) == _C_HEAD_FILL and _centered(c)
+                and _wrap_ok(c) and _thin4(c)):
+            d04 = True
+    ded(1, d04, "表头行 A2:F2（序号/资源类别/所属单元/登记数量（件）/核验数量（件）/备注）"
+                "不满足——加粗白色字、填充色 6FA8A0、水平垂直居中、自动换行、四周细实线边框")
+
+    # D05 数据行 A3:F16 格式（合计行另计）
+    d05 = False
+    for c in _iter_rect(ws, (3, 1, 16, 6)):
+        if c.row in sum_rows or c.value is None or c.coordinate in covered:
+            continue
+        sz = _num(c.font.sz)
+        if not (not bool(c.font.b) and (sz is None or sz in (11.0, 12.0))
+                and _centered(c) and _fill6(c) == _C_BODY_FILL and _thin4(c)):
+            d05 = True
+    ded(1, d05, "数据行 A3:F16 不满足——11 磅常规字（登记数量列 12 磅）、水平垂直居中、"
+                "填充色 E9F4F2、四周细实线边框")
+    # D06 “合计”行格式
+    d06 = False
+    for r in sum_rows:
+        for c in _iter_rect(ws, (r, 1, r, 6)):
+            if c.value is None or c.coordinate in covered:
+                continue
+            if not (bool(c.font.b) and _rgb6(c.font.color) == _C_SUM_FONT
+                    and _fill6(c) == _C_SUM_FILL and _centered(c) and _thin4(c)):
+                d06 = True
+    ded(1, d06, "“合计”行（第 5、8、11、14、17 行）不满足——加粗、字体颜色 1F2933、"
+                "填充色 D8EBE8、居中对齐、四周细实线边框")
+
+    # D07 主表 20 处合并
+    ded(1, not set(_MAIN_MERGES) <= merges,
+        "A3:A4、A6:A7、A9:A10、A12:A13、A15:A16 序号纵向合并，B3:B4、B6:B7、B9:B10、"
+        "B12:B13、B15:B16 类别纵向合并，A5:C5、A8:C8、A11:C11、A14:C14、A17:C17 合计跨列合并，"
+        "E3:E5、E6:E8、E9:E11、E12:E14、E15:E17 核验数量纵向合并被取消或范围被改变")
+
+    # D08 列宽 / 行高
+    d08 = False
+    for col, w in _COL_WIDTHS.items():
+        got = ws.column_dimensions[col].width if col in ws.column_dimensions else None
+        if got is None or abs(float(got) - w) > 0.1:
+            d08 = True
+    for r, h in _ROW_HEIGHTS.items():
+        got = ws.row_dimensions[r].height if r in ws.row_dimensions else None
+        if got is None or abs(float(got) - h) > 0.6:
+            d08 = True
+    for r in range(3, 18):
+        got = ws.row_dimensions[r].height if r in ws.row_dimensions else None
+        if got is None or abs(float(got) - _ROW_HEIGHT_BODY) > 0.6:
+            d08 = True
+    ded(1, d08, "列宽 A 4.88、B 16.13、C 21.5、D 16.38、F 9.0 或行高"
+                "（第 1 行 28.5、第 2 行 27.0、第 3 行及以下 26.0）被改动")
+
+    # D09 主表表头文字被改写
+    ded(1, bool(head_bad), "主表表头文字被改写为图表字段名（如把“登记数量（件）”“核验数量（件）”"
+                           "改成“登记数量”“核验数量”或英文字段）")
+
+    # D10 / D11 右侧汇总区取值
+    ded(3, bool(htop_bad), "H2:M7 汇总表被删除或数值被改写（表头资源类别/综管科/服务科/合计/"
+                           "核验数量/辅助列，及 5 个类别对应的 6·9·15·13、22·8·30·27、"
+                           "18·6·24·22、12·3·15·14、5·2·7·6）")
+    ded(3, bool(hbot_bad), "H10:M15 转置汇总表被删除或数值被改写（H10:M10 类别行，"
+                           "综管科 6/22/18/12/5、服务科 9/8/6/3/2、合计 15/30/24/15/7、"
+                           "核验数量 13/27/22/14/6 各行及“辅助列”行）")
+    # D12 H2:M2 与 H10:M10 表头格式
+    d12 = False
+    for ch in "HIJKLM":
+        for coord, want_fill in (("%s2" % ch, _C_HEAD_FILL), ("%s10" % ch, _C_BODY_FILL)):
+            c = ws[coord]
+            if not (bool(c.font.b) and _rgb6(c.font.color) == _C_WHITE
+                    and _centered(c) and _wrap_ok(c) and _thin4(c)
+                    and _fill6(c) == want_fill):
+                d12 = True
+    ded(1, d12, "H2:M2 与 H10:M10 表头不满足——加粗白色字、水平垂直居中、自动换行、"
+                "四周细实线边框（H2:M2 填充色 6FA8A0，H10:M10 填充色 E9F4F2）")
+
+    # D13 H13:M14 两行格式
+    d13 = False
+    for c in _iter_rect(ws, (13, 8, 14, 13)):
+        if c.value is None:
+            continue
+        if not (bool(c.font.b) and _rgb6(c.font.color) == _C_SUM_FONT
+                and _fill6(c) == _C_SUM_FILL and _centered(c)):
+            d13 = True
+    ded(1, d13, "H13:M14“合计”“核验数量”两行不满足——加粗、字体颜色 1F2933、"
+                "填充色 D8EBE8、居中对齐")
+
+    # D14 H15:M15“辅助列”行
+    h15 = ws["H15"]
+    d14 = not (_norm(h15.value) == "辅助列" and _fill6(h15) == _C_BODY_FILL and _thin4(h15))
+    ded(1, d14, "H15:M15“辅助列”行被删除，或其 E9F4F2 填充与四周细实线边框被改动")
+
+    # D15 承载台账的工作表
+    d15 = not (ws.title == _SHEET_NAME and ws.sheet_state == "visible"
+               and wb.sheetnames.index(ws.title) == 0)
+    ded(1, d15, "承载台账的工作表 Sheet1 被改名、隐藏、删除或调整为非首个工作表")
+
+    # D16 绘图数据表覆盖写入受保护区域
+    d16 = False
+    for rect in (_RECT_MAIN, _RECT_HELP):
+        for c in _iter_rect(ws, rect):
+            if c.value is not None and c.coordinate not in base_coords:
+                d16 = True
+    ded(1, d16, "新增的绘图数据表覆盖写入 A1:F17 或 H2:M15 所占单元格，挤占已有内容")
+
+    # D17 残留多余/空白工作表
+    used_sheets = set(an["sheet"] for an in anchors)
+    d17 = False
+    for w in wb.worksheets:
+        if w is ws:
+            continue
+        if w.title in used_sheets:
+            continue
+        if not any(c.value is not None for row in w.iter_rows() for c in row):
+            d17 = True
+    ded(1, d17, "交付文件中残留与本次任务无关的多余工作表或空白工作表")
+    # D18 残留未完成的中间图表或重复的第二个对比图
+    d18 = len(real_charts) >= 2 or any(
+        _norm(c["info"].get("title")) in ("图表标题", "ChartTitle") for c in real_charts)
+    ded(1, d18, "交付文件中残留未完成的中间图表（如标题仍为“图表标题”的默认簇状柱形图）"
+                "或功能重复的第二个对比图表")
+
+    # D19 自造内容
+    d19 = False
+    for w in wb.worksheets:
+        for row in w.iter_rows():
+            for c in row:
+                if c.value is None or _num(c.value) is not None:
+                    continue
+                if w is ws and c.coordinate in base_coords:
+                    continue
+                t = _norm(c.value)
+                if t in _ALLOWED_TEXT:
+                    continue
+                if "登记" in t and "核验" in t and "对比" in t:   # 图表标题文字
+                    continue
+                d19 = True
+    ded(1, d19, "绘图数据表中出现指令未要求的自造内容（如“差异”列、虚构科室、虚构数值、"
+                "拼接出的组合标签列）")
+
+    # D20 默认打开视图
+    sv = ws.sheet_view
+    zoom = sv.zoomScale
+    d20 = bool(ws.freeze_panes) or (sv.showGridLines is False) \
+        or (zoom is not None and int(zoom) != 100)
+    try:
+        if wb.views and wb.views[0].activeTab not in (None, 0):
+            d20 = True
+    except Exception:
+        pass
+    ded(1, d20, "工作簿的默认打开视图被改动（新增冻结窗格、隐藏网格线、修改缩放比例或"
+                "改变活动工作表定位）")
+
+    # D21 新增公式/批注/条件格式/数据验证
+    d21 = False
+    for rect in (_RECT_MAIN, _RECT_HELP):
+        for c in _iter_rect(ws, rect):
+            if getattr(c, "data_type", None) == "f" or getattr(c, "comment", None):
+                d21 = True
+    for holder in (ws.data_validations.dataValidation, list(ws.conditional_formatting)):
+        for item in holder:
+            sq = getattr(item, "sqref", None)
+            for rng in (getattr(sq, "ranges", []) or []):
+                rr = (rng.min_row, rng.min_col, rng.max_row, rng.max_col)
+                if _rect_overlap(rr, _RECT_MAIN) or _rect_overlap(rr, _RECT_HELP):
+                    d21 = True
+    ded(1, d21, "在台账主表或汇总辅助区单元格中新增指令未要求的公式、批注、条件格式或数据验证")
+
+    wb.close()
+
+    # ---------- 汇总 ----------
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("结果条目数(%d)与 max_delta 序列(%d)不一致"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    total = 0
+    dim2_items = []
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _sep, rule = raw.partition("：")
+        got = int(head.replace("+", "").replace("-", "").strip())
+        hit = got > 0
+        delta = max_delta if hit else 0
+        total += delta
+        dim2_items.append({"rule": rule, "max_delta": max_delta, "delta": delta,
+                           "hit": hit})
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total
+    return result
+
+
 if __name__ == "__main__":
-    if len(sys.argv) >= 2:
-        _dir = sys.argv[1]
-    else:
-        _dir = os.path.dirname(os.path.abspath(__file__))
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
     print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))

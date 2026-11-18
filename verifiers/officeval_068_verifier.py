@@ -1,1191 +1,929 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# pyright: reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportMissingParameterType=false
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingImports=false
 """
-对 "合并_浅蓝可编辑版.pptx" 的自动评估脚本。
+068 —— 汇报 PDF 与调度坐席 PPT 合并为浅蓝可编辑演示文稿 完成度校验器
 
-评分逻辑：
-  维度1（可用与可修改性）：硬性门槛。任一关键项失败 -> 总分 0，且不再检查维度2。
-  维度2（完成度评分细则）：
-      四个加分项，每项 +5（每项内部所有点都必须满足才计分）
-      最终输出命中明细 + 总分。
+指令：我现在要把两个文件合在一起后修改一下，把"综合调度坐席系统操作介绍"ppt里的
+      第13/16/18页删掉不用了，之后把"综合调度坐席系统操作介绍"ppt剩余的页面放在
+      第二个PDF的第8页后面，最后给我一个做好的PPT文件。所有PPT页面背景及字体改为
+      蓝色系，都做成可编辑的
+
+说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+由脚本自己在该目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为
+本地调试入口，才把 dict 序列化为 JSON 打印。
+
+判定一律不依赖任何外部基准文件：细则里写明的每一处常量（页数、逐页页序锚点、
+须保留的逐条文案、须缺席的三页标题、页面尺寸、蓝色相区间、可编辑门槛、
+矢量轮廓门槛、正文字号门槛）都以常量形式内联在本文件中，脚本只读被评估的
+那一个 .pptx。
 """
 
-import json
 import os
 import re
 import sys
+import json
 import zipfile
-from collections import Counter
+import colorsys
+import collections
+from xml.etree import ElementTree as ET
 
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# 脚本编号（用于返回结果 id 字段）
 SCRIPT_ID = "068"
+MAX_SCORE_TOTAL = 50
 
-# ---------- 期望的 25 页标题（严格按细则文字）----------
-# 顺序：第 1–25 页对应的标题，必须每一页都"命中"对应的名称。
-# 注：细则中第 1 页只写明是"封面"，第 8 页只写明是"典型设备组成"，
-#    其余页都给出了明确标题，这里完全按细则给出的字面命名。
-EXPECTED_TITLES = [
-    "封面",                                # 1
-    "目录",                                # 2
-    "网络定位与构成",                      # 3
-    "典型保障场景",                        # 4
-    "核心能力价值（一）",                  # 5
-    "核心能力价值（二）",                  # 6
-    "台站体系与协作架构",                  # 7
-    "典型设备组成",                        # 8
-    "云岚调度坐席平台",                    # 9
-    "内容结构",                            # 10
-    "系统总览：调度坐席的四层协作",        # 11
-    "登录：进入值守环境",                  # 12
-    "主界面：把高频操作放在同一屏",        # 13
-    "焦点规则：先确认“操作”，再确认“语音”",# 14
-    "工单窗口：先记录，再执行呼叫动作",    # 15
-    "线路状态：用可视化面板降低误操作",    # 16
-    "接续流程：从来话到三方沟通",          # 17
-    "转接与交叉操作：语音不一定跟着窗口走",# 18
-    "合并与拆分：处理复杂通话关系",        # 19
-    "查号：用更少输入找到正确联系人",      # 20
-    "即时会议：临时协同但不污染会议列表",  # 21
-    "座席互联：用于班组内快速沟通",        # 22
-    "主菜单：按业务动作重新归类",          # 23
-    "运行流程与管理要点",                  # 24
-    "谢谢聆听",                            # 25
+# 加分项满分序列，顺序与 results 的 append 顺序严格一致
+_MAX_DELTAS_ORDER = [
+    5,   # 01 交付 1 个 .pptx，含两部分内容共 25 页，无空白页无重复页
+    3,   # 02 不含"预约会议：把参会方和发起流程提前准备好"
+    3,   # 03 不含"工单列表与预约回呼：让未完成事项可追踪"
+    3,   # 04 不含"值守检查清单"
+    5,   # 05 第8页为"典型设备组成"，操作介绍紧随其后插入
+    5,   # 06 第24/25页为"运行流程与管理要点""谢谢聆听"
+    3,   # 07 第9-23页共15页依次就位
+    5,   # 08 25页页面背景底色均为蓝色系
+    5,   # 09 25页文字着色均为蓝色系
+    3,   # 10 蓝底与蓝字之间保持可读对比
+    5,   # 11 全部页面文字为可编辑文本
+    5,   # 12 全部示意图形为可编辑矢量形状
 ]
+assert sum(_MAX_DELTAS_ORDER) == MAX_SCORE_TOTAL
 
-# ---------- 颜色相关工具 ----------
-def hex_to_rgb(h):
-    h = h.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+# 减分项扣分序列，顺序与 results 中减分项的 append 顺序严格一致（共 24 项）
+_PENALTY_DELTAS_ORDER = [-3, -3, -3, -1, -3, -3, -1, -5, -3, -1, -1] + [-1] * 13
 
-def is_light_blue(rgb_hex):
-    """浅蓝/浅蓝渐变：R<=G<=B 且 B 偏高、整体偏亮；或落在常见浅蓝色域。"""
-    if not rgb_hex:
-        return False
-    try:
-        r, g, b = hex_to_rgb(rgb_hex)
-    except Exception:
-        return False
-    # 整体亮度高（不是深色）
-    bright = (r + g + b) / 3 >= 170
-    # 蓝色分量占优
-    blue_dom = b >= r and b >= g and b - min(r, g) >= 5
-    return bright and blue_dom
+# ============================ 命名空间 ============================
+NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
-def is_dark_blue_or_teal(rgb_hex):
-    """深蓝 / 蓝绿（用于标题文字判定）。"""
-    if not rgb_hex:
-        return False
-    try:
-        r, g, b = hex_to_rgb(rgb_hex)
-    except Exception:
-        return False
-    if (r + g + b) / 3 > 200:        # 太亮的不算
-        return False
-    # 深蓝：B 显著大于 R
-    deep_blue = b >= 90 and b - r >= 25
-    # 蓝绿：G、B 都不低且明显大于 R
-    teal = g >= 90 and b >= 90 and (g - r) >= 20 and (b - r) >= 20
-    return deep_blue or teal
+# ============================ 版式常量 ============================
+SLIDE_TOTAL = 25
+EMU_PER_IN = 914400.0
+EMU_PER_CM = 360000.0
+# 幻灯片尺寸：宽 14.22 英寸 × 高 8.00 英寸（1024×576 磅）
+SLIDE_W_IN, SLIDE_H_IN = 14.222, 8.0
+SIZE_TOL_IN = 0.15
 
-def is_high_saturation_bad(rgb_hex):
-    """大面积深黑 / 深红 / 高饱和（与浅蓝风格割裂）。"""
-    if not rgb_hex:
-        return False
-    try:
-        r, g, b = hex_to_rgb(rgb_hex)
-    except Exception:
-        return False
-    avg = (r + g + b) / 3
-    if avg <= 40:                          # 深黑
-        return True
-    if r >= 150 and r - g >= 60 and r - b >= 60:   # 深红
-        return True
-    return False
+# 逐页页序锚点：该页归一化文本必须含有下列全部片段，页序据此认定（不看页码标注）
+ORDER_ANCHORS = {
+    1:  ['应急有线人工通信保障网', '定义场景价值与台站体系解析'],
+    2:  ['CONTENTS'],
+    3:  ['什么是人工通信保障网'],
+    4:  ['从常态值守到突发联络的备用语音链路'],
+    5:  ['核心能力价值一', '强调可用可控可审计'],
+    6:  ['核心能力价值二', '让应急联络有顺序有冗余有恢复路径'],
+    7:  ['台站体系与协作架构'],
+    8:  ['典型设备组成'],
+    9:  ['操作介绍与值守流程'],
+    10: ['登录与界面', '值守规范'],
+    11: ['系统总览调度坐席的四层协作'],
+    12: ['登录进入值守环境'],
+    13: ['主界面把高频操作放在同一屏'],
+    14: ['焦点规则先确认操作再确认语音'],
+    15: ['工单窗口先记录再执行呼叫动作'],
+    16: ['线路状态用可视化面板降低误操作'],
+    17: ['接续流程从来话到三方沟通'],
+    18: ['转接与交叉操作语音不一定跟着窗口走'],
+    19: ['合并与拆分处理复杂通话关系'],
+    20: ['查号用更少输入找到正确联系人'],
+    21: ['即时会议临时协同但不污染会议列表'],
+    22: ['座席互联用于班组内快速沟通'],
+    23: ['主菜单按业务动作重新归类'],
+    24: ['运行流程与管理要点', '让人工链路形成可追踪的闭环'],
+    25: ['谢谢聆听', 'THANKSFORLISTENING'],
+}
+# 操作介绍内容所占的页位区间（第9页封面 + 第10-23页正文）
+AGENT_PAGES = list(range(9, 24))
+# 带眉标与页脚的操作介绍正文页（封面页无眉标页脚，不纳入该项）
+AGENT_BODY_PAGES = list(range(10, 24))
+PLACEHOLDER = 8            # 操作介绍内容须紧随其后插入的页位
+TAIL_PAGES = (24, 25)      # 专题汇报末两页所在页位
 
-def shape_fill_hex(sh):
-    try:
-        if sh.fill.type == 1:              # SOLID
-            rgb = sh.fill.fore_color.rgb
-            if rgb is not None:
-                return str(rgb)
-    except Exception:
-        pass
-    return None
+# 须整页缺席的三页标题（指令明确要求删除）
+DELETED_TITLES = [
+    '预约会议把参会方和发起流程提前准备好',
+    '工单列表与预约回呼让未完成事项可追踪',
+    '值守检查清单',
+]
+# 被删除三页的专属文案：若出现在任何保留页，说明删除页内容被挪并进了别的页面
+DELETED_BODY_TOKENS = ['把参会方', '发起流程', '预约回呼', '工单列表',
+                       '值守检查', '检查清单']
+# 两部分内容各自的识别标识
+PART_A_KEY = '应急有线人工通信保障网'
+PART_B_KEY = '云岚调度坐席平台'
+# 页面家具（页眉眉标 / 页脚），做重复文本判定时须排除
+FURNITURE = ('操作培训', '云岚调度坐席平台')
+# 指令未涉及、属于凭空新增的说明文字与小标题
+ADDED_HEADINGS = ['四个部分构成完整汇报框架', '协作说明', '运行说明',
+                  '操作说明', '快捷键', '会场窗口能力']
+# 标注页面来源的附加文字
+PROVENANCE_RE = re.compile(r'(?:PDF|PPT)原第\d+页')
+# 第9页封面须分行独立呈现、不得被"｜"并成一行的两处文字
+COVER_SPLIT_PAIR = ('操作介绍与值守流程', '面向调度中心服务热线园区值守等场景')
 
-# ---------- 基础读取 ----------
-def load_slide_data(prs):
-    """采集每页文本、形状、颜色信息。"""
-    data = []
-    for idx, slide in enumerate(prs.slides, 1):
-        shapes_info = []
-        all_text_segments = []
-        for sh in slide.shapes:
-            text = ""
-            font_names = []
-            font_sizes = []
-            bolds = []
-            colors = []
-            aligns = []
-            if sh.has_text_frame:
-                for para in sh.text_frame.paragraphs:
-                    if para.alignment is not None:
-                        aligns.append(str(para.alignment))
-                    for run in para.runs:
-                        if run.text:
-                            text += run.text
-                            font_names.append(run.font.name)
-                            font_sizes.append(run.font.size.pt if run.font.size else None)
-                            bolds.append(bool(run.font.bold))
-                            try:
-                                col = run.font.color.rgb
-                                colors.append(str(col) if col is not None else None)
-                            except Exception:
-                                colors.append(None)
-                    text += "\n"
-                text = text.strip()
-            fill_hex = shape_fill_hex(sh)
+# 逐页须保留的文案（键为页位，值为该页归一化文本须含有的全部片段）
+KEEP_TOC_A = (2, ['网络定位与构成', 'NetworkPositioningandComposition',
+                  '典型保障场景', 'TypicalSupportScenarios',
+                  '核心能力价值', 'CoreCapabilitiesandValue',
+                  '台站层级与设备', 'StationHierarchyandEquipment'])
+KEEP_P3 = (3, ['关键词人工接续有线传输层级汇接闭环记录', '四个基础组成',
+               '人工接续台', '有线传输链路', '用户终端', '安全与记录'])
+KEEP_P4 = (4, ['从常态值守到突发联络的备用语音链路', '应急指挥备份', '园区专线联络',
+               '偏远站点接入', '跨班值守交接', '大型活动保障', '灾害抢险协同'])
+KEEP_P56 = [(5, ['强调可用可控可审计', '稳定性', '可控性']),
+            (6, ['让应急联络有顺序有冗余有恢复路径', '优先级调度', '快速恢复',
+                 '低依赖运行', '易培训维护'])]
+KEEP_P7 = (7, ['层级汇接分区管理按需接入', '中心汇接站', '区域转接站',
+               '现场保障站', '终端接入点'])
+KEEP_P8 = (8, ['人工交换坐席', '线路分配架', '有线传输介质',
+               '安全记录设备', '值守终端'])
+KEEP_P24 = (24, ['让人工链路形成可追踪的闭环', '接入确认', '记录需求', '选择通道',
+                 '呼出转接', '归档复核', '可靠接入', '身份核对', '闭环记录'])
+KEEP_P25 = (25, ['THANKSFORLISTENING', '稳定可控可恢复',
+                 '人工有线通信链路为应急联络保留可靠的组织保障'])
+KEEP_TOC_B = (10, ['登录与界面', '工单处理', '接续操作',
+                   '检索查号', '会议协作', '值守规范'])
+KEEP_P11 = (11, ['来话接入', '坐席工作区', '路由与交换', '协作与归档'])
+KEEP_P16 = (16, ['L%02d' % n for n in range(1, 21)])
 
-            try:
-                left = sh.left or 0
-                top = sh.top or 0
-                width = sh.width or 0
-                height = sh.height or 0
-            except Exception:
-                left = top = width = height = 0
+# ============================ 判定门槛 ============================
+# 蓝色系：色相落在 185°-255° 视为蓝色相（深蓝、中蓝、浅蓝、蓝灰均计入）
+BLUE_HUE_LO, BLUE_HUE_HI = 185.0, 255.0
+NEUTRAL_S, NEUTRAL_L_HI, NEUTRAL_L_LO = 0.12, 0.94, 0.06
+# 深蓝底上的白字与近白字视为达标：明度高于此值即认定为白色或近白色
+NEAR_WHITE_L = 0.90
+# 【通用判定门槛】1）"蓝色系"只针对页面背景底色与文字着色两处，图形填充、
+#   图形描边、装饰细线、表格单元格边框均不参与判定。
+# 文字着色判定的容差：异色文字 run 数占全篇有文字 run 的比例上限
+FONT_OFF_RATIO = 0.02
+# 文字与其所在底色的对比度下限（低于此值视为压底不可辨识）
+CONTRAST_MIN = 2.0
+# 说明性正文字号下限（磅）；只对归一化后长度≥12 的成句文本设限，页码/眉标/页脚不计
+BODY_SIZE_MIN = 10.0
+BODY_TEXT_MIN_LEN = 12
+# 矢量轮廓门槛：全篇自由绘制轮廓（custGeom）总数下限
+CUSTGEOM_MIN = 20
+# 同页重复承载判定：单页出现的"文本包含/重复"关系数超过此值即认定重复叠压
+#   （标题与页脚眉标之间的一处正常回显不计入）
+DUP_REL_MAX = 1
+DUP_MIN_LEN = 6
 
-            shapes_info.append({
-                "shape": sh,
-                "type": sh.shape_type,
-                "text": text,
-                "font_names": font_names,
-                "font_sizes": font_sizes,
-                "bolds": bolds,
-                "text_colors": colors,
-                "alignments": aligns,
-                "fill_hex": fill_hex,
-                "left": left,
-                "top": top,
-                "width": width,
-                "height": height,
-            })
-            if text:
-                all_text_segments.append(text)
-
-        # 背景色
-        bg_hex = None
-        try:
-            if slide.background.fill.type == 1:
-                rgb = slide.background.fill.fore_color.rgb
-                if rgb is not None:
-                    bg_hex = str(rgb)
-        except Exception:
-            pass
-
-        data.append({
-            "index": idx,
-            "shapes": shapes_info,
-            "texts": all_text_segments,
-            "bg_hex": bg_hex,
-            "slide": slide,
-        })
-    return data
+# 归一化时剔除的空白与标点（保留数字，页码/线路编号判定要用）
+_PUNCT = set('　 \t\r\n·、，。；：？！“”‘’（）()《》〈〉【】[]{},.;:?!|｜/\\-—–~•*"\'')
 
 
-# ============================================================
-# 维度 1
-# ============================================================
-def _check_file_openable(file_path):
-    """检测文件是否"能够正常打开"。
-    返回 (openable: bool, reasons: list[str])。
-    检查项：
-      (a) 文件存在且非空；
-      (b) 是有效的 OOXML 压缩包（zipfile 可解压）；
-      (c) 关键部件齐全：至少包含 `ppt/presentation.xml`。
-    """
-    findings = []
-
-    # (a) 文件存在且非空
-    try:
-        if not os.path.exists(file_path):
-            findings.append("文件不存在")
-            return False, findings
-        if os.path.getsize(file_path) <= 0:
-            findings.append("文件大小为 0")
-            return False, findings
-    except Exception as e:
-        findings.append(f"文件状态读取失败: {e}")
-        return False, findings
-
-    # (b)(c) OOXML 结构
-    try:
-        with zipfile.ZipFile(file_path) as z:
-            names = set(z.namelist())
-            if "ppt/presentation.xml" not in names:
-                findings.append("OOXML 包缺少 ppt/presentation.xml，无法正常打开")
-    except zipfile.BadZipFile:
-        findings.append("文件不是有效的 OOXML 压缩包（无法作为 .pptx 打开）")
-    except Exception as e:
-        findings.append(f"打开 .pptx 失败: {e}")
-
-    return len(findings) == 0, findings
-
-
-def check_dimension1(_prs, _slide_data, file_path):
-    """返回 (passed: bool, reasons: list[str])。
-    维度 1 现只做"格式 + 能否正常打开"的硬门槛，因此 prs / slide_data 在此不使用，
-    仅为与主流程调用签名保持一致而保留。"""
-    reasons = []
-
-    # 1. 格式：交付文件为 .pptx
-    if not file_path.lower().endswith(".pptx"):
-        reasons.append("文件扩展名不是 .pptx")
-        return False, reasons
-
-    # 2. 能否正常打开
-    openable, findings = _check_file_openable(file_path)
-    if not openable:
-        reasons.append("文件无法正常打开：" + "；".join(findings))
-        return False, reasons
-
-    reasons.append("文件为 .pptx，能够正常打开")
-    return True, reasons
-
-
-# ============================================================
-# 维度 2
-# ============================================================
-def slide_title_text(info):
-    """取一页中最可能是"标题"的文本：选纵向靠上、字号较大、且不是 '01'/'页码' 之类的短编号。"""
-    candidates = []
-    for sh in info["shapes"]:
-        t = sh["text"].strip()
-        if not t:
-            continue
-        if re.fullmatch(r"\d{1,3}", t):           # 纯数字（页码）
-            continue
-        if re.fullmatch(r"PDF原第\d+页|PPT原第\d+页", t):  # 旧标记（如果存在）
-            continue
-        max_size = max([s for s in sh["font_sizes"] if s] or [0])
-        candidates.append((sh["top"], -max_size, t, sh))
-    candidates.sort()
-    # 取前 6 个合并作为标题搜索池
-    return " ".join(c[2] for c in candidates[:6])
+# ============================ 基础工具 ============================
+def _q(uri, name):
+    return '{%s}%s' % (uri, name)
 
 
 def _norm(s):
-    """归一化字符串：去空白、统一中英文标点，方便做包含匹配。"""
-    if not s:
-        return ""
-    s = s.replace("　", "").replace(" ", "").replace("\n", "").replace("\t", "")
-    # 引号 / 冒号 / 括号 全部转半角
-    table = str.maketrans({
-        "“": '"', "”": '"', "‘": "'", "’": "'",
-        "：": ":", "（": "(", "）": ")",
-        "，": ",", "。": ".", "、": ",",
-    })
-    return s.translate(table)
+    """去掉空白与标点后的比较用文本（保留数字与中英文字符）。"""
+    return ''.join(ch for ch in (s or '') if ch not in _PUNCT)
 
 
-def check_plus1_pages_and_order(prs, slide_data, file_path):
-    """+5：交付 .pptx，共 25 页；每一页按细则给出的顺序与标题一一对应。"""
-    detail = []
-
-    # (a) 文件格式
-    if not file_path.lower().endswith(".pptx"):
-        return False, ["文件不是 .pptx"]
-
-    # (b) 25 页
-    if len(prs.slides) != 25:
-        return False, [f"页数 {len(prs.slides)} ≠ 25"]
-
-    # (c) 每页标题必须匹配细则
-    #     细则写的是"第 1 页 = 封面、第 2 页 = 目录、第 10 页 = 内容结构"——
-    #     其中第 1 页是"封面"角色，第 2 页必须是"目录"（不能与第 10 页"内容结构"混用）。
-    #     其余页直接按字面匹配。
-    mismatches = []
-    for i, expected in enumerate(EXPECTED_TITLES, 1):
-        info = slide_data[i - 1]
-        page_text_norm = _norm("\n".join(info["texts"]))
-
-        if i == 1:                            # 封面
-            # 不允许出现"目录 / CONTENTS / 内容结构"等目录性关键词
-            if ("目录" in page_text_norm
-                    or "contents" in page_text_norm.lower()
-                    or "内容结构" in page_text_norm):
-                mismatches.append((i, expected, "含目录关键字，非封面"))
-                continue
-
-            # 必须能验证"封面身份"：满足以下任一：
-            #   1) 版式名 / 母版名 包含 "封面" / "title" / "cover"
-            #   2) 存在 PP_PLACEHOLDER.TITLE / CENTER_TITLE / SUBTITLE 版式占位符
-            #   3) 存在文字命中封面关键标题（"云岚" / "调度坐席" / "平台" 等主标题词），
-            #      且有明显的大字号主标题（>=24pt）
-            slide = info["slide"]
-            cover_id_ok = False
-            reasons_cover = []
-
-            # (1) 版式 / 母版名
-            try:
-                layout_name = (slide.slide_layout.name or "").lower()
-            except Exception:
-                layout_name = ""
-            try:
-                master_name = (slide.slide_layout.slide_master.name or "").lower()
-            except Exception:
-                master_name = ""
-            if any(k in layout_name for k in ("封面", "cover", "title"))\
-                    or any(k in master_name for k in ("封面", "cover", "title")):
-                cover_id_ok = True
-                reasons_cover.append(f"layout={layout_name!r}")
-
-            # (2) 标题/副标题占位符
-            if not cover_id_ok:
-                try:
-                    from pptx.enum.shapes import PP_PLACEHOLDER
-                    ph_kinds = set()
-                    for shp in slide.placeholders:
-                        try:
-                            ph_kinds.add(shp.placeholder_format.type)
-                        except Exception:
-                            pass
-                    if (PP_PLACEHOLDER.TITLE in ph_kinds
-                            or PP_PLACEHOLDER.CENTER_TITLE in ph_kinds
-                            or PP_PLACEHOLDER.SUBTITLE in ph_kinds):
-                        cover_id_ok = True
-                        reasons_cover.append("含 TITLE/CENTER_TITLE/SUBTITLE 占位符")
-                except Exception:
-                    pass
-
-            # (3) 关键标题词 + 大字号
-            if not cover_id_ok:
-                cover_keywords = ("云岚", "调度坐席", "调度台", "坐席平台")
-                if any(k in page_text_norm for k in cover_keywords):
-                    max_size = 0
-                    for sh in info["shapes"]:
-                        sizes = [s for s in sh["font_sizes"] if s] or [0]
-                        if max(sizes) > max_size:
-                            max_size = max(sizes)
-                    if max_size >= 24:
-                        cover_id_ok = True
-                        reasons_cover.append(f"含封面关键词且主标题字号={max_size}")
-
-            if not cover_id_ok:
-                mismatches.append((i, expected, "未能识别为封面（版式/占位符/关键标题均不匹配）"))
-            continue
-
-        if i == 2:                            # 目录
-            # 严格匹配"目录 / CONTENTS"，不接受"内容结构"（那是第 10 页）
-            if not any(k in page_text_norm for k in ("目录",))\
-                    and "contents" not in page_text_norm.lower():
-                mismatches.append((i, expected, "未出现'目录'/'CONTENTS'"))
-            continue
-
-        # 其余页：字面包含匹配
-        exp_norm = _norm(expected)
-        if exp_norm not in page_text_norm:
-            mismatches.append((i, expected, "字面标题未命中"))
-
-    if mismatches:
-        for item in mismatches:
-            if len(item) == 3:
-                i, t, why = item
-                detail.append(f"第 {i} 页未匹配到标题 {t!r}：{why}")
-            else:
-                i, t = item
-                detail.append(f"第 {i} 页未匹配到标题: {t!r}")
-        return False, detail
-
-    detail.append("文件为 .pptx；共 25 页；25 页标题与顺序全部匹配细则（第 2 页严格为目录，第 1 页身份为封面）")
-    return True, detail
+def _key(s):
+    """重复文本判定用的键：在 _norm 基础上再去掉数字（页码/序号不参与比较）。"""
+    return ''.join(ch for ch in _norm(s) if not ch.isdigit())
 
 
-def check_plus2_editable(prs, slide_data):
-    """+5：PDF 转换页面文字 + 全部 25 页可编辑。
-    细则要求：
-      - 第 1–8 页 及 第 24、25 页：
-          文本类：标题、正文、编号、说明 —— 均为可编辑文本框；
-          形状类：流程框、箭头、圆形、图标、分隔线、示意结构 —— 均为可编辑形状或
-                 可编辑组合对象。
-      - 第 9–23 页：文字、表格、形状、流程对象、图标 保持可编辑。
+class _Package(object):
+    """按 OPC 包读取 .pptx；只读，不改写被评估文件。"""
 
-    本函数**按对象类别**逐类检测，不再仅用数量阈值近似：
-      * "标题"     = 最大字号非纯数字文本；
-      * "正文"     = 中/大量文字（≥ 8 个字符）、字号不属于"标题字号"的文本框；
-      * "编号"     = 短小的编号型文本（纯数字、"01"、"①-⑳"、"Step X"、"1." 等）；
-      * "说明"     = 明显小字号（<= 14pt 或页面最小字号档）的补充文本；
-      * "流程框"   = 矩形 / 圆角矩形 类 AUTO_SHAPE；
-      * "箭头"     = ARROW / CHEVRON / PENTAGON 等箭头族 AUTO_SHAPE，
-                    或带箭头端点的 LINE / CONNECTOR；
-      * "圆形"     = OVAL / ELLIPSE；
-      * "图标"     = 小尺寸 AUTO_SHAPE / FREEFORM / GROUP（长宽 ≤ 页面 1/6），
-                    或非整页的矢量小图片；
-      * "分隔线"   = LINE / CONNECTOR，或极细长的矩形；
-      * "示意结构" = GROUP，或"多个可编辑形状 + 线/箭头"组合。
-    """
-    detail = []
-    PDF_PAGES = set(list(range(1, 9)) + [24, 25])     # 1-8、24、25
-    PPT_PAGES = set(range(9, 24))                     # 9-23
+    def __init__(self, path):
+        self.zf = zipfile.ZipFile(path)
+        self.names = list(self.zf.namelist())
+        self.nameset = set(self.names)
+        self._theme_cache = {}
 
-    # 兼容不同 python-pptx 版本
-    def _mst(name):
-        return getattr(MSO_SHAPE_TYPE, name, None)
-
-    T_PICTURE   = _mst("PICTURE")
-    T_AUTO      = _mst("AUTO_SHAPE")
-    T_FREEFORM  = _mst("FREEFORM")
-    T_GROUP     = _mst("GROUP")
-    T_LINE      = _mst("LINE")
-
-    def _auto_shape_name(sh_dict):
-        """返回该 shape 的 auto_shape_type 名称（大写字符串），失败时 ''。"""
+    def close(self):
         try:
-            ast = sh_dict["shape"].auto_shape_type
-            return str(ast).upper() if ast is not None else ""
-        except Exception:
-            return ""
-
-    def is_full_page_picture(s):
-        return (s["type"] == T_PICTURE
-                and s["width"] >= prs.slide_width * 0.85
-                and s["height"] >= prs.slide_height * 0.85)
-
-    # ---------- 文本类分类 ----------
-    NUMBERING_RE = re.compile(
-        (
-            r"^(?:"
-            r"\d{1,3}"                                # 1 / 01 / 100
-            r"|[①-⑳]"                                # 圈号
-            r"|[一二三四五六七八九十]{1,3}"           # 中文序号
-            r"|(?:step|步骤|序号)\s*\d{1,3}"          # Step 1 / 步骤1
-            r"|\d{1,3}[.、)）]"                       # 1. / 1) / 1、
-            r"|[A-Za-z][.、)）]"                      # A. / a)
-            r")$"
-        ),
-        re.IGNORECASE,
-    )
-
-    def classify_text_shape(sh_dict, title_size):
-        """把一个含文字的 shape 归入 title / body / number / caption / other。"""
-        text = sh_dict["text"].strip()
-        if not text:
-            return None
-        sizes = [s for s in sh_dict["font_sizes"] if s]
-        max_size = max(sizes) if sizes else 0
-        text_wo_ws = re.sub(r"\s+", "", text)
-
-        # 编号：短文本且匹配编号正则
-        if len(text_wo_ws) <= 6 and NUMBERING_RE.match(text_wo_ws):
-            return "number"
-        # 标题：字号 == 页面最大字号，且不是编号
-        if title_size and max_size and max_size >= title_size - 0.5:
-            return "title"
-        # 说明：小字号（<=14pt）
-        if max_size and max_size <= 14:
-            return "caption"
-        # 正文：其余较长文字
-        if len(text_wo_ws) >= 8:
-            return "body"
-        return "other"
-
-    # ---------- 形状类分类 ----------
-    def classify_non_text_shape(sh_dict):
-        """返回该 shape 所属的形状类别集合（可能多类），非可编辑形状返回空集。"""
-        t = sh_dict["type"]
-        if t == T_PICTURE:
-            # 图片默认不算"可编辑形状"，但小矢量图片可作为"图标"的兜底
-            if (sh_dict["width"] <= prs.slide_width / 6
-                    and sh_dict["height"] <= prs.slide_height / 6):
-                return {"icon_pic"}
-            return set()
-
-        cats = set()
-        name = _auto_shape_name(sh_dict)
-        w, h = sh_dict["width"], sh_dict["height"]
-        page_w, page_h = prs.slide_width, prs.slide_height
-
-        # 分组：本身算"示意结构"
-        if t == T_GROUP:
-            cats.add("diagram")
-
-        # 直线 / 连接线
-        if t == T_LINE or "CONNECTOR" in name or "LINE" in name:
-            cats.add("divider")
-            # 若形状名中含 ARROW，也当作箭头
-            if "ARROW" in name:
-                cats.add("arrow")
-
-        # AUTO_SHAPE 细分
-        if t == T_AUTO or t == T_FREEFORM:
-            if "ARROW" in name or "CHEVRON" in name or "PENTAGON" in name:
-                cats.add("arrow")
-            if "OVAL" in name or "ELLIPSE" in name or "CIRCLE" in name:
-                cats.add("circle")
-            if "RECTANGLE" in name or "ROUND" in name or name == "RECT":
-                # 极细长的矩形当分隔线
-                if (w > 0 and h > 0
-                        and (min(w, h) < max(page_w, page_h) * 0.01
-                             or (max(w, h) / max(min(w, h), 1)) > 25)):
-                    cats.add("divider")
-                else:
-                    cats.add("flowbox")
-            # 小尺寸形状 → 图标
-            if (w > 0 and h > 0
-                    and w <= page_w / 6 and h <= page_h / 6):
-                cats.add("icon")
-            # FREEFORM 通常是图标 / 示意
-            if t == T_FREEFORM:
-                cats.add("icon")
-
-        return cats
-
-    failures = []
-
-    for info in slide_data:
-        idx = info["index"]
-        shapes = info["shapes"]
-
-        # 是否含整页图片（PDF 截图特征）
-        has_full_page_pic = any(is_full_page_picture(s) for s in shapes)
-        if has_full_page_pic:
-            failures.append(f"第{idx}页存在整页图片（PDF 截图特征，未做可编辑转换）")
-            continue
-
-        # 计算该页最大字号（用于识别"标题"）
-        page_max_size = 0
-        for s in shapes:
-            if not s["text"]:
-                continue
-            if re.fullmatch(r"\d{1,3}", s["text"].strip()):
-                continue
-            sizes = [z for z in s["font_sizes"] if z]
-            if sizes and max(sizes) > page_max_size:
-                page_max_size = max(sizes)
-
-        # —— 文本类逐类归档 ——
-        text_cats = {"title": [], "body": [], "number": [], "caption": [], "other": []}
-        for s in shapes:
-            if not s["text"]:
-                continue
-            k = classify_text_shape(s, page_max_size)
-            if k:
-                text_cats[k].append(s)
-
-        # —— 形状类逐类归档 ——
-        shape_cats = {"flowbox": [], "arrow": [], "circle": [],
-                      "icon": [], "divider": [], "diagram": []}
-        for s in shapes:
-            if s["text"] and s["type"] not in (T_GROUP,):
-                # 已归入文本类的形状不再重复计入"流程框/箭头/圆形"等
-                # 但带文字的组合仍可算"示意结构"
-                continue
-            cats = classify_non_text_shape(s)
-            for c in cats:
-                if c == "icon_pic":
-                    shape_cats["icon"].append(s)
-                elif c in shape_cats:
-                    shape_cats[c].append(s)
-        # 若页内含 GROUP 或"多个 flowbox+箭头/线"组合，则视为存在示意结构
-        if (not shape_cats["diagram"]
-                and len(shape_cats["flowbox"]) >= 2
-                and (shape_cats["arrow"] or shape_cats["divider"])):
-            shape_cats["diagram"] = ["<derived-from-flowbox+line>"]
-
-        # ================= 判定 =================
-        if idx in PDF_PAGES:
-            missing_text = [n for n in ("title", "body", "number", "caption")
-                            if not text_cats[n]]
-            missing_shape = [n for n in ("flowbox", "arrow", "circle",
-                                          "icon", "divider", "diagram")
-                             if not shape_cats[n]]
-            if missing_text:
-                cn = {"title": "标题", "body": "正文",
-                      "number": "编号", "caption": "说明"}
-                failures.append(
-                    f"第{idx}页缺少可编辑文本类别: "
-                    + "、".join(cn[k] for k in missing_text)
-                )
-                continue
-            if missing_shape:
-                cn = {"flowbox": "流程框", "arrow": "箭头", "circle": "圆形",
-                      "icon": "图标", "divider": "分隔线", "diagram": "示意结构"}
-                failures.append(
-                    f"第{idx}页缺少可编辑形状类别: "
-                    + "、".join(cn[k] for k in missing_shape)
-                )
-                continue
-
-        elif idx in PPT_PAGES:
-            # 文字：至少存在"标题 + 正文/说明"其一
-            if not text_cats["title"]:
-                failures.append(f"第{idx}页缺少可编辑标题文字")
-                continue
-            if not (text_cats["body"] or text_cats["caption"] or text_cats["number"]):
-                failures.append(f"第{idx}页除标题外无其他可编辑文字")
-                continue
-            # 形状 / 流程对象 / 图标：至少存在两类
-            present = [k for k, v in shape_cats.items() if v]
-            if len(present) < 2:
-                failures.append(
-                    f"第{idx}页可编辑形状类别过少（仅 {present}），需同时具备形状/流程对象/图标"
-                )
-                continue
-            # 表格：若页内有大幅图片（可能是被烧录的表格/示意），判失败
-            for s in shapes:
-                if (s["type"] == T_PICTURE
-                        and s["width"] > prs.slide_width * 0.4
-                        and s["height"] > prs.slide_height * 0.4):
-                    failures.append(
-                        f"第{idx}页存在大幅图片（{int(s['width'])}×{int(s['height'])}），可能为不可编辑表格/示意"
-                    )
-                    break
-            else:
-                # 表格：如果 python-pptx 识别到 TABLE，则要求它是真表格（可编辑）
-                #       如果没有 TABLE，也不强制（细则语义："如有表格则必须可编辑"）
-                pass
-
-    if failures:
-        for f in failures:
-            detail.append(f)
-        return False, detail
-
-    detail.append(
-        "第 1-8、24、25 页：标题/正文/编号/说明 均为可编辑文本框；"
-        + "流程框/箭头/圆形/图标/分隔线/示意结构 均为可编辑形状或组合"
-    )
-    detail.append("第 9-23 页：文字、表格、形状、流程对象、图标 均保持可编辑")
-    return True, detail
-
-
-def check_plus3_style(prs, slide_data):
-    """+5：视觉风格细则。逐条对应：
-      (a) 全部 25 页背景统一采用浅蓝色或浅蓝渐变背景；
-      (b) 不出现与整体风格割裂的深黑、深红或高饱和背景；
-      (c) 标题统一使用深蓝色或蓝绿色文字；
-      (d) 标题字体、字号、加粗 和 左对齐方式保持一致；
-      (e) 正文中中文字体、英文字体、字号、行距和项目符号样式统一；
-      (f) 正文清晰可读；
-      (g) 使用白色、淡蓝色或蓝绿色圆角框；
-      (h) 圆角框的边框颜色、线宽和圆角程度保持一致。
-    """
-    detail = []
-    problems = []
-
-    # ===== (a) + (b) 背景 =====
-    # 背景来源优先级：slide 自身 -> slide_layout -> slide_master
-    # 不再接受纯白（FFFFFF）作为浅蓝色的替代——rubric 明确要求"浅蓝色或浅蓝渐变"。
-    LIGHT_BLUE_WHITELIST = {"F7FBFF", "F2F8FF", "EAF4FF", "E6F2FF", "DDEEFF"}
-
-    def _fill_hex_from_fill(fill):
-        """从 python-pptx 的 fill 对象解析出主色（SOLID/GRADIENT 均支持）。返回 (hex, is_gradient)。"""
-        try:
-            ft = fill.type
-        except Exception:
-            return None, False
-        # SOLID
-        try:
-            if ft == 1:                       # MSO_FILL.SOLID
-                rgb = fill.fore_color.rgb
-                if rgb is not None:
-                    return str(rgb), False
+            self.zf.close()
         except Exception:
             pass
-        # GRADIENT —— python-pptx 未提供高层 API，读 XML 里的 <a:gradFill><a:gs> 停靠色
+
+    def has(self, part):
+        return part in self.nameset
+
+    def text(self, part):
         try:
-            xml = fill._xPr.xml if hasattr(fill, "_xPr") else ""
-        except Exception:
-            xml = ""
-        if "<a:gradFill" in xml or ft == 3:  # 3 = GRADIENT (若 python-pptx 暴露)
-            m: "list[str]" = re.findall(r'<a:srgbClr\s+val="([0-9A-Fa-f]{6})"', xml)
-            if m:
-                # 取渐变色中"最浅"的一档做代表色
-                def brightness(h: str) -> int:
-                    r, g, b = hex_to_rgb(h)
-                    return r + g + b
-                pick: str = max(m, key=brightness)
-                return pick.upper(), True
-        return None, False
+            return self.zf.read(part).decode('utf-8', 'ignore')
+        except KeyError:
+            return ''
 
-    def _resolve_slide_bg(slide):
-        """按 slide -> layout -> master 顺序取有效背景色。返回 (hex, source, is_gradient)。"""
-        for source_name, obj in (
-            ("slide", slide),
-            ("layout", getattr(slide, "slide_layout", None)),
-            ("master", getattr(getattr(slide, "slide_layout", None), "slide_master", None)),
-        ):
-            if obj is None:
-                continue
-            try:
-                bg_fill = obj.background.fill
-            except Exception:
-                continue
-            hex_val, is_grad = _fill_hex_from_fill(bg_fill)
-            if hex_val:
-                return hex_val.upper(), source_name, is_grad
-        return None, None, False
+    def xml(self, part):
+        return ET.fromstring(self.zf.read(part))
 
-    bg_bad = []
-    bg_harsh = []
-    bg_unknown = []
-    bg_hex_seen = Counter()
-    for info in slide_data:
-        slide = info["slide"]
-        bg_hex, source, _is_grad = _resolve_slide_bg(slide)
-        if bg_hex is None:
-            bg_unknown.append(info["index"])
-            continue
-        bg_hex_seen[bg_hex] += 1
-        if is_high_saturation_bad(bg_hex):
-            bg_harsh.append((info["index"], bg_hex))
-            continue
-        if not (is_light_blue(bg_hex) or bg_hex in LIGHT_BLUE_WHITELIST):
-            bg_bad.append((info["index"], bg_hex, source))
+    def match(self, pattern):
+        rx = re.compile(pattern)
+        return [n for n in self.names if rx.match(n)]
 
-    if bg_unknown:
-        problems.append(f"(a) 存在无法判定背景色的页: {bg_unknown}（要求全部 25 页背景可判定且统一）")
-    if bg_bad:
-        problems.append(f"(a) 背景非浅蓝/浅蓝渐变（含 FFFFFF 纯白）: {bg_bad}")
-    if bg_harsh:
-        problems.append(f"(b) 出现深黑/深红/高饱和背景: {bg_harsh}")
-    # 统一性：只允许 1 种主背景色，且该主背景色覆盖全部 25 页（渐变的浅色停靠色相同也算统一）
-    if bg_hex_seen and len(slide_data) == 25:
-        _top_bg, top_cnt = bg_hex_seen.most_common(1)[0]
-        if top_cnt < 25:
-            problems.append(
-                f"(a) 背景色未在全部 25 页保持统一: 分布={dict(bg_hex_seen)}"
-            )
-
-    # ===== 选出每页"标题"和"正文" runs =====
-    title_runs = []   # 每条: (slide_idx, shape, run_font_name, run_size, run_bold, color, align)
-    body_runs  = []
-
-    for info in slide_data:
-        # 用最大字号的非数字文本作为该页标题
-        biggest_size = 0
-        biggest = None
-        for sh in info["shapes"]:
-            if not sh["text"]:
-                continue
-            if re.fullmatch(r"\d{1,3}", sh["text"].strip()):
-                continue
-            sizes = [s for s in sh["font_sizes"] if s] or [0]
-            if max(sizes) > biggest_size:
-                biggest_size = max(sizes)
-                biggest = sh
-
-        for sh in info["shapes"]:
-            if not sh["text"]:
-                continue
-            is_title = (sh is biggest)
-            tf = sh["shape"].text_frame
-            for p_idx, para in enumerate(tf.paragraphs):
-                align = str(para.alignment) if para.alignment is not None else None
-                line_spacing = None
-                try:
-                    line_spacing = para.line_spacing
-                except Exception:
-                    pass
-                # 项目符号检测：段落 xml 中是否带 <a:buChar/<a:buAutoNum/<a:buNone>
-                try:
-                    pPr_xml = para._pPr.xml if para._pPr is not None else ""
-                except Exception:
-                    pPr_xml = ""
-                bullet_kind = "none"
-                if "<a:buChar" in pPr_xml: bullet_kind = "char"
-                elif "<a:buAutoNum" in pPr_xml: bullet_kind = "num"
-                elif "<a:buBlip" in pPr_xml: bullet_kind = "pic"
-                for run in para.runs:
-                    if not run.text:
-                        continue
-                    name = run.font.name
-                    size = run.font.size.pt if run.font.size else None
-                    bold = bool(run.font.bold)
-                    try:
-                        col = run.font.color.rgb
-                        col = str(col) if col is not None else None
-                    except Exception:
-                        col = None
-                    rec = {
-                        "slide": info["index"],
-                        "name": name,
-                        "size": size,
-                        "bold": bold,
-                        "color": col,
-                        "align": align,
-                        "line_spacing": line_spacing,
-                        "bullet": bullet_kind,
-                        "text": run.text,
-                    }
-                    if is_title:
-                        title_runs.append(rec)
-                    else:
-                        body_runs.append(rec)
-
-    # ===== (c) 标题颜色：深蓝 / 蓝绿（不再放行 FFFFFF；白色标题只能在深色底色块上出现，
-    #        但 rubric 明确要求"深蓝或蓝绿" -> 白色一律判失败） =====
-    title_color_bad = []
-    title_color_unknown = []
-    for r in title_runs:
-        col = r["color"]
-        if col is None:
-            title_color_unknown.append((r["slide"], r["text"][:10]))
-            continue
-        if not is_dark_blue_or_teal(col):
-            title_color_bad.append((r["slide"], col, r["text"][:10]))
-    if title_color_bad:
-        problems.append(f"(c) 标题颜色非深蓝/蓝绿: {title_color_bad[:10]}")
-    if title_color_unknown and len(title_color_unknown) > len(title_runs) * 0.2:
-        problems.append(
-            f"(c) 过多标题的颜色无法从 run 上读取（占比 {len(title_color_unknown)}/{len(title_runs)}）"
-        )
-
-    # ===== (d) 标题字体、字号、加粗、左对齐 一致（阈值收紧到 0.95） =====
-    title_fonts  = Counter(r["name"] for r in title_runs if r["name"])
-    title_sizes  = Counter(round(r["size"]) for r in title_runs if r["size"])
-    title_bolds  = Counter(r["bold"] for r in title_runs)
-    title_aligns = Counter(r["align"] for r in title_runs if r["align"] is not None)
-
-    def _top_ratio(c):
-        if not c: return 1.0
-        return c.most_common(1)[0][1] / sum(c.values())
-
-    # rubric 要求"保持一致"——阈值 0.95，仅允许极少数版式差异（如封面/结尾页可能不同）
-    UNIFORM = 0.95
-
-    if title_fonts and _top_ratio(title_fonts) < UNIFORM:
-        problems.append(f"(d) 标题字体不统一: {title_fonts.most_common(5)}")
-    if title_sizes and _top_ratio(title_sizes) < UNIFORM:
-        problems.append(f"(d) 标题字号不统一: {title_sizes.most_common(5)}")
-    if title_bolds and _top_ratio(title_bolds) < UNIFORM:
-        problems.append(f"(d) 标题加粗不统一: {dict(title_bolds)}")
-    # 左对齐：rubric 明确"左对齐"——只接受 LEFT；CENTER/RIGHT/JUSTIFY 均判失败
-    if title_aligns:
-        non_left = {k: v for k, v in title_aligns.items() if "LEFT" not in (k or "")}
-        left_cnt = sum(v for k, v in title_aligns.items() if "LEFT" in (k or ""))
-        total = sum(title_aligns.values())
-        # 允许极少数封面/结尾等特殊版式的例外（例如"封面"和"谢谢聆听"两页 -> 2/25 ≈ 8%）
-        if left_cnt / total < 0.85 or non_left:
-            problems.append(f"(d) 标题对齐方式非左对齐或不一致: {dict(title_aligns)}")
-
-    # ===== (e) 正文中文字体 / 英文字体 / 字号 / 行距 / 项目符号 统一 =====
-    cn_fonts = Counter()
-    en_fonts = Counter()
-    body_sizes = Counter(round(r["size"]) for r in body_runs if r["size"])
-    body_line_spacings = Counter()
-    body_bullets = Counter()
-    for r in body_runs:
-        # 中/英文字体粗略区分：name 含 CJK 关键字 或 文本里多为中文 -> 视为中文字体
-        name = r["name"]
-        text = r["text"]
-        if name:
-            cn_chars = sum(1 for ch in text if "一" <= ch <= "鿿")
-            if cn_chars >= max(1, len(text) // 2):
-                cn_fonts[name] += 1
-            else:
-                en_fonts[name] += 1
-        if r["line_spacing"] is not None:
-            body_line_spacings[r["line_spacing"]] += 1
-        body_bullets[r["bullet"]] += 1
-
-    if cn_fonts and _top_ratio(cn_fonts) < UNIFORM:
-        problems.append(f"(e) 正文中文字体不统一: {cn_fonts.most_common(5)}")
-    if en_fonts and _top_ratio(en_fonts) < UNIFORM:
-        problems.append(f"(e) 正文英文字体不统一: {en_fonts.most_common(5)}")
-    if body_sizes and _top_ratio(body_sizes) < 0.85:
-        # 正文字号允许有次级层次（如"正文 + 说明"两档），阈值略放宽
-        problems.append(f"(e) 正文字号不统一: {body_sizes.most_common(5)}")
-    if body_line_spacings and _top_ratio(body_line_spacings) < UNIFORM:
-        problems.append(f"(e) 正文行距不统一: {body_line_spacings.most_common(5)}")
-    if body_bullets and _top_ratio(body_bullets) < UNIFORM:
-        problems.append(f"(e) 项目符号样式不统一: {dict(body_bullets)}")
-
-    # ===== (f) 正文清晰可读 =====
-    #   判定：正文字号不应过小，正文文字颜色与背景对比度不应过低
-    illegible = []
-    for r in body_runs:
-        if r["size"] and r["size"] < 8:
-            illegible.append((r["slide"], "size", r["size"]))
-        # 颜色对比：浅色文字 + 浅色背景 -> 不可读
-        if r["color"]:
-            try:
-                rr, gg, bb = hex_to_rgb(r["color"])
-                if (rr + gg + bb) / 3 > 220:           # 接近白色
-                    bg = slide_data[r["slide"] - 1]["bg_hex"]
-                    if bg:
-                        br, bgc, bbc = hex_to_rgb(bg)
-                        if (br + bgc + bbc) / 3 > 220:
-                            illegible.append((r["slide"], "contrast", r["text"][:8]))
-            except Exception:
-                pass
-    if len(illegible) > 5:
-        problems.append(f"(f) 正文可读性存在问题（{len(illegible)} 处）: {illegible[:5]}")
-
-    # ===== (g) (h) 圆角框：颜色（白/淡蓝/蓝绿）+ 边框颜色 / 线宽 / 圆角程度一致 =====
-    rounded_fills = Counter()
-    rounded_line_colors = Counter()
-    rounded_line_widths = Counter()
-    rounded_adjustments = Counter()           # 圆角程度
-    bad_rounded_fill = []
-    for info in slide_data:
-        for sh in info["shapes"]:
-            try:
-                ast = sh["shape"].auto_shape_type
-            except Exception:
-                ast = None
-            if ast is None or "ROUND" not in str(ast):
-                continue
-            # 填充色
-            fill_hex = sh["fill_hex"]
-            if fill_hex:
-                f_up = fill_hex.upper()
-                rounded_fills[f_up] += 1
-                ok_color = (f_up == "FFFFFF") or is_light_blue(f_up) or is_dark_blue_or_teal(f_up)
-                if not ok_color:
-                    bad_rounded_fill.append((info["index"], f_up))
-            # 边框颜色 / 线宽
-            try:
-                line = sh["shape"].line
-                try:
-                    lc = line.color.rgb
-                    if lc is not None:
-                        rounded_line_colors[str(lc).upper()] += 1
-                except Exception:
-                    pass
-                try:
-                    if line.width is not None:
-                        rounded_line_widths[int(line.width)] += 1
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            # 圆角程度：从 <a:prstGeom> 下的 <a:avLst><a:gd .. fmla="val NNN"/> 取值
-            try:
-                xml = sh["shape"]._element.xml
-                m = re.search(r'<a:gd[^/]*fmla="val (\d+)"', xml)
-                if m:
-                    rounded_adjustments[int(m.group(1))] += 1
-            except Exception:
-                pass
-
-    if bad_rounded_fill:
-        problems.append(f"(g) 圆角框填充色不在白/淡蓝/蓝绿: {bad_rounded_fill[:10]}")
-    if rounded_line_colors and _top_ratio(rounded_line_colors) < UNIFORM:
-        problems.append(f"(h) 圆角框边框颜色不一致: {rounded_line_colors.most_common(5)}")
-    if rounded_line_widths and _top_ratio(rounded_line_widths) < UNIFORM:
-        problems.append(f"(h) 圆角框线宽不一致: {rounded_line_widths.most_common(5)}")
-    if rounded_adjustments and _top_ratio(rounded_adjustments) < 0.85:
-        problems.append(f"(h) 圆角程度不一致: {rounded_adjustments.most_common(5)}")
-
-    if problems:
-        for p in problems:
-            detail.append(p)
-        return False, detail
-
-    detail.append("(a)(b) 全部 25 页背景为浅蓝/浅蓝渐变，无深黑/深红/高饱和背景")
-    detail.append("(c)(d) 标题统一为深蓝/蓝绿，字体/字号/加粗/对齐方式一致")
-    detail.append("(e)(f) 正文中英文字体、字号、行距、项目符号样式统一，正文清晰可读")
-    detail.append("(g)(h) 圆角框颜色为白/淡蓝/蓝绿，边框颜色、线宽与圆角程度一致")
-    return True, detail
-
-
-def check_plus4_page_numbers(prs, slide_data):
-    """+5：全部 25 页页码：按照最终合并顺序连续显示 1 至 25。
-    逐点对应：
-      (a) 全部 25 页都要显示页码；
-      (b) 页码按合并后顺序，依次连续显示 1, 2, ..., 25；
-      (c) 同一页只应显示一个页码（若同页出现多个不同页码值，视为不连续）。
-    判定"页码型文本框"的口径：
-      - 文本框只包含一行；
-      - 内容为纯数字 / '01' 这种 0 前导两位 / '第X页' / 'Page X' / 'X/25'；
-      - 位于页面边缘（左右靠边或上下靠边的 15% 区域）—— 用于把目录里的章节编号排除掉。
-    """
-    detail = []
-    problems = []
-
-    sw, sh_ = prs.slide_width, prs.slide_height
-    EDGE = 0.18                          # 距离页面边缘 18% 视为"边角"
-
-    def parse_page_number_text(t):
-        """如果该字符串看起来像一枚'页码'，返回其数字，否则返回 None。"""
-        t = t.strip()
-        if not t:
+    def _rels(self, part):
+        d, b = os.path.split(part)
+        rp = (d + '/_rels/' + b + '.rels').lstrip('/')
+        if not self.has(rp):
             return None
-        if re.fullmatch(r"0?\d{1,3}", t):
-            return int(t)
-        m = re.fullmatch(r"第\s*(\d{1,3})\s*页", t)
-        if m:
-            return int(m.group(1))
-        m = re.fullmatch(r"(?:page|p\.?)\s*(\d{1,3})", t, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
-        m = re.fullmatch(r"(\d{1,3})\s*/\s*(\d{1,3})", t)
-        if m:
-            return int(m.group(1))
+        return self.xml(rp)
+
+    def follow(self, part, type_suffix):
+        """沿关系链找到 part 引用的指定类型部件名；找不到返回 None。"""
+        if not part:
+            return None
+        rels = self._rels(part)
+        if rels is None:
+            return None
+        for rel in rels:
+            if (rel.get('Type') or '').endswith(type_suffix):
+                tgt = (rel.get('Target') or '').replace('\\', '/')
+                base = os.path.dirname(part)
+                while tgt.startswith('../'):
+                    tgt = tgt[3:]
+                    base = os.path.dirname(base)
+                return (base + '/' + tgt).lstrip('/')
         return None
 
-    def shape_is_at_edge(sh):
-        cx = sh["left"] + sh["width"] / 2
-        cy = sh["top"]  + sh["height"] / 2
-        return (cx < sw * EDGE or cx > sw * (1 - EDGE)
-                or cy < sh_ * EDGE or cy > sh_ * (1 - EDGE))
-
-    def collect_page_number_shapes(info):
-        """返回该页所有页码形状的 (数字值, shape 描述)。"""
-        hits = []
-        for sh in info["shapes"]:
-            txt = sh["text"].strip()
-            if not txt:
+    def slide_parts(self):
+        """按 sldIdLst 的放映顺序返回幻灯片部件名列表。"""
+        pres = self.xml('ppt/presentation.xml')
+        rels = self.xml('ppt/_rels/presentation.xml.rels')
+        rmap = {}
+        for rel in rels:
+            rmap[rel.get('Id')] = rel.get('Target') or ''
+        out = []
+        lst = pres.find(_q(NS_P, 'sldIdLst'))
+        if lst is None:
+            return out
+        for sid in lst:
+            tgt = rmap.get(sid.get(_q(NS_R, 'id')), '').replace('\\', '/')
+            if not tgt:
                 continue
-            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-            if len(lines) != 1:
-                continue
-            n = parse_page_number_text(lines[0])
-            if n is None:
-                continue
-            # 必须位于页面边缘，否则视作目录/正文里的编号
-            if not shape_is_at_edge(sh):
-                continue
-            hits.append((n, sh))
-        return hits
+            while tgt.startswith('../'):
+                tgt = tgt[3:]
+            if not tgt.startswith('ppt/'):
+                tgt = 'ppt/' + tgt.lstrip('/')
+            out.append(tgt)
+        return out
 
-    # —— (a)(b)(c) 逐页检查页码 ——
-    missing_pages = []
-    wrong_pages   = []
-    duplicates_on_page = []
+    def slide_size(self):
+        pres = self.xml('ppt/presentation.xml')
+        sz = pres.find(_q(NS_P, 'sldSz'))
+        if sz is None:
+            return (None, None)
+        try:
+            return (int(sz.get('cx')), int(sz.get('cy')))
+        except (TypeError, ValueError):
+            return (None, None)
 
-    for info in slide_data:
-        idx = info["index"]
-        page_num_shapes = collect_page_number_shapes(info)
-        nums = [n for n, _ in page_num_shapes]
-
-        if not page_num_shapes:
-            missing_pages.append(idx)
-            continue
-
-        # (b) 页码值必须等于当前页索引
-        if idx not in nums:
-            wrong_pages.append((idx, nums))
-
-        # (c) 同一页出现多个不同页码值（视为不连续）
-        unique_vals = set(nums)
-        if len(unique_vals) > 1:
-            duplicates_on_page.append((idx, sorted(unique_vals)))
-
-    if missing_pages:
-        problems.append(f"(a) 以下页未显示页码: {missing_pages}")
-    if wrong_pages:
-        problems.append(f"(b) 以下页页码与最终顺序不符: {wrong_pages[:10]}")
-    if duplicates_on_page:
-        problems.append(f"(c) 同页出现多个不同页码值（非连续单一）: {duplicates_on_page[:10]}")
-
-    if problems:
-        for p in problems:
-            detail.append(p)
-        return False, detail
-
-    detail.append("全部 25 页按合并顺序连续显示 1..25")
-    return True, detail
+    def clr_scheme(self, slide_part):
+        """与办公软件对齐：主题色取自该页所绑定 版式→母版→主题 的 clrScheme。"""
+        if slide_part in self._theme_cache:
+            return self._theme_cache[slide_part]
+        lay = self.follow(slide_part, 'slideLayout')
+        mas = self.follow(lay, 'slideMaster')
+        th = self.follow(mas, 'theme')
+        scheme = {}
+        if th and self.has(th):
+            root = self.xml(th)
+            for sch in root.iter(_q(NS_A, 'clrScheme')):
+                for child in sch:
+                    name = child.tag.split('}')[-1]
+                    srgb = child.find(_q(NS_A, 'srgbClr'))
+                    if srgb is not None:
+                        scheme[name] = (srgb.get('val') or '').upper()
+                        continue
+                    sysc = child.find(_q(NS_A, 'sysClr'))
+                    if sysc is not None:
+                        scheme[name] = (sysc.get('lastClr') or '').upper()
+                break
+        self._theme_cache[slide_part] = scheme
+        return scheme
 
 
-# ============================================================
-# 主流程
-# ============================================================
-# 被评估的目标文档名（脚本自己在传入的目录里定位并打开）
-TARGET_FILE_NAME = "合并_浅蓝可编辑版.pptx"
+# ============================ 颜色解析 ============================
+# 与办公软件对齐：schemeClr 先按 clrMap 的常用别名折回主题槽位，再套用
+#   lumMod/lumOff 亮度修饰，得到 PowerPoint 里眼睛看到的那个颜色。
+_SCHEME_ALIAS = {'bg1': 'lt1', 'tx1': 'dk1', 'bg2': 'lt2', 'tx2': 'dk2',
+                 'phClr': 'accent1'}
+_HEX6 = re.compile(r'^[0-9A-F]{6}$')
 
 
-def evaluate(dir_path: str) -> "dict[str, object]":
-    """统一入口：接收"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估文档。
+def _resolve_color(el, scheme):
+    """把 <a:srgbClr>/<a:schemeClr> 解析成 6 位十六进制；无法解析返回 None。"""
+    if el is None:
+        return None
+    tag = el.tag.split('}')[-1]
+    if tag == 'srgbClr':
+        hexv = (el.get('val') or '').upper()
+    elif tag == 'schemeClr':
+        slot = el.get('val') or ''
+        hexv = scheme.get(_SCHEME_ALIAS.get(slot, slot)) or ''
+    else:
+        return None
+    if not _HEX6.match(hexv):
+        return None
+    r, g, b = (int(hexv[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    lm = el.find(_q(NS_A, 'lumMod'))
+    lo = el.find(_q(NS_A, 'lumOff'))
+    if lm is not None and (lm.get('val') or '').isdigit():
+        l *= int(lm.get('val')) / 100000.0
+    if lo is not None and (lo.get('val') or '').isdigit():
+        l += int(lo.get('val')) / 100000.0
+    l = max(0.0, min(1.0, l))
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return '%02X%02X%02X' % tuple(int(round(v * 255)) for v in (r, g, b))
 
-    返回结构化字典（见 §2.2）。
+
+def _hsl(hexv):
+    r, g, b = (int(hexv[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    return (h * 360.0, s, l)
+
+
+def _is_neutral(hexv):
+    h, s, l = _hsl(hexv)
+    return s < NEUTRAL_S or l > NEUTRAL_L_HI or l < NEUTRAL_L_LO
+
+
+def _is_blue(hexv):
+    h, s, l = _hsl(hexv)
+    return BLUE_HUE_LO <= h <= BLUE_HUE_HI
+
+
+def _is_near_white(hexv):
+    """白色与近白色：深蓝底上的白字属达标着色，不计为异色。"""
+    return _hsl(hexv)[2] >= NEAR_WHITE_L
+
+
+def _rel_lum(hexv):
+    def _f(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (int(hexv[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * _f(r) + 0.7152 * _f(g) + 0.0722 * _f(b)
+
+
+def _contrast(a, b):
+    la, lb = _rel_lum(a), _rel_lum(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+# ============================ 形状与文本采集 ============================
+def _shapes(root, scheme):
+    """采集页内每个形状：位置尺寸、整块文本、逐 run 的字号与文字色、自身填充色。
+
+    与办公软件对齐：位置尺寸取 a:xfrm/a:off、a:ext（EMU）；文字取 a:t 的可见字符；
+      字号取 a:rPr/@sz（1/100 磅）；文字色与形状填充取各自的 a:solidFill 首子元素。
     """
-    result: "dict[str, object]" = {
+    out = []
+    for sp in root.iter(_q(NS_P, 'sp')):
+        off = next(iter(sp.iter(_q(NS_A, 'off'))), None)
+        ext = next(iter(sp.iter(_q(NS_A, 'ext'))), None)
+        x = int(off.get('x')) if off is not None and off.get('x') else None
+        y = int(off.get('y')) if off is not None and off.get('y') else None
+        cx = int(ext.get('cx')) if ext is not None and ext.get('cx') else 0
+        cy = int(ext.get('cy')) if ext is not None and ext.get('cy') else 0
+        runs = []
+        for r in sp.iter(_q(NS_A, 'r')):
+            t = r.find(_q(NS_A, 't'))
+            txt = (t.text or '') if t is not None else ''
+            rpr = r.find(_q(NS_A, 'rPr'))
+            sz = None
+            color = None
+            if rpr is not None:
+                if (rpr.get('sz') or '').isdigit():
+                    sz = int(rpr.get('sz')) / 100.0
+                sf = rpr.find(_q(NS_A, 'solidFill'))
+                if sf is not None and len(sf):
+                    color = _resolve_color(sf[0], scheme)
+            runs.append({'sz': sz, 'text': txt, 'color': color})
+        fill = None
+        spPr = sp.find(_q(NS_P, 'spPr'))
+        if spPr is not None:
+            sf = spPr.find(_q(NS_A, 'solidFill'))
+            if sf is not None and len(sf):
+                fill = _resolve_color(sf[0], scheme)
+        out.append({
+            'x': x, 'y': y, 'cx': cx, 'cy': cy, 'fill': fill, 'runs': runs,
+            'text': ''.join(r['text'] for r in runs),
+        })
+    return out
+
+
+def _bg_of_part(root, scheme):
+    """某个部件自身声明的底色：p:bg 的纯色填充或 p:bgRef 引用的主题色。"""
+    for bg in root.iter(_q(NS_P, 'bg')):
+        for sf in bg.iter(_q(NS_A, 'solidFill')):
+            if len(sf):
+                c = _resolve_color(sf[0], scheme)
+                if c:
+                    return c
+        for br in bg.iter(_q(NS_P, 'bgRef')):
+            for child in br:
+                c = _resolve_color(child, scheme)
+                if c:
+                    return c
+    return None
+
+
+def _eff_bg(pkg, slide_part, scheme):
+    """与办公软件对齐：页面实际生效的底色 —— 本页自设底色优先，未自设则
+    依次向其版式、母版继承（PowerPoint 的背景继承链就是这三级）。"""
+    lay = pkg.follow(slide_part, 'slideLayout')
+    mas = pkg.follow(lay, 'slideMaster') if lay else None
+    for part in (slide_part, lay, mas):
+        if not part or not pkg.has(part):
+            continue
+        c = _bg_of_part(pkg.xml(part), scheme)
+        if c:
+            return c
+    return None
+
+
+def _table_texts(root):
+    """表格单元格文本；GraphicFrame 里的 a:tbl 也承载正文，须一并纳入页面文本。"""
+    out = []
+    for tbl in root.iter(_q(NS_A, 'tbl')):
+        for tc in tbl.iter(_q(NS_A, 'tc')):
+            out.append(''.join((t.text or '') for t in tc.iter(_q(NS_A, 't'))))
+    return out
+
+
+# ============================ 对外接口 ============================
+class _TargetMissing(Exception):
+    """目录不存在或目录中没有 .pptx：连待评测对象都没有，不进入维度判定。"""
+
+
+def evaluate(dir_path):
+    """入参为目录路径，在该目录内定位 .pptx 并给出完成度评分。"""
+    result = {
         "id": SCRIPT_ID,
-        "file_name": TARGET_FILE_NAME,
+        "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 20,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        file_path = os.path.join(dir_path, TARGET_FILE_NAME)
-        if not os.path.exists(file_path):
-            result["status"] = "error"
-            result["error"] = f"文件不存在: {file_path}"
-            return result
-
-        prs = Presentation(file_path)
-        slide_data = load_slide_data(prs)
-
-        # ------- 维度 1 -------
-        d1_pass, d1_reasons = check_dimension1(prs, slide_data, file_path)
-        result["dim1_pass"] = d1_pass
-        if not d1_pass:
-            result["dim1_reason"] = "；".join(d1_reasons)
-            result["total_score"] = 0
-            return result
-
-        # ------- 维度 2 -------
-        plus_items = [
-            (
-                5,
-                "最终文件格式与页数：交付.pptx文件，共25页。第1至第8页，顺序为封面、目录、网络定位与构成、典型保障场景、核心能力价值（一）、核心能力价值（二）、台站体系与协作架构、典型设备组成；第9至第20页依次对应“云岚调度坐席平台”、“内容结构”、“系统总览：调度坐席的四层协作”、“登录：进入值守环境”、“主界面：把高频操作放在同一屏”、“焦点规则：先确认“操作”，再确认“语音””、“工单窗口：先记录，再执行呼叫动作”、“线路状态：用可视化面板降低误操作”、“接续流程：从来话到三方沟通”、“转接与交叉操作：语音不一定跟着窗口走”、“合并与拆分：处理复杂通话关系”、“查号：用更少输入找到正确联系人”；第21至第23页依次对应“即时会议：临时协同但不污染会议列表”、“座席互联：用于班组内快速沟通”、“主菜单：按业务动作重新归类”。第24、25页依次对应“运行流程与管理要点”和“谢谢聆听”。",
-                lambda p, s: check_plus1_pages_and_order(p, s, file_path),
-            ),
-            (
-                5,
-                "PDF转换页面文字：第1至第8页及第24、25页标题、正文、编号和说明均为可编辑文本框。流程框、箭头、圆形、图标、分隔线和示意结构均为可编辑形状或可编辑组合对象。最终第9至第23页的文字、表格、形状、流程对象和图标保持可编辑。",
-                check_plus2_editable,
-            ),
-            (
-                5,
-                "全部25页背景统一采用浅蓝色或浅蓝渐变背景，不出现与整体风格割裂的深黑、深红或高饱和背景。标题统一使用深蓝色或蓝绿色文字，字体、字号、加粗和左对齐方式保持一致。正文中中文字体、英文字体、字号、行距和项目符号样式统一，正文清晰可读。使用白色、淡蓝色或蓝绿色圆角框，边框颜色、线宽和圆角程度保持一致。",
-                check_plus3_style,
-            ),
-            (
-                5,
-                "全部25页页码：按照最终合并顺序连续显示1至25。",
-                check_plus4_page_numbers,
-            ),
-        ]
-
-        max_score = sum(pts for pts, _, _ in plus_items)
-        result["max_score"] = max_score
-
-        score = 0
-        dim2_items = []
-
-        # 加分项
-        for pts, rule_text, fn in plus_items:
-            ok, _ = fn(prs, slide_data)
-            delta = pts if ok else 0
-            score += delta
-            dim2_items.append({
-                "rule": rule_text,
-                "max_delta": pts,
-                "delta": delta,
-                "hit": bool(ok),
-                "detail": "",
-            })
-
-        result["dim2_items"] = dim2_items
-        result["total_score"] = score
-        return result
-
-    except Exception as e:
+        if not dir_path or not os.path.isdir(dir_path):
+            raise _TargetMissing(f"目录不存在：{dir_path}")
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith('.pptx') and not f.startswith('~$'))
+        if not cands:
+            raise _TargetMissing(f"目录中未找到 .pptx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, dir_path, result)
+    except _TargetMissing as exc:
+        # 找不到待评测文件：维度1 未参与判定，dim1_pass / dim1_reason 一律留空，满分也置 0
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
+    except Exception as exc:
+        # 文件存在但打不开 / 解析失败：维度1 判不通过，dim1_reason 给出错误摘要
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = f"文件无法解析或无法打开：{type(exc).__name__}: {exc}"
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+
+def _dim1_gate(file_path):
+    """维度1：交付文件为1个可正常打开的 PowerPoint 演示文稿（.pptx）。
+
+    与办公软件对齐：PowerPoint / WPS 打开 .pptx 时先校验 OPC 包结构与
+      [Content_Types].xml，再逐部件解析 XML；任一环节失败即"文件损坏无法打开"
+      或弹出"发现不可读取的内容"。此处按同一条链路检查：
+      ① 是 zip（OPC）包；② 有 [Content_Types].xml 与 ppt/presentation.xml；
+      ③ presentation.xml、每张幻灯片、母版、版式的 XML 均可解析；
+      ④ sldIdLst 指向的幻灯片部件都真实存在。
+    可编辑性与版面可读性不在本维度设卡，改由维度2 的对应加分项计分。
+    """
+    if not zipfile.is_zipfile(file_path):
+        return (None, '文件不是有效的 OPC(zip) 包，无法作为 .pptx 打开')
+    try:
+        pkg = _Package(file_path)
+    except Exception as exc:
+        return (None, '演示文稿包无法打开：%s' % exc)
+    for part in ('[Content_Types].xml', 'ppt/presentation.xml'):
+        if not pkg.has(part):
+            pkg.close()
+            return (None, '缺少必需部件 %s，打开时会提示"发现不可读取的内容"' % part)
+    try:
+        slides = pkg.slide_parts()
+        if not slides:
+            raise ValueError('sldIdLst 为空，演示文稿内没有可放映的幻灯片')
+        for part in slides:
+            if not pkg.has(part):
+                raise ValueError('幻灯片部件缺失：%s' % part)
+            pkg.xml(part)
+        for part in (pkg.match(r'ppt/slideMasters/slideMaster\d+\.xml$')
+                     + pkg.match(r'ppt/slideLayouts/slideLayout\d+\.xml$')):
+            pkg.xml(part)
+    except Exception as exc:
+        pkg.close()
+        return (None, '演示文稿内容无法正常解析：%s: %s' % (type(exc).__name__, exc))
+    return (pkg, '')
+
+
+def _evaluate_impl(file_path, dir_path, result):
+    # ---------------- 维度1 ----------------
+    pkg, reason = _dim1_gate(file_path)
+    if pkg is None:
+        result["status"] = "error"
+        result["error"] = reason
+        result["dim1_pass"] = False
+        result["dim1_reason"] = reason
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = MAX_SCORE_TOTAL
+        return result
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "交付物为1个可正常打开的 .pptx，包结构与各部件 XML 均可解析"
+    try:
+        return _score(pkg, file_path, dir_path, result)
+    finally:
+        pkg.close()
+
+
+def _score(pkg, file_path, dir_path, result):
+    results = []      # ["+N：规则说明", ...]，与 _MAX_DELTAS_ORDER 逐项对齐
+    details = []      # 与 results 等长的取证说明
+
+    def emit(delta, rule, detail=""):
+        results.append("%+d：%s" % (delta, rule))
+        details.append(detail)
+
+    # ---------------- 数据采集 ----------------
+    parts = pkg.slide_parts()
+    n = len(parts)
+    pages = range(1, n + 1)
+    roots, raws, shapes, ptext, schemes = {}, {}, {}, {}, {}
+    for i, part in enumerate(parts, 1):
+        roots[i] = pkg.xml(part)
+        raws[i] = pkg.text(part)
+        sch = pkg.clr_scheme(part)
+        schemes[i] = sch
+        shapes[i] = _shapes(roots[i], sch)
+        segs = [sp['text'] for sp in shapes[i]] + _table_texts(roots[i])
+        ptext[i] = _norm(''.join(segs))
+    alltext = ''.join(ptext.values())
+    cust_total = sum(len(re.findall(r'<a:custGeom', raws[i])) for i in pages)
+    pic_total = sum(len(re.findall(r'<p:pic>', raws[i])) for i in pages)
+    cx, cy = pkg.slide_size()
+
+    def has_all(i, tokens):
+        """第 i 页缺失的片段列表。"""
+        if i not in ptext:
+            return list(tokens)
+        return [t for t in tokens if t not in ptext[i]]
+
+    def page_number_present(i):
+        """第 i 页是否带页码标注：存在文本恰为该页序号，或以该页序号结尾。"""
+        pat_exact = re.compile(r'^0?%d$' % i)
+        pat_tail = re.compile(r'\s0?%d$' % i)
+        for sp in shapes[i]:
+            t = (sp['text'] or '').strip()
+            if pat_exact.match(t) or pat_tail.search(t):
+                return True
+        return False
+
+    # ==================== 维度2：加分项 ====================
+    # +5：交付1个 .pptx，同时包含专题汇报与操作介绍两部分内容，合计25页，
+    #     无空白页、无重复页
+    pptx_cnt = len([f for f in os.listdir(dir_path)
+                    if f.lower().endswith('.pptx') and not f.startswith('~$')])
+    blank = [i for i in pages if not ptext[i]]
+    seen_pages = collections.Counter(ptext[i] for i in pages if ptext[i])
+    repeat = [t[:14] for t, c in seen_pages.items() if c >= 2]
+    a01 = (pptx_cnt == 1 and n == SLIDE_TOTAL and not blank and not repeat
+           and PART_A_KEY in alltext and PART_B_KEY in alltext)
+    emit(5 if a01 else 0,
+         "交付1个 .pptx 文件，同时包含\"应急有线人工通信保障网\"专题汇报内容与\"云岚调度坐席平台\"操作介绍内容，合计25页，无空白页、无重复页",
+         ".pptx 数=%d 页数=%d 空白页=%s 重复页=%s 两部分内容=%s/%s"
+         % (pptx_cnt, n, blank or '无', repeat or '无',
+            PART_A_KEY in alltext, PART_B_KEY in alltext))
+
+    # +3 ×3：三页整页缺席（指令要求删除的三页）
+    for title, label in zip(DELETED_TITLES,
+                            ('预约会议：把参会方和发起流程提前准备好',
+                             '工单列表与预约回呼：让未完成事项可追踪',
+                             '值守检查清单')):
+        hit_pages = [i for i in pages if title in ptext[i]]
+        emit(3 if not hit_pages else 0,
+             "全篇不包含标题为\"%s\"的页面" % label,
+             "残留页：%s" % (hit_pages or '无'))
+
+    # +5：第8页为"典型设备组成"页，操作介绍内容整体紧随该页之后插入
+    a05_bad = []
+    if n < 9:
+        a05_bad.append('总页数不足9页')
+    else:
+        if has_all(PLACEHOLDER, ORDER_ANCHORS[PLACEHOLDER]):
+            a05_bad.append('第8页不是"典型设备组成"页')
+        if has_all(9, ORDER_ANCHORS[9]):
+            a05_bad.append('第9页不是"云岚调度坐席平台"封面页')
+        for i in range(1, PLACEHOLDER):
+            if has_all(i, ORDER_ANCHORS[i]):
+                a05_bad.append('第%d页不在原有汇报页位上' % i)
+    emit(5 if not a05_bad else 0,
+         "第8页为\"典型设备组成\"页，操作介绍内容整体紧随该页之后插入",
+         "异常：%s" % ('；'.join(a05_bad[:5]) or '无'))
+
+    # +5：第24页"运行流程与管理要点"、第25页"谢谢聆听"位于全篇最后
+    a06_bad = []
+    for i in TAIL_PAGES:
+        miss = has_all(i, ORDER_ANCHORS[i]) if i <= n else ORDER_ANCHORS[i]
+        if miss:
+            a06_bad.append('第%d页缺%s' % (i, '、'.join(miss)))
+    if n != SLIDE_TOTAL:
+        a06_bad.append('总页数为%d，末两页未落在第24、25页' % n)
+    emit(5 if not a06_bad else 0,
+         "第24页为\"运行流程与管理要点\"，第25页为\"谢谢聆听 / THANKS FOR LISTENING\"，即专题汇报末两页位于全篇最后",
+         "异常：%s" % ('；'.join(a06_bad[:5]) or '无'))
+
+    # +3：第9至第23页共15页依次就位且相对先后顺序一致
+    a07_bad = []
+    for i in AGENT_PAGES:
+        miss = has_all(i, ORDER_ANCHORS[i]) if i <= n else ORDER_ANCHORS[i]
+        if miss:
+            a07_bad.append('第%d页应为"%s"' % (i, ORDER_ANCHORS[i][0]))
+    emit(3 if not a07_bad else 0,
+         "第9至第23页依次为\"云岚调度坐席平台\"封面、\"内容结构\"、\"系统总览：调度坐席的四层协作\"、\"登录：进入值守环境\"、\"主界面：把高频操作放在同一屏\"、\"焦点规则：先确认'操作'，再确认'语音'\"、\"工单窗口：先记录，再执行呼叫动作\"、\"线路状态：用可视化面板降低误操作\"、\"接续流程：从来话到三方沟通\"、\"转接与交叉操作：语音不一定跟着窗口走\"、\"合并与拆分：处理复杂通话关系\"、\"查号：用更少输入找到正确联系人\"、\"即时会议：临时协同但不污染会议列表\"、\"座席互联：用于班组内快速沟通\"、\"主菜单：按业务动作重新归类\"，共15页且相对先后顺序一致",
+         "错位页：%s" % ('；'.join(a07_bad[:6]) or '无'))
+
+    # +5：25页的页面背景底色均为蓝色系
+    #    按【通用判定门槛】1）只看"页面背景"这一处：本页自设底色优先，未自设
+    #    则取版式与母版继承的底色；图形填充、描边、表格边框一律不参与判定。
+    eff_bg, bg_bad = {}, []
+    for i in pages:
+        c = _eff_bg(pkg, parts[i - 1], schemes[i])
+        eff_bg[i] = c
+        if c is None:
+            bg_bad.append('第%d页未取到生效底色' % i)
+        elif not _is_blue(c):
+            bg_bad.append('第%d页底色#%s非蓝色系' % (i, c))
+    emit(5 if not bg_bad else 0,
+         "25页的页面背景底色均为蓝色系（色相落在蓝色区间，如 #F2F8FF / #E5EFF8 / #BDD7EE / #123D5A 一类），无白底、米黄底、浅灰底、绿底等非蓝色背景残留，专题汇报部分与操作介绍部分的背景同属蓝色系",
+         "生效底色：%s；异常%d处：%s"
+         % (' '.join('%s×%d页' % (h or '未设置', c) for h, c in
+                     collections.Counter(eff_bg.values()).most_common(4)),
+            len(bg_bad), '；'.join(bg_bad[:4]) or '无'))
+
+    # +5：25页的文字着色均为蓝色系（白/近白字与中性灰字不计异色）
+    font_tot, font_off, off_run = 0, 0, []
+    for i in pages:
+        for sp in shapes[i]:
+            for r in sp['runs']:
+                if not r['color'] or len(_norm(r['text'])) == 0:
+                    continue
+                font_tot += 1
+                if (_is_blue(r['color']) or _is_near_white(r['color'])
+                        or _is_neutral(r['color'])):
+                    continue
+                font_off += 1
+                off_run.append('第%d页"%s"字色#%s'
+                               % (i, _norm(r['text'])[:8], r['color']))
+    off_share = (font_off / float(font_tot)) if font_tot else 0.0
+    emit(5 if off_share <= FONT_OFF_RATIO else 0,
+         "25页的文字着色均为蓝色系（深蓝、中蓝、蓝灰均可，如 #123D5A / #2C6FAA / #35A3DC / #5F7381 一类），深蓝底页面上的白色或近白色文字亦计达标，不出现橙色、青绿、草绿、正红等异色文字",
+         "显式着色文字%d处，其中异色%d处（占比%.1f%%，容差%.0f%%）：%s"
+         % (font_tot, font_off, off_share * 100, FONT_OFF_RATIO * 100,
+            '；'.join(off_run[:3]) or '无'))
+
+    # +3：蓝色背景与蓝色文字之间保持可读对比
+    #    只判"蓝底 × 蓝字/白字"这一组合：文字所在形状有填充时压形状填充，
+    #    否则压该页生效底色；异色文字的问题归上一条，不在此重复计分。
+    low_ct = []
+    for i in pages:
+        for sp in shapes[i]:
+            back = sp['fill'] or eff_bg[i]
+            if not back or not _is_blue(back):
+                continue
+            for r in sp['runs']:
+                if not r['color'] or len(_norm(r['text'])) < 2:
+                    continue
+                if not (_is_blue(r['color']) or _is_near_white(r['color'])):
+                    continue
+                cv = _contrast(r['color'], back)
+                if cv < CONTRAST_MIN:
+                    low_ct.append('第%d页"%s"字色#%s压底#%s对比度%.2f'
+                                  % (i, _norm(r['text'])[:8], r['color'],
+                                     back, cv))
+    emit(3 if not low_ct else 0,
+         "蓝色背景与蓝色文字之间保持可读对比（浅蓝底配深蓝或深蓝灰字，深蓝底配白字或浅蓝字），不出现蓝字压同明度蓝底而无法辨识的文字",
+         "对比度低于%.1f的文字%d处：%s"
+         % (CONTRAST_MIN, len(low_ct), '；'.join(low_ct[:3]) or '无'))
+
+    # +5：全部页面文字均为可编辑文本
+    txt_pages = [i for i in pages if not ptext[i]]
+    a11 = (pic_total == 0 and not txt_pages)
+    emit(5 if a11 else 0,
+         "全部页面文字均为可编辑文本（可选中、可改字、可改字号字色），无以图片形式呈现的文字",
+         "图片对象%d个；无可编辑文字的页面=%s" % (pic_total, txt_pages or '无'))
+
+    # +5：全部示意图形与图标均为可编辑矢量形状，关键面板可逐格逐项改字
+    a12_bad = []
+    if pic_total:
+        a12_bad.append('存在%d个图片对象' % pic_total)
+    lp, fp = KEEP_P16[0], KEEP_P24[0]
+    miss_l = has_all(lp, KEEP_P16[1])
+    if miss_l:
+        a12_bad.append('线路面板缺可改字标识%s' % '、'.join(miss_l[:4]))
+    miss_f = has_all(fp, ['接入确认', '记录需求', '选择通道', '呼出转接', '归档复核'])
+    if miss_f:
+        a12_bad.append('流程节点缺可改字条目%s' % '、'.join(miss_f))
+    emit(5 if not a12_bad else 0,
+         "全部示意图形与图标均为可编辑矢量形状或形状组合（可单独选中、可改填充与轮廓），\"线路状态：用可视化面板降低误操作\"页的线路面板与\"运行流程与管理要点\"页的流程节点可逐格逐项改字，无以图片形式嵌入的插图",
+         "异常：%s" % ('；'.join(a12_bad) or '无'))
+
+    # ==================== 维度2：减分项 ====================
+    def pen(delta, rule, violated, detail=""):
+        results.append("%s：%s" % (("%d" % delta) if violated else "-0", rule))
+        details.append(detail)
+
+    # -3：页面上不得有"PDF原第N页""PPT原第N页"一类标注页面来源的附加文字
+    prov = []
+    for i in pages:
+        m = PROVENANCE_RE.findall(''.join(sp['text'] for sp in shapes[i]))
+        if m:
+            prov.append('第%d页"%s"' % (i, m[0]))
+    pen(-3, "25页任一页面不满足页面上无\"PDF原第1页\"至\"PDF原第10页\"\"PPT原第1页\"至\"PPT原第17页\"一类标注页面来源的附加文字",
+        bool(prov), "命中%d页：%s" % (len(prov), '；'.join(prov[:4]) or '无'))
+
+    # -3：页面尺寸须为宽 14.22 英寸 × 高 8.00 英寸
+    w_in = (cx / EMU_PER_IN) if cx else 0.0
+    h_in = (cy / EMU_PER_IN) if cy else 0.0
+    size_bad = (abs(w_in - SLIDE_W_IN) > SIZE_TOL_IN
+                or abs(h_in - SLIDE_H_IN) > SIZE_TOL_IN)
+    pen(-3, "幻灯片页面尺寸不满足宽14.22英寸×高8.00英寸（36.12厘米×20.32厘米，1024×576 磅）",
+        size_bad, "实测 %.3f×%.3f 英寸（%.2f×%.2f 厘米）"
+        % (w_in, h_in, cx / EMU_PER_CM if cx else 0, cy / EMU_PER_CM if cy else 0))
+
+    # -3：首页须保留署名"通信保障研究组"
+    sign_bad = ('通信保障研究组' not in ptext.get(1, ''))
+    pen(-3, "首页不满足在\"应急有线人工通信保障网\"\"定义、场景、价值与台站体系解析\"下方保留署名\"通信保障研究组\"",
+        sign_bad, "首页署名=%s" % ('缺失' if sign_bad else '已保留'))
+
+    # -1：首页不得新增"稳定""可控""可恢复""2026"等标签文字
+    p1 = ptext.get(1, '')
+    add_tag = [t for t in ('稳定', '可控', '可恢复', '2026') if t in p1]
+    pen(-1, "首页不满足除\"应急有线人工通信保障网\"\"定义、场景、价值与台站体系解析\"\"通信保障研究组\"外无新增的\"稳定\"\"可控\"\"可恢复\"\"2026\"等标签文字",
+        bool(add_tag), "新增标签=%s" % (add_tag or '无'))
+
+    # -3："典型设备组成"页副标题须为指定文案
+    sub8_bad = ('用自绘图形替代实拍设备保持表达一致' not in ptext.get(8, ''))
+    pen(-3, "\"典型设备组成\"页副标题不满足文字为\"用自绘图形替代实拍设备，保持表达一致\"",
+        sub8_bad, "第8页副标题=%s" % ('已被改写或缺失' if sub8_bad else '与要求一致'))
+
+    # -3：各页不得新增原本不存在的说明文字与小标题
+    add_head = []
+    for t in ADDED_HEADINGS:
+        hp = [i for i in pages if t in ptext[i]]
+        if hp:
+            add_head.append('"%s"(第%s页)' % (t, hp[0]))
+    pen(-3, "各页不满足无新增的\"四个部分构成完整汇报框架\"\"协作说明\"\"运行说明\"\"操作说明\"\"快捷键\"\"会场窗口能力\"等原本不存在的说明文字与小标题",
+        bool(add_head), "新增说明文字%d处：%s" % (len(add_head), '；'.join(add_head[:4]) or '无'))
+
+    # -1："云岚调度坐席平台"封面页副标题与四项标签须分行独立呈现
+    merged = []
+    for sp in shapes.get(9, []):
+        k = _norm(sp['text'])
+        if COVER_SPLIT_PAIR[0] in k and COVER_SPLIT_PAIR[1] in k:
+            merged.append(sp['text'][:26])
+    pen(-1, "\"云岚调度坐席平台\"封面页不满足其副标题与\"登录\"\"接续\"\"会议\"\"回呼\"四项标签分行独立呈现，被合并为以\"｜\"分隔的单行",
+        bool(merged), "合并成一行的文本框=%s" % (merged[:1] or '无'))
+
+    # -5：示意图形须保留原有轮廓形态，不得被拍平为纯矩形/圆角矩形色块
+    flat_bad = (cust_total < CUSTGEOM_MIN)
+    pen(-5, "25页的示意图形不满足保留原有轮廓形态（含首页与各页装饰弧线、\"四个基础组成\"结构图示、六类保障场景图标、能力价值图标、台站层级示意图、五类设备示意图形、调度坐席界面模拟面板、人物头像圆形、流程箭头与连接线），被简化为纯矩形/圆角矩形色块或整体缺失",
+        flat_bad, "全篇自由绘制轮廓(custGeom)=%d 个，门槛%d 个"
+        % (cust_total, CUSTGEOM_MIN))
+
+    # -3：说明性正文字号不得小于10磅
+    small = []
+    for i in pages:
+        for sp in shapes[i]:
+            for r in sp['runs']:
+                if (r['sz'] is not None and r['sz'] < BODY_SIZE_MIN
+                        and len(_norm(r['text'])) >= BODY_TEXT_MIN_LEN):
+                    small.append('第%d页%.1f磅"%s"' % (i, r['sz'], r['text'][:12]))
+    pen(-3, "说明性正文文字不满足字号不小于10磅（不出现5.6磅、6.2磅、7.2磅、8.0磅、8.5磅一类难以辨识的字号）",
+        bool(small), "小字号正文%d处：%s" % (len(small), '；'.join(small[:3]) or '无'))
+
+    # -1：同一条目文字只出现一次，不得重复叠压
+    dup_pages = []
+    for i in pages:
+        keys = [_key(sp['text']) for sp in shapes[i]]
+        keys = [k for k in keys
+                if len(k) >= DUP_MIN_LEN and not any(f in k for f in FURNITURE)]
+        rel = 0
+        for a in range(len(keys)):
+            for b in range(len(keys)):
+                if a == b:
+                    continue
+                if keys[a] in keys[b] and (keys[a] != keys[b] or a < b):
+                    rel += 1
+                    break
+        if rel > DUP_REL_MAX:
+            dup_pages.append('第%d页%d处' % (i, rel))
+    pen(-1, "任一页面不满足同一条目文字只出现一次，出现\"大型活动保障\"\"灾害抢险协同\"\"值守终端\"等条目重复叠压的同名图形或文字",
+        bool(dup_pages), "重复叠压页：%s" % ('；'.join(dup_pages[:5]) or '无'))
+
+    # -1：页码标注须连续完整无空缺
+    no_num = [i for i in pages if not page_number_present(i)]
+    pen(-1, "25页的页码标注不满足连续完整无空缺，出现部分页面页码框为空白的情况",
+        bool(no_num), "缺页码的页面%d个：%s"
+        % (len(no_num), no_num[:8] or '无'))
+
+    # -1 ×13：逐页须原样保留的文案
+    def keep(spec, rule):
+        pg, tokens = spec
+        miss = has_all(pg, tokens) if pg <= n else list(tokens)
+        pen(-1, rule, bool(miss),
+            "第%d页缺失%d处：%s" % (pg, len(miss), '、'.join(miss[:5]) or '无'))
+
+    keep(KEEP_TOC_A,
+         "\"内容结构 / 目录 CONTENTS\"页不满足保留\"01 网络定位与构成 Network Positioning and Composition\"\"02 典型保障场景 Typical Support Scenarios\"\"03 核心能力价值 Core Capabilities and Value\"\"04 台站层级与设备 Station Hierarchy and Equipment\"四条中英文目录项")
+    keep(KEEP_P3,
+         "\"什么是人工通信保障网？\"页不满足保留\"关键词：人工接续 · 有线传输 · 层级汇接 · 闭环记录\"整行文字及\"人工接续台\"\"有线传输链路\"\"用户终端\"\"安全与记录\"四个基础组成条目")
+    keep(KEEP_P4,
+         "\"02 典型保障场景\"页不满足保留副标题\"从常态值守到突发联络的备用语音链路\"及\"应急指挥备份\"\"园区专线联络\"\"偏远站点接入\"\"跨班值守交接\"\"大型活动保障\"\"灾害抢险协同\"六个场景条目")
+
+    miss56 = []
+    for pg, tokens in KEEP_P56:
+        m = has_all(pg, tokens) if pg <= n else list(tokens)
+        if m:
+            miss56.append('第%d页缺%s' % (pg, '、'.join(m[:4])))
+    pen(-1, "\"03 核心能力价值（一）（二）\"两页不满足保留副标题\"强调可用、可控、可审计\"\"让应急联络有顺序、有冗余、有恢复路径\"及\"稳定性\"\"可控性\"\"优先级调度\"\"快速恢复\"\"低依赖运行\"\"易培训维护\"六个能力条目",
+        bool(miss56), "；".join(miss56) or '两页文案齐备')
+
+    keep(KEEP_P7,
+         "\"04 台站体系与协作架构\"页不满足保留副标题\"层级汇接、分区管理、按需接入\"及\"中心汇接站\"\"区域转接站\"\"现场保障站\"\"终端接入点\"四级台站条目")
+    keep(KEEP_P8,
+         "\"典型设备组成\"页不满足保留\"人工交换坐席\"\"线路分配架\"\"有线传输介质\"\"安全记录设备\"\"值守终端\"五类设备条目")
+    keep(KEEP_P24,
+         "\"运行流程与管理要点\"页不满足保留副标题\"让人工链路形成可追踪的闭环\"、\"1 接入确认\"\"2 记录需求\"\"3 选择通道\"\"4 呼出转接\"\"5 归档复核\"五步流程及\"可靠接入\"\"身份核对\"\"闭环记录\"三条值守原则")
+    keep(KEEP_P25,
+         "\"谢谢聆听\"页不满足保留\"THANKS FOR LISTENING\"\"稳定 · 可控 · 可恢复\"与\"人工有线通信链路为应急联络保留可靠的组织保障。\"三处文字")
+    keep(KEEP_TOC_B,
+         "\"内容结构\"（操作介绍部分）页不满足保留\"01 登录与界面\"至\"06 值守规范\"六条目录项")
+    keep(KEEP_P11,
+         "\"系统总览：调度坐席的四层协作\"页不满足保留四层协作的层级图示结构与各层名称文字")
+    keep(KEEP_P16,
+         "\"线路状态：用可视化面板降低误操作\"页不满足完整保留 L01 至 L20 共20个线路状态标识")
+
+    furn_bad = [i for i in AGENT_BODY_PAGES
+                if i <= n and not all(f in ptext[i] for f in FURNITURE)]
+    pen(-1, "操作介绍各页不满足保留眉标\"操作培训\"字样与页脚\"云岚调度坐席平台\"字样",
+        bool(furn_bad), "缺眉标或页脚的页面：%s" % (furn_bad or '无'))
+
+    moved = []
+    for t in DELETED_BODY_TOKENS:
+        hp = [i for i in pages if t in ptext[i]]
+        if hp:
+            moved.append('"%s"(第%d页)' % (t, hp[0]))
+    pen(-1, "被删除的三页内容不满足未被并入其他页面，出现将删除页文字挪入保留页的情况",
+        bool(moved), "挪入保留页的删除页文案%d处：%s"
+        % (len(moved), '；'.join(moved[:4]) or '无'))
+
+    # ==================== 汇总 ====================
+    order = list(_MAX_DELTAS_ORDER) + list(_PENALTY_DELTAS_ORDER)
+    if len(results) != len(order):
+        raise RuntimeError("评分项数量与满分表不一致：results=%d, order=%d"
+                           % (len(results), len(order)))
+    items = []
+    total_score = 0
+    for text, max_delta in zip(results, order):
+        head, _, rule = text.partition('：')
+        delta = int(head)
+        total_score += delta
+        items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": (delta != 0),
+        })
+    result["dim2_items"] = items
+    result["total_score"] = max(0, total_score)
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 本地调试用：默认使用脚本所在目录
-    default_dir = os.path.dirname(os.path.abspath(__file__))
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else default_dir
-    print(json.dumps(evaluate(target_dir), ensure_ascii=False, indent=2))
+    target = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(
+        os.path.abspath(__file__))
+    print(json.dumps(evaluate(target), ensure_ascii=False, indent=2))

@@ -115,6 +115,64 @@ def test_unrelated_errors_remain_errors() -> None:
     assert system_result["error"] == system_error
 
 
+def test_negative_total_score_is_clamped_to_zero() -> None:
+    verifier_result = {
+        "id": "077",
+        "file_name": "result.pptx",
+        "status": "ok",
+        "error": None,
+        "dim1_pass": True,
+        "dim1_reason": "",
+        "dim2_items": [
+            {
+                "rule": "保留扣分明细",
+                "max_delta": -3,
+                "delta": -3,
+                "hit": True,
+            }
+        ],
+        "total_score": -3,
+        "max_score": 70,
+    }
+
+    result = build_system_result(
+        "077",
+        verifier_result,
+        "ok",
+        None,
+        0.34,
+        "2026-09-30T00:00:00+08:00",
+    )
+
+    assert result["total_score"] == 0
+    assert result["dim2_items"] == verifier_result["dim2_items"]
+
+
+def test_non_numeric_total_score_is_normalized_to_zero() -> None:
+    verifier_result = {
+        "id": "077",
+        "file_name": "result.pptx",
+        "status": "ok",
+        "error": None,
+        "dim1_pass": True,
+        "dim1_reason": "",
+        "dim2_items": [],
+        "total_score": "-3",
+        "max_score": 70,
+    }
+
+    result = build_system_result(
+        "077",
+        verifier_result,
+        "ok",
+        None,
+        0.34,
+        "2026-09-30T00:00:00+08:00",
+    )
+
+    assert result["total_score"] == 0
+
+
 def test_minimum_score_sums_only_negative_max_delta() -> None:
 
     result = {

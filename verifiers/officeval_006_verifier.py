@@ -1,1077 +1,1110 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-高中数学作业自动评分脚本
-对目录内的 Word 文档进行两维度自动评测.
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-统一接口:
-    evaluate(dir_path: str) -> dict
-        - 接收脚本所在目录的路径, 脚本自己在该目录里定位并打开被评估的文档
-        - 返回结构化字典 (含维度一是否通过、维度二逐项得分、总分)
-"""
 import os
 import re
 import sys
 import json
-
+import zipfile
+import unicodedata
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
 
-W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-M_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .docx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 任务背景：把《2026年3月17日高中数学作业》(PDF) 的试题内容灌入所给 Word 试卷
+# 模板，版式一律以模板为准（不是以 PDF 版式为准），且正文与公式须可编辑。
+# 模板既有设定（本脚本的比对基准，硬编码于 _TPL_* 常量）：
+#   A4 纵向单栏；标题行 黑体 小二号(18磅) 加粗 居中 1.1 倍行距；
+#   卷首信息行 居中 加粗 五号(10.5磅) 1.1 倍行距；
+#   题型小标题 五号(10.5磅) 加粗 左对齐 1.35 倍行距；
+#   题位段落 中文宋体 + 西文 Times New Roman 五号(10.5磅) 不加粗 约 1.34 倍行距；
+#   页脚 居中"第 X 页 共 Y 页" 小五号(9磅) 且页码为 PAGE/NUMPAGES 域；
+#   全文无表格、无页眉；默认字体 西文 Times New Roman / 中文宋体。
 
-SCRIPT_ID = '006'
+SCRIPT_ID = "006"
+# 维度二所有评分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 60
 
-
-# ============================================================
-# 辅助函数
-# ============================================================
-
-def half_pt_to_pt(val):
-    return int(val) / 2.0
-
-
-def get_para_alignment(para):
-    ppr = para._element.find('{%s}pPr' % W_NS)
-    if ppr is None:
-        return None
-    jc = ppr.find('{%s}jc' % W_NS)
-    if jc is None:
-        return None
-    return jc.get('{%s}val' % W_NS)
-
-
-def get_para_line_spacing(para):
-    ppr = para._element.find('{%s}pPr' % W_NS)
-    if ppr is None:
-        return None, None
-    sp = ppr.find('{%s}spacing' % W_NS)
-    if sp is None:
-        return None, None
-    return sp.get('{%s}line' % W_NS), sp.get('{%s}lineRule' % W_NS)
-
-
-def line_spacing_multiplier(line, lineRule):
-    if line is None:
-        return None
-    line = int(line)
-    if lineRule is None or lineRule == 'auto':
-        return line / 240.0
-    return line / 240.0
-
-
-def get_run_font_info(run):
-    rpr = run._element.find('{%s}rPr' % W_NS)
-    if rpr is None:
-        return {}
-    info = {}
-    fonts = rpr.find('{%s}rFonts' % W_NS)
-    if fonts is not None:
-        info['eastAsia'] = fonts.get('{%s}eastAsia' % W_NS)
-        info['ascii'] = fonts.get('{%s}ascii' % W_NS)
-        info['hAnsi'] = fonts.get('{%s}hAnsi' % W_NS)
-    sz = rpr.find('{%s}sz' % W_NS)
-    if sz is not None:
-        info['size_halfpt'] = int(sz.get('{%s}val' % W_NS))
-    b = rpr.find('{%s}b' % W_NS)
-    if b is None:
-        info['bold'] = False
-    else:
-        val = b.get('{%s}val' % W_NS)
-        # OOXML: <w:b/> 或 val in (true/1/on) 表示加粗;
-        #        <w:b w:val="0"/> (或 false/off) 表示显式取消加粗
-        info['bold'] = val is None or str(val).lower() in ('true', '1', 'on')
-    return info
-
-
-def get_first_run_font(para):
-    for r in para.runs:
-        if r.text.strip():
-            return get_run_font_info(r)
-    return {}
-
-
-def has_omml_equation(para):
-    element = para._element
-    if element.findall('.//{%s}oMath' % M_NS) or element.findall('.//{%s}oMathPara' % M_NS):
-        return True
-    return False
-
-
-def check_omml_in_doc(doc):
-    for p in doc.paragraphs:
-        if has_omml_equation(p):
-            return True
-    for t in doc.tables:
-        for row in t.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    if has_omml_equation(p):
-                        return True
-    return False
-
-
-def has_sqrt_text(text):
-    return '√' in text or '\u221a' in text
-
-
-def has_fraction_text(text):
-    return bool(re.search(r'\d\s*/\s*\d', text))
-
-
-def get_footer_info(section):
-    footer = section.footer
-    if footer is None:
-        return None, False, False, ''
-    has_page = False
-    has_numpages = False
-    footer_text = ''
-    for p in footer.paragraphs:
-        footer_text += p.text
-        for fld in p._element.findall('.//{%s}fldSimple' % W_NS):
-            instr = fld.get('{%s}instr' % W_NS)
-            if instr == 'PAGE':
-                has_page = True
-            elif instr == 'NUMPAGES':
-                has_numpages = True
-    return footer_text.strip(), has_page, has_numpages, footer_text
-
-
-def is_empty_para(para):
-    return not para.text.strip()
-
-
-def count_images(doc):
-    return sum(1 for rel in doc.part.rels.values() if "image" in rel.reltype)
-
-
-def count_text_runs(doc):
-    return sum(1 for p in doc.paragraphs for r in p.runs if r.text.strip())
-
-
-# ============================================================
-# 评分主逻辑
-# ============================================================
-
-# 维度二全部评分项 (标签, 分值). 标签需与后续 hit_items.append(...) 完全一致.
-ALL_RULES = [
-    ('+1 标题行字体: 黑体小二加粗中文, Times New Roman小二加粗数字', 1),
-    ('+1 标题行段落格式: 居中对齐, 1.1倍行距', 1),
-    ('+1 第二行字体: 宋体五号加粗', 1),
-    ('+1 第二行段落格式: 居中对齐, 1.1倍行距', 1),
-    ('+1 章节标题字体: 宋体五号加粗', 1),
-    ('+1 章节标题段落格式: 两端对齐, 1.35倍行距', 1),
-    ('+1 正文字体: 中文宋体五号, 英文及数字Times New Roman五号', 1),
-    ('+1 正文段落格式: 两端对齐, 1.34倍行距', 1),
-    ('+3 页码: "第x页 共y页" 页面底部居中', 3),
-    ('-5 根号显示不全: 使用 "√x" 文本形式而非 OMML "$\\sqrt{x}$"', -5),
-    ('-5 试卷第一页、第二页题目下方出现空白行', -5),
-    ('-5 选项不对齐: 上一题选项A与下一题选项A/C位置不一致', -5),
-    ('-5 分数显示不对应: 使用 "a/b" 文本形式而非 OMML "$\\dfrac{a}{b}$"', -5),
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." 字符串反解为结构化 dim2_items 时用。顺序须与 _evaluate_impl 中
+# results.append(...) 的顺序严格一致；共 30 项，累加 = MAX_SCORE_TOTAL。
+_MAX_DELTAS_ORDER = [
+    # ---- 题目内容搬运完整性（13 项 / 19 分）----
+    3,  # 01 单选题第1-10题题干齐全
+    1,  # 02 多选题第11-14题题干齐全（仅4道，与填空题3道的分值对齐）
+    1,  # 03 填空题第15-17题题干齐全
+    1,  # 04 解答题第18-21题题干齐全（仅4道，与多选题4道的分值对齐）
+    3,  # 05 选择题 A/B/C/D 四选项齐全
+    1,  # 06 解答题各小问齐全（仅4道题的小问，与解答题题干分值对齐）
+    3,  # 07 题干数值与条件无抄错
+    1,  # 08 题型分组顺序
+    1,  # 09 卷首考生信息行已写入
+    1,  # 10 填空题留有作答空位
+    1,  # 11 第10题抛物线示意图
+    1,  # 12 第19题等腰三角形示意图
+    1,  # 13 两幅示意图位置正确
+    # ---- 数学表达的可编辑性（6 项 / 16 分）----
+    5,  # 14 分式为 Word 公式真分数
+    3,  # 15 根式为 Word 公式根号
+    3,  # 16 幂次与上下标为公式/真上下标
+    3,  # 17 数学符号显示正确
+    1,  # 18 角度使用度符号 °
+    1,  # 19 集合与区间括号配对完整
+    # ---- 与模板格式一致（11 项 / 25 分）----
+    1,  # 20 标题行 黑体小二加粗居中1.1倍行距
+    1,  # 21 卷首信息行 居中加粗五号1.1倍行距
+    3,  # 22 题型小标题 五号加粗左对齐1.35倍行距
+    3,  # 23 题干与选项 宋体+TNR 五号 不加粗
+    3,  # 24 题干与选项行距约1.34倍
+    5,  # 25 选项用制表位分列、全文无表格
+    3,  # 26 页脚版式"第 X 页 共 Y 页"小五号居中
+    1,  # 27 A4 纵向单栏
+    3,  # 28 同一题内无割裂该题的手工分页符
+    1,  # 29 解答题小问单独成段并缩进
+    1,  # 30 正文未混入来源PDF页面标记
 ]
+assert sum(_MAX_DELTAS_ORDER) == MAX_SCORE_TOTAL
+
+# 各评分项的细则原文，顺序与 _MAX_DELTAS_ORDER / results.append(...) 严格一致。
+# dim2_items 的 "rule" 只取本表中的细则文本; results 里的 "+N：..." 字符串仅用于
+# 反解 delta, 其携带的运行期实测数据(如"（表格 14 个，制表位/空格分列 0/14 题）")
+# 不写入 rule。
+_RULES_ORDER = [
+    # ---- 题目内容搬运完整性 ----
+    "单选题第1-10题题干全部搬入，无缺题",
+    "多选题第11-14题题干全部搬入，无缺题",
+    "填空题第15-17题题干全部搬入，无缺题",
+    "解答题第18-21题题干全部搬入，无缺题",
+    "每道选择题的A/B/C/D四个选项齐全，未漏项、未串项",
+    "解答题各小问齐全——18题(1)(2)、19题(1)(2)(3)、20题(1)(2)、21题(1)(2)",
+    "题干中的数值与条件与来源一致，无抄错",
+    "题型分组顺序为单选题→多选题→填空题→解答题，与模板题位顺序一致",
+    "卷首考生信息行（学校/姓名/班级/考号）已写入，并留有可填写的空位",
+    "填空题第15-17题句末留有作答横线或空位",
+    "第10题的抛物线与x轴交点示意图随该题呈现，图中A、B、P、O与x、y轴标注齐全",
+    "第19题的等腰三角形示意图随该题呈现，图中A、B、C、D、E、M、N标注齐全",
+    "两幅示意图均置于对应题干与选项/小问之间，未错位到别的题下",
+    # ---- 数学表达的可编辑性 ----
+    "分式以Word公式对象的真分数形式排版，可双击进入编辑，未降级为斜杠平排写法",
+    "根式以Word公式对象的根号形式排版，根号线完整覆盖被开方式",
+    "幂次与上下标以公式对象或Word真上标/下标格式呈现，未用Unicode特殊字符拼凑",
+    "数学符号（∩、∪、∈、≤、≠、∥、△、∞、π、α）显示正确，无乱码、方框或缺字",
+    "角度单位使用度符号°（30°、45°、90°、120°），未用形近字符替代",
+    "集合与区间括号（{ }、[ ]、( )、∪）配对完整，未出现断裂或缺半边",
+    # ---- 与模板格式一致 ----
+    "卷首标题行沿用模板标题格式——黑体、小二号（18磅）、加粗、居中、1.1倍行距",
+    "卷首考生信息行沿用模板同位行格式——居中、加粗、五号（10.5磅）、1.1倍行距",
+    "四个题型小标题沿用模板格式——五号（10.5磅）、加粗、左对齐、1.35倍行距，未改为居中或放大字号",
+    "题干与选项段落沿用模板题位格式——中文宋体、西文Times New Roman、五号（10.5磅）、不加粗",
+    "题干与选项段落行距沿用模板设定（约1.34倍），未压成单倍行距或另设其他固定值",
+    "选项以段落内制表位/空格分列排版，全文不含表格对象，与模板的纯段落结构一致",
+    "页脚沿用模板页码版式——居中的\"第 X 页 共 Y 页\"、小五号（9磅），未改写措辞或字号",
+    "纸张为A4（210mm×297mm）纵向、单栏排版，与模板一致",
+    "同一道题内未插入割裂该题的手工分页符（Ctrl+Enter 分页符、\"段前分页\"属性），"
+    "整题另起一页与自然换页不计为割裂",
+    "解答题小问(1)(2)(3)单独成段并统一缩进，层级清晰",
+    "正文（题干、选项、小问）中未混入来源PDF的页面标记"
+    "（形如\"试卷第N页，共3页\"\"答案第N页，共2页\"），"
+    "模板页脚自带的\"第 X 页 共 Y 页\"不计入本项",
+]
+assert len(_RULES_ORDER) == len(_MAX_DELTAS_ORDER)
+
+# ---------------- 模板基准常量 ----------------
+_TPL_TITLE_SIZE = (17.5, 18.5)      # 小二号 18 磅
+_TPL_TITLE_LS = (1.05, 1.15)        # 1.1 倍行距
+_TPL_TITLE_EASTASIA = ('黑体', 'SimHei')
+_TPL_BODY_SIZE = (10.0, 11.0)       # 五号 10.5 磅
+_TPL_INFO_LS = (1.05, 1.15)         # 1.1 倍行距
+_TPL_HEAD_LS = (1.30, 1.40)         # 1.35 倍行距
+_TPL_QUES_LS = (1.28, 1.40)         # 约 1.34 倍行距
+_TPL_FOOTER_SIZE = (8.5, 9.6)       # 小五号 9 磅（含转换取整容差）
+_TPL_SONGTI = ('宋体', 'SimSun', 'NSimSun')
+_TPL_ASCII = 'Times New Roman'
+_TPL_PGSZ = (11906, 16838)          # A4 纵向（twips）
+
+_NS_M = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+_NS_MC = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
 
 
-def _rule_name(label):
-    """把 '+1 xxx' / '-5 xxx' 前缀去掉, 只保留规则名."""
-    m = re.match(r'^[+-]\d+\s*', label)
-    return label[m.end():] if m else label
+def _m(tag):
+    """OMML（数学）命名空间下的标签全名。"""
+    return '{%s}%s' % (_NS_M, tag)
 
 
-def _build_dim2_items(hit_items):
-    """把命中标签列表拼成结构化 dim2_items (含未命中)."""
-    hit_set = set(hit_items)
-    items = []
-    for label, max_delta in ALL_RULES:
-        hit = label in hit_set
-        items.append({
-            'rule': _rule_name(label),
-            'max_delta': max_delta,
-            'delta': max_delta if hit else 0,
-            'hit': hit,
-            'detail': '',
-        })
-    return items
+_MC_FALLBACK = '{%s}Fallback' % _NS_MC
+_W_T = qn('w:t')
+_M_T = _m('t')
+_W_TAB = qn('w:tab')
+_W_BR = qn('w:br')
+_W_INSTR = qn('w:instrText')
+_W_DEL = qn('w:delText')
+
+# ---------------- 文本抽取与归一化 ----------------
+
+# Unicode 上/下标字符（判"用特殊字符拼凑上下标"用，同时用于归一化比对）
+_SUP_MAP = {
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    '⁺': '+', '⁻': '-', 'ⁿ': 'n', 'ˣ': 'x', 'ᵃ': 'a',
+    'ᵇ': 'b', 'ᶜ': 'c', 'ᵏ': 'k', 'ᵐ': 'm',
+}
+_SUB_MAP = {
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    '₊': '+', '₋': '-', 'ₙ': 'n', 'ₐ': 'a', 'ₑ': 'e',
+    'ₖ': 'k', 'ₘ': 'm', 'ᵢ': 'i', 'ⱼ': 'j',
+}
+_UNI_SCRIPT_CHARS = set(_SUP_MAP) | set(_SUB_MAP)
+
+# 各类"减号/连字符"统一成 ASCII '-'
+_MINUS_CHARS = '−–—‐‑‒－˗'
+# 各类括号统一成 ASCII
+_BRACKET_MAP = {
+    '（': '(', '）': ')', '［': '[', '］': ']',
+    '｛': '{', '｝': '}', '【': '[', '】': ']',
+    '｜': '|',
+}
 
 
-def _max_score():
-    # 满分 = 所有加分项 max_delta 之和 (不含扣分项)
-    return sum(md for _, md in ALL_RULES if md > 0)
+def _el_text(el):
+    """按文档顺序抽取元素内的可见文字，含 OMML 公式中的 m:t。
+
+    - 跳过 mc:Fallback 子树（AlternateContent 的回退分支会造成文字重复）；
+    - 跳过域代码 w:instrText 与删除痕迹 w:delText；
+    - w:tab -> '\\t'，w:br -> '\\n'。
+    """
+    parts = []
+
+    def walk(node):
+        for ch in node:
+            tag = ch.tag
+            if not isinstance(tag, str):
+                continue
+            if tag == _MC_FALLBACK or tag == _W_INSTR or tag == _W_DEL:
+                continue
+            if tag == _W_T or tag == _M_T:
+                parts.append(ch.text or '')
+                continue
+            if tag == _W_TAB:
+                parts.append('\t')
+            elif tag == _W_BR:
+                parts.append('\n')
+            walk(ch)
+
+    walk(el)
+    return ''.join(parts)
 
 
-def _open_doc_as_document(file_path: str):
-    """打开 .docx 文档 (python-docx 仅支持 OOXML/.docx)."""
+def _norm(s):
+    """数学文本归一化：Unicode 上下标还原为普通字符、统一减号/括号/全半角，
+    并去掉全部空白，便于与来源条件做"是否抄错"的稳定比对。"""
+    if not s:
+        return ''
+    out = []
+    for ch in s:
+        if ch in _SUP_MAP:
+            out.append(_SUP_MAP[ch])
+        elif ch in _SUB_MAP:
+            out.append(_SUB_MAP[ch])
+        elif ch in _MINUS_CHARS:
+            out.append('-')
+        elif ch in _BRACKET_MAP:
+            out.append(_BRACKET_MAP[ch])
+        elif ch.isspace():
+            continue
+        else:
+            out.append(ch)
+    txt = ''.join(out)
+    # 全角字母数字 -> 半角（NFKC 只作用于这些字符，避免影响 CJK）
+    txt = ''.join(unicodedata.normalize('NFKC', c) if '！' <= c <= '～' else c
+                  for c in txt)
+    return txt
+
+
+def _in_range(val, lo_hi):
+    return val is not None and lo_hi[0] <= val <= lo_hi[1]
+
+
+def _has_cjk(s):
+    return any('一' <= c <= '鿿' for c in (s or ''))
+
+
+def _has_ascii_word(s):
+    return any(('0' <= c <= '9') or ('a' <= c <= 'z') or ('A' <= c <= 'Z')
+               for c in (s or ''))
+
+
+# ---------------- 字体/字号继承链解析 ----------------
+
+def _style_chain(doc, style_id, limit=8):
+    """从 styles.xml 沿 w:basedOn 向上收集样式元素。"""
+    chain = []
+    styles_el = doc.styles.element
+    cur = style_id
+    seen = set()
+    while cur and cur not in seen and len(chain) < limit:
+        seen.add(cur)
+        found = None
+        for st in styles_el.findall(qn('w:style')):
+            if st.get(qn('w:styleId')) == cur:
+                found = st
+                break
+        if found is None:
+            break
+        chain.append(found)
+        based = found.find(qn('w:basedOn'))
+        cur = based.get(qn('w:val')) if based is not None else None
+    return chain
+
+
+def _para_style_id(para):
+    p_style = para._p.find(qn('w:pPr'))
+    if p_style is None:
+        return None
+    ps = p_style.find(qn('w:pStyle'))
+    return ps.get(qn('w:val')) if ps is not None else None
+
+
+def _doc_defaults_rpr(doc):
+    dd = doc.styles.element.find(qn('w:docDefaults'))
+    if dd is None:
+        return None
+    rpr_dd = dd.find(qn('w:rPrDefault'))
+    if rpr_dd is None:
+        return None
+    return rpr_dd.find(qn('w:rPr'))
+
+
+def _eastasia_of(rpr):
+    if rpr is None:
+        return None
+    fonts = rpr.find(qn('w:rFonts'))
+    if fonts is None:
+        return None
+    return fonts.get(qn('w:eastAsia'))
+
+
+def _ascii_of(rpr):
+    if rpr is None:
+        return None
+    fonts = rpr.find(qn('w:rFonts'))
+    if fonts is None:
+        return None
+    return fonts.get(qn('w:ascii')) or fonts.get(qn('w:hAnsi'))
+
+
+def _sz_of(rpr):
+    """w:sz 为半磅值，返回磅值。"""
+    if rpr is None:
+        return None
+    sz = rpr.find(qn('w:sz'))
+    if sz is None:
+        return None
+    try:
+        return int(sz.get(qn('w:val'))) / 2.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_effective(doc, run, para, getter):
+    """run rPr -> 段落样式(含 basedOn 链) -> docDefaults 依次取值。"""
+    val = getter(run._r.find(qn('w:rPr')))
+    if val:
+        return val
+    for st in _style_chain(doc, _para_style_id(para)):
+        val = getter(st.find(qn('w:rPr')))
+        if val:
+            return val
+    return getter(_doc_defaults_rpr(doc))
+
+
+def _resolve_effective_eastasia(doc, run, para):
+    return _resolve_effective(doc, run, para, _eastasia_of)
+
+
+def _resolve_effective_ascii(doc, run, para):
+    return _resolve_effective(doc, run, para, _ascii_of)
+
+
+def _resolve_effective_size(doc, run, para):
+    val = _resolve_effective(doc, run, para, _sz_of)
+    if val:
+        return val
+    # 兜底：Normal 样式字号（模板 Normal 为五号 10.5 磅）
+    try:
+        sz = doc.styles['Normal'].font.size
+        if sz is not None:
+            return sz.pt
+    except Exception:
+        pass
+    return 10.5
+
+
+def _run_bold(doc, run, para):
+    """加粗的有效值：run -> 段落样式链；None 视为不加粗。"""
+    rpr = run._r.find(qn('w:rPr'))
+    if rpr is not None:
+        b = rpr.find(qn('w:b'))
+        if b is not None:
+            v = b.get(qn('w:val'))
+            return v not in ('0', 'false', 'off')
+    for st in _style_chain(doc, _para_style_id(para)):
+        rpr = st.find(qn('w:rPr'))
+        if rpr is None:
+            continue
+        b = rpr.find(qn('w:b'))
+        if b is not None:
+            v = b.get(qn('w:val'))
+            return v not in ('0', 'false', 'off')
+    return False
+
+
+# ---------------- 文档结构切分 ----------------
+
+_QNUM_RE = re.compile(r'^(\d{1,2})\s*[．.、]')
+_HEAD_KEYS = ('单选题', '多选题', '填空题', '解答题')
+_OPT_RE = re.compile(r'([ABCD])\s*[．.、]')
+_SUBQ_RE = re.compile(r'\(\s*([123])\s*\)')
+_SRC_MARK_RE = re.compile(r'(试卷|答案)第\d+页,?共\d+页')
+_FOOTER_OK_RE = re.compile(r'^(第\d*页共\d*页)+$')
+
+
+def _iter_blocks(doc):
+    """把正文顶层子元素展平成有序 block 列表（段落与表格），并预取文字。"""
+    blocks = []
+    for child in doc.element.body.iterchildren():
+        tag = child.tag
+        if not isinstance(tag, str):
+            continue
+        if tag == qn('w:p'):
+            blocks.append({'kind': 'p', 'el': child, 'text': _el_text(child)})
+        elif tag == qn('w:tbl'):
+            blocks.append({'kind': 'tbl', 'el': child, 'text': _el_text(child)})
+    return blocks
+
+
+def _find_headings(blocks):
+    """定位四个题型小标题 block 下标：{'单选题': idx, ...}。"""
+    heads = {}
+    for i, b in enumerate(blocks):
+        if b['kind'] != 'p':
+            continue
+        t = _norm(b['text'])
+        if not t or len(t) > 60:
+            continue
+        if _QNUM_RE.match(t):
+            continue
+        for key in _HEAD_KEYS:
+            if key in t and key not in heads:
+                heads[key] = i
+    return heads
+
+
+def _find_questions(blocks):
+    """按 1..21 严格递增匹配题号，返回 {题号: 起始 block 下标}。"""
+    starts = {}
+    expected = 1
+    for i, b in enumerate(blocks):
+        if expected > 21:
+            break
+        t = _norm(b['text'])
+        m = _QNUM_RE.match(t)
+        if m and int(m.group(1)) == expected:
+            starts[expected] = i
+            expected += 1
+    return starts
+
+
+def _question_ranges(blocks, q_starts, heads):
+    """每题的 block 区间 [start, end)：下一题起点或下一个题型小标题处截断。"""
+    head_idx = sorted(heads.values())
+    ranges = {}
+    for n, start in q_starts.items():
+        end = q_starts.get(n + 1, len(blocks))
+        for hi in head_idx:
+            if start < hi < end:
+                end = hi
+                break
+        ranges[n] = (start, end)
+    return ranges
+
+
+def _range_text(blocks, rng):
+    s, e = rng
+    return '\n'.join(blocks[i]['text'] for i in range(s, e))
+
+
+def _count_tags(el, tag):
+    return sum(1 for _ in el.iter(tag))
+
+
+def _has_figure(blocks, rng):
+    """区间内是否存在图形对象（DrawingML 或 VML）。"""
+    s, e = rng
+    for i in range(s, e):
+        el = blocks[i]['el']
+        if _count_tags(el, qn('w:drawing')) or _count_tags(el, qn('w:pict')):
+            return True
+    return False
+
+
+def _open_word_document(file_path):
+    """打开 .docx；异常直接向上抛，由 evaluate 统一兜底。"""
     return Document(file_path)
 
 
-def _find_target_file(dir_path):
-    """在给定目录内定位待评估的 Word 文档 (.docx)."""
-    if not os.path.isdir(dir_path):
-        return None
-    for name in sorted(os.listdir(dir_path)):
-        if name.startswith('~$'):
-            continue
-        if name.lower().endswith('.docx'):
-            return os.path.join(dir_path, name)
-    return None
+def _zip_read(file_path, name_filter):
+    """读取包内匹配的 XML 部件文本，返回 {部件名: 文本}。"""
+    out = {}
+    with zipfile.ZipFile(file_path) as zf:
+        for name in zf.namelist():
+            if name_filter(name):
+                out[name] = zf.read(name).decode('utf-8', errors='ignore')
+    return out
 
 
-def _error_result(dir_path, message):
-    file_name = ''
-    if dir_path:
-        candidate = _find_target_file(dir_path)
-        if candidate:
-            file_name = os.path.basename(candidate)
-    return {
-        'id': SCRIPT_ID,
-        'file_name': file_name,
-        'status': 'error',
-        'error': message,
-        'dim1_pass': False,
-        'dim1_reason': message,
-        'dim2_items': [],
-        'total_score': 0,
-        'max_score': _max_score(),
-    }
+def evaluate(dir_path):
+    """入口：在 dir_path 内定位待评估的 .docx 并返回评分字典。
 
-
-def evaluate(dir_path: str) -> dict:
-    """对指定目录内的 Word 文档进行两维度评测.
-
-    参数:
-        dir_path: 脚本所在目录路径, 脚本自动在其中定位 .docx 文件.
-    返回:
-        结构化字典, 字段说明见 "脚本接口差异与统一建议.md" §2.2.
+    - 定位不到被评估文件时：error 只回纯文本原因（不带异常类名），
+      dim1_pass 与 dim1_reason 一律留空（空字符串，表示维度一根本没进入判定），
+      dim2_items=[]、total_score=max_score=0。
+    - 维度一未通过时：dim1_pass=False，且 dim1_reason 带出错误摘要。
     """
+    result = {
+        "id": SCRIPT_ID,
+        "file_name": "",
+        "status": "ok",
+        "error": None,
+        "dim1_pass": False,
+        "dim1_reason": "",
+        "dim2_items": [],
+        "total_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
+    }
     try:
-        return _evaluate_impl(dir_path)
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"目录不存在或不是目录：{dir_path}")
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith(('.docx', '.doc'))
+                       and not f.startswith('~$')
+                       and os.path.isfile(os.path.join(dir_path, f)))
+        if not cands:
+            raise FileNotFoundError(f"目录中未找到 .docx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 找不到被评估文件：error 只回传纯文本原因，不带异常类名；维度一根本没进入
+        # 判定，dim1_pass 与 dim1_reason 一律留空（空字符串，而非 False），满分归零
+        result["status"] = "error"
+        result["error"] = str(exc)
+        result["file_name"] = ""
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
     except Exception as exc:
-        return _error_result(dir_path, f'{type(exc).__name__}: {exc}')
+        # 文件存在但打不开/解析失败：维度一未通过，dim1_reason 带上错误摘要便于定位
+        result["status"] = "error"
+        result["error"] = f"脚本运行异常：{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = f"文件无法解析或打开失败：{type(exc).__name__}: {exc}"
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
 
 
-def _evaluate_impl(dir_path: str) -> dict:
-    file_path = _find_target_file(dir_path)
-    if file_path is None:
-        return _error_result(dir_path, '目录下未找到 .docx 文件')
-    file_name = os.path.basename(file_path)
+def _evaluate_impl(file_path, result):
+    doc = _open_word_document(file_path)
+    body = doc.element.body
+    blocks = _iter_blocks(doc)
 
-    try:
-        doc = _open_doc_as_document(file_path)
-    except Exception as exc:
-        return _error_result(dir_path, f'无法打开文档: {exc}')
+    full_text = '\n'.join(b['text'] for b in blocks)
+    full_norm = _norm(full_text)
 
-    # ---- 维度二: 得分项检查 ----
-    hit_items = []
+    heads = _find_headings(blocks)
+    q_starts = _find_questions(blocks)
+    q_ranges = _question_ranges(blocks, q_starts, heads)
+    q_norm = {n: _norm(_range_text(blocks, r)) for n, r in q_ranges.items()}
+    q_raw = {n: _range_text(blocks, r) for n, r in q_ranges.items()}
 
-    paragraphs = doc.paragraphs
-    title_para = paragraphs[0]
-    second_para = paragraphs[1]
+    n_tbl = _count_tags(body, qn('w:tbl'))
 
-    # 识别章节标题
-    #   - 兼容两种落盘方式:
-    #     (a) 文本直接含 "一、单选题" 之类 -> 正则 ^[一二三四五六七八九十]、
-    #     (b) "一、二、三、四" 由 w:pPr/w:numPr 自动编号生成, 文本仅剩 "单选题" 等 -> 走 numPr + 名称白名单
-    pattern_chinese_num = re.compile(r'^[一二三四五六七八九十]、')
-    _section_names = {'单选题', '多选题', '填空题', '解答题'}
+    # ---------- 维度1：可正常打开 ----------
+    # 唯一门槛：文件能被解析打开。打不开会在 evaluate 的异常兜底里置 dim1_pass=False；
+    # 能走到这里说明 Document(file_path) 已成功，即视为通过。
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "文件可正常打开"
 
-    def _para_has_numpr(para):
-        ppr = para._element.find('{%s}pPr' % W_NS)
-        return ppr is not None and ppr.find('{%s}numPr' % W_NS) is not None
+    results = []
 
-    section_header_paras = []
-    section_header_indices = set()
-    for i, p in enumerate(paragraphs):
-        stripped = p.text.strip()
-        norm = re.sub(r'\s+', '', p.text)
-        if pattern_chinese_num.match(stripped) or (norm in _section_names and _para_has_numpr(p)):
-            section_header_paras.append(p)
-            section_header_indices.add(i)
-
-    # 正文段落 (排除标题、第二行、章节标题)
-    body_paras = []
-    skip_idx = {0, 1} | section_header_indices
-    for i, p in enumerate(paragraphs):
-        if i not in skip_idx and p.text.strip():
-            body_paras.append(p)
-
-    # --- +1: 标题行字体 (黑体小二加粗中文, Times New Roman小二加粗数字) ---
-    # 细则: 文档顶部第一行内容为 "2026 年 3 月 17 日高中数学作业"
-    #       中文文本 -> 黑体 / 小二(18pt=36 halfpt) / 加粗
-    #       数字文本 -> Times New Roman / 小二 / 加粗
-    def _is_cjk(ch):
-        return '一' <= ch <= '鿿'
-
-    expected_title_norm = '2026年3月17日高中数学作业'
-    title_text_norm = re.sub(r'\s+', '', title_para.text)
-    title_content_ok = title_text_norm == expected_title_norm
-
-    chinese_ok = True
-    digit_ok = True
-    found_cn = False
-    found_digit = False
-    for run in title_para.runs:
-        if not run.text:
-            continue
-        f = get_run_font_info(run)
-        size_ok = f.get('size_halfpt') == 36  # 小二 = 18pt = 36 half-pt
-        bold_ok = f.get('bold') is True
-        ascii_font = (f.get('ascii') or '').lower()
-        hansi_font = (f.get('hAnsi') or '').lower()
-        east_font = f.get('eastAsia')
-        for ch in run.text:
-            if _is_cjk(ch):
-                found_cn = True
-                if not (east_font == '黑体' and size_ok and bold_ok):
-                    chinese_ok = False
-            elif ch.isdigit():
-                found_digit = True
-                if not ((ascii_font == 'times new roman' or hansi_font == 'times new roman')
-                        and size_ok and bold_ok):
-                    digit_ok = False
-
-    if title_content_ok and found_cn and found_digit and chinese_ok and digit_ok:
-        hit_items.append('+1 标题行字体: 黑体小二加粗中文, Times New Roman小二加粗数字')
-
-    # --- +1: 标题行段落格式 (居中对齐, 1.1倍行距) ---
-    # 细则: 文档顶部第一行内容为 "2026 年 3 月 17 日高中数学作业"
-    #       段落格式 -> 居中对齐 + 1.1 倍行距
-    # 基于 Word 段落属性:
-    #   w:pPr/w:jc/@w:val = "center"
-    #   w:pPr/w:spacing/@w:lineRule = "auto" 且 @w:line = 264 (1.1 * 240)
-    title_align = get_para_alignment(title_para)
-    title_line, title_rule = get_para_line_spacing(title_para)
-    align_ok = title_align == 'center'
-    spacing_ok = False
-    if title_line is not None and (title_rule is None or title_rule == 'auto'):
-        try:
-            spacing_ok = int(title_line) == 264
-        except (TypeError, ValueError):
-            spacing_ok = False
-    if title_content_ok and align_ok and spacing_ok:
-        hit_items.append('+1 标题行段落格式: 居中对齐, 1.1倍行距')
-
-    # --- +1: 第二行字体 (宋体五号加粗) ---
-    # 细则: 文档顶部第二行内容为包含
-    #       "学校：____________　姓名：____________　班级：____________　考号：____________"
-    #       汉字文本为宋体五号加粗
-    # 判定: 先校验第二行内容包含四个字段且各带下划线占位 (前置条件),
-    #       再遍历该段落所有含汉字的 run, 确认均为 宋体 / 五号(10.5pt, 21 half-pt 附近) / 加粗;
-    #       内容不对或任一汉字 run 字体不符均不得分.
-    s2_text = second_para.text
-    # 内容包含性判定: 四个字段 (学校/姓名/班级/考号) 且每个字段后都有下划线占位
-    required_fields = ['学校', '姓名', '班级', '考号']
-    fields_ok = all(fd in s2_text for fd in required_fields)
-    underline_ok = s2_text.count('_') >= 4 * 12  # 每个字段 12 个下划线, 共 4 个字段
-    s2_content_ok = fields_ok and underline_ok
-
-    s2_font_ok = False
-    if s2_content_ok:
-        s2_font_ok = True
-        found_s2_cn = False
-        for run in second_para.runs:
-            if not any(_is_cjk(ch) for ch in run.text):
-                continue
-            found_s2_cn = True
-            f = get_run_font_info(run)
-            size_ok = (f.get('size_halfpt') is not None
-                       and abs(half_pt_to_pt(f['size_halfpt']) - 10.5) <= 1)
-            bold_ok = f.get('bold') is True
-            if not (f.get('eastAsia') == '宋体' and size_ok and bold_ok):
-                s2_font_ok = False
-                break
-        if not found_s2_cn:
-            s2_font_ok = False
-
-    if s2_content_ok and s2_font_ok:
-        hit_items.append('+1 第二行字体: 宋体五号加粗')
-
-    # --- +1: 第二行段落格式 (居中对齐, 1.1倍行距) ---
-    # 细则: 文档顶部第二行内容包含 "学校：____________　姓名：____________　班级：____________　考号：____________"
-    #       段落格式 -> 居中对齐 + 1.1 倍行距
-    # 基于 Word 段落属性:
-    #   w:pPr/w:jc/@w:val = "center"
-    #   w:pPr/w:spacing/@w:lineRule = "auto" 且 @w:line = 264 (1.1 * 240)
-    s2_align = get_para_alignment(second_para)
-    s2_line, s2_rule = get_para_line_spacing(second_para)
-    s2_align_ok = s2_align == 'center'
-    s2_spacing_ok = False
-    if s2_line is not None and (s2_rule is None or s2_rule == 'auto'):
-        try:
-            s2_spacing_ok = int(s2_line) == 264
-        except (TypeError, ValueError):
-            s2_spacing_ok = False
-    if s2_content_ok and s2_align_ok and s2_spacing_ok:
-        hit_items.append('+1 第二行段落格式: 居中对齐, 1.1倍行距')
-
-    # --- +1: 章节标题字体 (宋体五号加粗) ---
-    # 细则: "一、单选题"、"二、多选题"、"三、填空题"、"四、解答题" 格式为 宋体 / 五号 / 加粗
-    # 基于 Word 属性 (含继承链, 由高到低):
-    #   run rPr  →  段落 pPr/rPr  →  段落 style rPr (递归 basedOn)  →  docDefaults/rPrDefault
-    #   - "一、二、三、四" 由 w:pPr/w:numPr 自动编号生成 (numId=1), 不在 p.text 中
-    #     -> 章节段落识别: 段落文本 ∈ {单选题, 多选题, 填空题, 解答题} 且带 w:numPr
-    #   - 宋体: eastAsia == '宋体'; 五号: sz val == 21; 加粗: w:b (无 val 或 val ∈ true/1/on)
-
-    _styles_el = doc.styles.element
-    _style_by_id = {
-        s.get('{%s}styleId' % W_NS): s
-        for s in _styles_el.findall('{%s}style' % W_NS)
-        if s.get('{%s}styleId' % W_NS)
+    # ============ 一、题目内容搬运完整性 ============
+    # 各题的特征关键词（归一化后比对），用于判断题干是否真正搬入而非仅有题号
+    q_keys = {
+        1: ('已知集合',), 2: ('图象经过点',), 3: ('sin',), 4: ('等差数列',),
+        5: ('圆心到直线',), 6: ('红球',), 7: ('恒成立',), 8: ('正方体',),
+        9: ('最大值',), 10: ('抛物线',),
+        11: ('单调递增',), 12: ('等比数列',), 13: ('两个不同',), 14: ('骰子',),
+        15: ('定义域',), 16: ('tan',), 17: ('渐近线',),
+        18: ('已知数列',), 19: ('等腰三角形',), 20: ('椭圆',), 21: ('极小值',),
     }
 
-    def _rpr_to_font(rpr):
-        info = {'eastAsia': None, 'ascii': None, 'hAnsi': None,
-                'size_halfpt': None, 'bold': None}
-        if rpr is None:
-            return info
-        fonts = rpr.find('{%s}rFonts' % W_NS)
-        if fonts is not None:
-            info['eastAsia'] = fonts.get('{%s}eastAsia' % W_NS)
-            info['ascii'] = fonts.get('{%s}ascii' % W_NS)
-            info['hAnsi'] = fonts.get('{%s}hAnsi' % W_NS)
-        sz = rpr.find('{%s}sz' % W_NS)
-        if sz is not None:
-            val = sz.get('{%s}val' % W_NS)
-            if val:
-                info['size_halfpt'] = int(val)
-        b = rpr.find('{%s}b' % W_NS)
-        if b is not None:
-            v = b.get('{%s}val' % W_NS)
-            info['bold'] = v is None or str(v).lower() in ('true', '1', 'on')
-        return info
+    def _group_ok(nums):
+        missing = []
+        for n in nums:
+            txt = q_norm.get(n)
+            if not txt or not any(k in txt for k in q_keys[n]):
+                missing.append(n)
+        return missing
 
-    def _style_font_chain(style_id, seen=None):
-        """沿 basedOn 链累积 style rPr, 高优先级在前."""
-        if seen is None:
-            seen = set()
-        if not style_id or style_id in seen or style_id not in _style_by_id:
-            return {'eastAsia': None, 'ascii': None, 'hAnsi': None,
-                    'size_halfpt': None, 'bold': None}
-        seen.add(style_id)
-        s = _style_by_id[style_id]
-        cur = _rpr_to_font(s.find('{%s}rPr' % W_NS))
-        based = s.find('{%s}basedOn' % W_NS)
-        base_id = based.get('{%s}val' % W_NS) if based is not None else None
-        base = _style_font_chain(base_id, seen)
-        return {k: cur.get(k) if cur.get(k) is not None else base.get(k)
-                for k in cur}
-
-    _doc_default_font = None
-    def _doc_defaults_font():
-        nonlocal _doc_default_font
-        if _doc_default_font is not None:
-            return _doc_default_font
-        dd = _styles_el.find('{%s}docDefaults' % W_NS)
-        if dd is None:
-            _doc_default_font = _rpr_to_font(None)
-            return _doc_default_font
-        rprd = dd.find('{%s}rPrDefault' % W_NS)
-        rpr = rprd.find('{%s}rPr' % W_NS) if rprd is not None else None
-        _doc_default_font = _rpr_to_font(rpr)
-        return _doc_default_font
-
-    def _default_para_style_id():
-        for sid, s in _style_by_id.items():
-            if s.get('{%s}type' % W_NS) == 'paragraph' and s.get('{%s}default' % W_NS) == '1':
-                return sid
-        return None
-
-    _default_pstyle_id = _default_para_style_id()
-
-    def _para_style_id(para):
-        ppr = para._element.find('{%s}pPr' % W_NS)
-        if ppr is None:
-            return _default_pstyle_id
-        ps = ppr.find('{%s}pStyle' % W_NS)
-        if ps is None:
-            return _default_pstyle_id
-        return ps.get('{%s}val' % W_NS) or _default_pstyle_id
-
-    def _get_para_rpr_font(para):
-        ppr = para._element.find('{%s}pPr' % W_NS)
-        if ppr is None:
-            return _rpr_to_font(None)
-        return _rpr_to_font(ppr.find('{%s}rPr' % W_NS))
-
-    def _effective_font(para, run):
-        rf = get_run_font_info(run)
-        pf = _get_para_rpr_font(para)
-        sf = _style_font_chain(_para_style_id(para))
-        df = _doc_defaults_font()
-        # 继承合并: run > pPr/rPr > style chain > docDefaults
-        merged = {}
-        for k in ('eastAsia', 'ascii', 'hAnsi', 'size_halfpt', 'bold'):
-            for src in (rf, pf, sf, df):
-                v = src.get(k) if isinstance(src, dict) else None
-                if v is not None:
-                    merged[k] = v
-                    break
-            else:
-                merged[k] = None
-        return merged
-
-    def _has_numpr(para):
-        ppr = para._element.find('{%s}pPr' % W_NS)
-        return ppr is not None and ppr.find('{%s}numPr' % W_NS) is not None
-
-    required_sections = ['一、单选题', '二、多选题', '三、填空题', '四、解答题']
-    required_names = {'单选题', '多选题', '填空题', '解答题'}
-    name_to_full = {'单选题': '一、单选题', '多选题': '二、多选题',
-                    '填空题': '三、填空题', '解答题': '四、解答题'}
-
-    section_map = {}
-    for p in paragraphs:
-        t = re.sub(r'\s+', '', p.text)
-        if t in required_sections and t not in section_map:
-            section_map[t] = p
-            continue
-        if t in required_names and _has_numpr(p):
-            full = name_to_full[t]
-            if full not in section_map:
-                section_map[full] = p
-
-    if all(name in section_map for name in required_sections):
-        all_ok = True
-        for name in required_sections:
-            p = section_map[name]
-            para_ok = False
-            for run in p.runs:
-                if not run.text.strip():
-                    continue
-                f = _effective_font(p, run)
-                if not (f.get('eastAsia') == '宋体'
-                        and f.get('size_halfpt') == 21
-                        and f.get('bold') is True):
-                    para_ok = False
-                    break
-                para_ok = True
-            if not para_ok:
-                all_ok = False
-                break
-        if all_ok:
-            hit_items.append('+1 章节标题字体: 宋体五号加粗')
-
-    # --- +1: 章节标题段落格式 (两端对齐, 1.35倍行距) ---
-    # 细则: "一、单选题"、"二、多选题"、"三、填空题"、"四、解答题" 段落格式为 两端对齐 + 1.35倍行距
-    # 基于 Word 段落属性:
-    #   w:pPr/w:jc/@w:val = "both" (两端对齐)
-    #   w:pPr/w:spacing/@w:lineRule = "auto" 且 @w:line = 324 (1.35 * 240)
-    if all(name in section_map for name in required_sections):
-        all_ok = True
-        for name in required_sections:
-            p = section_map[name]
-            align = get_para_alignment(p)
-            line, rule = get_para_line_spacing(p)
-            # 两端对齐: w:jc/@w:val = "both"
-            align_ok = align == 'both'
-            # 1.35 倍行距: line=324, lineRule=auto
-            spacing_ok = False
-            if line is not None and (rule is None or rule == 'auto'):
-                try:
-                    spacing_ok = int(line) == 324
-                except (TypeError, ValueError):
-                    spacing_ok = False
-            if not (align_ok and spacing_ok):
-                all_ok = False
-                break
-        if all_ok:
-            hit_items.append('+1 章节标题段落格式: 两端对齐, 1.35倍行距')
-
-    # --- +1: 正文字体 (中文宋体五号, 英文及阿拉伯数字 Times New Roman 五号) ---
-    # 细则: 试卷正文
-    #   中文        -> 宋体 / 五号 (10.5pt = 21 half-pt)
-    #   英文 / 数字 -> Times New Roman / 五号
-    # 基于 Word run 属性:
-    #   w:rPr/w:rFonts/@w:eastAsia = "宋体"          (中文)
-    #   w:rPr/w:rFonts/@w:ascii    = "Times New Roman" (英文/数字)
-    #   w:rPr/w:rFonts/@w:hAnsi    = "Times New Roman" (英文/数字)
-    #   w:rPr/w:sz/@w:val = 21
-    if body_paras:
-        all_ok = True
-        for p in body_paras:
-            for run in p.runs:
-                if not run.text:
-                    continue
-                f = get_run_font_info(run)
-                # 五号: 21 half-pt (精确)
-                if f.get('size_halfpt') != 21:
-                    all_ok = False
-                    break
-                east_font = f.get('eastAsia')
-                ascii_font = (f.get('ascii') or '')
-                hansi_font = (f.get('hAnsi') or '')
-                for ch in run.text:
-                    if _is_cjk(ch):
-                        if east_font != '宋体':
-                            all_ok = False
-                            break
-                    elif ('A' <= ch <= 'Z') or ('a' <= ch <= 'z') or ch.isdigit():
-                        if not (ascii_font == 'Times New Roman'
-                                and hansi_font == 'Times New Roman'):
-                            all_ok = False
-                            break
-                if not all_ok:
-                    break
-            if not all_ok:
-                break
-        if all_ok:
-            hit_items.append('+1 正文字体: 中文宋体五号, 英文及数字Times New Roman五号')
-
-    # --- +1: 正文段落格式 (两端对齐, 1.34倍行距) ---
-    # 细则: 试卷正文段落格式为 两端对齐 + 1.34 倍行距
-    # 基于 Word 段落属性:
-    #   w:pPr/w:jc/@w:val = "both" (两端对齐)
-    #   w:pPr/w:spacing/@w:lineRule = "auto" 且 @w:line = round(1.34 * 240) = 322
-    if body_paras:
-        all_ok = True
-        for p in body_paras:
-            align = get_para_alignment(p)
-            line, rule = get_para_line_spacing(p)
-            align_ok = align == 'both'
-            spacing_ok = False
-            if line is not None and (rule is None or rule == 'auto'):
-                try:
-                    # 1.34 * 240 = 321.6, Word 存整数 (321 或 322)
-                    spacing_ok = int(line) in (321, 322)
-                except (TypeError, ValueError):
-                    spacing_ok = False
-            if not (align_ok and spacing_ok):
-                all_ok = False
-                break
-        if all_ok:
-            hit_items.append('+1 正文段落格式: 两端对齐, 1.34倍行距')
-
-    # --- +3: 页码 (每页都有, 样式 "第x页 共y页", 页面底部居中) ---
-    # 细则:
-    #   1) 试卷每页都有页码       -> 每个 section 的 footer 均须包含页码域
-    #   2) 样式为 "第x页 共y页"    -> footer 文本能匹配 ^第.*页共.*页$
-    #   3) 页码放置在页面底部居中  -> 承载页码的 footer 段落水平居中
-    # 基于 Word footer 属性:
-    #   页码域: w:fldSimple/@w:instr 含 "PAGE" / "NUMPAGES"
-    #          或 w:instrText 文本含 "PAGE" / "NUMPAGES" (复杂 field)
-    #   居中: 两种合法方式均识别
-    #     (A) 承载段落 w:pPr/w:jc/@w:val = "center"
-    #     (B) 页码位于 w:drawing 里的锚定文本框, 且水平位置相对页边距居中:
-    #         w:drawing//wp:anchor/wp:positionH[@relativeFrom='margin']/wp:align = 'center'
-    # 说明: 当页码放在 (B) 中时, 承载段落的 p.text 为空,
-    #       需要递归收集 w:t (含 drawing 内部) 作为样式匹配文本
-
-    WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
-
-    def _drawing_horiz_center(el):
-        anchors = el.findall('.//{%s}anchor' % WP_NS)
-        for anchor in anchors:
-            ph = anchor.find('{%s}positionH' % WP_NS)
-            if ph is None:
-                continue
-            if ph.get('relativeFrom') != 'margin':
-                continue
-            align = ph.find('{%s}align' % WP_NS)
-            if align is not None and (align.text or '').strip() == 'center':
-                return True
-        return False
-
-    def _collect_all_text(el):
-        parts = []
-        for wt in el.findall('.//{%s}t' % W_NS):
-            if wt.text:
-                parts.append(wt.text)
-        return ''.join(parts)
-
-    def _check_footer(section):
-        footer = section.footer
-        if footer is None:
-            return False
-        for p in footer.paragraphs:
-            has_page = False
-            has_numpages = False
-            for fld in p._element.findall('.//{%s}fldSimple' % W_NS):
-                instr = fld.get('{%s}instr' % W_NS) or ''
-                if 'PAGE' in instr and 'NUMPAGES' not in instr:
-                    has_page = True
-                if 'NUMPAGES' in instr:
-                    has_numpages = True
-            for it in p._element.findall('.//{%s}instrText' % W_NS):
-                txt = (it.text or '').strip()
-                if 'PAGE' in txt and 'NUMPAGES' not in txt:
-                    has_page = True
-                if 'NUMPAGES' in txt:
-                    has_numpages = True
-            if not (has_page and has_numpages):
-                continue
-            # 样式匹配文本: 递归收集所有 w:t (覆盖 drawing 内部承载的页码字样)
-            all_text = _collect_all_text(p._element)
-            cleaned = re.sub(r'\s+', '', all_text)
-            style_ok = bool(re.match(r'^第.*页共.*页$', cleaned))
-            # 居中: 段落 jc=center 或 drawing 锚定 wp:align=center relativeFrom=margin
-            align = get_para_alignment(p)
-            align_ok = align == 'center' or _drawing_horiz_center(p._element)
-            if style_ok and align_ok:
-                return True
-        return False
-
-    if doc.sections and all(_check_footer(sec) for sec in doc.sections):
-        hit_items.append('+3 页码: "第x页 共y页" 页面底部居中')
-
-    # --- -5: 根号显示不全 (√x 文本形式, 非 OMML 数学公式) ---
-    # 细则: 试卷中的根号显示不全, 如根号x应显示为 "$\sqrt{x}$" (OMML 数学公式)
-    #       而不是 "√x" (普通文本字符 U+221A)
-    # 基于 Word XML:
-    #   - OMML 公式渲染的根号在 <m:rad> / <m:radPr> 结构中, 其 <m:t> 里的字符
-    #     由 Word 排版为根号符号, 不会以 U+221A 作为普通 run 文本存在
-    #   - "√x" 文本形式表现为普通 run 里的 <w:t> 直接包含 U+221A 字符
-    # 判定: 只要文档中存在任一 <w:t> 文本里含有 U+221A 且该 <w:t> 不在 <m:oMath> 内,
-    #       即触发扣分
-    def _has_sqrt_text_outside_omml(container):
-        for wt in container._element.findall('.//{%s}t' % W_NS):
-            if not wt.text or '√' not in wt.text:
-                continue
-            # 检查是否位于 oMath / oMathPara 内
-            in_omml = False
-            anc = wt.getparent()
-            while anc is not None:
-                tag = anc.tag
-                if tag == '{%s}oMath' % M_NS or tag == '{%s}oMathPara' % M_NS:
-                    in_omml = True
-                    break
-                anc = anc.getparent()
-            if not in_omml:
-                return True
-        return False
-
-    sqrt_bad = False
-    for p in doc.paragraphs:
-        if _has_sqrt_text_outside_omml(p):
-            sqrt_bad = True
-            break
-    if not sqrt_bad:
-        for t in doc.tables:
-            for row in t.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        if _has_sqrt_text_outside_omml(p):
-                            sqrt_bad = True
-                            break
-                    if sqrt_bad:
-                        break
-                if sqrt_bad:
-                    break
-            if sqrt_bad:
-                break
-    if sqrt_bad:
-        hit_items.append('-5 根号显示不全: 使用 "√x" 文本形式而非 OMML "$\\sqrt{x}$"')
-
-    # --- -5: 试卷第一页、第二页题目下方出现空白行 ---
-    # 细则: 试卷第一页、第二页题目下方出现空白行
-    # 基于 Word 属性:
-    #   - 页边界: <w:lastRenderedPageBreak/> (Word 保存时记录的最近一次渲染分页点)
-    #            或显式 <w:br w:type="page"/> 分页符
-    #   - "题目" 段落: 段落文本以 "数字." 或 "数字、" 起始, 如 "1.", "12、"
-    #   - "空白行"    : 段落 w:p 内不含任何 "可见内容":
-    #                   - p.text strip 后无文字
-    #                   - 且不含图形对象 (w:drawing / w:pict / v:shape / v:group)
-    #                   - 且不含公式对象 (m:oMath / m:oMathPara)
-    #                   仅此三类都缺失时才视为真正的排版空行
-    # 判定: 在第 1、2 页范围内, 若存在 "题目段落" 之后的下一个段落是空段落, 则触发扣分
-
-    V_NS = 'urn:schemas-microsoft-com:vml'
-
-    def _para_has_visual_object(para):
-        el = para._element
-        for tag in ('{%s}drawing' % W_NS,
-                    '{%s}pict' % W_NS,
-                    '{%s}shape' % V_NS,
-                    '{%s}group' % V_NS,
-                    '{%s}oMath' % M_NS,
-                    '{%s}oMathPara' % M_NS):
-            if el.findall('.//' + tag):
-                return True
-        return False
-
-    def _is_true_empty_para(para):
-        return is_empty_para(para) and not _para_has_visual_object(para)
-
-    # 1) 定位第 1、2 页涉及的段落索引范围: 前两个 page break 之前的段落
-    page_break_para_idx = []
-    for i, p in enumerate(paragraphs):
-        el = p._element
-        if el.findall('.//{%s}lastRenderedPageBreak' % W_NS):
-            page_break_para_idx.append(i)
-            continue
-        found_page_br = False
-        for br in el.findall('.//{%s}br' % W_NS):
-            if br.get('{%s}type' % W_NS) == 'page':
-                found_page_br = True
-                break
-        if found_page_br:
-            page_break_para_idx.append(i)
-
-    if len(page_break_para_idx) >= 2:
-        upper = page_break_para_idx[1]
-    elif len(page_break_para_idx) == 1:
-        upper = len(paragraphs) - 1
+    # 01 单选题 1-10
+    miss = _group_ok(range(1, 11))
+    if not miss:
+        results.append("+3：单选题第1-10题题干全部搬入，无缺题（10/10）")
     else:
-        upper = len(paragraphs) - 1
+        results.append(f"+0：单选题第1-10题题干全部搬入，无缺题（缺 {miss}）")
 
-    question_pattern = re.compile(r'^\s*\d+\s*[\.\．、]')
-    empty_after_question = False
-    for i in range(upper):
-        p = paragraphs[i]
-        if question_pattern.match(p.text or ''):
-            if i + 1 <= upper and _is_true_empty_para(paragraphs[i + 1]):
-                empty_after_question = True
+    # 02 多选题 11-14
+    miss = _group_ok(range(11, 15))
+    if not miss:
+        results.append("+1：多选题第11-14题题干全部搬入，无缺题（4/4）")
+    else:
+        results.append(f"+0：多选题第11-14题题干全部搬入，无缺题（缺 {miss}）")
+
+    # 03 填空题 15-17
+    miss = _group_ok(range(15, 18))
+    if not miss:
+        results.append("+1：填空题第15-17题题干全部搬入，无缺题（3/3）")
+    else:
+        results.append(f"+0：填空题第15-17题题干全部搬入，无缺题（缺 {miss}）")
+
+    # 04 解答题 18-21
+    miss = _group_ok(range(18, 22))
+    if not miss:
+        results.append("+1：解答题第18-21题题干全部搬入，无缺题（4/4）")
+    else:
+        results.append(f"+0：解答题第18-21题题干全部搬入，无缺题（缺 {miss}）")
+
+    # 05 选择题 A/B/C/D 四选项齐全
+    bad_opt = []
+    for n in range(1, 15):
+        labels = set(_OPT_RE.findall(q_norm.get(n, '')))
+        if labels != {'A', 'B', 'C', 'D'}:
+            bad_opt.append(n)
+    if not bad_opt:
+        results.append("+3：每道选择题的A/B/C/D四个选项齐全，未漏项、未串项（14题）")
+    else:
+        results.append(f"+0：每道选择题的A/B/C/D四个选项齐全，未漏项、未串项（异常题号 {bad_opt}）")
+
+    # 06 解答题各小问齐全
+    need_sub = {18: {'1', '2'}, 19: {'1', '2', '3'}, 20: {'1', '2'}, 21: {'1', '2'}}
+    bad_sub = []
+    for n, need in need_sub.items():
+        got = set(_SUBQ_RE.findall(q_norm.get(n, '')))
+        if not need.issubset(got):
+            bad_sub.append(n)
+    if not bad_sub:
+        results.append("+1：解答题各小问齐全——18题(1)(2)、19题(1)(2)(3)、20题(1)(2)、21题(1)(2)")
+    else:
+        results.append(f"+0：解答题各小问齐全（小问缺失题号 {bad_sub}）")
+
+    # 07 题干数值与条件与来源一致
+    facts = ['a1=3', 'a8=24', 'AB=AC=5', 'BC=6', 'DE=1',
+             'x2+y2-4x+2y-4=0', '3个红球', '2个蓝球', '1个白球']
+    lost = [f for f in facts if f not in full_norm]
+    if not lost:
+        results.append(f"+3：题干中的数值与条件与来源一致，无抄错（{len(facts)}项关键条件全中）")
+    else:
+        results.append(f"+0：题干中的数值与条件与来源一致，无抄错（未命中 {lost}）")
+
+    # 08 题型分组顺序
+    if len(heads) == 4:
+        order = [heads[k] for k in _HEAD_KEYS]
+        seq_ok = all(order[i] < order[i + 1] for i in range(3))
+    else:
+        seq_ok = False
+    if seq_ok:
+        results.append("+1：题型分组顺序为单选题→多选题→填空题→解答题，与模板题位顺序一致")
+    else:
+        results.append(f"+0：题型分组顺序为单选题→多选题→填空题→解答题（识别到 {len(heads)}/4 个题型小标题）")
+
+    # 09 卷首考生信息行
+    info_idx = None
+    for i, b in enumerate(blocks[:10]):
+        t = _norm(b['text'])
+        if all(k in t for k in ('学校', '姓名', '班级', '考号')):
+            info_idx = i
+            break
+    if info_idx is not None:
+        results.append("+1：卷首考生信息行（学校/姓名/班级/考号）已写入，并留有可填写的空位")
+    else:
+        results.append("+0：卷首考生信息行（学校/姓名/班级/考号）已写入，并留有可填写的空位")
+
+    # 10 填空题第15-17题句末留有作答横线或空位
+    blank_bad = []
+    for n in (15, 16, 17):
+        raw = q_raw.get(n, '')
+        if not (re.search(r'[_＿]{3,}', raw) or '\t' in raw
+                or re.search(r'[ 　]{4,}', raw)):
+            blank_bad.append(n)
+    if not blank_bad:
+        results.append("+1：填空题第15-17题句末留有作答横线或空位")
+    else:
+        results.append(f"+0：填空题第15-17题句末留有作答横线或空位（缺空位题号 {blank_bad}）")
+
+    # 11 第10题抛物线示意图
+    fig10 = 10 in q_ranges and _has_figure(blocks, q_ranges[10])
+    if fig10:
+        results.append("+1：第10题的抛物线与x轴交点示意图随该题呈现，图中A、B、P、O与x、y轴标注齐全")
+    else:
+        results.append("+0：第10题的抛物线与x轴交点示意图随该题呈现，图中A、B、P、O与x、y轴标注齐全")
+
+    # 12 第19题等腰三角形示意图
+    fig19 = 19 in q_ranges and _has_figure(blocks, q_ranges[19])
+    if fig19:
+        results.append("+1：第19题的等腰三角形示意图随该题呈现，图中A、B、C、D、E、M、N标注齐全")
+    else:
+        results.append("+0：第19题的等腰三角形示意图随该题呈现，图中A、B、C、D、E、M、N标注齐全")
+
+    # 13 两幅示意图均置于对应题干与选项/小问之间，未错位到别的题下
+    stray = [n for n, r in q_ranges.items()
+             if n not in (10, 19) and _has_figure(blocks, r)]
+    if fig10 and fig19 and not stray:
+        results.append("+1：两幅示意图均置于对应题干与选项/小问之间，未错位到别的题下")
+    else:
+        results.append(f"+0：两幅示意图均置于对应题干与选项/小问之间，未错位到别的题下（错位题号 {stray}）")
+
+    # ============ 二、数学表达的可编辑性 ============
+    n_frac = _count_tags(body, _m('f'))
+    n_rad = _count_tags(body, _m('rad'))
+    n_ssup = _count_tags(body, _m('sSup'))
+    n_ssub = _count_tags(body, _m('sSub'))
+    n_vert = 0
+    for va in body.iter(qn('w:vertAlign')):
+        if va.get(qn('w:val')) in ('superscript', 'subscript'):
+            n_vert += 1
+    n_uni_script = sum(1 for c in full_text if c in _UNI_SCRIPT_CHARS)
+    n_slash = len(re.findall(r'\d\s*/\s*\d|[a-zA-Z]\s*/\s*\d', full_norm))
+
+    # 14 分式以 Word 公式对象的真分数形式排版
+    if n_frac >= 8 and n_frac >= n_slash:
+        results.append(f"+5：分式以Word公式对象的真分数形式排版，可双击进入编辑，未降级为斜杠平排写法"
+                       f"（m:f 真分数 {n_frac} 处，斜杠平排 {n_slash} 处）")
+    else:
+        results.append(f"+0：分式以Word公式对象的真分数形式排版，可双击进入编辑，未降级为斜杠平排写法"
+                       f"（m:f 真分数 {n_frac} 处，斜杠平排 {n_slash} 处）")
+
+    # 15 根式以 Word 公式对象的根号形式排版
+    if n_rad >= 3:
+        results.append(f"+3：根式以Word公式对象的根号形式排版，根号线完整覆盖被开方式（m:rad {n_rad} 处）")
+    else:
+        results.append(f"+0：根式以Word公式对象的根号形式排版，根号线完整覆盖被开方式（m:rad {n_rad} 处）")
+
+    # 16 幂次与上下标以公式对象或 Word 真上标/下标呈现
+    n_script = n_ssup + n_ssub + n_vert
+    if n_script >= 12 and n_uni_script == 0:
+        results.append(f"+3：幂次与上下标以公式对象或Word真上标/下标格式呈现，未用Unicode特殊字符拼凑"
+                       f"（公式上下标 {n_ssup + n_ssub} 处、真上下标 {n_vert} 处、Unicode拼凑 0 处）")
+    else:
+        results.append(f"+0：幂次与上下标以公式对象或Word真上标/下标格式呈现，未用Unicode特殊字符拼凑"
+                       f"（公式上下标 {n_ssup + n_ssub} 处、真上下标 {n_vert} 处、Unicode拼凑 {n_uni_script} 处）")
+
+    # 17 数学符号显示正确
+    need_sym = ('∩', '∪', '∈', '≤', '≠', '∥', '△', '∞', 'π', 'α')
+    miss_sym = [s for s in need_sym if s not in full_text]
+    garbled = full_text.count('�') + full_text.count('□')
+    if not miss_sym and garbled == 0:
+        results.append("+3：数学符号（∩、∪、∈、≤、≠、∥、△、∞、π、α）显示正确，无乱码、方框或缺字")
+    else:
+        results.append(f"+0：数学符号（∩、∪、∈、≤、≠、∥、△、∞、π、α）显示正确，无乱码、方框或缺字"
+                       f"（缺失 {miss_sym}，乱码/方框 {garbled} 处）")
+
+    # 18 角度单位使用度符号 °
+    n_deg = full_text.count('°')
+    n_fake_deg = full_text.count('◦') + full_text.count('∘') + full_text.count('˚')
+    if n_deg >= 4 and n_fake_deg == 0:
+        results.append(f"+1：角度单位使用度符号°（30°、45°、90°、120°），未用形近字符替代（° {n_deg} 处）")
+    else:
+        results.append(f"+0：角度单位使用度符号°（30°、45°、90°、120°），未用形近字符替代"
+                       f"（° {n_deg} 处，形近字符 {n_fake_deg} 处）")
+
+    # 19 集合与区间括号配对完整
+    n_open = sum(full_norm.count(c) for c in '([{')
+    n_close = sum(full_norm.count(c) for c in ')]}')
+    if abs(n_open - n_close) <= 1:
+        results.append(f"+1：集合与区间括号（{{ }}、[ ]、( )、∪）配对完整，未出现断裂或缺半边"
+                       f"（左 {n_open} / 右 {n_close}）")
+    else:
+        results.append(f"+0：集合与区间括号（{{ }}、[ ]、( )、∪）配对完整，未出现断裂或缺半边"
+                       f"（左 {n_open} / 右 {n_close}）")
+
+    # ============ 三、与模板格式一致 ============
+    def _ls_mult(para):
+        """段落行距的"倍数"值；固定值/最小值返回 None（视为未沿用模板倍数行距）。"""
+        v = para.paragraph_format.line_spacing
+        if v is None:
+            return None
+        if hasattr(v, 'pt'):
+            return None
+        return float(v)
+
+    def _vis_runs(para):
+        return [r for r in para.runs if (r.text or '').strip()]
+
+    def _is_left(para):
+        return para.alignment in (None, WD_ALIGN_PARAGRAPH.LEFT)
+
+    def _para_of(el):
+        return Paragraph(el, doc)
+
+    # 20 卷首标题行——黑体、小二号(18磅)、加粗、居中、1.1 倍行距
+    title_para = None
+    for b in blocks:
+        if b['kind'] == 'p' and _norm(b['text']):
+            title_para = _para_of(b['el'])
+            break
+    t_align = t_ls = None
+    t_bad = ['未找到标题行']
+    if title_para is not None:
+        t_bad = []
+        t_align = title_para.alignment
+        t_ls = _ls_mult(title_para)
+        if t_align != WD_ALIGN_PARAGRAPH.CENTER:
+            t_bad.append('未居中')
+        if not _in_range(t_ls, _TPL_TITLE_LS):
+            t_bad.append(f'行距 {t_ls}')
+        for r in _vis_runs(title_para):
+            if not _in_range(_resolve_effective_size(doc, r, title_para), _TPL_TITLE_SIZE):
+                t_bad.append('字号非小二号(18磅)')
                 break
-    if empty_after_question:
-        hit_items.append('-5 试卷第一页、第二页题目下方出现空白行')
+        for r in _vis_runs(title_para):
+            if not _run_bold(doc, r, title_para):
+                t_bad.append('未加粗')
+                break
+        for r in _vis_runs(title_para):
+            if _has_cjk(r.text) and _resolve_effective_eastasia(doc, r, title_para) \
+                    not in _TPL_TITLE_EASTASIA:
+                t_bad.append('中文字体非黑体')
+                break
+    if not t_bad:
+        results.append("+1：卷首标题行沿用模板标题格式——黑体、小二号（18磅）、加粗、居中、1.1倍行距")
+    else:
+        results.append(f"+0：卷首标题行沿用模板标题格式——黑体、小二号（18磅）、加粗、居中、1.1倍行距"
+                       f"（偏差：{'、'.join(sorted(set(t_bad)))}）")
 
-    # --- -5: 试卷中每道题的选项不对齐 ---
-    # 细则: 上一题的选项 A 应与下一题的选项 A 或选项 C 对齐
-    # 思路: 对每道题, 提取其选项 A / C 在页面上的实际水平位置 (以 twips 表示),
-    #       再比较相邻题目间 A-A 或 A-C 的位置差是否为 0 (或在容差内).
-    #       覆盖三种常见排版:
-    #         (1) 表格布局 (4 列×1行 或 2 列×2行): 位置 = 表格左边界 + 列偏移
-    #         (2) 制表位(tab)分隔: 位置 = 触发该选项文本前的 tab 停靠位置(w:tabs/w:tab/@w:pos),
-    #             若没有显式 tabs 定义则用默认制表位 (Word 默认 720 twips 一档) 估算
-    #         (3) 普通段落 (纯空格/文本缩进): 位置 = 段落左缩进 + 选项前空白字符数 * 单字符宽度估算
-    #       "对齐" 判定: 位置值以整数(twips)比较, 差值在容差 (20 twips, 约 0.03cm) 内视为对齐.
-    EMU_PER_TWIP = 635  # 1 twip = 635 EMU, 用于统一表格 (twips) 与 drawing (EMU) 单位
-    ALIGN_TOLERANCE_TWIPS = 20
+    # 21 卷首考生信息行——居中、加粗、五号(10.5磅)、1.1 倍行距
+    i_bad = ['未找到考生信息行']
+    if info_idx is not None and blocks[info_idx]['kind'] == 'p':
+        ip = _para_of(blocks[info_idx]['el'])
+        i_bad = []
+        if ip.alignment != WD_ALIGN_PARAGRAPH.CENTER:
+            i_bad.append('未居中')
+        if not _in_range(_ls_mult(ip), _TPL_INFO_LS):
+            i_bad.append(f'行距 {_ls_mult(ip)}')
+        for r in _vis_runs(ip):
+            if not _run_bold(doc, r, ip):
+                i_bad.append('未加粗')
+                break
+        for r in _vis_runs(ip):
+            if not _in_range(_resolve_effective_size(doc, r, ip), _TPL_BODY_SIZE):
+                i_bad.append('字号非五号(10.5磅)')
+                break
+    if not i_bad:
+        results.append("+1：卷首考生信息行沿用模板同位行格式——居中、加粗、五号（10.5磅）、1.1倍行距")
+    else:
+        results.append(f"+0：卷首考生信息行沿用模板同位行格式——居中、加粗、五号（10.5磅）、1.1倍行距"
+                       f"（偏差：{'、'.join(sorted(set(i_bad)))}）")
 
-    def _table_col_positions(tbl):
-        """返回表格中 A 列 / C 列 (若存在) 的左边界水平位置 (twips)."""
-        el = tbl._element
-        tblPr = el.find('{%s}tblPr' % W_NS)
-        jc_val = None
-        ind_w = 0
-        if tblPr is not None:
-            jc = tblPr.find('{%s}jc' % W_NS)
-            if jc is not None:
-                jc_val = jc.get('{%s}val' % W_NS)
-            tblInd = tblPr.find('{%s}tblInd' % W_NS)
-            if tblInd is not None:
-                w = tblInd.get('{%s}w' % W_NS)
-                ind_w = int(w) if w else 0
-        # 居中/居右表格没有固定左边界基准, 仅左对齐(或默认)表格的位置才有跨表可比性
-        base = ind_w if jc_val in (None, 'left', 'start') else None
+    # 22 四个题型小标题——五号(10.5磅)、加粗、左对齐、1.35 倍行距
+    h_bad = []
+    if len(heads) != 4:
+        h_bad.append(f'仅识别到{len(heads)}个小标题')
+    for key in _HEAD_KEYS:
+        if key not in heads:
+            continue
+        hp = _para_of(blocks[heads[key]]['el'])
+        if not _is_left(hp):
+            h_bad.append(f'{key}未左对齐')
+        if not _in_range(_ls_mult(hp), _TPL_HEAD_LS):
+            h_bad.append(f'{key}行距{_ls_mult(hp)}')
+        for r in _vis_runs(hp):
+            if not _in_range(_resolve_effective_size(doc, r, hp), _TPL_BODY_SIZE):
+                h_bad.append(f'{key}字号非五号')
+                break
+        for r in _vis_runs(hp):
+            if not _run_bold(doc, r, hp):
+                h_bad.append(f'{key}未加粗')
+                break
+    if not h_bad:
+        results.append("+3：四个题型小标题沿用模板格式——五号（10.5磅）、加粗、左对齐、1.35倍行距，未改为居中或放大字号")
+    else:
+        results.append(f"+0：四个题型小标题沿用模板格式——五号（10.5磅）、加粗、左对齐、1.35倍行距，未改为居中或放大字号"
+                       f"（偏差：{'、'.join(h_bad[:6])}）")
 
-        tblGrid = el.find('{%s}tblGrid' % W_NS)
-        cols = []
-        if tblGrid is not None:
-            for c in tblGrid.findall('{%s}gridCol' % W_NS):
-                w = c.get('{%s}w' % W_NS)
-                cols.append(int(w) if w else 0)
-
-        row0_cells = tbl.rows[0].cells if tbl.rows else []
-        n_cols = len(cols) or len(row0_cells)
-
-        pos_a = base
-        pos_c = None
-        if base is not None:
-            if n_cols >= 4:
-                # 4 列布局: A 在列0, C 在列2 -> 偏移 = 列0宽 + 列1宽
-                if len(cols) >= 2:
-                    pos_c = base + cols[0] + cols[1]
-            elif n_cols == 2:
-                # 2 列 x 2 行布局: A 在 (行0,列0), C 在 (行1,列0) -> 与 A 同列
-                pos_c = base
-        return pos_a, pos_c
-
-    def _is_option_table(tbl):
-        # 只考察 A/B/C/D 选项表: 首行首格文本以 A．/ A. 起始
-        if not tbl.rows:
-            return False
-        first_text = tbl.rows[0].cells[0].text.strip()
-        return bool(re.match(r'^A[．.]', first_text))
-
-    def _para_default_left_indent(para):
-        """段落左缩进 (twips), 取 w:ind/@w:left 或 @w:start, 缺省为 0."""
-        ppr = para._element.find('{%s}pPr' % W_NS)
-        if ppr is None:
-            return 0
-        ind = ppr.find('{%s}ind' % W_NS)
-        if ind is None:
-            return 0
-        v = ind.get('{%s}left' % W_NS) or ind.get('{%s}start' % W_NS)
-        try:
-            return int(v) if v else 0
-        except (TypeError, ValueError):
-            return 0
-
-    def _para_tab_stops(para):
-        """段落自定义制表位列表 (twips), 按位置升序."""
-        ppr = para._element.find('{%s}pPr' % W_NS)
-        if ppr is None:
-            return []
-        tabs = ppr.find('{%s}tabs' % W_NS)
-        if tabs is None:
-            return []
-        stops = []
-        for tab in tabs.findall('{%s}tab' % W_NS):
-            pos = tab.get('{%s}pos' % W_NS)
-            if pos is not None:
-                try:
-                    stops.append(int(pos))
-                except (TypeError, ValueError):
-                    pass
-        return sorted(stops)
-
-    DEFAULT_TAB_INTERVAL = 720  # Word 默认制表位间隔 (twips, 0.5 英寸)
-
-    def _next_tab_stop(custom_stops, after):
-        for pos in custom_stops:
-            if pos > after:
-                return pos
-        # 无自定义制表位覆盖该区间, 用默认间隔估算下一档
-        return ((after // DEFAULT_TAB_INTERVAL) + 1) * DEFAULT_TAB_INTERVAL
-
-    def _option_positions_in_paragraph_text(para):
-        """从纯段落文本中定位选项 A / C 的水平位置 (twips), 兼容 tab 分隔与空格缩进.
-
-        - 若字符 A/C 前是若干个 tab (\\t), 用制表位序列逐档推进定位.
-        - 否则用 "段落左缩进 + 前导空白字符数 * 估算字宽" 近似定位 (空格布局).
-        """
-        indent = _para_default_left_indent(para)
-        tab_stops = _para_tab_stops(para)
-        SPACE_WIDTH_TWIPS = 100  # 五号字下单个空格宽度的粗略估算 (仅用于同文档内相对比较)
-
-        text = para.text
-        result = {}
-        for label, pattern in (('A', r'A[．.、]'), ('C', r'C[．.、]')):
-            m = re.search(pattern, text)
-            if not m:
-                continue
-            prefix = text[:m.start()]
-            if '\t' in prefix:
-                pos = indent
-                for _ in prefix.split('\t')[:-1]:
-                    pos = _next_tab_stop(tab_stops, pos)
-                result[label] = pos
+    # 题位段落集合：题干段落 + 区间内（含表格单元格内）的选项/小问段落
+    ques_para_els = []
+    stem_paras = []
+    for n in sorted(q_ranges):
+        s, e = q_ranges[n]
+        if blocks[s]['kind'] == 'p':
+            stem_paras.append(_para_of(blocks[s]['el']))
+        for i in range(s, e):
+            b = blocks[i]
+            if b['kind'] == 'p':
+                ques_para_els.append(b['el'])
             else:
-                leading_spaces = len(prefix) - len(prefix.lstrip(' 　'))
-                result[label] = indent + leading_spaces * SPACE_WIDTH_TWIPS
-        return result.get('A'), result.get('C')
+                ques_para_els.extend(list(b['el'].iter(qn('w:p'))))
 
-    def _extract_question_option_positions():
-        """按文档顺序遍历, 为每道选择题提取其选项 A / C 的水平位置.
+    # 23 题干与选项段落——中文宋体、西文 Times New Roman、五号(10.5磅)、不加粗
+    chk = ok = 0
+    f_bad = []
+    for el in ques_para_els:
+        p = _para_of(el)
+        for r in _vis_runs(p):
+            txt = r.text
+            chk += 1
+            bad = []
+            if not _in_range(_resolve_effective_size(doc, r, p), _TPL_BODY_SIZE):
+                bad.append('字号')
+            if _run_bold(doc, r, p):
+                bad.append('加粗')
+            if _has_cjk(txt) and _resolve_effective_eastasia(doc, r, p) not in _TPL_SONGTI:
+                bad.append('中文非宋体')
+            if _has_ascii_word(txt) and _resolve_effective_ascii(doc, r, p) != _TPL_ASCII:
+                bad.append('西文非TNR')
+            if bad:
+                f_bad.extend(bad)
+            else:
+                ok += 1
+    f_ratio = (ok / chk) if chk else 0.0
+    if chk >= 20 and f_ratio >= 0.90:
+        results.append(f"+3：题干与选项段落沿用模板题位格式——中文宋体、西文Times New Roman、五号（10.5磅）、不加粗"
+                       f"（合规 {ok}/{chk} 段落文字块）")
+    else:
+        results.append(f"+0：题干与选项段落沿用模板题位格式——中文宋体、西文Times New Roman、五号（10.5磅）、不加粗"
+                       f"（合规 {ok}/{chk}，偏差项 {sorted(set(f_bad))}）")
 
-        返回 [(pos_a, pos_c), ...], 每题一条记录 (缺失的位置为 None).
-        表格布局按表格出现顺序处理; 非表格布局按 "选项段落所在的题目段落" 顺序处理,
-        两者根据在文档 body 中的出现顺序统一排序.
-        """
-        body = doc.element.body
-        records = []
+    # 24 题干与选项段落行距沿用模板设定（约 1.34 倍）
+    ls_vals = [_ls_mult(p) for p in stem_paras]
+    ls_ok = sum(1 for v in ls_vals if _in_range(v, _TPL_QUES_LS))
+    if ls_vals and ls_ok / len(ls_vals) >= 0.80:
+        results.append(f"+3：题干与选项段落行距沿用模板设定（约1.34倍），未压成单倍行距或另设其他固定值"
+                       f"（合规 {ls_ok}/{len(ls_vals)} 个题位段落）")
+    else:
+        results.append(f"+0：题干与选项段落行距沿用模板设定（约1.34倍），未压成单倍行距或另设其他固定值"
+                       f"（合规 {ls_ok}/{len(ls_vals)}，实测值样例 {sorted(set(v for v in ls_vals if v is not None))[:4]}）")
 
-        # 表格 -> python-docx Table 对象映射 (按 body 出现顺序)
-        table_by_element = {t._element: t for t in doc.tables}
-        # 段落 -> python-docx Paragraph 对象映射
-        para_by_element = {p._element: p for p in doc.paragraphs}
+    # 25 选项以段落内制表位/空格分列排版，全文不含表格对象
+    tab_opt = 0
+    for n in range(1, 15):
+        if '\t' in q_raw.get(n, '') or re.search(r'[ 　]{2,}', q_raw.get(n, '')):
+            tab_opt += 1
+    if n_tbl == 0 and tab_opt >= 12:
+        results.append(f"+5：选项以段落内制表位/空格分列排版，全文不含表格对象，与模板的纯段落结构一致"
+                       f"（表格 0 个，制表位/空格分列 {tab_opt}/14 题）")
+    else:
+        results.append(f"+0：选项以段落内制表位/空格分列排版，全文不含表格对象，与模板的纯段落结构一致"
+                       f"（表格 {n_tbl} 个，制表位/空格分列 {tab_opt}/14 题）")
 
-        for child in body.iterchildren():
-            tag = child.tag
-            if tag == '{%s}tbl' % W_NS and child in table_by_element:
-                tbl = table_by_element[child]
-                if _is_option_table(tbl):
-                    pos_a, pos_c = _table_col_positions(tbl)
-                    if pos_a is not None or pos_c is not None:
-                        records.append((pos_a, pos_c))
-            elif tag == '{%s}p' % W_NS and child in para_by_element:
-                p = para_by_element[child]
-                if re.search(r'(?:^|\s)A[．.、]', p.text):
-                    pos_a, pos_c = _option_positions_in_paragraph_text(p)
-                    if pos_a is not None or pos_c is not None:
-                        records.append((pos_a, pos_c))
-        return records
+    # ---- 页脚 / 节属性 ----
+    def _strip_fallback(xml):
+        return re.sub(r'<mc:Fallback\b.*?</mc:Fallback>', '', xml, flags=re.S)
 
-    def _aligned(prev_rec, cur_rec, tol=ALIGN_TOLERANCE_TWIPS):
-        """判定上一题选项 A 与下一题选项 A 或 C 是否对齐 (位置差在容差内)."""
-        prev_a, _ = prev_rec
-        cur_a, cur_c = cur_rec
-        if prev_a is None:
-            return True  # 缺失基准位置时不误判为不对齐
-        for cand in (cur_a, cur_c):
-            if cand is not None and abs(cand - prev_a) <= tol:
-                return True
-        return cur_a is None and cur_c is None
+    def _xml_texts(xml):
+        return ''.join(mt.group(1) for mt in
+                       re.finditer(r'<w:t(?:\s[^>]*)?>(.*?)</w:t>', xml, re.S))
 
-    option_records = _extract_question_option_positions()
-    misaligned = False
-    for i in range(1, len(option_records)):
-        if not _aligned(option_records[i - 1], option_records[i]):
-            misaligned = True
-            break
-    if misaligned:
-        hit_items.append('-5 选项不对齐: 上一题选项A与下一题选项A/C位置不一致')
+    ftr_parts = _zip_read(file_path, lambda nm: re.match(r'word/footer\d*\.xml$', nm))
+    ftr_xml = _strip_fallback('\n'.join(ftr_parts.values()))
+    ftr_text = _norm(_xml_texts(ftr_xml))
+    ftr_sizes = sorted({int(v) / 2.0 for v in re.findall(r'<w:sz w:val="(\d+)"', ftr_xml)})
 
-    # --- -5: 分数显示不对应 (a/b 文本形式, 非 OMML 分数) ---
-    # 细则: 试卷中的分数显示不对应, 如三分之一应显示为 "$\dfrac{1}{3}$" (OMML 数学公式)
-    #       而不是 "1/3" (普通文本 "数字/数字")
-    # 基于 Word XML:
-    #   - OMML 分数存放在 <m:f> / <m:frac> 结构中, 分子分母由 <m:num> / <m:den> 包裹,
-    #     其字符不会以 "数字/数字" 形式出现在普通 <w:t> 里
-    #   - "a/b" 文本形式: 普通 <w:t> 里直接出现 "\d+/\d+" 或跨相邻 <w:t> 拼接后出现该模式
-    # 判定: 只要文档中存在任一 <w:t>(或同一 run/相邻 run 拼接) 匹配 "\d+/\d+" 且该 <w:t>
-    #       不位于 <m:oMath> / <m:oMathPara> 内, 即触发扣分
-    def _has_frac_text_outside_omml(container):
-        # 逐段落检查: 收集不在 OMML 内的 w:t 文本, 拼接后正则匹配 "\d+/\d+"
-        buf = []
-        for wt in container._element.findall('.//{%s}t' % W_NS):
-            if not wt.text:
+    # 26 页脚沿用模板页码版式——居中的"第 X 页 共 Y 页"、小五号(9磅)
+    ftr_bad = []
+    if not ftr_parts:
+        ftr_bad.append('无页脚')
+    if not _FOOTER_OK_RE.match(ftr_text):
+        ftr_bad.append(f'措辞"{ftr_text[:24]}"与模板不一致')
+    if 'center' not in ftr_xml:
+        ftr_bad.append('未居中')
+    if not any(_in_range(s, _TPL_FOOTER_SIZE) for s in ftr_sizes):
+        ftr_bad.append(f'字号 {ftr_sizes} 非小五号(9磅)')
+    if not ftr_bad:
+        results.append(f"+3：页脚沿用模板页码版式——居中的\"第 X 页 共 Y 页\"、小五号（9磅），未改写措辞或字号"
+                       f"（页脚文字\"{ftr_text}\"，字号 {ftr_sizes}）")
+    else:
+        results.append(f"+0：页脚沿用模板页码版式——居中的\"第 X 页 共 Y 页\"、小五号（9磅），未改写措辞或字号"
+                       f"（偏差：{'、'.join(ftr_bad)}）")
+
+    # 27 纸张为 A4 纵向、单栏排版
+    pg_bad = ['无节属性']
+    if doc.sections:
+        sec = doc.sections[0]
+        pg_bad = []
+        try:
+            w_tw = sec.page_width.twips
+            h_tw = sec.page_height.twips
+        except Exception:
+            w_tw = h_tw = None
+        if not (w_tw and h_tw and abs(w_tw - _TPL_PGSZ[0]) <= 80
+                and abs(h_tw - _TPL_PGSZ[1]) <= 80):
+            pg_bad.append(f'纸张 {w_tw}x{h_tw} twips 非A4纵向')
+        cols = sec._sectPr.find(qn('w:cols'))
+        n_col = 1
+        if cols is not None:
+            try:
+                n_col = int(cols.get(qn('w:num')) or 1)
+            except ValueError:
+                n_col = 1
+        if n_col != 1:
+            pg_bad.append(f'{n_col}栏')
+    if not pg_bad:
+        results.append("+1：纸张为A4（210mm×297mm）纵向、单栏排版，与模板一致")
+    else:
+        results.append(f"+0：纸张为A4（210mm×297mm）纵向、单栏排版，与模板一致"
+                       f"（偏差：{'、'.join(pg_bad)}）")
+
+    # 28 同一道题内未插入割裂该题的手工分页符
+    #    识别两类手工分页：w:br[@w:type="page"]（Ctrl+Enter 分页符）与 w:pageBreakBefore（段前分页）。
+    #    分页落在该题首段 = 整题另起一页，不算割裂；分页之后该题已无文字的也不算。
+    #    Word 因页面排满产生的自然换页在 XML 中无标记，不在本项判定范围内。
+    def _split_page_break(el):
+        """返回 (本块是否含手工分页符, 分页符之后本块内剩余文字)。"""
+        state = {'found': False}
+        after = []
+
+        def walk(node):
+            for ch in node:
+                tag = ch.tag
+                if not isinstance(tag, str):
+                    continue
+                if tag == _MC_FALLBACK or tag == _W_INSTR or tag == _W_DEL:
+                    continue
+                if tag == _W_BR and ch.get(qn('w:type')) == 'page':
+                    state['found'] = True
+                    continue
+                if tag == _W_T or tag == _M_T:
+                    if state['found']:
+                        after.append(ch.text or '')
+                    continue
+                walk(ch)
+
+        walk(el)
+        return state['found'], ''.join(after)
+
+    split_kind = {}
+    for n in sorted(q_ranges):
+        s, e = q_ranges[n]
+        for i in range(s, e):
+            el = blocks[i]['el']
+            ppr = el.find(qn('w:pPr')) if blocks[i]['kind'] == 'p' else None
+            pbb = False
+            if ppr is not None:
+                pbb_el = ppr.find(qn('w:pageBreakBefore'))
+                if pbb_el is not None:
+                    # 转换器常写出显式关闭的 w:val="0"，不能当成分页符
+                    pbb = pbb_el.get(qn('w:val')) not in ('0', 'false', 'off')
+            has_br, after_txt = _split_page_break(el)
+            if not (pbb or has_br):
                 continue
-            in_omml = False
-            anc = wt.getparent()
-            while anc is not None:
-                tag = anc.tag
-                if tag == '{%s}oMath' % M_NS or tag == '{%s}oMathPara' % M_NS:
-                    in_omml = True
-                    break
-                anc = anc.getparent()
-            if not in_omml:
-                buf.append(wt.text)
-        text = ''.join(buf)
-        return bool(re.search(r'\d+\s*/\s*\d+', text))
-
-    frac_bad = False
-    for p in doc.paragraphs:
-        if _has_frac_text_outside_omml(p):
-            frac_bad = True
-            break
-    if not frac_bad:
-        for t in doc.tables:
-            for row in t.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        if _has_frac_text_outside_omml(p):
-                            frac_bad = True
-                            break
-                    if frac_bad:
-                        break
-                if frac_bad:
-                    break
-            if frac_bad:
+            if pbb and i == s:
+                continue  # 整题另起一页，未割裂本题
+            tail = (_norm(blocks[i]['text']) if pbb else _norm(after_txt))
+            tail += ''.join(_norm(blocks[j]['text']) for j in range(i + 1, e))
+            if tail:
+                split_kind[n] = '段前分页' if pbb else '分页符'
                 break
-    if frac_bad:
-        hit_items.append('-5 分数显示不对应: 使用 "a/b" 文本形式而非 OMML "$\\dfrac{a}{b}$"')
+    if not split_kind:
+        results.append("+3：同一道题内未插入割裂该题的手工分页符（Ctrl+Enter 分页符、\"段前分页\"属性），"
+                       "整题另起一页与自然换页不计为割裂")
+    else:
+        split_detail = '、'.join(f"第{n}题（{split_kind[n]}）" for n in sorted(split_kind))
+        results.append(f"+0：同一道题内未插入割裂该题的手工分页符（Ctrl+Enter 分页符、\"段前分页\"属性），"
+                       f"整题另起一页与自然换页不计为割裂（被割裂 {split_detail}）")
 
-    # ---- 汇总输出 (结构化) ----
-    total = 0
-    for item in hit_items:
-        m = re.match(r'^([+-]\d+)', item)
-        if m:
-            total += int(m.group(1))
+    # 29 解答题小问 (1)(2)(3) 单独成段并统一缩进
+    sub_bad = []
+    for n, need in need_sub.items():
+        if n not in q_ranges:
+            sub_bad.append(n)
+            continue
+        s, e = q_ranges[n]
+        found = set()
+        indent_ok = True
+        for i in range(s, e):
+            if blocks[i]['kind'] != 'p':
+                continue
+            t = _norm(blocks[i]['text'])
+            mm = _SUBQ_RE.match(t)
+            if not mm:
+                continue
+            found.add(mm.group(1))
+            p = _para_of(blocks[i]['el'])
+            pf = p.paragraph_format
+            raw = blocks[i]['text']
+            if not ((pf.left_indent and pf.left_indent > 0)
+                    or (pf.first_line_indent and pf.first_line_indent > 0)
+                    or raw.startswith('\t') or raw.startswith('　')):
+                indent_ok = False
+        if not need.issubset(found) or not indent_ok:
+            sub_bad.append(n)
+    if not sub_bad:
+        results.append("+1：解答题小问(1)(2)(3)单独成段并统一缩进，层级清晰")
+    else:
+        results.append(f"+0：解答题小问(1)(2)(3)单独成段并统一缩进，层级清晰（异常题号 {sorted(sub_bad)}）")
 
-    return {
-        'id': SCRIPT_ID,
-        'file_name': file_name,
-        'status': 'ok',
-        'error': None,
-        'dim1_pass': True,
-        'dim1_reason': '',
-        'dim2_items': _build_dim2_items(hit_items),
-        'total_score': total,
-        'max_score': _max_score(),
-    }
+    # 30 正文未混入来源 PDF 的页面标记（只查正文，页脚措辞由第 26 项判定）
+    src_marks = [mm.group(0) for mm in _SRC_MARK_RE.finditer(full_norm)]
+    if not src_marks:
+        results.append("+1：正文（题干、选项、小问）中未混入来源PDF的页面标记"
+                       "（形如\"试卷第N页，共3页\"\"答案第N页，共2页\"），"
+                       "模板页脚自带的\"第 X 页 共 Y 页\"不计入本项")
+    else:
+        results.append(f"+0：正文（题干、选项、小问）中未混入来源PDF的页面标记"
+                       f"（形如\"试卷第N页，共3页\"\"答案第N页，共2页\"），"
+                       f"模板页脚自带的\"第 X 页 共 Y 页\"不计入本项"
+                       f"（正文混入 {len(src_marks)} 处：{src_marks[:3]}）")
+
+    # ---------- 汇总：results -> dim2_items ----------
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"dim2 项数不一致：results={len(results)} vs order={len(_MAX_DELTAS_ORDER)}")
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta, rule in zip(results, _MAX_DELTAS_ORDER, _RULES_ORDER):
+        head = raw.partition("：")[0]
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta > 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total_score += (max_delta if hit else 0)
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
-if __name__ == '__main__':
-    # 本地调试: 默认在脚本所在目录里定位文档; 也可用 sys.argv[1] 显式覆盖.
-    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    _result = evaluate(_dir)
-    # 用 ensure_ascii=True 避免在 Windows 默认代码页下的终端编码报错;
-    # 也遵守 "不允许修改 sys.stdout" 的统一约定.
-    print(json.dumps(_result, ensure_ascii=True, indent=2))
+if __name__ == "__main__":
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

@@ -1,23 +1,6 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-11～20岁身高统计图模板 —— 自动评估脚本（officeval_096）
-
-评估逻辑：
-  维度1（可用与可修改性）：硬性门槛。任意一条不满足 => 直接 0 分，不再检查维度2。
-  维度2（完成度评分细则）：在维度1通过后逐条评估。
-      - 加分细则：必须满足该细则中的【每一个】子点，才累加该细则的分数。
-      - 扣分细则：满足该细则中【任意一个】子点，即扣除该细则的分数。
-      （本模板细则全部为加分项，未给出扣分项；代码已预留扣分项处理框架。）
-
-所有细则均由代码自动判定，不依赖人工。对于不易精确判定的点（如"图表能随数据自动更新"），
-采用结构性判据灵活变通：图表数据源为指向工作表单元格的引用(numRef/c:f)而非写死的常量，
-即认定为"数据驱动、可自动更新"。
-
-对外接口（统一约定）：
-  evaluate(dir_path: str) -> dict
-    - 入参：脚本所在目录的路径；脚本自己在该目录里定位并打开被评估的 .xlsx/.xlsm 文档。
-    - 返回：结构化字典（含 id/file_name/status/dim1_pass/dim2_items/total_score/max_score）。
-"""
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
 import os
 import re
@@ -26,1358 +9,1081 @@ import json
 import zipfile
 import xml.etree.ElementTree as ET
 
-# ---------------------------------------------------------------------------
-# 命名空间
-# ---------------------------------------------------------------------------
-NS = {
-    "x":  "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-    "c":  "http://schemas.openxmlformats.org/drawingml/2006/chart",
-    "a":  "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "r":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
-    "rel":"http://schemas.openxmlformats.org/package/2006/relationships",
-}
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为“脚本所在目录的路径”，
+# 由脚本自己在该目录内定位并打开被评估的 .xlsx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 任务：按输入图片新建 Excel——上方“11～20 岁身高统计表（可直接填写数据）”，
+# 下方仅有数据点、无折线的统计图；横轴 11～20 岁，纵轴 0-200cm、每 50 一格；
+# 表中一输入数据，下方图表自动显示对应数据点。
+# 本任务为“从零生成”类：输入仅一张参考图片，无可被破坏的原始文件，故 dim2
+# 只设加分项——命中记 max_delta，未命中记 0，total_score ∈ [0, +49]；
+# “惹麻烦”（预填占位数据、残留辅助区、限制与 0-200cm 矛盾等）以对应加分项
+# 不得分的方式体现，不另设负分。
+#
+# 实现口径：不依赖 openpyxl（其对 chart 的读回有损），直接解包 xlsx 读 XML，
+# 判定的是“用户打开办公软件真正看到/用到的效果”。
 
-REQUIRED_AGES = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+SCRIPT_ID = "096"
+
+# 维度二加分项按“结果追加顺序”的 max_delta；末端把 results 里的 "+N：..."
+# 字符串反解为结构化 dim2_items 时用。顺序须与 _evaluate_impl 中
+# results.append(...) 的顺序严格一致；共 23 项，累加 = MAX_SCORE_TOTAL。
+_ADD_DELTAS_ORDER = [
+    3,  # A01 版面：表在上/图在下，图表尺寸适中且未压盖统计表
+    3,  # A02 交付整洁：无可见的中间辅助数据区
+    1,  # A03 统计表标题（11-20 岁身高统计表）
+    3,  # A04 年龄行 11、12…20 共 10 个，完整有序
+    3,  # A05 身高/cm 行：10 个与年龄一一对应的可填写单元格
+    3,  # A06 身高单元格留空交付，无需先清除示例数据
+    1,  # A07 表格边框/内容居中/列宽足够显示
+    1,  # A08 无与 0-200cm 矛盾的限制或提示
+    3,  # A09 XY 散点图且数据点间无连线
+    1,  # A10 数据点标记清晰可见
+    1,  # A11 数据点显示数值标签
+    1,  # A12 图表标题
+    3,  # A13 横轴：最小 11、最大 20、单位 1
+    3,  # A14 纵轴：最小 0、最大 200
+    1,  # A15 纵轴主要刻度单位 50
+    1,  # A16 横轴标题“年龄”
+    1,  # A17 纵轴标题“身高/cm”
+    1,  # A18 绘图区主要网格线
+    5,  # A19 Y 值系列联动统计表身高单元格
+    3,  # A20 X 值系列引用统计表年龄单元格（非常量数组）
+    3,  # A21 空值不产生 0 值假数据点
+    3,  # A22 10 个年龄全部纳入联动区域
+    1,  # A23 工作簿自动重算
+]
+MAX_SCORE_TOTAL = sum(_ADD_DELTAS_ORDER)   # +49：完成度上限
+assert MAX_SCORE_TOTAL == 49
+_MAX_DELTAS_ORDER = _ADD_DELTAS_ORDER
+
+# ---------- 命名空间 ----------
+NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+NS_C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+NS_XDR = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
+NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+NS_PR = 'http://schemas.openxmlformats.org/package/2006/relationships'
+
+# 指令要求的年龄序列与纵轴口径
+_AGES = list(range(11, 21))
+_Y_MAX = 200.0
+_Y_UNIT = 50.0
+_X_MIN, _X_MAX, _X_UNIT = 11.0, 20.0, 1.0
+# 图表尺寸“适中”区间（EMU；1cm = 360000 EMU）：约 5cm~40cm 宽、3cm~30cm 高
+_SIZE_MIN_CX, _SIZE_MAX_CX = 1800000, 14400000
+_SIZE_MIN_CY, _SIZE_MAX_CY = 1080000, 10800000
+
+_ERR_VALUES = ('#REF!', '#VALUE!', '#NAME?', '#DIV/0!', '#NULL!', '#NUM!')
+_CELL_RE = re.compile(r'\$?([A-Z]{1,3})\$?(\d{1,7})')
 
 
-# ---------------------------------------------------------------------------
-# 工具：列号 <-> 数字
-# ---------------------------------------------------------------------------
-def col_to_num(col):
-    """'A'->1, 'B'->2 ... 'AA'->27"""
+def q(ns, tag):
+    return '{%s}%s' % (ns, tag)
+
+
+def _col_to_num(col):
+    """列字母 -> 1 起的列号。"""
     n = 0
     for ch in col:
-        n = n * 26 + (ord(ch.upper()) - ord('A') + 1)
+        n = n * 26 + (ord(ch) - 64)
     return n
 
 
-def split_ref(ref):
-    """'B7' -> ('B', 7)"""
-    m = re.match(r"([A-Za-z]+)(\d+)", ref)
-    return m.group(1), int(m.group(2))
-
-
-# ---------------------------------------------------------------------------
-# 读取 xlsx/xlsm 内部结构
-# ---------------------------------------------------------------------------
-class Workbook:
-    """直接解析 OOXML 包，避免依赖会重算/丢弃图表的库。"""
-
-    def __init__(self, path):
-        self.path = path
-        self.openable = False
-        self.open_error = None
-        self.zip = None
-        self.names = []
-        self.shared_strings = []
-        self.sheets = []          # [{name, part, xmlroot}]
-        self.charts = []          # [ET.Element(chartSpace)]
-        self.content_types = None
-        self._load()
-
-    # -- 底层读取 ----------------------------------------------------------
-    def _read(self, name):
-        try:
-            with self.zip.open(name) as f:
-                return f.read()
-        except KeyError:
-            return None
-
-    def _xml(self, name):
-        data = self._read(name)
-        if data is None:
-            return None
-        try:
-            return ET.fromstring(data)
-        except ET.ParseError:
-            return None
-
-    def _load(self):
-        try:
-            self.zip = zipfile.ZipFile(self.path, "r")
-            self.names = self.zip.namelist()
-        except (zipfile.BadZipFile, FileNotFoundError, OSError) as e:
-            self.open_error = str(e)
-            return
-
-        # [Content_Types].xml —— 用于判断 xlsm/损坏
-        self.content_types = self._read("[Content_Types].xml")
-
-        # sharedStrings
-        sst = self._xml("xl/sharedStrings.xml")
-        if sst is not None:
-            for si in sst.findall("x:si", NS):
-                self.shared_strings.append(self._si_text(si))
-
-        # workbook -> sheet 列表 + 关系
-        wb = self._xml("xl/workbook.xml")
-        rels = self._parse_rels("xl/_rels/workbook.xml.rels")
-        if wb is not None:
-            for sh in wb.findall(".//x:sheet", NS):
-                name = sh.get("name", "")
-                rid = sh.get("{%s}id" % NS["r"])
-                target = rels.get(rid)
-                part = self._norm_part("xl", target) if target else None
-                root = self._xml(part) if part else None
-                self.sheets.append({"name": name, "part": part, "xmlroot": root})
-
-        # 收集所有图表 part
-        for n in self.names:
-            if re.match(r"xl/(drawings/)?charts/chart\d+\.xml$", n) or \
-               re.match(r"xl/charts/chart\d+\.xml$", n):
-                root = self._xml(n)
-                if root is not None:
-                    self.charts.append(root)
-
-        self.openable = True
-
-    @staticmethod
-    def _si_text(si):
-        parts = []
-        for t in si.iter("{%s}t" % NS["x"]):
-            parts.append(t.text or "")
-        return "".join(parts)
-
-    def _parse_rels(self, relpath):
-        out = {}
-        root = self._xml(relpath)
-        if root is None:
-            return out
-        for rel in root.findall("rel:Relationship", NS):
-            out[rel.get("Id")] = rel.get("Target")
-        return out
-
-    @staticmethod
-    def _norm_part(base, target):
-        # target 形如 "worksheets/sheet1.xml" 或 "/xl/worksheets/sheet1.xml"
-        if target.startswith("/"):
-            return target.lstrip("/")
-        # 处理 ../
-        path = base + "/" + target
-        segs = []
-        for s in path.split("/"):
-            if s == "..":
-                if segs:
-                    segs.pop()
-            elif s in ("", "."):
-                continue
-            else:
-                segs.append(s)
-        return "/".join(segs)
-
-    # -- 便捷访问 ----------------------------------------------------------
-    def cell_text(self, sheet, ref):
-        """返回单元格显示文本（解析共享字符串 / inline / 数值）。"""
-        root = sheet["xmlroot"]
-        if root is None:
-            return None
-        for c in root.iter("{%s}c" % NS["x"]):
-            if c.get("r") == ref:
-                return self._cell_value(c)
-        return None
-
-    def _cell_value(self, c):
-        t = c.get("t")
-        v = c.find("x:v", NS)
-        if t == "s":  # shared string
-            if v is not None and v.text is not None:
-                idx = int(v.text)
-                if 0 <= idx < len(self.shared_strings):
-                    return self.shared_strings[idx]
-            return None
-        if t == "inlineStr":
-            is_el = c.find("x:is", NS)
-            return self._si_text(is_el) if is_el is not None else None
-        if v is not None:
-            return v.text
-        return None
-
-    def iter_cells(self, sheet):
-        """yield (ref, cell_element, text)"""
-        root = sheet["xmlroot"]
-        if root is None:
-            return
-        for c in root.iter("{%s}c" % NS["x"]):
-            ref = c.get("r")
-            if ref:
-                yield ref, c, self._cell_value(c)
-
-    def all_text(self):
-        """工作簿中所有可见文本（标题/说明/共享串），用于关键字匹配。"""
-        texts = list(self.shared_strings)
-        for sh in self.sheets:
-            for _ref, _c, txt in self.iter_cells(sh):
-                if txt:
-                    texts.append(txt)
-        return texts
-
-
-# ---------------------------------------------------------------------------
-# 图表辅助
-# ---------------------------------------------------------------------------
-def chart_series(chart):
-    """返回图表中所有 <c:ser>。"""
-    return chart.findall(".//c:ser", NS)
-
-
-def chart_type(chart):
-    """返回主要图表类型标签集合，如 {'scatterChart'}, {'lineChart'} 等。"""
-    types = set()
-    plot = chart.find(".//c:plotArea", NS)
-    if plot is None:
-        return types
-    for child in plot:
-        tag = child.tag.split("}")[-1]
-        if tag.endswith("Chart"):
-            types.add(tag)
-    return types
-
-
-def numref_points(numref):
-    """从 numRef/numCache 取出数值点列表。"""
-    pts = []
-    cache = numref.find("c:numCache", NS)
-    if cache is None:
-        return pts
-    for pt in cache.findall("c:pt", NS):
-        v = pt.find("c:v", NS)
-        if v is not None and v.text is not None:
-            try:
-                pts.append(float(v.text))
-            except ValueError:
-                pass
-    return pts
-
-
-def series_refs(chart):
-    """返回 [(xval_f, xpts, yval_f, ypts)]，f 为公式引用字符串。"""
-    out = []
-    for ser in chart_series(chart):
-        xref = ser.find(".//c:xVal//c:numRef", NS)
-        if xref is None:
-            xref = ser.find(".//c:xVal//c:strRef", NS)
-        yref = ser.find(".//c:yVal//c:numRef", NS)
-        # 折线/柱状图用 cat/val 而非 xVal/yVal
-        if yref is None:
-            yref = ser.find(".//c:val//c:numRef", NS)
-        if xref is None:
-            xref = ser.find(".//c:cat//c:numRef", NS)
-        if xref is None:
-            xref = ser.find(".//c:cat//c:strRef", NS)
-        xf = xref.find("c:f", NS).text if (xref is not None and xref.find("c:f", NS) is not None) else None
-        yf = yref.find("c:f", NS).text if (yref is not None and yref.find("c:f", NS) is not None) else None
-        xpts = numref_points(xref) if xref is not None else []
-        ypts = numref_points(yref) if yref is not None else []
-        out.append((xf, xpts, yf, ypts))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 维度1：可用与可修改性（硬门槛）
-# ---------------------------------------------------------------------------
-def evaluate_dim1(wb):
-    """返回 (passed: bool, details: list[(ok, desc)])"""
-    details = []
-
-    # 1.1 交付文件为 xlsx 或 .xlsm 格式，文件可正常打开
-    ext = os.path.splitext(wb.path)[1].lower()
-    ok_fmt = ext in (".xlsx", ".xlsm") and wb.openable
-    desc = "交付文件为 xlsx 或 .xlsm 格式，文件可正常打开"
-    if not wb.openable and wb.open_error:
-        desc += "（打开失败：%s）" % wb.open_error
-    details.append((ok_fmt, desc))
-
-    passed = all(ok for ok, _ in details)
-    return passed, details
-
-
-# ---------------------------------------------------------------------------
-# 维度2：完成度评分细则
-# ---------------------------------------------------------------------------
-def _find_age_height_table(wb):
-    """
-    在所有工作表中寻找"年龄行/列 + 身高行/列"结构。
-    返回 dict: {
-        'found': bool,                    # 是否定位到年龄数据表
-        'ages': set(已覆盖年龄),
-        'age_full': bool,                 # 年龄是否覆盖 11~20 全部 10 个
-        'height_cells_editable': bool,    # 10 个年龄是否都有可编辑身高单元格
-        'has_height_header': bool,        # 表内是否有"身高/cm"等身高数据行/列标识
-        'sheet': sheet, 'orient': 'row'|'col',
-        'age_refs': {age: ref}, 'age_row': int|None, 'age_col': str|None,
-        'height_refs': [...], 'height_area': set(全部身高单元格ref),
-        'table_top_row': int|None,        # 数据表所在的最上一行（用于"上方/下方"判定）
-    }
-    """
-    best = {"found": False, "ages": set(), "age_full": False,
-            "height_cells_editable": False, "has_height_header": False,
-            "sheet": None, "orient": None, "age_refs": {}, "age_row": None,
-            "age_col": None, "height_refs": [], "height_area": set(),
-            "table_top_row": None}
-
-    for s in wb.sheets:
-        if s["xmlroot"] is None:
-            continue
-        # 建立 ref -> (cellobj, text) 索引
-        cells = {}
-        for ref, c, txt in wb.iter_cells(s):
-            cells[ref] = (c, txt)
-
-        # ---- 横向布局：某行是"年龄"，相邻行是"身高" ----
-        # 找包含年龄数字 11..20 的行
-        rows = {}
-        for ref, (c, txt) in cells.items():
-            col, row = split_ref(ref)
-            rows.setdefault(row, []).append((col, c, txt))
-
-        for row, items in rows.items():
-            ages_here = {}      # age -> col
-            for col, c, txt in items:
-                val = _as_int(txt)
-                if val in REQUIRED_AGES:
-                    ages_here[val] = col
-            age_set = set(ages_here.keys()) & set(REQUIRED_AGES)
-            if len(age_set) >= 8:
-                # 该行是年龄行；身高数据通常在下一行（同列）
-                hrow = row + 1
-                editable = 0
-                hrefs = []
-                harea = set()
-                for age in REQUIRED_AGES:
-                    col = ages_here.get(age)
-                    if not col:
-                        continue
-                    href = "%s%d" % (col, hrow)
-                    harea.add(href)
-                    hcell = cells.get(href)
-                    if hcell is not None and _is_editable_numeric(hcell[0]):
-                        editable += 1
-                        hrefs.append(href)
-                # "身高/cm"标识：年龄行或身高行的行首标签含"身高"
-                header_txt = _row_label(cells, row) + _row_label(cells, hrow)
-                has_hdr = ("身高" in header_txt) or ("cm" in header_txt.lower())
-                cand = {
-                    "found": True, "ages": age_set,
-                    "age_full": set(REQUIRED_AGES).issubset(age_set),
-                    "height_cells_editable": editable >= 10,
-                    "has_height_header": has_hdr,
-                    "sheet": s, "orient": "row",
-                    "age_refs": {a: "%s%d" % (ages_here[a], row) for a in age_set},
-                    "age_row": row, "age_col": None,
-                    "height_refs": hrefs, "height_area": harea,
-                    "table_top_row": row,
-                }
-                if _better(cand, best):
-                    best = cand
-
-        # ---- 纵向布局：某列是"年龄"，相邻列是"身高" ----
-        cols = {}
-        for ref, (c, txt) in cells.items():
-            col, row = split_ref(ref)
-            cols.setdefault(col, []).append((row, c, txt))
-
-        for col, items in cols.items():
-            ages_here = {}      # age -> row
-            for row, c, txt in items:
-                val = _as_int(txt)
-                if val in REQUIRED_AGES:
-                    ages_here[val] = row
-            age_set = set(ages_here.keys()) & set(REQUIRED_AGES)
-            if len(age_set) >= 8:
-                next_col = _col_shift(col, 1)
-                editable = 0
-                hrefs = []
-                harea = set()
-                min_row = min(ages_here.values()) if ages_here else None
-                for age in REQUIRED_AGES:
-                    row = ages_here.get(age)
-                    if not row:
-                        continue
-                    href = "%s%d" % (next_col, row)
-                    harea.add(href)
-                    hcell = cells.get(href)
-                    if hcell is not None and _is_editable_numeric(hcell[0]):
-                        editable += 1
-                        hrefs.append(href)
-                # "身高/cm"标识：年龄列或身高列的列首表头含"身高"
-                header_txt = _col_label(cells, col) + _col_label(cells, next_col)
-                has_hdr = ("身高" in header_txt) or ("cm" in header_txt.lower())
-                cand = {
-                    "found": True, "ages": age_set,
-                    "age_full": set(REQUIRED_AGES).issubset(age_set),
-                    "height_cells_editable": editable >= 10,
-                    "has_height_header": has_hdr,
-                    "sheet": s, "orient": "col",
-                    "age_refs": {a: "%s%d" % (col, ages_here[a]) for a in age_set},
-                    "age_row": None, "age_col": col,
-                    "height_refs": hrefs, "height_area": harea,
-                    "table_top_row": min_row,
-                }
-                if _better(cand, best):
-                    best = cand
-
-    return best
-
-
-def _row_label(cells, row):
-    """取某一行所有单元格文本拼接（用于识别行表头，如'身高/cm'）。"""
-    parts = []
-    for ref, (_c, txt) in cells.items():
-        _col, r = split_ref(ref)
-        if r == row and txt:
-            parts.append(str(txt))
-    return " ".join(parts)
-
-
-def _col_label(cells, col):
-    """取某一列所有单元格文本拼接（用于识别列表头）。"""
-    parts = []
-    for ref, (_c, txt) in cells.items():
-        c, _r = split_ref(ref)
-        if c == col and txt:
-            parts.append(str(txt))
-    return " ".join(parts)
-
-
-def _better(cand, best):
-    score = (cand["age_full"], cand["has_height_header"],
-             cand["height_cells_editable"], len(cand["ages"]))
-    bscore = (best["age_full"], best["has_height_header"],
-              best["height_cells_editable"], len(best["ages"]))
-    return score > bscore
-
-
-def _as_int(txt):
-    try:
-        f = float(txt)
-        if f == int(f):
-            return int(f)
-    except (TypeError, ValueError):
-        pass
-    return None
-
-
-def _is_editable_numeric(cell):
-    """单元格可作为身高输入：是数值或空值，且不是被锁定的纯文本标题。
-    公式单元格(<f>)视为派生显示，不算可填写输入。"""
-    if cell.find("x:f", NS) is not None:
-        return False
-    t = cell.get("t")
-    if t in (None, "n"):   # 数值或空
-        return True
-    # 文本但内容是纯数字也接受
-    v = cell.find("x:v", NS)
-    if v is not None and _as_int(v.text) is not None:
-        return True
-    # 空文本单元格（可填写）
-    if v is None:
-        return True
-    return False
-
-
-def _col_shift(col, delta):
-    return _num_to_col(col_to_num(col) + delta)
-
-
 def _num_to_col(n):
-    s = ""
+    """1 起的列号 -> 列字母。"""
+    s = ''
     while n > 0:
-        n, rem = divmod(n - 1, 26)
-        s = chr(ord('A') + rem) + s
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
     return s
 
 
-def _chart_bound_to_table(wb, table):
-    """
-    图表是否"基于身高统计表"，且"修改身高数据后对应数据点能自动更新"。
-    判据（结构性，等价于自动更新）：图表某系列的数值数据源 y 引用，
-    经公式链最终落在身高统计表的可编辑身高单元格区域上。
-    返回 (based_on_table: bool, auto_update: bool)
-    """
-    height_area = table.get("height_area", set())
-    height_sheet = table["sheet"]["name"] if table.get("sheet") else None
-    if not wb.charts:
-        return False, False
-
-    based = False
-    auto = False
-    for ch in wb.charts:
-        for (_xf, _xp, yf, _yp) in series_refs(ch):
-            if not yf:
-                continue
-            # y 数据源最终引用到的单元格集合（含经一层公式中转）
-            targets = _resolve_ref_to_cells(wb, yf)
-            if not targets:
-                continue
-            based = True
-            # 是否命中身高统计表的可编辑身高单元格
-            for (sh_name, ref) in targets:
-                if (height_sheet is None or sh_name in (None, height_sheet)) \
-                        and ref in height_area:
-                    auto = True
-                    break
-        if auto:
-            break
-    return based, auto
+def _split_ref(ref):
+    """'B12' -> ('B', 12)；解析失败返回 (None, None)。"""
+    m = re.match(r'^\$?([A-Z]{1,3})\$?(\d{1,7})$', (ref or '').upper())
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
 
 
-def _resolve_ref_to_cells(wb, formula):
-    """
-    把图表数据源公式（如 '身高记录'!$B$13:$B$22）展开为单元格集合 [(sheet, ref)]。
-    若这些单元格本身是公式（如 =IF(B7="",NA(),B7)），再向上追溯其引用的源单元格，
-    从而判断图表是否最终绑定到可填写的身高输入单元格（=> 数据改动会自动传导更新）。
-    """
-    direct = _expand_ref(wb, formula)
-    out = set(direct)
-    for (sh_name, ref) in direct:
-        sheet = _sheet_by_name(wb, sh_name)
-        if sheet is None:
-            continue
-        cell = _get_cell(wb, sheet, ref)
-        if cell is None:
-            continue
-        f = cell.find("x:f", NS)
-        if f is not None and f.text:
-            # 该图表点单元格是公式 —— 取公式中引用的源单元格
-            for r in _refs_in_formula(f.text):
-                out.add((sh_name, r))
-    return out
+def _norm_ref(ref):
+    """去掉 $ 并大写：'$B$12' -> 'B12'。"""
+    c, r = _split_ref(ref)
+    return None if c is None else '%s%d' % (c, r)
 
 
-def _expand_ref(wb, formula):
-    """解析 \"'sheet'!$A$13:$B$22\" / 'Sheet1!A1' 为 [(sheet, 'A13'), ...]。"""
-    cells = set()
-    if not formula:
-        return cells
-    # 拆多区域（逗号分隔）
-    for part in formula.split(","):
-        part = part.strip()
-        sh = None
-        if "!" in part:
-            sh, rng = part.split("!", 1)
-            sh = sh.strip().strip("'")
-        else:
-            rng = part
-        rng = rng.replace("$", "")
-        if ":" in rng:
-            a, b = rng.split(":", 1)
-            for r in _cells_in_range(a, b):
-                cells.add((sh, r))
-        else:
-            m = re.match(r"^[A-Za-z]+\d+$", rng)
-            if m:
-                cells.add((sh, rng))
-    return cells
-
-
-def _cells_in_range(a, b):
-    ca, ra = split_ref(a)
-    cb, rb = split_ref(b)
-    n1, n2 = col_to_num(ca), col_to_num(cb)
+def _expand_area(area):
+    """'$B$3:$K$3' / 'B3' -> ['B3', 'C3', ...]（单区域，上限 4096 格）。"""
+    area = (area or '').replace('$', '').upper()
+    if not area:
+        return []
+    if ':' not in area:
+        one = _norm_ref(area)
+        return [one] if one else []
+    a, _, b = area.partition(':')
+    c1, r1 = _split_ref(a)
+    c2, r2 = _split_ref(b)
+    if c1 is None or c2 is None:
+        return []
+    n1, n2 = _col_to_num(c1), _col_to_num(c2)
+    lo_c, hi_c = min(n1, n2), max(n1, n2)
+    lo_r, hi_r = min(r1, r2), max(r1, r2)
+    if (hi_c - lo_c + 1) * (hi_r - lo_r + 1) > 4096:
+        return []
     out = []
-    for col in range(min(n1, n2), max(n1, n2) + 1):
-        for row in range(min(ra, rb), max(ra, rb) + 1):
-            out.append("%s%d" % (_num_to_col(col), row))
+    for r in range(lo_r, hi_r + 1):
+        for c in range(lo_c, hi_c + 1):
+            out.append('%s%d' % (_num_to_col(c), r))
     return out
 
 
-def _refs_in_formula(text):
-    """从公式文本中抽取单元格引用（如 IF(B7="",NA(),B7) -> ['B7']）。"""
-    refs = set()
-    for m in re.finditer(r"\$?([A-Za-z]{1,3})\$?(\d+)", text):
-        refs.add("%s%s" % (m.group(1), m.group(2)))
-    return refs
-
-
-def _sheet_by_name(wb, name):
-    for s in wb.sheets:
-        if s["name"] == name:
-            return s
-    # 引用未带表名时，默认取首个工作表
-    if name is None and wb.sheets:
-        return wb.sheets[0]
-    return None
-
-
-def _get_cell(wb, sheet, ref):
-    root = sheet["xmlroot"]
-    if root is None:
-        return None
-    for c in root.iter("{%s}c" % NS["x"]):
-        if c.get("r") == ref:
-            return c
-    return None
-
-
-# ---- 加分细则判定函数：每个返回 (passed, subpoints[(ok,desc)]) ----------
-def rule_plus3(wb, table):
-    """+3：逐点对应细则 ——
-    工作表上方制作了"11～20岁身高统计表"或同义标题的数据表；
-    表中年龄覆盖 11、12、…、20 岁；
-    身高统计表包含可直接填写的身高/cm 数据行或数据列；
-    10 个年龄均有对应的可编辑身高输入单元格；
-    下方制作了基于身高统计表的可编辑 Excel 图表；
-    修改任意年龄对应身高数据后，图表中对应数据点能自动更新。
-    """
-    subs = []
-
-    # 点1：工作表"上方"制作了"11～20岁身高统计表"或同义标题的数据表
-    #   注意：标题必须是"数据表"的标题，而非图表标题；
-    #   因此不能在全工作簿文本里随意查找关键词（那样会把图表标题里的
-    #   "身高统计图"/"成长记录"之类同义词也当成表标题命中，造成冒充）。
-    #   这里改为：只在数据表附近区域（数据表上方若干行、同列范围内）查找标题文本。
-    table_kw = ["身高统计表", "身高情况统计表", "身高记录表",
-                "11～20岁身高", "11~20岁身高"]
-    has_title = _table_has_nearby_title(wb, table, table_kw)
-    # "上方"：数据表位于图表之上（数据表起始行号小于图表锚点行）
-    above = _table_above_chart(wb, table)
-    subs.append((has_title and above,
-                 "工作表上方制作了“11～20岁身高统计表”或同义标题的数据表"))
-
-    # 点2：表中年龄覆盖 11、12、13、14、15、16、17、18、19、20 岁
-    ages_ok = table["found"] and table["age_full"]
-    subs.append((ages_ok, "表中年龄覆盖 11、12、…、20 共 10 个（实测覆盖 %d 个）"
-                 % (len(table["ages"]) if table["found"] else 0)))
-
-    # 点3：身高统计表包含可直接填写的"身高/cm"数据行或数据列
-    header_ok = table["found"] and table["has_height_header"]
-    subs.append((header_ok,
-                 "身高统计表含可直接填写的“身高/cm”数据行或数据列"))
-
-    # 点4：10 个年龄均有对应的可编辑身高输入单元格
-    cells_ok = table["found"] and table["height_cells_editable"]
-    subs.append((cells_ok, "10 个年龄均有对应的可编辑身高输入单元格"))
-
-    # 点5 + 点6：下方制作了基于身高统计表的可编辑 Excel 图表，
-    #            且修改身高数据后对应数据点能自动更新
-    based, auto = _chart_bound_to_table(wb, table)
-    below = _chart_below_table(wb, table)
-    subs.append((bool(wb.charts) and based and below,
-                 "下方制作了基于身高统计表的可编辑 Excel 图表"))
-    subs.append((auto,
-                 "修改任意年龄对应身高数据后，图表中对应数据点能自动更新"))
-
-    passed = all(ok for ok, _ in subs)   # 加分项：每一个点都要踩到才得分
-    return passed, subs
-
-
-def _table_above_chart(wb, table):
-    """数据表是否在图表上方：数据表起始行 < 图表锚点起始行。无图表锚点信息时宽松返回 True。"""
-    top = table.get("table_top_row")
-    anchor = _chart_anchor_row(wb)
-    if top is None or anchor is None:
-        return True
-    return top < anchor
-
-
-def _chart_below_table(wb, table):
-    """图表是否在数据表下方：图表锚点行 > 数据表（含身高区）最大行。"""
-    anchor = _chart_anchor_row(wb)
-    if anchor is None:
-        return True
-    rows = []
-    if table.get("age_row"):
-        rows.append(table["age_row"])
-    for ref in table.get("height_area", set()):
-        rows.append(split_ref(ref)[1])
-    table_bottom = max(rows) if rows else None
-    if table_bottom is None:
-        return True
-    return anchor >= table_bottom
-
-
-def _chart_anchor_row(wb):
-    """从 drawing XML 读取图表锚点的起始行（0-based -> 转 1-based）。取最小者。"""
-    best = None
-    for n in wb.names:
-        if re.match(r"xl/drawings/drawing\d+\.xml$", n):
-            root = wb._xml(n)
-            if root is None:
-                continue
-            xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
-            for frm in root.iter("{%s}from" % xdr):
-                rowel = frm.find("{%s}row" % xdr)
-                if rowel is not None and rowel.text is not None:
-                    r = int(rowel.text) + 1
-                    best = r if best is None else min(best, r)
-    return best
-
-
-def rule_plus5_axes(wb, table):
-    """+5：逐点对应细则 ——
-    横轴：箭头指向为年龄；刻度范围覆盖 11~20 岁；
-          横轴标签显示 11、12、…、20 或等效连续年龄刻度。
-    纵轴：箭头指向为身高/cm；最小值为 0 或接近 0；最大值为 200cm 或接近 200cm；
-          主刻度单位为 50cm；能显示 0、50、100、150、200 或接近该间隔的刻度效果。
-    """
-    subs = []
-    if not wb.charts:
-        # 细则的每个点都依赖图表，无图表则全部不满足
-        subs.append((False, "横轴箭头指向为年龄"))
-        subs.append((False, "横轴刻度范围覆盖 11~20 岁"))
-        subs.append((False, "横轴标签显示 11、12、…、20 或等效连续年龄刻度"))
-        subs.append((False, "纵轴箭头指向为身高/cm"))
-        subs.append((False, "纵轴最小值为 0 或接近 0"))
-        subs.append((False, "纵轴最大值为 200cm 或接近 200cm"))
-        subs.append((False, "纵轴主刻度单位为 50cm"))
-        subs.append((False, "纵轴能显示 0、50、100、150、200 或接近该间隔的刻度效果"))
-        return False, subs
-
-    # 取第一个含数据的图表
-    chart = None
-    for ch in wb.charts:
-        if series_refs(ch):
-            chart = ch
-            break
-    if chart is None:
-        chart = wb.charts[0]
-
-    # --- 解析坐标轴 ---
-    val_axes = chart.findall(".//c:valAx", NS)
-    cat_axes = chart.findall(".//c:catAx", NS)
-    # 横轴：年龄。散点图横轴是 valAx(axPos=b)，折线/柱状是 catAx。
-    x_axis = _axis_by_pos(val_axes + cat_axes, "b")
-    y_axis = _axis_by_pos(val_axes + cat_axes, "l")
-
-    # ===== 横轴 =====
-    # 点1：横轴箭头指向为年龄
-    #   "箭头指向为年龄"——横轴用于表达年龄维度。判据：横轴绑定的是年龄数据
-    #   （x 系列值落在 11~20 年龄集合）或横轴标题/标签语义为年龄。
-    x_is_age = _axis_is_age(x_axis, wb, chart, table)
-    subs.append((x_is_age, "横轴箭头指向为年龄"))
-
-    # 点2：横轴刻度范围覆盖 11~20 岁
-    #   类别轴（catAx，折线图/柱状图常见）通常不写 c:scaling/min/max，
-    #   用 _axis_num 取值会恒为 None 而误判失败；这类轴的"范围"应由实际
-    #   类别标签集合是否覆盖 11~20 来判断。数值轴（valAx，散点图常见）才用
-    #   min/max 判断范围覆盖。
-    x_min = _axis_num(x_axis, "min")
-    x_max = _axis_num(x_axis, "max")
-    if x_axis is not None and x_axis.tag.endswith("}catAx"):
-        cat_ages = _axis_category_values(chart)
-        range_cover = set(REQUIRED_AGES).issubset(cat_ages)
-        range_desc = "类别标签=%s" % (",".join(str(a) for a in sorted(cat_ages)) or "无")
-    else:
-        range_cover = (x_min is not None and x_max is not None
-                       and x_min <= 11 and x_max >= 20)
-        range_desc = "min=%s, max=%s" % (_fmt(x_min), _fmt(x_max))
-    subs.append((range_cover,
-                 "横轴刻度范围覆盖 11~20 岁（实测 %s）" % range_desc))
-
-    # 点3：横轴标签显示 11、12、…、20 或等效连续年龄刻度
-    #   判据：横轴标签集合（散点图 = x 数据点值；类别轴 = 类别文本）含连续 11..20，
-    #   或主刻度单位为 1 且范围覆盖 11~20（=> 必然逐格显示 11,12,...,20）。
-    labels_ok = _axis_labels_show_ages(x_axis, wb, chart)
-    subs.append((labels_ok,
-                 "横轴标签显示 11、12、…、20 或等效连续年龄刻度"))
-
-    # ===== 纵轴 =====
-    # 点4：纵轴箭头指向为身高/cm
-    #   判据：纵轴绑定身高数据系列，或纵轴标题/系列名含"身高"或"cm"。
-    y_is_height = _axis_is_height(y_axis, wb, chart, table)
-    subs.append((y_is_height, "纵轴箭头指向为身高/cm"))
-
-    y_min = _axis_num(y_axis, "min")
-    y_max = _axis_num(y_axis, "max")
-    y_unit = _axis_num(y_axis, "majorUnit")
-
-    # 点5/6/7：纵轴参数允许"接近"，但容差要收紧并统一。
-    # 这里统一按 ±2 处理：足以覆盖少量四舍五入/模板微调，
-    # 也避免把明显偏离的刻度（例如 0±10、200±20、50±10）误算进去。
-    tol = 2
-
-    # 点5：纵轴最小值为 0 或接近 0
-    min_ok = (y_min is not None and abs(y_min - 0) <= tol)
-    subs.append((min_ok, "纵轴最小值为 0 或接近 0（实测 %s，容差±%s）" % (_fmt(y_min), tol)))
-
-    # 点6：纵轴最大值为 200cm 或接近 200cm
-    max_ok = (y_max is not None and abs(y_max - 200) <= tol)
-    subs.append((max_ok, "纵轴最大值为 200cm 或接近 200cm（实测 %s，容差±%s）" % (_fmt(y_max), tol)))
-
-    # 点7：纵轴主刻度单位为 50cm
-    unit_ok = (y_unit is not None and abs(y_unit - 50) <= tol)
-    subs.append((unit_ok, "纵轴主刻度单位为 50cm（实测 %s，容差±%s）" % (_fmt(y_unit), tol)))
-
-    # 点8：能显示 0、50、100、150、200 或接近该间隔的刻度效果
-    #   由 min≈0、max≈200、unit≈50 共同决定的刻度序列；
-    #   据此生成实际主刻度序列，逐一比对是否接近 {0,50,100,150,200}。
-    ticks_ok, tick_seq = _ticks_match_target(y_min, y_max, y_unit,
-                                             target=[0, 50, 100, 150, 200])
-    subs.append((ticks_ok,
-                 "纵轴能显示 0、50、100、150、200 或接近该间隔的刻度效果（实测刻度：%s）"
-                 % (",".join(_fmt(t) for t in tick_seq) if tick_seq else "无")))
-
-    passed = all(ok for ok, _ in subs)   # 加分项：每一个点都要踩到才得分
-    return passed, subs
-
-
-def _axis_is_age(axis, wb, chart, table):
-    """横轴是否表达年龄维度。"""
-    # 1) 横轴绑定的 x 系列值集合是否落在年龄域 11..20
-    xs = set()
-    for (xf, xp, _yf, _yp) in series_refs(chart):
-        for v in xp:
-            if v == int(v):
-                xs.add(int(v))
-    if xs and (set(xs) & set(REQUIRED_AGES)) and max(xs) <= 30:
-        return True
-    # 2) 横轴标题文本含"年龄"
-    if axis is not None and _axis_title_text(axis) and "年龄" in _axis_title_text(axis):
-        return True
-    # 3) x 数据源引用年龄行/列单元格
-    if table.get("found"):
-        age_refs = set(table.get("age_refs", {}).values())
-        for (xf, _xp, _yf, _yp) in series_refs(chart):
-            if not xf:
-                continue
-            cells = {ref for (_sh, ref) in _expand_ref(wb, xf)}
-            if cells & age_refs:
-                return True
-    return False
-
-
-def _axis_is_height(axis, wb, chart, table):
-    """纵轴是否表达身高/cm 维度。"""
-    # 1) 纵轴标题含"身高"或"cm"
-    t = _axis_title_text(axis)
-    if t and ("身高" in t or "cm" in t.lower()):
-        return True
-    # 2) 系列名（y 系列）含"身高"或"cm"
-    for ser in chart_series(chart):
-        tx = ser.find(".//c:tx//c:v", NS)
-        name = tx.text if tx is not None and tx.text else ""
-        if "身高" in name or "cm" in name.lower():
-            return True
-    # 3) y 数据源引用身高数据区域
-    if table.get("found"):
-        harea = table.get("height_area", set())
-        for (_xf, _xp, yf, _yp) in series_refs(chart):
-            if not yf:
-                continue
-            targets = _resolve_ref_to_cells(wb, yf)
-            if {ref for (_sh, ref) in targets} & harea:
-                return True
-    return False
-
-
-def _title_text_from_chart(wb, chart):
-    """提取图表标题文本。
-
-    优先读取 c:title 内的富文本 a:t；若标题通过 c:tx/c:strRef/c:f 绑定到单元格，
-    则按公式引用解析到工作表单元格并拼接单元格文本。只处理传入的这个 chart，
-    避免把工作簿里其它图表的标题混进来。
-    """
-    title = chart.find("c:title", NS)
-    if title is None:
-        return ""
-
-    # 1) 富文本标题：<c:title><c:tx><c:rich>...<a:t>
-    txts = [t.text for t in title.iter("{%s}t" % NS["a"]) if t.text]
-    rich_text = "".join(txts).strip()
-    if rich_text:
-        return rich_text
-
-    # 2) 单元格引用标题：<c:title><c:tx><c:strRef><c:f>Sheet!$A$1</c:f>
-    str_ref = title.find(".//c:tx/c:strRef", NS)
-    if str_ref is None:
-        return ""
-    f = str_ref.find("c:f", NS)
-    if f is None or not f.text:
-        return ""
-
-    parts = []
-    for sh_name, ref in _expand_ref(wb, f.text):
-        sheet = _sheet_by_name(wb, sh_name)
-        if sheet is None:
+def _parse_formula_ref(f):
+    """解析图表数据源公式 -> (sheet_name 或 None, [单元格引用...])。
+    形如 Sheet1!$B$3:$K$3 / '身高记录'!$B$13:$B$22 / (A1:A5,B1:B5)。"""
+    if not f:
+        return None, []
+    sheet = None
+    cells = []
+    for part in str(f).replace('(', '').replace(')', '').split(','):
+        part = part.strip()
+        if not part:
             continue
-        txt = wb.cell_text(sheet, ref)
-        if txt:
-            parts.append(str(txt).strip())
-    return " ".join(p for p in parts if p)
-
-
-def _axis_title_text(axis):
-    if axis is None:
-        return ""
-    title = axis.find("c:title", NS)
-    if title is None:
-        return ""
-    return "".join(t.text or "" for t in title.iter("{%s}t" % NS["a"]))
-
-
-def _axis_category_values(chart):
-    """取类别轴（catAx）的类别标签值集合（作为整数年龄）。
-    与 _axis_labels_show_ages 中 B) 分支使用同一数据源：系列的 c:cat。
-    用于类别轴场景下判断"刻度范围覆盖 11~20"——类别轴没有 min/max，
-    其"范围"就是类别标签本身覆盖的取值集合。
-    """
-    cats = set()
-    for ser in chart_series(chart):
-        cat = ser.find(".//c:cat", NS)
-        if cat is not None:
-            for v in cat.iter("{%s}v" % NS["c"]):
-                iv = _as_int(v.text)
-                if iv is not None:
-                    cats.add(iv)
-    return cats
-
-
-def _axis_labels_show_ages(axis, wb, chart):
-    """横轴标签是否显示 11..20 或等效连续年龄刻度。"""
-    # A) 数值轴（散点图常见）：标签由 min/max/majorUnit 决定。
-    #    要保证 11~20 十个整数刻度都能显示，主刻度单位必须恰为 1——
-    #    单位为 2 时刻度落在 11,13,15,...或 12,14,16,...，无法保证十个年龄
-    #    全部显示，因此不再把 unit=2 当作"等效连续刻度"接受。
-    if axis is not None:
-        amin = _axis_num(axis, "min")
-        amax = _axis_num(axis, "max")
-        unit = _axis_num(axis, "majorUnit")
-        if amin is not None and amax is not None and unit is not None:
-            if amin <= 11 and amax >= 20 and abs(unit - 1) < 1e-6:
-                return True
-    # B) 类别轴：直接取类别文本，判断是否含连续 11..20
-    cats = _axis_category_values(chart)
-    if set(REQUIRED_AGES).issubset(cats):
-        return True
-    # C) 散点 x 数据点值含完整 11..20（等效连续年龄刻度标签）
-    xs = set()
-    for (_xf, xp, _yf, _yp) in series_refs(chart):
-        for v in xp:
-            iv = _as_int(v)
-            if iv is not None:
-                xs.add(iv)
-    return set(REQUIRED_AGES).issubset(xs)
-
-
-def _ticks_match_target(amin, amax, unit, target):
-    """由 min/max/unit 生成主刻度序列，并判断是否覆盖/接近 target 刻度。"""
-    if amin is None or amax is None or unit is None or unit <= 0:
-        return False, []
-    ticks = []
-    v = amin
-    # 防御：限制循环次数
-    guard = 0
-    while v <= amax + 1e-6 and guard < 1000:
-        ticks.append(round(v, 6))
-        v += unit
-        guard += 1
-    if not ticks:
-        return False, ticks
-    # target 中的每个目标刻度，在实测刻度里都能找到一个接近值（容差 ±5cm）
-    tol = 5
-    all_hit = all(any(abs(t - tg) <= tol for t in ticks) for tg in target)
-    return all_hit, ticks
-
-
-def rule_plus5_markers_only(wb, table):
-    """+5：逐点对应细则 ——
-    点1：图表显示数据点（marker）。
-    点2：不显示连接各数据点的折线。
-    两点都要踩到才计分。
-    """
-    subs = []
-    if not wb.charts:
-        subs.append((False, "图表显示数据点"))
-        subs.append((False, "不显示连接各数据点的折线"))
-        return False, subs
-
-    # 取含数据系列的图表（与其它细则一致的选取口径）
-    chart = None
-    for ch in wb.charts:
-        if chart_series(ch):
-            chart = ch
-            break
-    if chart is None:
-        chart = wb.charts[0]
-
-    types = chart_type(chart)
-    shows_markers, line_shown, detail = _marker_line_state(chart, types)
-
-    # 点1：显示数据点
-    subs.append((shows_markers, "图表显示数据点（%s）" % detail))
-    # 点2：不显示连接各数据点的折线
-    subs.append((not line_shown, "不显示连接各数据点的折线（%s）" % detail))
-
-    passed = all(ok for ok, _ in subs)
-    return passed, subs
-
-
-def _marker_line_state(chart, types):
-    """
-    判定图表的"是否显示数据点"与"是否显示连线"。
-    返回 (shows_markers: bool, line_shown: bool, detail: str)
-    """
-    # ---- 散点图 ----
-    if "scatterChart" in types:
-        style = chart.find(".//c:scatterStyle", NS)
-        sval = style.get("val") if style is not None else None
-        # scatterStyle 的 OOXML 语义（ECMA-376 §21.2.2.140）：
-        #   marker       —— 仅标记，不连线
-        #   lineMarker   —— 标记 + 直线连接
-        #   line         —— 仅直线，不显示标记
-        #   smooth       —— 仅平滑线
-        #   smoothMarker —— 标记 + 平滑线
-        #   none         —— 未设置，图表应用程序按默认（通常为 lineMarker）渲染
-        # scatterStyle=marker 是"不显示连接线"的显式声明，可作为强证据直接采信；
-        # 无需再要求每个系列都额外写 a:ln/a:noFill——那是过严的要求，
-        # 会把 Office 中标准的"仅标记散点图"误判为有连线。
-        # 系列级设置仅在可能覆盖/矛盾全局样式时才参与判断：
-        #   - 若某系列显式将连线设为 noFill，则该系列一定无连接线；
-        #   - 若某系列显式设置了非 none 的连线（有宽度/颜色的 a:ln），
-        #     则该系列存在连接线，即使全局 scatterStyle=marker 也不能认为无线。
-        no_line_styles = ("marker",)
-        line_styles = ("line", "lineMarker", "smooth", "smoothMarker")
-        if sval in no_line_styles:
-            line_shown = _any_series_line_explicit_on(chart)
-        elif sval in line_styles:
-            line_shown = not _all_series_line_off(chart)
+        if '!' in part:
+            sname, _, area = part.rpartition('!')
+            sname = sname.strip()
+            if sname.startswith("'") and sname.endswith("'"):
+                sname = sname[1:-1].replace("''", "'")
+            if sheet is None:
+                sheet = sname
         else:
-            # scatterStyle 缺失/none：无法确定默认渲染，退回系列级判据——
-            # 只有当所有系列都显式关闭连线时才认为无连接线。
-            line_shown = not _all_series_line_off(chart)
-        # 显示数据点：style 含 marker，或系列显式设置了 marker 符号(非 none)
-        shows_markers = (sval in ("marker", "lineMarker", "smoothMarker")) \
-            or _any_series_marker_on(chart)
-        # 散点图默认即显示点；style=none 时若无明确关闭 marker 也按显示点处理
-        if sval in (None, "none") and not _any_series_marker_off(chart):
-            shows_markers = True
-        detail = "散点图 scatterStyle=%s" % sval
-        return shows_markers, line_shown, detail
-
-    # ---- 折线图 ----
-    if "lineChart" in types:
-        # 折线图默认显示连线；仅当每个系列连线都 noFill 才算"不显示折线"
-        line_shown = not _all_series_line_off(chart)
-        shows_markers = _any_series_marker_on(chart)
-        detail = "折线图"
-        return shows_markers, line_shown, detail
-
-    # ---- 其它类型 ----
-    # 细则只关心"数据点"与"连接折线"。非散点/折线类（柱状/饼图等）没有
-    # 连接各数据点的折线，但也并非以数据点形式呈现 —— 按不满足细则处理。
-    detail = "图表类型 %s（非散点/折线，不符合“只显示数据点”形态）" % (",".join(types) or "未知")
-    return False, False, detail
+            area = part
+        cells.extend(_expand_area(area))
+    return sheet, cells
 
 
-def _all_series_line_off(chart):
-    """所有数据系列的连线是否都被显式隐藏（a:ln/a:noFill）。无系列则 False。"""
-    sers = chart_series(chart)
-    if not sers:
-        return False
-    for ser in sers:
-        nofill = ser.find(".//c:spPr/a:ln/a:noFill", NS)
-        if nofill is None:
-            return False
-    return True
+class _Sheet(object):
+    """一张工作表的“用户可见事实”：单元格值/公式/样式、合并区、数据有效性、
+    行列隐藏与列宽、以及挂在该表上的图表。"""
+
+    def __init__(self, name):
+        self.name = name
+        self.cells = {}          # 'A1' -> {'text','num','f','s'}
+        self.merged = []         # ['A1:K1', ...]
+        self.dv = []             # [{'sqref','type','f1','f2'}]
+        self.col_width = {}      # 列号 -> 宽度
+        self.col_hidden = set()  # 列号
+        self.row_hidden = set()  # 行号
+        self.default_col_width = 8.43
+        self.charts = []         # [chart dict]
+        self.anchors = []        # [{'from_row','to_row','cx','cy','has_chart'}]
+        self.pictures = 0
+
+    def text(self, ref):
+        c = self.cells.get(_norm_ref(ref) or '')
+        return (c or {}).get('text', '') or ''
+
+    def num(self, ref):
+        c = self.cells.get(_norm_ref(ref) or '')
+        return (c or {}).get('num')
+
+    def formula(self, ref):
+        c = self.cells.get(_norm_ref(ref) or '')
+        return (c or {}).get('f')
+
+    def width_of(self, col_letter):
+        n = _col_to_num(col_letter)
+        return self.col_width.get(n, self.default_col_width)
 
 
-def _any_series_line_explicit_on(chart):
-    """是否存在系列显式启用了连接线（a:ln 设置了非 noFill 的填充，
-    如 a:solidFill/a:pattFill/a:gradFill，或指定了线宽 w）。
-    用于在 scatterStyle=marker（全局声明"仅标记、不连线"）时，
-    识别系列级样式覆盖全局设置、仍画出连接线的情形。"""
-    for ser in chart_series(chart):
-        ln = ser.find(".//c:spPr/a:ln", NS)
-        if ln is None:
-            continue
-        if ln.find("a:noFill", NS) is not None:
-            continue
-        has_fill = any(ln.find("a:%s" % tag, NS) is not None
-                        for tag in ("solidFill", "gradFill", "pattFill"))
-        if has_fill or ln.get("w") is not None:
-            return True
-    return False
+class _Xlsx(object):
+    """解包并解析 xlsx：工作簿 / 共享字符串 / 样式 / 工作表 / 绘图 / 图表。"""
 
+    def __init__(self, path):
+        self.path = path
+        self.zip = zipfile.ZipFile(path)
+        self.names = set(self.zip.namelist())
+        self.shared = []
+        self.cell_xfs = []       # [{'borderId','halign','fillId'}]
+        self.border_has_edge = []
+        self.fill_is_yellow = []
+        self.sheets = []         # [_Sheet]
+        self.calc_mode = 'auto'
+        self.chart_parts = 0
+        self._load()
 
-def _any_series_marker_on(chart):
-    """是否有系列显式启用了数据点标记（c:marker/c:symbol != none）。"""
-    for ser in chart_series(chart):
-        sym = ser.find(".//c:marker/c:symbol", NS)
-        if sym is not None and sym.get("val") not in (None, "none"):
-            return True
-    return False
-
-
-def _any_series_marker_off(chart):
-    """是否存在系列显式关闭了数据点标记（c:marker/c:symbol = none）。"""
-    for ser in chart_series(chart):
-        sym = ser.find(".//c:marker/c:symbol", NS)
-        if sym is not None and sym.get("val") == "none":
-            return True
-    return False
-
-
-def rule_plus1_title(wb, table):
-    """+1：逐点对应细则 ——
-    点1：图表具有标题。
-    点2：标题包含“身高”“统计图”或“成长记录”等能说明图表用途的文字。
-    两点都要踩到才计分。
-    """
-    subs = []
-
-    # 点1：图表具有标题
-    # 这里按“每个图表自己的标题”判断，不从工作簿全局取文本。
-    # 既支持富文本标题，也支持通过 c:tx/c:strRef/c:f 绑定到单元格的标题。
-    title_text = ""
-    has_title = False
-    for ch in wb.charts:
-        deleted = ch.find(".//c:autoTitleDeleted", NS)
-        if deleted is not None and deleted.get("val") == "1":
-            continue
-        title_text = _title_text_from_chart(wb, ch)
-        if title_text.strip():
-            has_title = True
-            break
-    subs.append((has_title, "图表具有标题（标题：%s）" % (title_text or "无")))
-
-    # 点2：标题包含"身高""统计图"或"成长记录"等能说明图表用途的文字
-    kw = ["身高", "统计图", "成长记录"]
-    kw_ok = has_title and any(k in title_text for k in kw)
-    subs.append((kw_ok,
-                 "标题包含“身高”“统计图”或“成长记录”等能说明图表用途的文字"))
-
-    passed = all(ok for ok, _ in subs)
-    return passed, subs
-
-
-# ---- 坐标轴解析辅助 ----------------------------------------------------
-def _axis_by_pos(axes, pos):
-    for ax in axes:
-        p = ax.find("c:axPos", NS)
-        if p is not None and p.get("val") == pos:
-            return ax
-    return axes[0] if axes else None
-
-
-def _axis_num(axis, kind):
-    if axis is None:
-        return None
-    if kind in ("min", "max"):
-        node = axis.find("c:scaling/c:%s" % kind, NS)
-    else:  # majorUnit
-        node = axis.find("c:%s" % kind, NS)
-    if node is not None and node.get("val") is not None:
-        try:
-            return float(node.get("val"))
-        except ValueError:
+    # ---------- 基础 ----------
+    def _xml(self, name):
+        if name not in self.names:
             return None
-    return None
+        try:
+            return ET.fromstring(self.zip.read(name))
+        except ET.ParseError:
+            return None
+
+    def _rels_of(self, part):
+        """返回 part 的 rId -> 目标绝对路径 映射。"""
+        d = os.path.dirname(part)
+        rels = '%s/_rels/%s.rels' % (d, os.path.basename(part))
+        root = self._xml(rels)
+        out = {}
+        if root is None:
+            return out
+        for rel in root.findall(q(NS_PR, 'Relationship')):
+            tgt = rel.get('Target') or ''
+            rid = rel.get('Id')
+            if tgt.startswith('/'):
+                full = tgt.lstrip('/')
+            else:
+                full = os.path.normpath(os.path.join(d, tgt)).replace('\\', '/')
+            out[rid] = full
+        return out
+
+    # ---------- 装载 ----------
+    def _load(self):
+        self.chart_parts = len([n for n in self.names
+                                if re.match(r'xl/(charts|drawings/charts)/chart\d*\.xml$', n)])
+        self._load_shared()
+        self._load_styles()
+        wb = self._xml('xl/workbook.xml')
+        if wb is None:
+            raise ValueError('缺少 xl/workbook.xml，非有效 xlsx 工作簿')
+        calc = wb.find(q(NS_MAIN, 'calcPr'))
+        if calc is not None and (calc.get('calcMode') or 'auto') == 'manual':
+            self.calc_mode = 'manual'
+        rels = self._rels_of('xl/workbook.xml')
+        holder = wb.find(q(NS_MAIN, 'sheets'))
+        for sh in (holder if holder is not None else []):
+            rid = sh.get(q(NS_R, 'id'))
+            target = rels.get(rid)
+            sheet = _Sheet(sh.get('name') or '')
+            if target and target in self.names:
+                self._load_sheet(sheet, target)
+            self.sheets.append(sheet)
+
+    def _load_shared(self):
+        root = self._xml('xl/sharedStrings.xml')
+        if root is None:
+            return
+        for si in root.findall(q(NS_MAIN, 'si')):
+            self.shared.append(''.join(t.text or '' for t in si.iter(q(NS_MAIN, 't'))))
+
+    def _load_styles(self):
+        root = self._xml('xl/styles.xml')
+        if root is None:
+            return
+        borders = root.find(q(NS_MAIN, 'borders'))
+        for b in (borders if borders is not None else []):
+            has = False
+            for edge in ('left', 'right', 'top', 'bottom'):
+                e = b.find(q(NS_MAIN, edge))
+                if e is not None and e.get('style'):
+                    has = True
+            self.border_has_edge.append(has)
+        fills = root.find(q(NS_MAIN, 'fills'))
+        for fl in (fills if fills is not None else []):
+            rgb = ''
+            pf = fl.find(q(NS_MAIN, 'patternFill'))
+            if pf is not None:
+                fg = pf.find(q(NS_MAIN, 'fgColor'))
+                if fg is not None:
+                    rgb = (fg.get('rgb') or '').upper()
+            # 判定“黄色底”：R、G 高且 B 低
+            yellow = False
+            if len(rgb) == 8:
+                r, g, b2 = int(rgb[2:4], 16), int(rgb[4:6], 16), int(rgb[6:8], 16)
+                yellow = r > 200 and g > 180 and b2 < 150
+            self.fill_is_yellow.append(yellow)
+        xfs = root.find(q(NS_MAIN, 'cellXfs'))
+        for xf in (xfs if xfs is not None else []):
+            al = xf.find(q(NS_MAIN, 'alignment'))
+            self.cell_xfs.append({
+                'borderId': int(xf.get('borderId') or 0),
+                'fillId': int(xf.get('fillId') or 0),
+                'halign': (al.get('horizontal') if al is not None else None) or '',
+            })
+
+    def style_of(self, s_idx):
+        try:
+            return self.cell_xfs[int(s_idx)]
+        except (TypeError, ValueError, IndexError):
+            return {'borderId': 0, 'fillId': 0, 'halign': ''}
+
+    def has_border(self, s_idx):
+        bid = self.style_of(s_idx)['borderId']
+        return bool(bid) and bid < len(self.border_has_edge) and self.border_has_edge[bid]
+
+    def has_yellow_fill(self, s_idx):
+        fid = self.style_of(s_idx)['fillId']
+        return bool(fid) and fid < len(self.fill_is_yellow) and self.fill_is_yellow[fid]
+
+    def _load_sheet(self, sheet, part):
+        root = self._xml(part)
+        if root is None:
+            return
+        fmt = root.find(q(NS_MAIN, 'sheetFormatPr'))
+        if fmt is not None:
+            for k in ('defaultColWidth', 'baseColWidth'):
+                if fmt.get(k):
+                    try:
+                        sheet.default_col_width = float(fmt.get(k))
+                        break
+                    except ValueError:
+                        pass
+        cols = root.find(q(NS_MAIN, 'cols'))
+        for col in (cols if cols is not None else []):
+            try:
+                lo, hi = int(col.get('min')), int(col.get('max'))
+            except (TypeError, ValueError):
+                continue
+            for n in range(lo, min(hi, lo + 256) + 1):
+                if col.get('width'):
+                    try:
+                        sheet.col_width[n] = float(col.get('width'))
+                    except ValueError:
+                        pass
+                if (col.get('hidden') or '0') in ('1', 'true'):
+                    sheet.col_hidden.add(n)
+        data = root.find(q(NS_MAIN, 'sheetData'))
+        for row in (data if data is not None else []):
+            try:
+                r_idx = int(row.get('r'))
+            except (TypeError, ValueError):
+                r_idx = None
+            if r_idx is not None and (row.get('hidden') or '0') in ('1', 'true'):
+                sheet.row_hidden.add(r_idx)
+            for c in row.findall(q(NS_MAIN, 'c')):
+                ref = _norm_ref(c.get('r') or '')
+                if not ref:
+                    continue
+                sheet.cells[ref] = self._cell_of(c)
+        mc = root.find(q(NS_MAIN, 'mergeCells'))
+        for m in (mc if mc is not None else []):
+            if m.get('ref'):
+                sheet.merged.append(m.get('ref'))
+        dvs = root.find(q(NS_MAIN, 'dataValidations'))
+        for dv in (dvs if dvs is not None else []):
+            f1 = dv.find(q(NS_MAIN, 'formula1'))
+            f2 = dv.find(q(NS_MAIN, 'formula2'))
+            sheet.dv.append({
+                'sqref': dv.get('sqref') or '',
+                'type': dv.get('type') or '',
+                'operator': dv.get('operator') or '',
+                'f1': (f1.text if f1 is not None else None),
+                'f2': (f2.text if f2 is not None else None),
+            })
+        dr = root.find(q(NS_MAIN, 'drawing'))
+        if dr is not None:
+            target = self._rels_of(part).get(dr.get(q(NS_R, 'id')))
+            if target:
+                self._load_drawing(sheet, target)
+
+    def _cell_of(self, c):
+        t = c.get('t') or 'n'
+        v = c.find(q(NS_MAIN, 'v'))
+        f = c.find(q(NS_MAIN, 'f'))
+        raw = v.text if v is not None else None
+        text, num = '', None
+        if t == 's':
+            try:
+                text = self.shared[int(raw)]
+            except (TypeError, ValueError, IndexError):
+                text = ''
+        elif t == 'inlineStr':
+            is_el = c.find(q(NS_MAIN, 'is'))
+            text = '' if is_el is None else ''.join(x.text or '' for x in is_el.iter(q(NS_MAIN, 't')))
+        elif raw is not None:
+            text = raw
+            try:
+                num = float(raw)
+            except ValueError:
+                num = None
+        if t in ('str', 'e', 'b'):
+            num = None
+        f_txt = None if f is None else (f.text or '')
+        return {'text': text or '', 'num': num, 'f': f_txt, 't': t, 's': c.get('s')}
+
+    def _load_drawing(self, sheet, part):
+        root = self._xml(part)
+        if root is None:
+            return
+        rels = self._rels_of(part)
+        for tag in ('twoCellAnchor', 'oneCellAnchor', 'absoluteAnchor'):
+            for a in root.findall(q(NS_XDR, tag)):
+                item = {'from_row': None, 'to_row': None, 'cx': None, 'cy': None,
+                        'has_chart': False}
+                frm = a.find(q(NS_XDR, 'from'))
+                if frm is not None:
+                    rw = frm.find(q(NS_XDR, 'row'))
+                    if rw is not None and (rw.text or '').strip().isdigit():
+                        item['from_row'] = int(rw.text)
+                to = a.find(q(NS_XDR, 'to'))
+                if to is not None:
+                    rw = to.find(q(NS_XDR, 'row'))
+                    if rw is not None and (rw.text or '').strip().isdigit():
+                        item['to_row'] = int(rw.text)
+                ext = a.find(q(NS_XDR, 'ext'))
+                if ext is None:
+                    ext = a.find('.//' + q(NS_A, 'ext'))
+                if ext is not None:
+                    try:
+                        item['cx'] = int(ext.get('cx'))
+                        item['cy'] = int(ext.get('cy'))
+                    except (TypeError, ValueError):
+                        pass
+                ch = a.find('.//' + q(NS_C, 'chart'))
+                if ch is not None:
+                    item['has_chart'] = True
+                    target = rels.get(ch.get(q(NS_R, 'id')))
+                    parsed = self._load_chart(target) if target else None
+                    if parsed is not None:
+                        parsed['anchor'] = item
+                        sheet.charts.append(parsed)
+                if a.find('.//' + q(NS_XDR, 'pic')) is not None:
+                    sheet.pictures += 1
+                sheet.anchors.append(item)
+
+    # ---------- 图表 ----------
+    def _load_chart(self, part):
+        root = self._xml(part)
+        if root is None:
+            return None
+        chart = root.find(q(NS_C, 'chart'))
+        if chart is None:
+            return None
+        plot = chart.find(q(NS_C, 'plotArea'))
+        if plot is None:
+            return None
+        out = {
+            'part': part,
+            'title': _rich_text(chart.find(q(NS_C, 'title'))),
+            'title_deleted': _val(chart.find(q(NS_C, 'autoTitleDeleted'))) == '1',
+            'disp_blanks': _val(chart.find(q(NS_C, 'dispBlanksAs'))) or '',
+            'groups': [],
+            'series': [],
+            'axes': [],
+        }
+        for g in list(plot):
+            local = g.tag.split('}')[-1]
+            if not local.endswith('Chart'):
+                continue
+            out['groups'].append(local)
+            grp_showval = _val(g.find(q(NS_C, 'dLbls') + '/' + q(NS_C, 'showVal')))
+            scatter_style = _val(g.find(q(NS_C, 'scatterStyle')))
+            for ser in g.findall(q(NS_C, 'ser')):
+                out['series'].append(self._ser_of(ser, local, scatter_style, grp_showval))
+        for local in ('valAx', 'catAx', 'dateAx', 'serAx'):
+            for ax in plot.findall(q(NS_C, local)):
+                sc = ax.find(q(NS_C, 'scaling'))
+                out['axes'].append({
+                    'kind': local,
+                    'pos': _val(ax.find(q(NS_C, 'axPos'))) or '',
+                    'deleted': _val(ax.find(q(NS_C, 'delete'))) == '1',
+                    'min': _fval(sc.find(q(NS_C, 'min'))) if sc is not None else None,
+                    'max': _fval(sc.find(q(NS_C, 'max'))) if sc is not None else None,
+                    'major_unit': _fval(ax.find(q(NS_C, 'majorUnit'))),
+                    'title': _rich_text(ax.find(q(NS_C, 'title'))),
+                    'gridlines': ax.find(q(NS_C, 'majorGridlines')) is not None,
+                })
+        return out
+
+    def _ser_of(self, ser, group, scatter_style, grp_showval):
+        s = {'group': group, 'scatter_style': scatter_style or '',
+             'no_line': False, 'marker': None, 'show_val': grp_showval or '0'}
+        sp = ser.find(q(NS_C, 'spPr'))
+        if sp is not None:
+            ln = sp.find(q(NS_A, 'ln'))
+            if ln is not None:
+                if ln.find(q(NS_A, 'noFill')) is not None:
+                    s['no_line'] = True
+                else:
+                    try:
+                        if int(ln.get('w') or -1) == 0:
+                            s['no_line'] = True
+                    except ValueError:
+                        pass
+        mk = ser.find(q(NS_C, 'marker'))
+        if mk is not None:
+            s['marker'] = _val(mk.find(q(NS_C, 'symbol'))) or 'auto'
+        own = _val(ser.find(q(NS_C, 'dLbls') + '/' + q(NS_C, 'showVal')))
+        if own is not None:
+            s['show_val'] = own
+        for key, tag in (('x', 'xVal'), ('y', 'yVal'), ('cat', 'cat'), ('val', 'val')):
+            node = ser.find(q(NS_C, tag))
+            if node is None:
+                continue
+            ref = node.find(q(NS_C, 'numRef'))
+            lit = node.find(q(NS_C, 'numLit'))
+            if ref is None and lit is None:
+                ref = node.find(q(NS_C, 'strRef'))
+                lit = node.find(q(NS_C, 'strLit'))
+            f = None if ref is None else _text(ref.find(q(NS_C, 'f')))
+            cnt = None
+            holder = ref if ref is not None else lit
+            if holder is not None:
+                pc = holder.find('.//' + q(NS_C, 'ptCount'))
+                cnt = _fval(pc)
+            s[key + '_f'] = f
+            s[key + '_is_lit'] = (ref is None and lit is not None)
+            s[key + '_count'] = int(cnt) if cnt is not None else 0
+        return s
 
 
-def _table_has_nearby_title(wb, table, keywords):
-    """判断"数据表标题"，而非在全工作簿文本中盲目搜关键词。
-
-    问题背景：原实现在全工作簿文本（wb.all_text()）中查找标题关键词，
-    未绑定到具体的数据表；同时把"身高统计图""成长记录"等图表标题的
-    同义词也纳入表标题关键词，导致图表标题被误判为数据表标题（冒充）。
-
-    修正：只在数据表所在工作表、且位于数据表上方邻近区域（数据表起始行
-    及其上方最多 3 行、覆盖数据表所跨列范围）内查找标题文本；不再匹配
-    "身高统计图""成长记录"等明显属于图表标题的措辞，避免与
-    rule_plus1_title 的图表标题关键词混淆。
-    """
-    if not table.get("found") or table.get("sheet") is None:
-        return False
-
-    sheet = table["sheet"]
-    top_row = table.get("table_top_row")
-    if top_row is None:
-        return False
-
-    # 数据表跨列范围：由年龄引用和身高区域的列共同确定
-    cols = set()
-    for ref in table.get("age_refs", {}).values():
-        c, _r = split_ref(ref)
-        cols.add(col_to_num(c))
-    for ref in table.get("height_area", set()):
-        c, _r = split_ref(ref)
-        cols.add(col_to_num(c))
-    if table.get("age_col"):
-        cols.add(col_to_num(table["age_col"]))
-    if not cols:
-        return False
-    min_col, max_col = min(cols), max(cols)
-
-    # 标题通常在数据表正上方 1~3 行，允许略微超出数据表列范围（左右各放宽 1 列）
-    search_rows = range(max(1, top_row - 3), top_row)
-    search_cols = range(max(1, min_col - 1), max_col + 2)
-
-    for ref, _c, txt in wb.iter_cells(sheet):
-        if not txt:
-            continue
-        col, row = split_ref(ref)
-        if row not in search_rows:
-            continue
-        if col_to_num(col) not in search_cols:
-            continue
-        if any(k in txt for k in keywords):
-            return True
-    return False
+def _val(el):
+    return None if el is None else (el.get('val') or None)
 
 
-def _fmt(v):
+def _fval(el):
+    v = _val(el)
     if v is None:
-        return "无"
-    if v == int(v):
-        return str(int(v))
-    return str(v)
-
-
-# ---------------------------------------------------------------------------
-# 维度2 评估编排
-# ---------------------------------------------------------------------------
-# 评分细则表：(分值, 类型, 细则内容原文, 判定函数)
-#   type = "plus" 加分项（须满足全部子点）/ "minus" 扣分项（满足任一子点即扣）
-SCORING_RULES = [
-    (+3, "plus",
-     "工作表上方制作了“11～20岁身高统计表”或同义标题的数据表，表中年龄覆盖11、12、13、14、15、16、17、18、19、20岁。"
-     "身高统计表包含可直接填写的身高/cm数据行或数据列，10个年龄均有对应的可编辑身高输入单元格。"
-     "下方制作了基于身高统计表的可编辑Excel图表，修改任意年龄对应身高数据后，图表中的对应数据点能自动更新。",
-     rule_plus3),
-    (+5, "plus",
-     "图表横轴箭头指向为年龄，刻度范围覆盖11～20岁，横轴标签显示11、12、13、14、15、16、17、18、19、20或等效连续年龄刻度。"
-     "纵轴箭头指向为身高/cm，最小值为0或接近0，最大值为200cm或接近200cm；"
-     "纵轴主刻度单位为50cm，能显示0、50、100、150、200或接近该间隔的刻度效果。",
-     rule_plus5_axes),
-    (+5, "plus",
-     "图表只显示数据点，不显示连接各数据点的折线。",
-     rule_plus5_markers_only),
-    (+1, "plus",
-     "图表具有标题，标题包含“身高”“统计图”或“成长记录”等能说明图表用途的文字。",
-     rule_plus1_title),
-    # 扣分项（本模板细则未给出，留作扩展示例）：
-    # (-2, "minus", "示例扣分项内容", rule_minus_example),
-]
-
-
-def evaluate_dim2(wb):
-    table = _find_age_height_table(wb)
-    results = []   # [(score, rtype, content, hit, applied, subpoints)]
-    total = 0
-    for score, rtype, content, func in SCORING_RULES:
-        passed, subs = func(wb, table)
-        if rtype == "plus":
-            hit = passed                      # 加分：全部子点满足
-        else:  # minus
-            hit = any(ok for ok, _ in subs)   # 扣分：任一子点满足即触发
-        applied = score if hit else 0
-        total += applied
-        results.append((score, rtype, content, hit, applied, subs))
-    return total, results, table
-
-
-# ---------------------------------------------------------------------------
-# 报告打印
-# ---------------------------------------------------------------------------
-def _mark(ok):
-    return "[√]" if ok else "[×]"
-
-
-# ---------------------------------------------------------------------------
-# 统一对外接口
-# ---------------------------------------------------------------------------
-SCRIPT_ID = "096"
-
-
-def _locate_target_file(dir_path):
-    """在给定目录里定位被评估的 .xlsx/.xlsm 文档。
-
-    选取规则：
-      1) 过滤掉临时文件（以 ~$ 开头）、以 _ 开头的辅助文件（如 _copy.xlsx）、
-         以及非 xlsx/xlsm 后缀。
-      2) 若目录中恰好有一个候选文件，直接返回；
-      3) 若存在多个候选，则优先选择文件名包含"身高"关键词的那个；
-      4) 否则按文件名排序返回第一个。
-    """
-    if not os.path.isdir(dir_path):
         return None
-    candidates = []
-    for name in os.listdir(dir_path):
-        low = name.lower()
-        if name.startswith("~$") or name.startswith("_"):
-            continue
-        if not (low.endswith(".xlsx") or low.endswith(".xlsm")):
-            continue
-        candidates.append(name)
-    if not candidates:
+    try:
+        return float(v)
+    except ValueError:
         return None
-    if len(candidates) == 1:
-        return os.path.join(dir_path, candidates[0])
-    # 优先包含"身高"关键词的候选
-    preferred = [n for n in candidates if "身高" in n]
-    pick = preferred[0] if preferred else sorted(candidates)[0]
-    return os.path.join(dir_path, pick)
 
 
-def _build_dim2_items(results, max_total):
-    """将 evaluate_dim2 的原始结果转换为统一的 dim2_items 列表。"""
-    items = []
-    for score, rtype, content, hit, applied, subs in results:
-        # detail：逐子点 [√]/[×] 说明，便于排查（此处按需求置空，保留计算以维持原逻辑）
-        detail = "; ".join(("%s %s" % (_mark(ok), desc)) for ok, desc in subs)
-        _ = detail  # 保留原始 detail 计算以不破坏逻辑，输出中置空
-        items.append({
-            "rule": content,
-            "max_delta": score,
-            "delta": applied,
-            "hit": bool(hit),
-            "detail": "",
-        })
-    return items
+def _text(el):
+    return None if el is None else (el.text or '')
 
 
-def evaluate(dir_path: str) -> dict:
-    """统一入口：接收脚本所在目录的路径，脚本自身在该目录内定位并评估文档。"""
+def _rich_text(el):
+    """取 c:title / c:tx 里 a:t 的拼接文本。"""
+    if el is None:
+        return ''
+    return ''.join(t.text or '' for t in el.iter(q(NS_A, 't'))).strip()
+
+
+def evaluate(dir_path):
+    """按接口约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为“脚本所在目录的路径”，脚本自己在该目录里定位并打开被评估的
+    .xlsx（忽略以 ~$ 打头的 Excel 临时锁文件）。
+
+    未找到待评文件（目录不存在或目录内没有工作簿）时，返回 status='error'、
+    file_name 与 dim1_pass/dim1_reason 均留空、dim2_items 为空、分值全 0；
+    其他运行异常则给出“脚本运行异常：…”摘要，并按维度一未通过计 0 分。"""
     result = {
         "id": SCRIPT_ID,
-        "file_name": None,
+        "file_name": "",
         "status": "ok",
         "error": None,
         "dim1_pass": False,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": sum(score for score, rtype, *_ in SCORING_RULES
-                         if rtype == "plus"),
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        path = _locate_target_file(dir_path)
-        if not path or not os.path.exists(path):
-            result["status"] = "error"
-            result["error"] = "在目录中未找到被评估的 .xlsx/.xlsm 文件：%s" % dir_path
-            return result
-        result["file_name"] = os.path.basename(path)
-
-        wb = Workbook(path)
-
-        # ---- 维度1 ----
-        d1_pass, d1_details = evaluate_dim1(wb)
-        result["dim1_pass"] = bool(d1_pass)
-        if not d1_pass:
-            fails = [desc for ok, desc in d1_details if not ok]
-            result["dim1_reason"] = "; ".join(fails)
-            # 维度一未通过：dim2_items 保持为空，总分为 0
-            return result
-
-        # ---- 维度2 ----
-        total, results_raw, _table = evaluate_dim2(wb)
-        result["dim2_items"] = _build_dim2_items(results_raw, result["max_score"])
-        result["total_score"] = int(total)
-        return result
-    except Exception as e:  # 兜底：任何未预期异常都归为 status=error
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"目录不存在或不是目录：{dir_path}")
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith(('.xlsx', '.xlsm', '.xls')) and not f.startswith('~$')
+            and os.path.isfile(os.path.join(dir_path, f))
+        )
+        if not cands:
+            raise FileNotFoundError(f"目录中未找到 .xlsx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 未找到待评文件：不进入维度判定，dim1_pass 留空，分值一并归零
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = "%s: %s" % (type(e).__name__, e)
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = f"脚本运行异常：{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = (f"维度一未通过：文件无法打开或解析"
+                                f"（{type(exc).__name__}: {exc}），完成度总分记 0")
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+
+def _fail_dim1(result, reason):
+    """维度一门禁未通过：完成度总分直接记 0。
+
+    dim1_reason 统一带上「维度一未通过：…」前缀与计分后果，便于直接作为错误摘要展示。
+    """
+    result["dim1_pass"] = False
+    result["dim1_reason"] = "维度一未通过：%s，完成度总分记 0" % reason
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    return result
+
+
+def _evaluate_impl(file_path, result):
+    """维度一门禁 + 维度二加分项评估主体；对内构造 "+N：..." 结果串，
+    末尾按 _MAX_DELTAS_ORDER 反解成结构化 dim2_items 填入 result。"""
+    if not zipfile.is_zipfile(file_path):
+        return _fail_dim1(result, "文件非 OOXML 工作簿（无法解包），Excel 不可正常打开")
+    wb = _Xlsx(file_path)
+    results = []
+
+    # ========== 维度1：可用与可修改性 ==========
+    if not wb.sheets:
+        return _fail_dim1(result, "工作簿内无工作表，文件不可用")
+    filled = sum(len(s.cells) for s in wb.sheets)
+    if filled == 0:
+        return _fail_dim1(result, "工作簿内无任何单元格内容，交付物为空")
+    err_cells = 0
+    for s in wb.sheets:
+        for c in s.cells.values():
+            if c['t'] == 'e' or (c['text'] or '').strip() in _ERR_VALUES:
+                err_cells += 1
+    if err_cells > 3:
+        return _fail_dim1(result, f"公式大面积报错（{err_cells} 个错误值单元格），交付物不可用")
+    if wb.chart_parts == 0:
+        pics = sum(s.pictures for s in wb.sheets)
+        if pics > 0:
+            return _fail_dim1(result, "统计图为图片/截图对象而非可编辑的原生图表")
+        return _fail_dim1(result, "工作簿内不存在任何原生图表对象，无统计图可评")
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "文件可正常打开，统计表为可编辑单元格、统计图为原生图表对象，未见公式报错"
+
+    # ========== 公共定位：统计表所在工作表、年龄行、身高行 ==========
+    def _locate_table():
+        """返回 (sheet, age_row, age_cols, height_row, best_score)。
+        年龄行 = 含“年龄”标签且横向连续出现 11…20 的行；身高行 = 含“身高”标签、
+        且与年龄列一一对应的行。找不到完整结构时返回尽可能多的定位信息。"""
+        best = (None, None, [], None, -1)
+        for sh in wb.sheets:
+            rows = {}
+            for ref, c in sh.cells.items():
+                col, r = _split_ref(ref)
+                if col is None:
+                    continue
+                rows.setdefault(r, []).append((_col_to_num(col), col, c))
+            for r, items in sorted(rows.items()):
+                items.sort()
+                has_label = any('年龄' in (c['text'] or '') for (_, _, c) in items)
+                # 该行按列序出现的、落在 11~20 的整数
+                got = [(int(c['num']), col) for (_, col, c) in items
+                       if c['num'] is not None and float(c['num']).is_integer()
+                       and 11 <= c['num'] <= 20]
+                if not has_label and not got:
+                    continue
+                ages = [v for v, _ in got]
+                score = (10 if ages == _AGES else len(set(ages) & set(_AGES)))
+                score += 2 if has_label else 0
+                if score <= best[4]:
+                    continue
+                age_cols = [col for _, col in got]
+                h_row = None
+                for r2, items2 in sorted(rows.items()):
+                    if r2 <= r:
+                        continue
+                    if any('身高' in (c['text'] or '') for (_, _, c) in items2):
+                        h_row = r2
+                        break
+                best = (sh, r, age_cols, h_row, score)
+        return best
+
+    tsheet, age_row, age_cols, height_row, _ = _locate_table()
+    age_cells = ['%s%d' % (c, age_row) for c in age_cols] if (tsheet and age_row) else []
+    height_cells = (['%s%d' % (c, height_row) for c in age_cols]
+                    if (tsheet and height_row and age_cols) else [])
+    ages_got = [int(tsheet.num(ref)) for ref in age_cells] if tsheet else []
+
+    # 取被评图表：优先统计表所在工作表上的第一张图表
+    chart = None
+    chart_sheet = None
+    for sh in ([tsheet] if tsheet else []) + wb.sheets:
+        if sh is not None and sh.charts:
+            chart, chart_sheet = sh.charts[0], sh
+            break
+    series = (chart or {}).get('series') or []
+    axes = [a for a in ((chart or {}).get('axes') or []) if not a['deleted']]
+    x_axes = [a for a in axes if a['pos'] in ('b', 't')]
+    y_axes = [a for a in axes if a['pos'] in ('l', 'r')]
+    x_ax = x_axes[0] if x_axes else None
+    y_ax = y_axes[0] if y_axes else None
+
+    def _sheet_by_name(name):
+        if not name:
+            return chart_sheet or tsheet
+        for sh in wb.sheets:
+            if sh.name == name:
+                return sh
+        return None
+
+    def _reach(f, targets, target_sheet):
+        """判断图表数据源公式 f 能“活引用”到 targets（同表单元格列表）的哪些格：
+        ① 直接落在 targets 上；② 引用的是同/异表的中间格，而该格公式又引用了
+        targets（放行一跳辅助列，用户在表里输入后图表仍会自动刷新）。
+        返回可达的 targets 集合。"""
+        if not f or not targets or target_sheet is None:
+            return set()
+        sname, cells = _parse_formula_ref(f)
+        src = _sheet_by_name(sname)
+        if src is None or not cells:
+            return set()
+        hit = set()
+        tset = set(targets)
+        for ref in cells:
+            if src is target_sheet and ref in tset:
+                hit.add(ref)
+                continue
+            fml = src.formula(ref)
+            if not fml:
+                continue
+            for m in _CELL_RE.finditer(fml.upper()):
+                cand = '%s%d' % (m.group(1), int(m.group(2)))
+                if cand in tset:
+                    hit.add(cand)
+        return hit
+
+    # ========== 维度2：完成度加分项 ==========
+
+    # +3：A01 版面为“统计表在上、统计图在下”，图表尺寸适中且未压盖统计表
+    #     注：辅助数据被图表压盖的情形由 A02 判定，此处不重复扣。
+    table_last_row = 0
+    if tsheet and age_row:
+        table_last_row = max(age_row, height_row or 0)
+    anchor = (chart or {}).get('anchor') or {}
+    layout_ok = False
+    if chart is not None and chart_sheet is tsheet and table_last_row and anchor:
+        from_row_1b = None if anchor['from_row'] is None else anchor['from_row'] + 1
+        below_ok = from_row_1b is not None and from_row_1b > table_last_row
+        cx, cy = anchor.get('cx'), anchor.get('cy')
+        if cx and cy:
+            size_ok = (_SIZE_MIN_CX <= cx <= _SIZE_MAX_CX and _SIZE_MIN_CY <= cy <= _SIZE_MAX_CY)
+        elif anchor.get('to_row') is not None and anchor['from_row'] is not None:
+            size_ok = (anchor['to_row'] - anchor['from_row']) >= 8
+        else:
+            size_ok = False
+        layout_ok = bool(below_ok and size_ok)
+    if layout_ok:
+        results.append("+3：版面为统计表在上、统计图在下，图表尺寸适中且未压盖统计表")
+    else:
+        results.append("+0：版面为统计表在上、统计图在下，图表尺寸适中且未压盖统计表")
+
+    # +3：A02 交付整洁——统计表所在工作表上无可见的中间辅助数据区
+    #     口径：除统计表区域外，凡带公式或数值的单元格即视为辅助数据；
+    #     置于独立工作表或真正隐藏的行/列可放行，白字、被图表压盖不算隐藏。
+    table_region = set(age_cells) | set(height_cells)
+    if tsheet and age_row:
+        for c in age_cols:
+            table_region.add('%s%d' % (c, age_row))
+        for ref, cell in tsheet.cells.items():
+            col, r = _split_ref(ref)
+            if r in (age_row, height_row) and ('年龄' in cell['text'] or '身高' in cell['text']):
+                table_region.add(ref)
+    helper_cells = []
+    if tsheet:
+        for ref, cell in tsheet.cells.items():
+            if ref in table_region:
+                continue
+            if cell['f'] is None and cell['num'] is None:
+                continue          # 纯文字（标题/说明）不算辅助数据
+            col, r = _split_ref(ref)
+            if r in tsheet.row_hidden or _col_to_num(col) in tsheet.col_hidden:
+                continue          # 真正隐藏的行列放行
+            helper_cells.append(ref)
+    if tsheet is not None and not helper_cells:
+        results.append("+3：交付整洁，统计表所在工作表无需用户维护的可见辅助数据区")
+    else:
+        results.append("+0：交付整洁，统计表所在工作表无需用户维护的可见辅助数据区")
+
+    # +1：A03 统计表标题（体现“11-20 岁身高统计表”）
+    title_ok = False
+    if tsheet and age_row:
+        for ref, cell in tsheet.cells.items():
+            _, r = _split_ref(ref)
+            if r is None or r >= age_row:
+                continue
+            t = (cell['text'] or '').replace(' ', '')
+            if '统计表' in t or ('身高' in t and '表' in t):
+                if re.search(r'11\s*[-~～－—至到]\s*20', t):
+                    title_ok = True
+                    break
+    if title_ok:
+        results.append("+1：统计表设有标题，体现“11-20 岁身高统计表”")
+    else:
+        results.append("+0：统计表设有标题，体现“11-20 岁身高统计表”")
+
+    # +3：A04 年龄行完整有序填入 11、12…20 共 10 个
+    if ages_got == _AGES:
+        results.append("+3：年龄行完整有序填入 11、12…20 共 10 个年龄")
+    else:
+        results.append("+0：年龄行完整有序填入 11、12…20 共 10 个年龄")
+
+    # +3：A05 身高/cm 行：与年龄一一对应的 10 个可直接录入的单元格（非公式）
+    h_struct_ok = False
+    if tsheet and height_cells and len(height_cells) == 10:
+        label_ok = any('身高' in (c['text'] or '')
+                       for ref, c in tsheet.cells.items()
+                       if _split_ref(ref)[1] == height_row)
+        no_formula = all(tsheet.formula(ref) is None for ref in height_cells)
+        no_text = all(tsheet.num(ref) is not None or not (tsheet.text(ref) or '').strip()
+                      for ref in height_cells)
+        h_struct_ok = bool(label_ok and no_formula and no_text)
+    if h_struct_ok:
+        results.append("+3：设有“身高/cm”行，10 个与年龄一一对应、可直接录入的单元格")
+    else:
+        results.append("+0：设有“身高/cm”行，10 个与年龄一一对应、可直接录入的单元格")
+
+    # +3：A06 身高单元格留空交付，用户可直接填写、无需先清除示例数据
+    blank_ok = bool(height_cells) and all(
+        (tsheet.num(ref) is None and not (tsheet.text(ref) or '').strip())
+        for ref in height_cells)
+    if blank_ok:
+        results.append("+3：身高单元格留空交付，用户可直接填写、无需先清除示例数据")
+    else:
+        results.append("+0：身高单元格留空交付，用户可直接填写、无需先清除示例数据")
+
+    # +1：A07 表格具备边框、内容居中，列宽足以完整显示“身高/cm”等文字
+    style_ok = False
+    if tsheet and age_cells and height_cells:
+        checked = list(age_cells) + list(height_cells)
+        label_refs = [ref for ref, c in tsheet.cells.items()
+                      if _split_ref(ref)[1] in (age_row, height_row)
+                      and ('年龄' in c['text'] or '身高' in c['text'])]
+        checked += label_refs
+        all_styled = True
+        for ref in checked:
+            cell = tsheet.cells.get(ref)
+            if cell is None:
+                all_styled = False
+                break
+            if not wb.has_border(cell['s']) or wb.style_of(cell['s'])['halign'] != 'center':
+                all_styled = False
+                break
+        label_cols = [_split_ref(r)[0] for r in label_refs] or ['A']
+        width_ok = all(tsheet.width_of(c) >= 6.0 for c in label_cols)
+        style_ok = bool(all_styled and width_ok)
+    if style_ok:
+        results.append("+1：统计表加边框、内容居中，列宽足以完整显示“年龄”“身高/cm”")
+    else:
+        results.append("+0：统计表加边框、内容居中，列宽足以完整显示“年龄”“身高/cm”")
+
+    # +1：A08 未设置与“0-200cm”矛盾的限制或提示（数据有效性上限、提示文案口径）
+    conflict = []
+    if tsheet and height_cells:
+        hset = set(height_cells)
+        for dv in tsheet.dv:
+            covered = set()
+            for area in (dv['sqref'] or '').split():
+                covered |= set(_expand_area(area))
+            if not (covered & hset):
+                continue
+            try:
+                lo = float(dv['f1']) if dv['f1'] is not None else None
+                hi = float(dv['f2']) if dv['f2'] is not None else None
+            except ValueError:
+                lo = hi = None
+            if hi is None or hi < _Y_MAX or (lo is not None and lo > 0):
+                conflict.append('数据有效性范围 %s~%s 与 0-200cm 不一致' % (dv['f1'], dv['f2']))
+        for ref, cell in tsheet.cells.items():
+            t = (cell['text'] or '')
+            for m in re.finditer(r'0\s*[-~～－—到至]\s*(\d{2,3})', t):
+                v = float(m.group(1))
+                if 100 <= v <= 300 and abs(v - _Y_MAX) > 0.01:
+                    conflict.append('提示文案写作 0-%s，与 0-200cm 不一致' % m.group(1))
+            if '黄色' in t or '黄底' in t:
+                if not any(wb.has_yellow_fill((tsheet.cells.get(h) or {}).get('s'))
+                           for h in height_cells):
+                    conflict.append('提示“黄色单元格”但身高输入区并无黄色填充')
+    if tsheet is not None and height_cells and not conflict:
+        results.append("+1：未设置与 0-200cm 矛盾的输入限制或提示文案")
+    else:
+        results.append("+0：未设置与 0-200cm 矛盾的输入限制或提示文案")
+
+    # +3：A09 图表为 XY 散点图，且数据点之间不绘制折线
+    #     判定依据只认“系列线条被显式设为无线条”（ser/spPr/a:ln/a:noFill，或 ln@w=0）：
+    #     c:scatterStyle 只是子类型提示，Excel/WPS 对散点系列一律按 spPr 里的线条设定
+    #     渲染——只写 scatterStyle="marker" 而不关掉系列线条时，打开文件仍会画出折线。
+    groups = set((chart or {}).get('groups') or [])
+    scatter_ok = False
+    if chart is not None and series:
+        is_scatter = 'scatterChart' in groups
+        no_other = not (groups - {'scatterChart'})
+        markers_only = all(s['no_line'] for s in series)
+        scatter_ok = bool(is_scatter and no_other and markers_only)
+    if scatter_ok:
+        results.append("+3：图表为 XY 散点图且仅显示数据点，数据点之间无连线")
+    else:
+        results.append("+0：图表为 XY 散点图且仅显示数据点，数据点之间无连线")
+
+    # +1：A10 数据点标记清晰可见（未把标记设为“无”）
+    marker_ok = bool(series) and all((s['marker'] or 'auto') != 'none' for s in series)
+    if marker_ok:
+        results.append("+1：数据点使用可见标记（未设为“无”）")
+    else:
+        results.append("+0：数据点使用可见标记（未设为“无”）")
+
+    # +1：A11 数据点旁显示身高数值标签（系列级设定优先于图表组级）
+    label_val_ok = bool(series) and all(s['show_val'] == '1' for s in series)
+    if label_val_ok:
+        results.append("+1：数据点旁显示身高数值标签")
+    else:
+        results.append("+0：数据点旁显示身高数值标签")
+
+    # +1：A12 图表标题体现“11～20 岁身高统计图”
+    ct = ((chart or {}).get('title') or '').replace(' ', '')
+    ctitle_ok = bool(ct) and not (chart or {}).get('title_deleted') and '身高' in ct \
+        and ('统计' in ct or '图' in ct)
+    if ctitle_ok:
+        results.append("+1：图表设有标题，体现“11～20 岁身高统计图”")
+    else:
+        results.append("+0：图表设有标题，体现“11～20 岁身高统计图”")
+
+    # +3：A13 横轴（年龄轴）最小值 11、最大值 20、主要刻度单位 1
+    def _eq(a, b):
+        return a is not None and abs(a - b) < 0.01
+
+    x_ok = bool(x_ax) and _eq(x_ax['min'], _X_MIN) and _eq(x_ax['max'], _X_MAX) \
+        and _eq(x_ax['major_unit'], _X_UNIT)
+    if x_ok:
+        results.append("+3：横轴最小值 11、最大值 20、主要刻度单位 1（10 个年龄刻度齐全）")
+    else:
+        results.append("+0：横轴最小值 11、最大值 20、主要刻度单位 1（10 个年龄刻度齐全）")
+
+    # +3：A14 纵轴（身高轴）最小值 0、最大值 200（min 缺省=自动从 0 起，视为达标）
+    y_ok = bool(y_ax) and _eq(y_ax['max'], _Y_MAX) and (y_ax['min'] is None or _eq(y_ax['min'], 0.0))
+    if y_ok:
+        results.append("+3：纵轴最小值 0、最大值 200")
+    else:
+        results.append("+0：纵轴最小值 0、最大值 200")
+
+    # +1：A15 纵轴主要刻度单位 50（每 50 一格）
+    y_unit_ok = bool(y_ax) and _eq(y_ax['major_unit'], _Y_UNIT)
+    if y_unit_ok:
+        results.append("+1：纵轴主要刻度单位 50（0/50/100/150/200 每 50 一格）")
+    else:
+        results.append("+0：纵轴主要刻度单位 50（0/50/100/150/200 每 50 一格）")
+
+    # +1：A16 横轴标题“年龄”
+    xt_ok = bool(x_ax) and '年龄' in (x_ax['title'] or '')
+    if xt_ok:
+        results.append("+1：横轴设有轴标题“年龄”")
+    else:
+        results.append("+0：横轴设有轴标题“年龄”")
+
+    # +1：A17 纵轴标题“身高/cm”（含单位 cm）
+    yt = (y_ax['title'] if y_ax else '') or ''
+    yt_ok = '身高' in yt and re.search(r'cm', yt, re.I) is not None
+    if yt_ok:
+        results.append("+1：纵轴设有轴标题“身高/cm”，体现单位 cm")
+    else:
+        results.append("+0：纵轴设有轴标题“身高/cm”，体现单位 cm")
+
+    # +1：A18 绘图区有主要网格线（至少纵轴方向，便于按格读数）
+    grid_ok = bool(y_ax) and y_ax['gridlines']
+    if grid_ok:
+        results.append("+1：绘图区设有主要网格线，便于按格读取数据点")
+    else:
+        results.append("+0：绘图区设有主要网格线，便于按格读取数据点")
+
+    # ---- 表图联动：先把各系列的 X/Y 数据源解析成“可达的表内单元格” ----
+    y_reach, x_reach = set(), set()
+    y_is_lit = x_is_lit = False
+    y_counts = []
+    helper_formulas = []
+    for s in series:
+        if s.get('y_is_lit') or s.get('val_is_lit'):
+            y_is_lit = True
+        if s.get('x_is_lit') or s.get('cat_is_lit'):
+            x_is_lit = True
+        yf = s.get('y_f') or s.get('val_f')
+        xf = s.get('x_f') or s.get('cat_f')
+        y_reach |= _reach(yf, height_cells, tsheet)
+        x_reach |= _reach(xf, age_cells, tsheet)
+        y_counts.append(s.get('y_count') or s.get('val_count') or 0)
+        for f in (yf, xf):
+            sname, cells = _parse_formula_ref(f)
+            src = _sheet_by_name(sname)
+            if src is None:
+                continue
+            for ref in cells:
+                fml = src.formula(ref)
+                if fml:
+                    helper_formulas.append(fml.upper())
+
+    # +5：A19 Y 值系列联动统计表身高单元格，输入即自动出现数据点
+    y_link_ok = bool(height_cells) and not y_is_lit and len(y_reach) >= 1
+    if y_link_ok:
+        results.append("+5：Y 值系列联动统计表身高单元格，输入数据后图表自动显示数据点")
+    else:
+        results.append("+0：Y 值系列联动统计表身高单元格，输入数据后图表自动显示数据点")
+
+    # +3：A20 X 值系列引用统计表年龄单元格（非写死的常量数组）
+    x_link_ok = bool(age_cells) and not x_is_lit and len(x_reach) == len(age_cells)
+    if x_link_ok:
+        results.append("+3：X 值系列引用统计表年龄单元格，非写死的常量数组")
+    else:
+        results.append("+0：X 值系列引用统计表年龄单元格，非写死的常量数组")
+
+    # +3：A21 空值不产生 0 值假数据点（显式空距，或用 NA()/IF 屏蔽空单元格）
+    blank_guard_ok = ((chart or {}).get('disp_blanks') == 'gap'
+                      or any('NA()' in f for f in helper_formulas))
+    if blank_guard_ok:
+        results.append("+3：未填写的身高不产生 0 值假数据点（空距显示或 NA() 屏蔽）")
+    else:
+        results.append("+0：未填写的身高不产生 0 值假数据点（空距显示或 NA() 屏蔽）")
+
+    # +3：A22 10 个年龄全部纳入联动区域，任意年龄单独填写均能正确出点
+    #     前置 y_link_ok：避免出现“联动未打通却判全区域纳入”的自相矛盾组合
+    #     （某系列 Y 值写死常量时 y_is_lit 置真，而 y_reach 是跨系列并集）。
+    full_ok = (y_link_ok and len(height_cells) == 10 and len(y_reach) == 10
+               and any(c == 10 for c in y_counts))
+    if full_ok:
+        results.append("+3：10 个年龄全部纳入联动区域，任意年龄单独填写均能正确出点")
+    else:
+        results.append("+0：10 个年龄全部纳入联动区域，任意年龄单独填写均能正确出点")
+
+    # +1：A23 工作簿处于自动重算，输入后图表即时刷新
+    if wb.calc_mode != 'manual':
+        results.append("+1：工作簿处于自动重算，输入数据后图表即时刷新")
+    else:
+        results.append("+0：工作簿处于自动重算，输入数据后图表即时刷新")
+
+    # ========== 将 results 反解为结构化 dim2_items ==========
+    # 逐项按追加顺序对齐 _MAX_DELTAS_ORDER：解析每条 "+N：说明" 的 N 与 rule。
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"dim2 项数不一致：results={len(results)} vs order={len(_MAX_DELTAS_ORDER)}"
+        )
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta > 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total_score += (max_delta if hit else 0)
+
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 本地调试：默认以脚本所在目录为参数；也允许通过命令行显式指定目录。
-    # 使用 ensure_ascii=True 避免在 GBK 等非 UTF-8 控制台下崩溃
-    # （遵循约定：脚本本身不修改 sys.stdout）。
+    # 本地调试入口：evaluate 只接收“脚本所在目录的路径”，由脚本自己在该目录里
+    # 定位并打开被评估的 .xlsx。命令行第 1 个参数可覆盖目录路径；未指定时使用
+    # 脚本自身所在目录。
     if len(sys.argv) >= 2:
         _dir = sys.argv[1]
     else:
         _dir = os.path.dirname(os.path.abspath(__file__))
-    print(json.dumps(evaluate(_dir), ensure_ascii=True, indent=2))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

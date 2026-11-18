@@ -1,592 +1,219 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Excel 自动评分脚本：子表数据提取到汇总表。
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-对外接口：
-    evaluate(dir_path: str) -> dict
-        参数 dir_path 为脚本所在目录路径，脚本自己在该目录内定位并打开被评估的
-        xlsx/xlsm 文档，返回结构化评分字典。
-
-评分逻辑：
-1. 先检查维度1（可用与可修改性），任意失败则最终 0 分并停止。
-2. 维度1全部通过后，继续检查维度2，命中得分点/扣分点后累计分数。
-3. 结果通过返回值以结构化 dict 交付，不通过 print 输出主结果。
-"""
-
-from __future__ import annotations
-
-import json
-import math
 import os
 import re
 import sys
-from dataclasses import dataclass
-from typing import Any, Iterable, Optional
-
+import json
 import openpyxl
-from openpyxl.cell.cell import Cell
-from openpyxl.worksheet.worksheet import Worksheet
 
-
-ERROR_VALUES = {"#REF!", "#VALUE!", "#NAME?", "#DIV/0!", "#N/A", "#NULL!", "#NUM!"}
-EXPECTED_HEADERS = [
-    "序号",
-    "构件分区",
-    "子表",
-    "新构件编号",
-    "楼层/部位",
-    "砼体积(m³)",
-    "总重量合计(kg)",
-    "含量(kg/m³)",
-    "备注",
-]
-EXPECTED_CHILD_SHEETS = [f"Sheet{i}" for i in list(range(1, 11)) + list(range(12, 62))]
-EXPECTED_SHEETS = ["汇总"] + EXPECTED_CHILD_SHEETS
-STRUCT_A_SHEETS = ["Sheet3", *[f"Sheet{i}" for i in range(6, 11)], *[f"Sheet{i}" for i in range(12, 40)], "Sheet41"]
-STRUCT_B_SHEETS = ["Sheet5", *[f"Sheet{i}" for i in range(42, 62)]]
-
-
-@dataclass
-class CheckResult:
-    passed: bool
-    label: str
-    detail: str = ""
-    score: int = 0
-
-
-def is_blank(value: Any) -> bool:
-    return value is None or (isinstance(value, str) and value.strip() == "")
-
-
-def is_formula(value: Any) -> bool:
-    return isinstance(value, str) and value.startswith("=")
-
-
-def is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
-
-
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip().replace(" ", "")
-
-
-def normalize_formula(value: Any) -> str:
-    return normalize_text(value).upper().replace("'", "")
-
-
-def values_equal(a: Any, b: Any, tolerance: float = 1e-6) -> bool:
-    if is_number(a) and is_number(b):
-        return abs(float(a) - float(b)) <= tolerance
-    return normalize_text(a) == normalize_text(b)
-
-
-def column_index_to_letter(index: int) -> str:
-    result = ""
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
-
-
-def cell_has_formula_error(value: Any) -> bool:
-    return isinstance(value, str) and value.strip().upper() in ERROR_VALUES
-
-
-def find_cell_containing(ws: Worksheet, keyword: str, max_row: int = 80, max_col: int = 20) -> Optional[Cell]:
-    target = normalize_text(keyword)
-    for row in ws.iter_rows(min_row=1, max_row=min(max_row, ws.max_row), min_col=1, max_col=min(max_col, ws.max_column)):
-        for cell in row:
-            if target and target in normalize_text(cell.value):
-                return cell
-    return None
-
-
-def sheet_has_label(ws: Worksheet, keyword: str) -> bool:
-    return find_cell_containing(ws, keyword) is not None
-
-
-def formula_reference(formula: Any) -> Optional[tuple[str, str]]:
-    """从类似 ='Sheet3'!D20 或 =Sheet3!D20 的公式中提取 (sheet, cell)。"""
-    if not is_formula(formula):
-        return None
-    text = formula.strip()
-    # 仅提取直接引用。对于 INDIRECT/INDEX 等等效公式，返回 None，由其他检查处理。
-    match = re.fullmatch(r"=\s*'?([^'=!]+)'?!\$?([A-Z]{1,3})\$?(\d+)\s*", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    return match.group(1), f"{match.group(2).upper()}{match.group(3)}"
-
-
-_TW_CELL_CACHE: dict[str, set[str]] = {}
-_KG_CELL_CACHE: dict[str, set[str]] = {}
-
-
-def _next_row_coord(coord: str) -> str:
-    match = re.match(r"([A-Z]+)(\d+)", coord)
-    if not match:
-        return coord
-    return f"{match.group(1)}{int(match.group(2)) + 1}"
-
-
-def _scan_child_labels(ws: Worksheet) -> dict[str, str]:
-    """返回子表中关键标签所在单元格坐标：砼重量(t)、重量(kg)、总重量合计。"""
-    found: dict[str, str] = {}
-    for row in ws.iter_rows(min_row=1, max_row=min(40, ws.max_row), min_col=1, max_col=min(16, ws.max_column)):
-        for cell in row:
-            if isinstance(cell.value, str):
-                text = cell.value.strip()
-                if text == "砼重量(t)" and "tw" not in found:
-                    found["tw"] = cell.coordinate
-                elif text == "重量(kg)" and "kg" not in found:
-                    found["kg"] = cell.coordinate
-                elif text == "总重量合计" and "tot" not in found:
-                    found["tot"] = cell.coordinate
-    return found
-
-
-def forbidden_tw_cells(wb_formula: Any, sheet: str) -> set[str]:
-    """“砼重量(t)”列的数据单元格（细则禁止 F 列从此取数）。"""
-    if sheet in _TW_CELL_CACHE:
-        return _TW_CELL_CACHE[sheet]
-    cells: set[str] = set()
-    if sheet in wb_formula.sheetnames:
-        labels = _scan_child_labels(wb_formula[sheet])
-        tw_label = labels.get("tw")
-        if tw_label:
-            # 标签正下方为该列数值。
-            cells.add(_next_row_coord(tw_label).upper())
-    _TW_CELL_CACHE[sheet] = cells
-    return cells
-
-
-def forbidden_kg_item_cells(wb_formula: Any, sheet: str) -> set[str]:
-    """配筋明细中每一条“重量(kg)”单项数据单元格（细则禁止 G 列用单条代替合计）。"""
-    if sheet in _KG_CELL_CACHE:
-        return _KG_CELL_CACHE[sheet]
-    cells: set[str] = set()
-    if sheet in wb_formula.sheetnames:
-        labels = _scan_child_labels(wb_formula[sheet])
-        kg_label = labels.get("kg")
-        if kg_label:
-            match = re.match(r"([A-Z]+)(\d+)", kg_label)
-            if match:
-                col = match.group(1)
-                start = int(match.group(2)) + 1
-                # 单项数据从标签下一行起，到“总重量合计”行之前；未识别合计行时回退 4 行。
-                end = start + 4
-                tot_label = labels.get("tot")
-                if tot_label:
-                    tot_match = re.match(r"([A-Z]+)(\d+)", tot_label)
-                    if tot_match and tot_match.group(1) == col:
-                        end = int(tot_match.group(2))
-                cells = {f"{col}{r}".upper() for r in range(start, end)}
-    _KG_CELL_CACHE[sheet] = cells
-    return cells
-
-
-def child_source_cell(wb_formula: Any, sheet: str) -> tuple[Optional[str], Optional[str]]:
-    """按结构A/B返回该子表砼体积、总重量合计的目标单元格坐标(vol_cell, tot_cell)。
-
-    结构A（Sheet3、Sheet6~10、Sheet12~39、Sheet41）：砼体积在D20，总重量合计在I10。
-    结构B（Sheet5、Sheet42~61）：砼体积在E21，总重量合计在I11。
-    其余子表（Sheet1/2/4等未归入两种结构）用标签定位“总重量合计”“砼体积”所在单元格。
-    """
-    if sheet in STRUCT_A_SHEETS:
-        return "D20", "I10"
-    if sheet in STRUCT_B_SHEETS:
-        return "E21", "I11"
-    if sheet in wb_formula.sheetnames:
-        labels = _scan_child_labels(wb_formula[sheet])
-        tot_label = labels.get("tot")
-        vol_cell = find_cell_containing(wb_formula[sheet], "砼体积")
-        vol_coord = None
-        if vol_cell is not None:
-            match = re.match(r"([A-Z]+)(\d+)", vol_cell.coordinate)
-            if match:
-                # 砼体积标签通常与数值同行、右侧或下一行，按同行下一列取值失败时回退到下一行。
-                vol_coord = _next_row_coord(vol_cell.coordinate).upper()
-        return vol_coord, (tot_label.upper() if tot_label else None)
-    return None, None
-
-
-def child_cell_value(wb_values: Any, sheet: str, coord: Optional[str]) -> Any:
-    if not coord or sheet not in wb_values.sheetnames:
-        return None
-    try:
-        return wb_values[sheet][coord].value
-    except Exception:
-        return None
-
-
-def summary_value_matches_child_source(
-    wb_values: Any, sheet: str, summary_value: Any, source_coord: Optional[str]
-) -> bool:
-    """校验汇总单元格计算值是否与子表目标单元格计算值一致（容差1e-6）。"""
-    if source_coord is None:
-        return False
-    source_value = child_cell_value(wb_values, sheet, source_coord)
-    if not is_number(source_value):
-        return False
-    return values_equal(summary_value, source_value)
-
-
-def sheet_for_summary_row(row: int) -> Optional[str]:
-    index = row - 3
-    if 0 <= index < len(EXPECTED_CHILD_SHEETS):
-        return EXPECTED_CHILD_SHEETS[index]
-    return None
-
-
-def summary_row_for_sheet(sheet_name: str) -> Optional[int]:
-    try:
-        return EXPECTED_CHILD_SHEETS.index(sheet_name) + 3
-    except ValueError:
-        return None
-
-
-def _cell_ref_pattern(row: int, col_letter: str) -> str:
-    # 支持带 $ 的绝对/混合引用（如 $G3、G$3、$G$3），列字母大小写已由 normalize_formula 统一为大写。
-    return r"\$?" + col_letter + r"\$?" + str(row)
-
-
-def evaluate_h_formula_equivalent(formula: Any, row: int) -> bool:
-    """结构化校验 H 列公式：必须是“G{row} 除以 F{row}”（分子为G、分母为F），可选套 IFERROR。
-
-    不再使用“同一行同时出现 G、F、'/'”这种宽松子串判断——那会把 =F{row}/G{row}（分子分母颠倒）
-    误判为等效公式。这里显式解析除法表达式两侧的操作数，确认左侧（分子）引用的是 G{row}、
-    右侧（分母）引用的是 F{row}，且两者之间恰好是一个除号（不允许中间夹杂其他单元格或函数）。
-    """
-    if not is_formula(formula):
-        return False
-    f = normalize_formula(formula)
-
-    g_ref = _cell_ref_pattern(row, "G")
-    f_ref = _cell_ref_pattern(row, "F")
-
-    # 核心除法表达式：G{row}/F{row}，允许两侧各自包一层括号，如 (G3)/(F3)。
-    div_pattern = re.compile(r"\(*" + g_ref + r"\)*\s*/\s*\(*" + f_ref + r"\)*")
-
-    # 标准写法：=IFERROR(G{row}/F{row},"")，允许第二个参数是任意字符串/空串，允许空格差异。
-    iferror_pattern = re.compile(
-        r"^=IFERROR\(\s*" + div_pattern.pattern + r"\s*,\s*\"[^\"]*\"\s*\)$"
-    )
-    if iferror_pattern.match(f):
-        return True
-
-    # 等效写法：去掉最外层 IFERROR 包装后，公式本身就是（且仅是）G{row}/F{row} 这一个除法表达式。
-    bare_pattern = re.compile(r"^=\(*" + g_ref + r"\)*\s*/\s*\(*" + f_ref + r"\)*\)*$")
-    if bare_pattern.match(f):
-        return True
-
-    return False
-
-
-def load_workbooks(path: str) -> tuple[Any, Any]:
-    """加载工作簿。返回 (wb_formula, wb_values)。"""
-    wb_formula = openpyxl.load_workbook(path, data_only=False)
-    wb_values = openpyxl.load_workbook(path, data_only=True)
-    return wb_formula, wb_values
-
-
-def dimension1_checks(path: str, wb_formula: Any, wb_values: Any) -> list[CheckResult]:
-    results: list[CheckResult] = []
-
-    ext = os.path.splitext(path)[1].lower()
-    results.append(CheckResult(ext in {".xls", ".xlsx", ".xlsm"}, "D1-1 交付文件为xls、xlsx或.xlsm格式，文件可正常打开", f"当前扩展名：{ext}"))
-
-    return results
-
-
-def dimension2_checks(wb_formula: Any, wb_values: Any) -> list[CheckResult]:
-    results: list[CheckResult] = []
-    ws_sum_f = wb_formula["汇总"]
-    ws_sum_v = wb_values["汇总"]
-
-    # +5：严格对应细则。
-    #   F列（砼体积）：F3:F62 全部为数值或引用公式，不出现空白/文本单位/错误值，
-    #                 且不能从“砼重量(t)”列提取数据。
-    #   G列（总重量）：G3:G62 全部为数值或引用公式，
-    #                 且不能用配筋明细中任意一条“重量(kg)”代替总重量合计。
-    f_bad: list[str] = []
-    g_bad: list[str] = []
-    for row in range(3, 63):
-        sheet = sheet_for_summary_row(row)
-        vol_coord, tot_coord = child_source_cell(wb_formula, sheet) if sheet is not None else (None, None)
-        # ---- F 列：砼体积 ----
-        cf = ws_sum_f.cell(row=row, column=6)
-        vf = ws_sum_v.cell(row=row, column=6).value
-        if is_blank(vf):
-            f_bad.append(f"F{row} 空白")
-        elif cell_has_formula_error(vf):
-            f_bad.append(f"F{row} 错误值={vf!r}")
-        elif isinstance(vf, str) and any(u in vf for u in ("m³", "m3")):
-            f_bad.append(f"F{row} 文本单位={vf!r}")
-        elif not is_number(vf):
-            f_bad.append(f"F{row} 非数值={vf!r}")
-        elif not (is_formula(cf.value) or is_number(cf.value)):
-            f_bad.append(f"F{row} 非数值或公式={cf.value!r}")
-        else:
-            # 不能从“砼重量(t)”列提取数据；同时数值/取数必须确实来自对应子表的砼体积单元格。
-            f_ref = formula_reference(cf.value)
-            if sheet is not None and f_ref is not None and f_ref[0] == sheet:
-                forbidden = forbidden_tw_cells(wb_formula, sheet)
-                if f_ref[1] in forbidden:
-                    f_bad.append(f"F{row} 取自砼重量(t)列={sheet}!{f_ref[1]}")
-                elif f_ref[1] != vol_coord:
-                    # 直接引用能解析，但落点不是该子表的砼体积单元格：仍需按取值比对兜底判断。
-                    if not summary_value_matches_child_source(wb_values, sheet, vf, vol_coord):
-                        f_bad.append(f"F{row} 取数单元格={sheet}!{f_ref[1]}，与{sheet}!{vol_coord}(砼体积)不一致")
-            elif is_formula(cf.value):
-                # 公式无法直接解析出(sheet, cell)（如 INDIRECT/INDEX、跨表间接引用等），
-                # 不能默认合格：必须比对计算结果与该子表砼体积单元格的值是否一致。
-                if sheet is None or not summary_value_matches_child_source(wb_values, sheet, vf, vol_coord):
-                    f_bad.append(f"F{row} 公式={cf.value!r} 无法核实取自{sheet}!{vol_coord}(砼体积)，计算值={vf!r}")
-        # ---- G 列：总重量合计 ----
-        cg = ws_sum_f.cell(row=row, column=7)
-        vg = ws_sum_v.cell(row=row, column=7).value
-        if is_blank(vg):
-            g_bad.append(f"G{row} 空白")
-        elif cell_has_formula_error(vg):
-            g_bad.append(f"G{row} 错误值={vg!r}")
-        elif not is_number(vg):
-            g_bad.append(f"G{row} 非数值={vg!r}")
-        elif not (is_formula(cg.value) or is_number(cg.value)):
-            g_bad.append(f"G{row} 非数值或公式={cg.value!r}")
-        else:
-            # 不能用配筋明细中任意一条“重量(kg)”代替总重量合计；同时必须确实取自该子表的总重量合计单元格。
-            g_ref = formula_reference(cg.value)
-            if sheet is not None and g_ref is not None and g_ref[0] == sheet:
-                forbidden = forbidden_kg_item_cells(wb_formula, sheet)
-                if g_ref[1] in forbidden:
-                    g_bad.append(f"G{row} 取自配筋明细单条重量(kg)={sheet}!{g_ref[1]}")
-                elif g_ref[1] != tot_coord:
-                    if not summary_value_matches_child_source(wb_values, sheet, vg, tot_coord):
-                        g_bad.append(f"G{row} 取数单元格={sheet}!{g_ref[1]}，与{sheet}!{tot_coord}(总重量合计)不一致")
-            elif is_formula(cg.value):
-                # 同上：INDIRECT/INDEX 等无法解析引用的公式，不能默认合格，必须比对取值。
-                if sheet is None or not summary_value_matches_child_source(wb_values, sheet, vg, tot_coord):
-                    g_bad.append(f"G{row} 公式={cg.value!r} 无法核实取自{sheet}!{tot_coord}(总重量合计)，计算值={vg!r}")
-    ok = not f_bad and not g_bad
-    detail_parts = []
-    if f_bad:
-        detail_parts.append("F列异常：" + "; ".join(f_bad[:8]) + (" ..." if len(f_bad) > 8 else ""))
-    if g_bad:
-        detail_parts.append("G列异常：" + "; ".join(g_bad[:8]) + (" ..." if len(g_bad) > 8 else ""))
-    results.append(CheckResult(ok, "+5 F列填砼体积、G列填总重量合计，均为数值或公式，F不取砼重量(t)列、G不取配筋单条重量(kg)", "；".join(detail_parts) or "F3:F62 砼体积、G3:G62 总重量合计均合规", 5))
-
-    # +5：严格对应细则的两条格式要求。
-    #   砼体积格式：F3:F62 使用数值格式“0.000”，单元格中不重复显示“m³”文字。
-    #   总重量格式：G3:G62 使用数值格式“0.000”，单元格中不重复显示“kg”文字。
-    f_fmt_bad: list[str] = []
-    g_fmt_bad: list[str] = []
-    for row in range(3, 63):
-        # F 列：砼体积。
-        cf = ws_sum_f.cell(row=row, column=6)
-        vf = ws_sum_v.cell(row=row, column=6).value
-        if cf.number_format != "0.000":
-            f_fmt_bad.append(f"F{row} 格式={cf.number_format!r}")
-        if isinstance(vf, str) and "m³" in vf:
-            f_fmt_bad.append(f"F{row} 含单位文字={vf!r}")
-        # G 列：总重量。
-        cg = ws_sum_f.cell(row=row, column=7)
-        vg = ws_sum_v.cell(row=row, column=7).value
-        if cg.number_format != "0.000":
-            g_fmt_bad.append(f"G{row} 格式={cg.number_format!r}")
-        if isinstance(vg, str) and "kg" in vg:
-            g_fmt_bad.append(f"G{row} 含单位文字={vg!r}")
-    ok = not f_fmt_bad and not g_fmt_bad
-    fmt_parts = []
-    if f_fmt_bad:
-        fmt_parts.append("砼体积F列：" + "; ".join(f_fmt_bad[:8]) + (" ..." if len(f_fmt_bad) > 8 else ""))
-    if g_fmt_bad:
-        fmt_parts.append("总重量G列：" + "; ".join(g_fmt_bad[:8]) + (" ..." if len(g_fmt_bad) > 8 else ""))
-    results.append(CheckResult(ok, "+5 F3:F62砼体积、G3:G62总重量均用数值格式0.000，F列不显示“m³”、G列不显示“kg”文字", "；".join(fmt_parts) or "F/G 列格式均为0.000，且无重复单位文字", 5))
-
-    # +5：严格对应细则的两条含量列要求。
-    #   含量公式：H3:H62 用公式计算总重量合计除以砼体积，
-    #            H3 为 =IFERROR(G3/F3,"") 或等效公式，并向下填充至 H62。
-    #   含量格式：H3:H62 用数值格式“0.00”，保持浅橙色填充，
-    #            计算结果与对应行 G 列除以 F 列的结果一致。
-    # +5：严格对应细则的含量列两条要求（不含填充色约束）。
-    #   含量公式：H3:H62 用公式计算总重量合计除以砼体积，
-    #            H3 为 =IFERROR(G3/F3,"") 或等效公式，并向下填充至 H62。
-    #   含量格式：H3:H62 用数值格式“0.00”，计算结果与对应行 G 列除以 F 列的结果一致。
-    h_formula_bad: list[str] = []
-    h_format_bad: list[str] = []
-    h_result_bad: list[str] = []
-    for row in range(3, 63):
-        c_formula = ws_sum_f.cell(row=row, column=8)
-        h_value = ws_sum_v.cell(row=row, column=8).value
-        f_value = ws_sum_v.cell(row=row, column=6).value
-        g_value = ws_sum_v.cell(row=row, column=7).value
-        # 公式：=IFERROR(G{row}/F{row},"") 或等效，向下填充至 H62。
-        if not evaluate_h_formula_equivalent(c_formula.value, row):
-            h_formula_bad.append(f"H{row}={c_formula.value!r}")
-        # 数值格式“0.00”。
-        if c_formula.number_format != "0.00":
-            h_format_bad.append(f"H{row} 格式={c_formula.number_format!r}")
-        # 结果与 G 列除以 F 列一致。
-        # data_only 缓存可能陈旧（工作簿保存前未重算），若已确认 H 公式结构正确
-        # （分子G、分母F），则该行结果是否正确本质上等价于“公式是否正确”，
-        # 不必再单独依赖可能过期的缓存值来判定结果一致——避免把未重算的正确公式误判为不一致。
-        # 仅当公式结构校验未通过（或干脆不是公式）时，才需要用缓存值兜底核验实际结果。
-        if is_number(f_value) and is_number(g_value) and float(f_value) != 0:
-            expected = float(g_value) / float(f_value)
-            formula_confirmed = evaluate_h_formula_equivalent(c_formula.value, row)
-            if not formula_confirmed:
-                if not is_number(h_value) or abs(float(h_value) - expected) > 1e-6:
-                    h_result_bad.append(f"H{row}={h_value!r}，期望≈{expected:.6f}")
-            elif is_number(h_value) and abs(float(h_value) - expected) > 1e-6:
-                # 公式结构已确认正确，但缓存值仍明显对不上：多半是缓存彻底陈旧/损坏，
-                # 而不是公式本身的问题，此处仍需报告以免真正的结果错误被放过。
-                h_result_bad.append(f"H{row}={h_value!r}，期望≈{expected:.6f}（公式结构正确，但缓存值不一致，请确认工作簿已重新计算）")
-    ok = not h_formula_bad and not h_format_bad and not h_result_bad
-    details = []
-    if h_formula_bad:
-        details.append("公式非=IFERROR(G/F,\"\")或等效：" + "; ".join(h_formula_bad[:8]) + (" ..." if len(h_formula_bad) > 8 else ""))
-    if h_format_bad:
-        details.append("格式非0.00：" + "; ".join(h_format_bad[:8]) + (" ..." if len(h_format_bad) > 8 else ""))
-    if h_result_bad:
-        details.append("结果与G/F不一致：" + "; ".join(h_result_bad[:8]) + (" ..." if len(h_result_bad) > 8 else ""))
-    results.append(CheckResult(ok, "+5 “汇总”!H3:H62用公式=IFERROR(G/F,\"\")或等效并下拉填充至H62、格式0.00，结果与G列除以F列一致", "；".join(details) or "H3:H62 公式、格式、结果均合规", 5))
-
-    # +5：Sheet3 及同结构子表（Sheet3、Sheet6~Sheet10、Sheet12~Sheet39、Sheet41）。
-    #   砼体积：均从各子表 D20 提取，写入“汇总”对应行的 F 列。
-    #   总重量合计：均从各子表 I10 提取，写入“汇总”对应行的 G 列。
-    #   引用可来自 Excel/WPS，允许 $ 锚定、空格、加不加单引号等等效写法。
-    bad_a: list[str] = []
-    for sheet in STRUCT_A_SHEETS:
-        row = summary_row_for_sheet(sheet)
-        if row is None:
-            bad_a.append(f"{sheet}: 汇总行缺失")
-            continue
-        cf = ws_sum_f.cell(row=row, column=6).value
-        cg = ws_sum_f.cell(row=row, column=7).value
-        # F 列 砼体积 ← 子表 D20。
-        if formula_reference(cf) != (sheet, "D20"):
-            bad_a.append(f"F{row} 砼体积应取{sheet}!D20，实际={cf!r}")
-        # G 列 总重量合计 ← 子表 I10。
-        if formula_reference(cg) != (sheet, "I10"):
-            bad_a.append(f"G{row} 总重量合计应取{sheet}!I10，实际={cg!r}")
-    results.append(CheckResult(not bad_a, "+5 Sheet3及同结构子表：砼体积取各子表D20填入汇总F列、总重量合计取各子表I10填入汇总G列", "; ".join(bad_a[:10]) + (" ..." if len(bad_a) > 10 else ""), 5))
-
-    # +5：Sheet5 及同结构子表（Sheet5、Sheet42~Sheet61）。
-    #   砼体积：均从各子表 E21 提取，写入“汇总”对应行的 F 列。
-    #   总重量合计：均从各子表 I11 提取，写入“汇总”对应行的 G 列。
-    #   引用可来自 Excel/WPS，允许 $ 锚定、空格、加不加单引号等等效写法。
-    bad_b: list[str] = []
-    for sheet in STRUCT_B_SHEETS:
-        row = summary_row_for_sheet(sheet)
-        if row is None:
-            bad_b.append(f"{sheet}: 汇总行缺失")
-            continue
-        cf = ws_sum_f.cell(row=row, column=6).value
-        cg = ws_sum_f.cell(row=row, column=7).value
-        # F 列 砼体积 ← 子表 E21。
-        if formula_reference(cf) != (sheet, "E21"):
-            bad_b.append(f"F{row} 砼体积应取{sheet}!E21，实际={cf!r}")
-        # G 列 总重量合计 ← 子表 I11。
-        if formula_reference(cg) != (sheet, "I11"):
-            bad_b.append(f"G{row} 总重量合计应取{sheet}!I11，实际={cg!r}")
-    results.append(CheckResult(not bad_b, "+5 Sheet5及同结构子表：砼体积取各子表E21填入汇总F列、总重量合计取各子表I11填入汇总G列", "; ".join(bad_b[:10]) + (" ..." if len(bad_b) > 10 else ""), 5))
-
-    # -1：“汇总”!F3:F62 和 !G3:G62 中有任意10个以上单元格为空白（空白数 > 10 触发）。
-    #   取 data_only 计算值判断：公式返回空串或单元格无内容均计为空白，与办公软件所见一致。
-    # 已按需求删除该扣分规则。
-
-    # -3：“汇总”!F3:G62 使用文本格式，导致数值左上角出现错误提示或不能参与计算。
-    # 已按需求删除该扣分规则。
-
-    # -3：出现名为“sheet11”的空白工作表。
-    # 已按需求删除该扣分规则。
-
-    # -1：“构件材料数据汇总”没有出现合并单元格的行为。
-    # 已按需求删除该扣分规则。
-
-    return results
-
-
-def print_dimension1(results: list[CheckResult]) -> bool:
-    """本地调试用：打印维度1明细并返回是否全部通过。"""
-    print("=== 维度1：可用与可修改性 ===")
-    all_passed = True
-    for result in results:
-        icon = "✅" if result.passed else "❌"
-        print(f"{icon} {result.label}")
-        if result.detail:
-            print(f"   {result.detail}")
-        if not result.passed:
-            all_passed = False
-    return all_passed
-
-
-def scoring_text(label: str) -> str:
-    """去掉内部标签开头已有的 +5/-3 等分值，避免最终输出重复分数。"""
-    return re.sub(r"^[+-]\d+\s*", "", label).strip()
-
-
-def print_dimension2(results: list[CheckResult]) -> int:
-    """本地调试用：打印维度2明细并返回累计得分。"""
-    total = 0
-    hit_results = [result for result in results if result.passed]
-    for result in hit_results:
-        total += result.score
-
-    print(f"维度二：评分结果（{total} / 25）")
-    for result in hit_results:
-        print(f"{result.score:+d}：{scoring_text(result.label)}")
-    return total
-
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .xlsx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
 
 SCRIPT_ID = "090"
-MAX_SCORE = 25
-SUPPORTED_EXTS = {".xlsx", ".xlsm"}
+# 维度二加分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 56
+# 维度二减分项 max_delta 之和（全部命中时的下限修正量）
+MAX_DEDUCT_TOTAL = -31
+
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 results.append(...) 的顺序严格一致；共 37 项，
+# 加分 16 项累加 = 56，减分 21 项累加 = -31。
+_MAX_DELTAS_ORDER = [
+    # —— 一、加分项：砼体积(m³) 列（汇总表 F3:F62）——
+    5,   # 01 F3=0.049（体积列标题带多余后缀、数值在第三节 H 列）
+    3,   # 02 F4=0.049（体积数值在第三节 E 列，节标题在第 18 行）
+    3,   # 03 F6=0.053（体积数值在第三节 B 列，紧邻构件类型右侧）
+    5,   # 04 F41=0.404（体积数值在第三节 F 列，结构上移、列数扩展至 J 列）
+    3,   # 05 F5、F8:F12、F13:F40、F42 共 35 行（第三节 D 列常规结构）
+    3,   # 06 F7、F43:F62 共 21 行（第三节 E 列、节标题下移两行）
+    # —— 一、加分项：总重量合计(kg) 列（汇总表 G3:G62）——
+    5,   # 07 G3=19.006（无合计行，标签与数值在第 2 行构件信息区）
+    5,   # 08 G4=17.422（标签在合并行右端 I 列、数值反向在左端 A 列）
+    3,   # 09 G6=18.801（合计数值紧邻标签右侧 B 列）
+    5,   # 10 G41=97.116（以配筋表新增列的列标题 + 下方纵向数值给出）
+    3,   # 11 G5、G8:G40、G42 共 35 行（标签第 10 行行首、数值同行 I 列）
+    3,   # 12 G7、G43:G62 共 21 行（合计行下移至第 11 行、数值同行 I 列）
+    # —— 一、加分项：整体完成质量 ——
+    5,   # 13 120 个单元格全部有值，无空值/错误值/占位文字
+    3,   # 14 抽查 10 行 G÷F 保留两位与同行 H 列一致（无行错位）
+    1,   # 15 F、G 列为 3 位小数数值形式
+    1,   # 16 F、G 列为数值或可正常求值的公式，非文本型数字
+    # —— 二、减分项：汇总表中不应改动的列 ——
+    -3,  # 17 H3:H62 含量显示数值被清空/改为其他数值/重算为不同结果
+    -1,  # 18 A/B/D/E/I 列任一内容被改动
+    -1,  # 19 C 列 60 行子表名不再依次为 Sheet1~Sheet10、Sheet12~Sheet61
+    -1,  # 20 第 1 行标题或 A1:I1 合并区域、第 2 行 9 个表头被改写
+    # —— 二、减分项：子表内容 ——
+    -3,  # 21 任一子表"总重量合计"数值被改写/清空/替换为公式
+    -3,  # 22 任一子表第三节体积/砼重量/尺寸或第一节重量(kg)被改写/清空
+    -3,  # 23 任一子表第二节"附件配置清单"条目被删除或改写
+    -3,  # 24 178 个智能表格对象数量减少或引用区域被改变
+    -1,  # 25 智能表格自动筛选被清除或筛选范围与表格区域不一致
+    -1,  # 26 298 处合并单元格数量或范围发生改变
+    -1,  # 27 工作表数量不为 61 个，或名称、排列顺序被改动
+    # —— 二、减分项：格式与外观 ——
+    -1,  # 28 标题/表头/数据区显示出来的字体色与填充色被改动
+    -1,  # 29 F、G 列数字格式非 0.000，或 H 列非 0.00
+    -1,  # 30 数据区非水平居中+垂直居中，或四边细实线边框被去除
+    -1,  # 31 汇总表列宽或任一子表列宽被改变
+    -1,  # 32 汇总表行高，或任一工作表默认行高 13.5 / 默认列宽 9 被改动
+    -1,  # 33 任一工作表网格线由隐藏被改为显示
+    -1,  # 34 页边距、页面方向/纸张/打印区域被改动
+    # —— 二、减分项：交付物整洁度 ——
+    -1,  # 35 交付目录遗留脚本/临时表/中间产物，或输出多个工作簿
+    -1,  # 36 新增指令未要求的说明文字、批注、辅助列/行或标色提示
+    -1,  # 37 汇总表不再是 A1:I62 的 62 行 9 列结构（新增汇总行/小计行/辅助列）
+]
+assert len(_MAX_DELTAS_ORDER) == 37
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+assert sum(d for d in _MAX_DELTAS_ORDER if d < 0) == MAX_DEDUCT_TOTAL
+
+# ========== 既有状态基准 ==========
+# 下列常量描述"按指令只填 F、G 两列时，工作簿其余部分应保持的既有状态"，
+# 供减分项逐项比对；与被评估文件无关，不依赖任何外部文件。
+SUPPORTED_EXTS = ('.xlsx', '.xlsm')
+SUMMARY_SHEET = '汇总'
+CHILD_SHEETS = ['Sheet%d' % i for i in list(range(1, 11)) + list(range(12, 62))]
+EXPECTED_SHEETS = [SUMMARY_SHEET] + CHILD_SHEETS
+SUMMARY_TITLE = '构件材料数据汇总'
+SUMMARY_HEADERS = ['序号', '构件分区', '子表', '新构件编号', '楼层/部位',
+                   '砼体积(m³)', '总重量合计(kg)', '含量(kg/m³)', '备注']
+ERROR_TEXTS = ('#REF!', '#VALUE!', '#DIV/0!', '#NAME?', '#N/A', '#NULL!', '#NUM!')
+PLACEHOLDER_TEXTS = ('待补充', '待填', 'N/A', 'NA', '无', '--', '?')
+TOTAL_TABLES = 178
+TOTAL_MERGED = 298
+DEFAULT_ROW_HEIGHT = 13.5
+DEFAULT_COL_WIDTH = 9.0
+PAGE_MARGINS = (0.7, 0.7, 0.75, 0.75, 0.3, 0.3)   # 左 右 上 下 页眉 页脚
+# 颜色一律只比对后 6 位 RGB：8 位 ARGB（FF203864）与 6 位 RGB（203864）两种写法
+# 在表格软件中显示为同一颜色，视为一致，只判定颜色本身有没有被改。
+TITLE_FONT_RGB = 'FFFFFF'
+TITLE_FILL_RGB = '203864'
+HEADER_FILL_A_RGB = '00A6A6'                      # A2:E2 与 I2
+HEADER_FILL_B_RGB = '1F4E78'                      # F2:H2
+DATA_FONT_RGB = '1F2937'
+DATA_FILL_ODD_RGB = 'FFFFFF'                      # 第 3、5、7…… 行
+DATA_FILL_EVEN_RGB = 'F5F7FA'                     # 第 4、6、8…… 行
+WIDTH_TOL = 0.05                                  # 列宽比对容差（浮点精度漂移不计）
+HEIGHT_TOL = 0.01
+# 抽查 G÷F 与 H 列一致性的 10 行（覆盖 4 种子表结构 + 首尾行）
+SPOT_ROWS = (3, 4, 5, 6, 7, 19, 38, 41, 43, 62)
+
+_BASELINE_JSON = r"""{"SUMMARY_ROWS":{"3":[1,"A区标准段","Sheet1","PC-GZ-001","二层板底",387.88],"4":[2,"B区转换段","Sheet2","PC-GZ-002","三层板面",355.55],"5":[3,"C区机电段","Sheet3","PC-GZ-003","楼梯间旁",383.32],"6":[4,"D区装配段","Sheet4","PC-GZ-004","走廊区",354.74],"7":[5,"E区加强段","Sheet5","PC-GZ-005","核心筒边",408.68],"8":[6,"A区标准段","Sheet6","PC-GZ-006","设备平台",370.09],"9":[7,"B区转换段","Sheet7","PC-GZ-007","二层板底",384.94],"10":[8,"C区机电段","Sheet8","PC-GZ-008","三层板面",352.17],"11":[9,"D区装配段","Sheet9","PC-GZ-009","楼梯间旁",379.21],"12":[10,"E区加强段","Sheet10","PC-GZ-010","走廊区",350.42],"13":[11,"A区标准段","Sheet12","PC-GZ-011","核心筒边",385.02],"14":[12,"B区转换段","Sheet13","PC-GZ-012","设备平台",350.02],"15":[13,"C区机电段","Sheet14","PC-GZ-013","二层板底",377.33],"16":[14,"D区装配段","Sheet15","PC-GZ-014","三层板面",348.98],"17":[15,"E区加强段","Sheet16","PC-GZ-015","楼梯间旁",360.37],"18":[16,"A区标准段","Sheet17","PC-GZ-016","走廊区",388.82],"19":[17,"B区转换段","Sheet18","PC-GZ-017","核心筒边",134.23],"20":[18,"C区机电段","Sheet19","PC-GZ-018","设备平台",134.67],"21":[19,"D区装配段","Sheet20","PC-GZ-019","二层板底",142.52],"22":[20,"E区加强段","Sheet21","PC-GZ-020","三层板面",142.52],"23":[21,"A区标准段","Sheet22","PC-GZ-021","楼梯间旁",146.29],"24":[22,"B区转换段","Sheet23","PC-GZ-022","走廊区",146.89],"25":[23,"C区机电段","Sheet24","PC-GZ-023","核心筒边",263.37],"26":[24,"D区装配段","Sheet25","PC-GZ-024","设备平台",272.33],"27":[25,"E区加强段","Sheet26","PC-GZ-025","二层板底",265.19],"28":[26,"A区标准段","Sheet27","PC-GZ-026","三层板面",258.87],"29":[27,"B区转换段","Sheet28","PC-GZ-027","楼梯间旁",267.8],"30":[28,"C区机电段","Sheet29","PC-GZ-028","走廊区",260.71],"31":[29,"D区装配段","Sheet30","PC-GZ-029","核心筒边",256.71],"32":[30,"E区加强段","Sheet31","PC-GZ-030","设备平台",266.2],"33":[31,"A区标准段","Sheet32","PC-GZ-031","二层板底",255.5],"34":[32,"B区转换段","Sheet33","PC-GZ-032","三层板面",273.4],"35":[33,"C区机电段","Sheet34","PC-GZ-033","楼梯间旁",286.15],"36":[34,"D区装配段","Sheet35","PC-GZ-034","走廊区",288.5],"37":[35,"E区加强段","Sheet36","PC-GZ-035","核心筒边",275.25],"38":[36,"A区标准段","Sheet37","PC-GZ-036","设备平台",239.23],"39":[37,"B区转换段","Sheet38","PC-GZ-037","二层板底",250.15],"40":[38,"C区机电段","Sheet39","PC-GZ-038","三层板面",250.15],"41":[39,"D区装配段","Sheet40","PC-GZ-039","楼梯间旁",240.39],"42":[40,"E区加强段","Sheet41","PC-GZ-040","走廊区",147.83],"43":[41,"A区标准段","Sheet42","PC-GZ-041","核心筒边",152.22],"44":[42,"B区转换段","Sheet43","PC-GZ-042","设备平台",152.22],"45":[43,"C区机电段","Sheet44","PC-GZ-043","二层板底",147.83],"46":[44,"D区装配段","Sheet45","PC-GZ-044","三层板面",149.63],"47":[45,"E区加强段","Sheet46","PC-GZ-045","楼梯间旁",154.78],"48":[46,"A区标准段","Sheet47","PC-GZ-046","走廊区",154.78],"49":[47,"B区转换段","Sheet48","PC-GZ-047","核心筒边",151.72],"50":[48,"C区机电段","Sheet49","PC-GZ-048","设备平台",146.45],"51":[49,"D区装配段","Sheet50","PC-GZ-049","二层板底",151.38],"52":[50,"E区加强段","Sheet51","PC-GZ-050","三层板面",151.38],"53":[51,"A区标准段","Sheet52","PC-GZ-051","楼梯间旁",147.56],"54":[52,"B区转换段","Sheet53","PC-GZ-052","走廊区",147.23],"55":[53,"C区机电段","Sheet54","PC-GZ-053","核心筒边",152.25],"56":[54,"D区装配段","Sheet55","PC-GZ-054","设备平台",152.25],"57":[55,"E区加强段","Sheet56","PC-GZ-055","二层板底",147.23],"58":[56,"A区标准段","Sheet57","PC-GZ-056","三层板面",145.92],"59":[57,"B区转换段","Sheet58","PC-GZ-057","楼梯间旁",150.75],"60":[58,"C区机电段","Sheet59","PC-GZ-058","走廊区",150.75],"61":[59,"D区装配段","Sheet60","PC-GZ-059","核心筒边",147.02],"62":[60,"E区加强段","Sheet61","PC-GZ-060","设备平台",144.23]},"GT_VOLUME":{"3":0.049,"4":0.049,"5":0.053,"6":0.053,"7":0.044,"8":0.044,"9":0.047,"10":0.047,"11":0.048,"12":0.048,"13":0.059,"14":0.059,"15":0.054,"16":0.054,"17":0.068,"18":0.045,"19":0.659,"20":0.566,"21":0.319,"22":0.319,"23":0.289,"24":0.289,"25":0.309,"26":0.308,"27":0.309,"28":0.333,"29":0.332,"30":0.333,"31":0.341,"32":0.339,"33":0.334,"34":0.244,"35":0.246,"36":0.244,"37":0.248,"38":0.402,"39":0.402,"40":0.402,"41":0.404,"42":0.33,"43":0.329,"44":0.329,"45":0.33,"46":0.356,"47":0.357,"48":0.357,"49":0.35,"50":0.299,"51":0.3,"52":0.3,"53":0.296,"54":0.319,"55":0.317,"56":0.317,"57":0.319,"58":0.322,"59":0.323,"60":0.323,"61":0.32,"62":0.393},"GT_WEIGHT":{"3":19.006,"4":17.422,"5":20.316,"6":18.801,"7":17.982,"8":16.284,"9":18.092,"10":16.552,"11":18.202,"12":16.82,"13":22.716,"14":20.651,"15":20.376,"16":18.845,"17":24.505,"18":17.497,"19":88.456,"20":76.226,"21":45.463,"22":45.463,"23":42.279,"24":42.452,"25":81.381,"26":83.877,"27":81.945,"28":86.204,"29":88.908,"30":86.815,"31":87.539,"32":90.243,"33":85.338,"34":66.71,"35":70.393,"36":70.393,"37":68.261,"38":96.171,"39":100.56,"40":100.56,"41":97.116,"42":48.783,"43":50.079,"44":50.079,"45":48.783,"46":53.267,"47":55.255,"48":55.255,"49":53.102,"50":43.79,"51":45.414,"52":45.414,"53":43.678,"54":46.966,"55":48.262,"56":48.262,"57":46.966,"58":46.985,"59":48.691,"60":48.691,"61":47.047,"62":56.682},"SUMMARY_WIDTHS":{"A":25.7083333333333,"B":8.20833333333333,"C":5.91666666666667,"D":8.88333333333333,"E":7.94166666666667,"F":8.48333333333333,"G":11.7083333333333,"H":9.29166666666667,"I":3.5},"SUMMARY_ROW_HEIGHTS":{"1":32.0,"2":42.0,"3":33.0,"4":33.0,"5":42.0,"6":33.0,"7":33.0,"8":24.0,"9":33.0,"10":33.0,"11":33.0,"12":33.0,"13":33.0,"14":33.0,"15":33.0,"16":33.0,"17":33.0,"18":33.0,"19":33.0,"20":33.0,"21":33.0,"22":33.0,"23":33.0,"24":33.0,"25":33.0,"26":33.0,"27":33.0,"28":33.0,"29":33.0,"30":33.0,"31":33.0,"32":33.0,"33":33.0,"34":33.0,"35":33.0,"36":33.0,"37":33.0,"38":33.0,"39":33.0,"40":33.0,"41":33.0,"42":33.0,"43":33.0,"44":33.0,"45":33.0,"46":33.0,"47":33.0,"48":33.0,"49":33.0,"50":33.0,"51":33.0,"52":33.0,"53":33.0,"54":33.0,"55":33.0,"56":33.0,"57":33.0,"58":33.0,"59":33.0,"60":33.0,"61":33.0,"62":33.0},"SUMMARY_MERGED":["A1:I1"],"SUB_WIDTHS":{"Sheet1":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet2":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet3":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet4":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet5":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet6":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet7":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet8":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet9":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet10":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet12":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet13":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet14":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet15":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet16":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet17":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet18":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet19":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet20":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet21":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet22":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet23":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet24":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet25":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet26":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet27":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet28":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet29":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet30":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet31":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet32":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet33":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet34":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet35":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet36":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet37":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet38":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet39":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet40":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet41":{"A":11.0,"B":18.0,"D":17.0,"E":12.0,"F":17.0,"G":13.0,"H":17.0,"I":15.0},"Sheet42":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet43":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet44":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet45":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet46":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet47":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet48":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet49":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet50":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet51":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet52":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet53":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet54":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet55":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet56":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet57":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet58":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet59":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet60":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175},"Sheet61":{"A":13.3416666666667,"B":14.5083333333333,"C":21.675,"D":15.5083333333333,"E":12.5083333333333,"F":17.0083333333333,"G":13.3416666666667,"H":13.0,"I":12.175}},"SUB_BASE":{"Sheet1":{"wl":"G2","wc":"H2","wv":19.006,"vh":"H18","vc":"H19","vv":0.049,"cwh":"D18","cwc":"D19","cwv":0.12,"szh":"C18","szc":"C19","szv":"1037×600×60","rc":"I","rr":[6,7,8,9],"rv":[5.855,5.528,4.482,3.141],"ah":12,"av":[["A01-01","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-01","预埋套管","DN20-L120","镀锌钢",2,"现场穿线预留","复核通过","材料组",null],["C03-01","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet1_Acc":"A12:I15","T_Sheet1_Con":"A18:I19","T_Sheet1_Rebar":"A5:I9"},"mg":["A11:I11","A17:I17","A1:I1","A4:I4"]},"Sheet2":{"wl":"I10","wc":"A10","wv":17.422,"vh":"E19","vc":"E20","vv":0.049,"cwh":"D19","cwc":"D20","cwv":0.12,"szh":"C19","szc":"C20","szv":"1174×600×60","rc":"I","rr":[6,7,8,9],"rv":[6.209,5.158,3.36,2.695],"ah":13,"av":[["A01-02","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-02","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-02","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet2_Acc":"A15:I18","T_Sheet2_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet3":{"wl":"A10","wc":"I10","wv":20.316,"vh":"D19","vc":"D20","vv":0.053,"cwh":"E19","cwc":"E20","cwv":0.13,"szh":"C19","szc":"C20","szv":"1311×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[6.48,5.622,4.375,3.839,20.316],"ah":13,"av":[["A01-03","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-03","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-03","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet3_Acc":"A15:I18","T_Sheet3_Con":"A21:I22","T_Sheet3_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet4":{"wl":"A10","wc":"B10","wv":18.801,"vh":"B18","vc":"B19","vv":0.053,"cwh":"E18","cwc":"E19","cwv":0.13,"szh":"C18","szc":"C19","szv":"1448×600×60","rc":"I","rr":[6,7,8,9],"rv":[6.328,4.959,4.306,3.208],"ah":12,"av":[["A01-04","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-04","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-04","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet4_Acc":"A14:I17","T_Sheet4_Rebar":"A7:I11"},"mg":["A11:I11","A17:I17","A1:I1","A4:I4"]},"Sheet5":{"wl":"A11","wc":"I11","wv":17.982,"vh":"E20","vc":"E21","vv":0.044,"cwh":"D20","cwc":"D21","cwv":0.108,"szh":"C20","szc":"C21","szv":"1585×600×60","rc":"I","rr":[6,7,8,9],"rv":[5.69,4.799,4.009,3.484],"ah":14,"av":[["A01-05","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-05","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-05","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet5_Acc":"A16:I19","T_Sheet5_Con":"A22:I23","T_Sheet5_Rebar":"A7:I13"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet6":{"wl":"A10","wc":"I10","wv":16.284,"vh":"D19","vc":"D20","vv":0.044,"cwh":"E19","cwc":"E20","cwv":0.108,"szh":"C19","szc":"C20","szv":"1722×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[5.54,4.611,3.492,2.641,16.284],"ah":13,"av":[["A01-06","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-06","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-06","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet6_Acc":"A15:I18","T_Sheet6_Con":"A21:I22","T_Sheet6_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet7":{"wl":"A10","wc":"I10","wv":18.092,"vh":"D19","vc":"D20","vv":0.047,"cwh":"E19","cwc":"E20","cwv":0.115,"szh":"C19","szc":"C20","szv":"1859×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[6.071,4.734,4.354,2.933,18.092],"ah":13,"av":[["A01-07","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-07","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-07","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet7_Acc":"A15:I18","T_Sheet7_Con":"A21:I22","T_Sheet7_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet8":{"wl":"A10","wc":"I10","wv":16.552,"vh":"D19","vc":"D20","vv":0.047,"cwh":"E19","cwc":"E20","cwv":0.115,"szh":"C19","szc":"C20","szv":"1996×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[5.184,4.922,3.266,3.18,16.552],"ah":13,"av":[["A01-08","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-08","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-08","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet8_Acc":"A15:I18","T_Sheet8_Con":"A21:I22","T_Sheet8_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet9":{"wl":"A10","wc":"I10","wv":18.202,"vh":"D19","vc":"D20","vv":0.048,"cwh":"E19","cwc":"E20","cwv":0.118,"szh":"C19","szc":"C20","szv":"2133×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[6.024,4.822,3.644,3.712,18.202],"ah":13,"av":[["A01-09","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-09","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-09","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet9_Acc":"A15:I18","T_Sheet9_Con":"A21:I22","T_Sheet9_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet10":{"wl":"A10","wc":"I10","wv":16.82,"vh":"D19","vc":"D20","vv":0.048,"cwh":"E19","cwc":"E20","cwv":0.118,"szh":"C19","szc":"C20","szv":"2270×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[5.696,4.528,3.829,2.767,16.82],"ah":13,"av":[["A01-10","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-10","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-10","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet10_Acc":"A15:I18","T_Sheet10_Con":"A21:I22","T_Sheet10_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet12":{"wl":"A10","wc":"I10","wv":22.716,"vh":"D19","vc":"D20","vv":0.059,"cwh":"E19","cwc":"E20","cwv":0.145,"szh":"C19","szc":"C20","szv":"2407×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[7.256,6.068,5.444,3.948,22.716],"ah":13,"av":[["A01-11","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-11","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-11","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet12_Acc":"A15:I18","T_Sheet12_Con":"A21:I22","T_Sheet12_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet13":{"wl":"A10","wc":"I10","wv":20.651,"vh":"D19","vc":"D20","vv":0.059,"cwh":"E19","cwc":"E20","cwv":0.145,"szh":"C19","szc":"C20","szv":"2544×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[6.807,5.791,4.766,3.287,20.651],"ah":13,"av":[["A01-12","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-12","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-12","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet13_Acc":"A15:I18","T_Sheet13_Con":"A21:I22","T_Sheet13_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet14":{"wl":"A10","wc":"I10","wv":20.376,"vh":"D19","vc":"D20","vv":0.054,"cwh":"E19","cwc":"E20","cwv":0.132,"szh":"C19","szc":"C20","szv":"2681×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[6.25,5.568,4.577,3.981,20.376],"ah":13,"av":[["A01-13","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-13","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-13","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet14_Acc":"A15:I18","T_Sheet14_Con":"A21:I22","T_Sheet14_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet15":{"wl":"A10","wc":"I10","wv":18.845,"vh":"D19","vc":"D20","vv":0.054,"cwh":"E19","cwc":"E20","cwv":0.132,"szh":"C19","szc":"C20","szv":"2818×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[5.638,5.192,4.216,3.799,18.845],"ah":13,"av":[["A01-14","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-14","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-14","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet15_Acc":"A15:I18","T_Sheet15_Con":"A21:I22","T_Sheet15_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet16":{"wl":"A10","wc":"I10","wv":24.505,"vh":"D19","vc":"D20","vv":0.068,"cwh":"E19","cwc":"E20","cwv":0.167,"szh":"C19","szc":"C20","szv":"2955×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[8.839,5.944,5.783,3.939,24.505],"ah":13,"av":[["A01-15","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-15","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-15","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet16_Acc":"A15:I18","T_Sheet16_Con":"A21:I22","T_Sheet16_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet17":{"wl":"A10","wc":"I10","wv":17.497,"vh":"D19","vc":"D20","vv":0.045,"cwh":"E19","cwc":"E20","cwv":0.11,"szh":"C19","szc":"C20","szv":"3092×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[5.73,4.788,3.83,3.149,17.497],"ah":13,"av":[["A01-16","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-16","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-16","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet17_Acc":"A15:I18","T_Sheet17_Con":"A21:I22","T_Sheet17_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet18":{"wl":"A10","wc":"I10","wv":88.456,"vh":"D19","vc":"D20","vv":0.659,"cwh":"E19","cwc":"E20","cwv":1.615,"szh":"C19","szc":"C20","szv":"3229×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[28.324,24.655,21.169,14.308,88.456],"ah":13,"av":[["A01-17","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-17","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-17","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet18_Acc":"A15:I18","T_Sheet18_Con":"A21:I22","T_Sheet18_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet19":{"wl":"A10","wc":"I10","wv":76.226,"vh":"D19","vc":"D20","vv":0.566,"cwh":"E19","cwc":"E20","cwv":1.387,"szh":"C19","szc":"C20","szv":"3366×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[24.62,22.15,16.637,12.819,76.226],"ah":13,"av":[["A01-18","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-18","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-18","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet19_Acc":"A15:I18","T_Sheet19_Con":"A21:I22","T_Sheet19_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet20":{"wl":"A10","wc":"I10","wv":45.463,"vh":"D19","vc":"D20","vv":0.319,"cwh":"E19","cwc":"E20","cwv":0.782,"szh":"C19","szc":"C20","szv":"3503×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[15.04,12.676,9.768,7.979,45.463],"ah":13,"av":[["A01-19","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-19","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-19","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet20_Acc":"A15:I18","T_Sheet20_Con":"A21:I22","T_Sheet20_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet21":{"wl":"A10","wc":"I10","wv":45.463,"vh":"D19","vc":"D20","vv":0.319,"cwh":"E19","cwc":"E20","cwv":0.782,"szh":"C19","szc":"C20","szv":"3640×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[14.975,11.883,9.973,8.632,45.463],"ah":13,"av":[["A01-20","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-20","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-20","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet21_Acc":"A15:I18","T_Sheet21_Con":"A21:I22","T_Sheet21_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet22":{"wl":"A10","wc":"I10","wv":42.279,"vh":"D19","vc":"D20","vv":0.289,"cwh":"E19","cwc":"E20","cwv":0.708,"szh":"C19","szc":"C20","szv":"3777×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[13.127,11.919,9.662,7.571,42.279],"ah":13,"av":[["A01-21","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-21","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-21","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet22_Acc":"A15:I18","T_Sheet22_Con":"A21:I22","T_Sheet22_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet23":{"wl":"A10","wc":"I10","wv":42.452,"vh":"D19","vc":"D20","vv":0.289,"cwh":"E19","cwc":"E20","cwv":0.708,"szh":"C19","szc":"C20","szv":"3914×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[15.067,10.47,8.068,8.847,42.452],"ah":13,"av":[["A01-22","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-22","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-22","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet23_Acc":"A15:I18","T_Sheet23_Con":"A21:I22","T_Sheet23_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet24":{"wl":"A10","wc":"I10","wv":81.381,"vh":"D19","vc":"D20","vv":0.309,"cwh":"E19","cwc":"E20","cwv":0.757,"szh":"C19","szc":"C20","szv":"4051×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[27.527,22.992,18.859,12.003,81.381],"ah":13,"av":[["A01-23","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-23","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-23","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet24_Acc":"A15:I18","T_Sheet24_Con":"A21:I22","T_Sheet24_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet25":{"wl":"A10","wc":"I10","wv":83.877,"vh":"D19","vc":"D20","vv":0.308,"cwh":"E19","cwc":"E20","cwv":0.755,"szh":"C19","szc":"C20","szv":"4188×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[27.537,23.331,16.145,16.864,83.877],"ah":13,"av":[["A01-24","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-24","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-24","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet25_Acc":"A15:I18","T_Sheet25_Con":"A21:I22","T_Sheet25_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet26":{"wl":"A10","wc":"I10","wv":81.945,"vh":"D19","vc":"D20","vv":0.309,"cwh":"E19","cwc":"E20","cwv":0.757,"szh":"C19","szc":"C20","szv":"4325×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[25.876,23.71,19.298,13.061,81.945],"ah":13,"av":[["A01-25","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-25","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-25","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet26_Acc":"A15:I18","T_Sheet26_Con":"A21:I22","T_Sheet26_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet27":{"wl":"A10","wc":"I10","wv":86.204,"vh":"D19","vc":"D20","vv":0.333,"cwh":"E19","cwc":"E20","cwv":0.816,"szh":"C19","szc":"C20","szv":"4462×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[30.168,22.061,17.699,16.276,86.204],"ah":13,"av":[["A01-26","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-26","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-26","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet27_Acc":"A15:I18","T_Sheet27_Con":"A21:I22","T_Sheet27_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet28":{"wl":"A10","wc":"I10","wv":88.908,"vh":"D19","vc":"D20","vv":0.332,"cwh":"E19","cwc":"E20","cwv":0.813,"szh":"C19","szc":"C20","szv":"999×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[29.249,24.344,21.353,13.962,88.908],"ah":13,"av":[["A01-27","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-27","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-27","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet28_Acc":"A15:I18","T_Sheet28_Con":"A21:I22","T_Sheet28_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet29":{"wl":"A10","wc":"I10","wv":86.815,"vh":"D19","vc":"D20","vv":0.333,"cwh":"E19","cwc":"E20","cwv":0.816,"szh":"C19","szc":"C20","szv":"1136×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[28.298,22.863,20.832,14.822,86.815],"ah":13,"av":[["A01-28","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-28","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-28","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet29_Acc":"A15:I18","T_Sheet29_Con":"A21:I22","T_Sheet29_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet30":{"wl":"A10","wc":"I10","wv":87.539,"vh":"D19","vc":"D20","vv":0.341,"cwh":"E19","cwc":"E20","cwv":0.835,"szh":"C19","szc":"C20","szv":"1273×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[29.093,22.788,21.035,14.623,87.539],"ah":13,"av":[["A01-29","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-29","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-29","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet30_Acc":"A15:I18","T_Sheet30_Con":"A21:I22","T_Sheet30_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet31":{"wl":"A10","wc":"I10","wv":90.243,"vh":"D19","vc":"D20","vv":0.339,"cwh":"E19","cwc":"E20","cwv":0.831,"szh":"C19","szc":"C20","szv":"1410×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[30.897,23.925,17.831,17.59,90.243],"ah":13,"av":[["A01-30","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-30","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-30","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet31_Acc":"A15:I18","T_Sheet31_Con":"A21:I22","T_Sheet31_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet32":{"wl":"A10","wc":"I10","wv":85.338,"vh":"D19","vc":"D20","vv":0.334,"cwh":"E19","cwc":"E20","cwv":0.818,"szh":"C19","szc":"C20","szv":"1547×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[26.956,22.116,19.143,17.123,85.338],"ah":13,"av":[["A01-31","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-31","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-31","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet32_Acc":"A15:I18","T_Sheet32_Con":"A21:I22","T_Sheet32_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet33":{"wl":"A10","wc":"I10","wv":66.71,"vh":"D19","vc":"D20","vv":0.244,"cwh":"E19","cwc":"E20","cwv":0.598,"szh":"C19","szc":"C20","szv":"1684×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[20.959,17.393,14.323,14.035,66.71],"ah":13,"av":[["A01-32","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-32","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-32","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet33_Acc":"A15:I18","T_Sheet33_Con":"A21:I22","T_Sheet33_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet34":{"wl":"A10","wc":"I10","wv":70.393,"vh":"D19","vc":"D20","vv":0.246,"cwh":"E19","cwc":"E20","cwv":0.603,"szh":"C19","szc":"C20","szv":"1821×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[23.115,19.222,16.531,11.525,70.393],"ah":13,"av":[["A01-33","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-33","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-33","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet34_Acc":"A15:I18","T_Sheet34_Con":"A21:I22","T_Sheet34_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet35":{"wl":"A10","wc":"I10","wv":70.393,"vh":"D19","vc":"D20","vv":0.244,"cwh":"E19","cwc":"E20","cwv":0.598,"szh":"C19","szc":"C20","szv":"1958×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[22.21,18.421,16.109,13.653,70.393],"ah":13,"av":[["A01-34","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-34","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-34","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet35_Acc":"A15:I18","T_Sheet35_Con":"A21:I22","T_Sheet35_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet36":{"wl":"A10","wc":"I10","wv":68.261,"vh":"D19","vc":"D20","vv":0.248,"cwh":"E19","cwc":"E20","cwv":0.608,"szh":"C19","szc":"C20","szv":"2095×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[21.547,18.448,15.199,13.067,68.261],"ah":13,"av":[["A01-35","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-35","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-35","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet36_Acc":"A15:I18","T_Sheet36_Con":"A21:I22","T_Sheet36_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet37":{"wl":"A10","wc":"I10","wv":96.171,"vh":"D19","vc":"D20","vv":0.402,"cwh":"E19","cwc":"E20","cwv":0.985,"szh":"C19","szc":"C20","szv":"2232×600×70","rc":"I","rr":[6,7,8,9,10],"rv":[28.7,26.839,22.222,18.41,96.171],"ah":13,"av":[["A01-36","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-36","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-36","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet37_Acc":"A15:I18","T_Sheet37_Con":"A21:I22","T_Sheet37_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet38":{"wl":"A10","wc":"I10","wv":100.56,"vh":"D19","vc":"D20","vv":0.402,"cwh":"E19","cwc":"E20","cwv":0.985,"szh":"C19","szc":"C20","szv":"2369×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[33.81,24.346,22.519,19.885,100.56],"ah":13,"av":[["A01-37","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-37","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-37","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet38_Acc":"A15:I18","T_Sheet38_Con":"A21:I22","T_Sheet38_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet39":{"wl":"A10","wc":"I10","wv":100.56,"vh":"D19","vc":"D20","vv":0.402,"cwh":"E19","cwc":"E20","cwv":0.985,"szh":"C19","szc":"C20","szv":"2506×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[34.317,26.951,23.677,15.615,100.56],"ah":13,"av":[["A01-38","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-38","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-38","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet39_Acc":"A15:I18","T_Sheet39_Con":"A21:I22","T_Sheet39_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet40":{"wl":"J5","wc":"J6","wv":97.116,"vh":"F18","vc":"F19","vv":0.404,"cwh":"E18","cwc":"E19","cwv":0.99,"szh":"C18","szc":"C19","szv":"2643×600×70","rc":"I","rr":[6,7,8,9],"rv":[31.917,26.866,20.595,17.738],"ah":12,"av":[["A01-39","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-39","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-39","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet40_Acc":"A14:I17","T_Sheet40_Con":"A20:I21","T_Sheet40_Rebar":"A7:I11"},"mg":["A11:I11","A17:I17","A1:I1","A4:I4"]},"Sheet41":{"wl":"A10","wc":"I10","wv":48.783,"vh":"D19","vc":"D20","vv":0.33,"cwh":"E19","cwc":"E20","cwv":0.809,"szh":"C19","szc":"C20","szv":"2780×600×60","rc":"I","rr":[6,7,8,9,10],"rv":[16.319,14.583,9.562,8.319,48.783],"ah":13,"av":[["A01-40","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-40","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-40","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet41_Acc":"A15:I18","T_Sheet41_Con":"A21:I22","T_Sheet41_Rebar":"A7:I12"},"mg":["A10:H10","A12:I12","A18:I18","A1:I1","A4:I4"]},"Sheet42":{"wl":"A11","wc":"I11","wv":50.079,"vh":"E20","vc":"E21","vv":0.329,"cwh":"D20","cwc":"D21","cwv":0.806,"szh":"C20","szc":"C21","szv":"2917×600×60","rc":"I","rr":[6,7,8,9],"rv":[16.473,12.952,10.203,10.451],"ah":14,"av":[["A01-41","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-41","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-41","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet42_Acc":"A15:I18","T_Sheet42_Con":"A21:I22","T_Sheet42_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet43":{"wl":"A11","wc":"I11","wv":50.079,"vh":"E20","vc":"E21","vv":0.329,"cwh":"D20","cwc":"D21","cwv":0.806,"szh":"C20","szc":"C21","szv":"3054×600×70","rc":"I","rr":[6,7,8,9],"rv":[17.841,12.734,10.888,8.616],"ah":14,"av":[["A01-42","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-42","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-42","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet43_Acc":"A15:I18","T_Sheet43_Con":"A21:I22","T_Sheet43_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet44":{"wl":"A11","wc":"I11","wv":48.783,"vh":"E20","vc":"E21","vv":0.33,"cwh":"D20","cwc":"D21","cwv":0.809,"szh":"C20","szc":"C21","szv":"3191×600×60","rc":"I","rr":[6,7,8,9],"rv":[15.355,14.311,10.089,9.028],"ah":14,"av":[["A01-43","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-43","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-43","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet44_Acc":"A15:I18","T_Sheet44_Con":"A21:I22","T_Sheet44_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet45":{"wl":"A11","wc":"I11","wv":53.267,"vh":"E20","vc":"E21","vv":0.356,"cwh":"D20","cwc":"D21","cwv":0.872,"szh":"C20","szc":"C21","szv":"3328×600×60","rc":"I","rr":[6,7,8,9],"rv":[17.297,14.526,12.884,8.56],"ah":14,"av":[["A01-44","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-44","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-44","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet45_Acc":"A15:I18","T_Sheet45_Con":"A21:I22","T_Sheet45_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet46":{"wl":"A11","wc":"I11","wv":55.255,"vh":"E20","vc":"E21","vv":0.357,"cwh":"D20","cwc":"D21","cwv":0.875,"szh":"C20","szc":"C21","szv":"3465×600×70","rc":"I","rr":[6,7,8,9],"rv":[18.382,15.649,11.327,9.897],"ah":14,"av":[["A01-45","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-45","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-45","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet46_Acc":"A15:I18","T_Sheet46_Con":"A21:I22","T_Sheet46_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet47":{"wl":"A11","wc":"I11","wv":55.255,"vh":"E20","vc":"E21","vv":0.357,"cwh":"D20","cwc":"D21","cwv":0.875,"szh":"C20","szc":"C21","szv":"3602×600×60","rc":"I","rr":[6,7,8,9],"rv":[18.695,13.97,11.923,10.667],"ah":14,"av":[["A01-46","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-46","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-46","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet47_Acc":"A15:I18","T_Sheet47_Con":"A21:I22","T_Sheet47_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet48":{"wl":"A11","wc":"I11","wv":53.102,"vh":"E20","vc":"E21","vv":0.35,"cwh":"D20","cwc":"D21","cwv":0.858,"szh":"C20","szc":"C21","szv":"3739×600×60","rc":"I","rr":[6,7,8,9],"rv":[17.493,14.481,11.834,9.294],"ah":14,"av":[["A01-47","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-47","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-47","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet48_Acc":"A15:I18","T_Sheet48_Con":"A21:I22","T_Sheet48_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet49":{"wl":"A11","wc":"I11","wv":43.79,"vh":"E20","vc":"E21","vv":0.299,"cwh":"D20","cwc":"D21","cwv":0.733,"szh":"C20","szc":"C21","szv":"3876×600×70","rc":"I","rr":[6,7,8,9],"rv":[14.85,11.059,10.38,7.501],"ah":14,"av":[["A01-48","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-48","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-48","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet49_Acc":"A15:I18","T_Sheet49_Con":"A21:I22","T_Sheet49_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet50":{"wl":"A11","wc":"I11","wv":45.414,"vh":"E20","vc":"E21","vv":0.3,"cwh":"D20","cwc":"D21","cwv":0.735,"szh":"C20","szc":"C21","szv":"4013×600×60","rc":"I","rr":[6,7,8,9],"rv":[14.373,12.519,9.296,9.226],"ah":14,"av":[["A01-49","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-49","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-49","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet50_Acc":"A15:I18","T_Sheet50_Con":"A21:I22","T_Sheet50_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet51":{"wl":"A11","wc":"I11","wv":45.414,"vh":"E20","vc":"E21","vv":0.3,"cwh":"D20","cwc":"D21","cwv":0.735,"szh":"C20","szc":"C21","szv":"4150×600×60","rc":"I","rr":[6,7,8,9],"rv":[15.307,11.879,10.592,7.636],"ah":14,"av":[["A01-50","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-50","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-50","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet51_Acc":"A15:I18","T_Sheet51_Con":"A21:I22","T_Sheet51_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet52":{"wl":"A11","wc":"I11","wv":43.678,"vh":"E20","vc":"E21","vv":0.296,"cwh":"D20","cwc":"D21","cwv":0.725,"szh":"C20","szc":"C21","szv":"4287×600×70","rc":"I","rr":[6,7,8,9],"rv":[13.969,11.994,8.867,8.848],"ah":14,"av":[["A01-51","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-51","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-51","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet52_Acc":"A15:I18","T_Sheet52_Con":"A21:I22","T_Sheet52_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet53":{"wl":"A11","wc":"I11","wv":46.966,"vh":"E20","vc":"E21","vv":0.319,"cwh":"D20","cwc":"D21","cwv":0.782,"szh":"C20","szc":"C21","szv":"4424×600×60","rc":"I","rr":[6,7,8,9],"rv":[16.605,11.262,10.811,8.288],"ah":14,"av":[["A01-52","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-52","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-52","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet53_Acc":"A15:I18","T_Sheet53_Con":"A21:I22","T_Sheet53_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet54":{"wl":"A11","wc":"I11","wv":48.262,"vh":"E20","vc":"E21","vv":0.317,"cwh":"D20","cwc":"D21","cwv":0.777,"szh":"C20","szc":"C21","szv":"961×600×60","rc":"I","rr":[6,7,8,9],"rv":[15.632,13.609,10.083,8.938],"ah":14,"av":[["A01-53","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-53","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-53","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet54_Acc":"A15:I18","T_Sheet54_Con":"A21:I22","T_Sheet54_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet55":{"wl":"A11","wc":"I11","wv":48.262,"vh":"E20","vc":"E21","vv":0.317,"cwh":"D20","cwc":"D21","cwv":0.777,"szh":"C20","szc":"C21","szv":"1098×600×70","rc":"I","rr":[6,7,8,9],"rv":[17.032,11.916,10.722,8.592],"ah":14,"av":[["A01-54","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-54","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-54","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet55_Acc":"A15:I18","T_Sheet55_Con":"A21:I22","T_Sheet55_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet56":{"wl":"A11","wc":"I11","wv":46.966,"vh":"E20","vc":"E21","vv":0.319,"cwh":"D20","cwc":"D21","cwv":0.782,"szh":"C20","szc":"C21","szv":"1235×600×60","rc":"I","rr":[6,7,8,9],"rv":[14.405,14.009,9.385,9.167],"ah":14,"av":[["A01-55","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-55","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-55","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet56_Acc":"A15:I18","T_Sheet56_Con":"A21:I22","T_Sheet56_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet57":{"wl":"A11","wc":"I11","wv":46.985,"vh":"E20","vc":"E21","vv":0.322,"cwh":"D20","cwc":"D21","cwv":0.789,"szh":"C20","szc":"C21","szv":"1372×600×60","rc":"I","rr":[6,7,8,9],"rv":[16.307,12.464,9.95,8.264],"ah":14,"av":[["A01-56","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-56","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-56","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet57_Acc":"A15:I18","T_Sheet57_Con":"A21:I22","T_Sheet57_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet58":{"wl":"A11","wc":"I11","wv":48.691,"vh":"E20","vc":"E21","vv":0.323,"cwh":"D20","cwc":"D21","cwv":0.791,"szh":"C20","szc":"C21","szv":"1509×600×70","rc":"I","rr":[6,7,8,9],"rv":[15.508,14.115,9.798,9.27],"ah":14,"av":[["A01-57","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-57","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-57","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet58_Acc":"A15:I18","T_Sheet58_Con":"A21:I22","T_Sheet58_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet59":{"wl":"A11","wc":"I11","wv":48.691,"vh":"E20","vc":"E21","vv":0.323,"cwh":"D20","cwc":"D21","cwv":0.791,"szh":"C20","szc":"C21","szv":"1646×600×60","rc":"I","rr":[6,7,8,9],"rv":[15.945,12.017,10.882,9.847],"ah":14,"av":[["A01-58","定位垫块","PVC-25","PVC",10,"控制保护层","资料齐全","施工组",null],["B02-58","预埋套管","DN20-L120","镀锌钢","2","现场穿线预留","复核通过","材料组","列1"],["C03-58","识别铭牌","QP-40×60","铝合金",2,"构件扫码登记","待进场复核","质检组",null]],"tb":{"T_Sheet59_Acc":"A15:I18","T_Sheet59_Con":"A21:I22","T_Sheet59_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet60":{"wl":"A11","wc":"I11","wv":47.047,"vh":"E20","vc":"E21","vv":0.32,"cwh":"D20","cwc":"D21","cwv":0.784,"szh":"C20","szc":"C21","szv":"1783×600×60","rc":"I","rr":[6,7,8,9],"rv":[14.637,13.82,11.522,7.068],"ah":14,"av":[["A01-59","定位垫块","PVC-25","PVC",8,"控制保护层","复核通过","材料组",null],["B02-59","预埋套管","DN20-L120","镀锌钢","3","现场穿线预留","待进场复核","质检组","列1"],["C03-59","识别铭牌","QP-40×60","铝合金",3,"构件扫码登记","资料齐全","施工组",null]],"tb":{"T_Sheet60_Acc":"A15:I18","T_Sheet60_Con":"A21:I22","T_Sheet60_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]},"Sheet61":{"wl":"A11","wc":"I11","wv":56.682,"vh":"E20","vc":"E21","vv":0.393,"cwh":"D20","cwc":"D21","cwv":0.963,"szh":"C20","szc":"C21","szv":"1920×600×70","rc":"I","rr":[6,7,8,9],"rv":[18.096,15.607,11.702,11.277],"ah":14,"av":[["A01-60","定位垫块","PVC-25","PVC",9,"控制保护层","待进场复核","质检组",null],["B02-60","预埋套管","DN20-L120","镀锌钢","4","现场穿线预留","资料齐全","施工组","列1"],["C03-60","识别铭牌","QP-40×60","铝合金",1,"构件扫码登记","复核通过","材料组",null]],"tb":{"T_Sheet61_Acc":"A15:I18","T_Sheet61_Con":"A21:I22","T_Sheet61_Rebar":"A7:I12"},"mg":["A11:H11","A13:I13","A19:I19","A1:I1","A4:I4"]}},"SUB_DIMS":{"Sheet1":[24,9],"Sheet2":[23,9],"Sheet3":[26,9],"Sheet4":[23,9],"Sheet5":[27,9],"Sheet6":[26,9],"Sheet7":[26,10],"Sheet8":[26,9],"Sheet9":[26,9],"Sheet10":[26,9],"Sheet12":[26,9],"Sheet13":[26,9],"Sheet14":[26,9],"Sheet15":[26,9],"Sheet16":[26,9],"Sheet17":[26,9],"Sheet18":[26,9],"Sheet19":[26,9],"Sheet20":[26,9],"Sheet21":[26,9],"Sheet22":[26,9],"Sheet23":[26,9],"Sheet24":[26,9],"Sheet25":[26,9],"Sheet26":[26,9],"Sheet27":[26,9],"Sheet28":[26,9],"Sheet29":[26,9],"Sheet30":[26,9],"Sheet31":[26,9],"Sheet32":[26,9],"Sheet33":[26,9],"Sheet34":[26,9],"Sheet35":[26,9],"Sheet36":[26,9],"Sheet37":[26,9],"Sheet38":[26,9],"Sheet39":[26,9],"Sheet40":[21,10],"Sheet41":[26,9],"Sheet42":[27,9],"Sheet43":[27,9],"Sheet44":[27,9],"Sheet45":[27,9],"Sheet46":[27,9],"Sheet47":[27,9],"Sheet48":[27,9],"Sheet49":[27,9],"Sheet50":[27,9],"Sheet51":[27,9],"Sheet52":[27,9],"Sheet53":[27,9],"Sheet54":[27,9],"Sheet55":[27,9],"Sheet56":[27,9],"Sheet57":[27,9],"Sheet58":[27,9],"Sheet59":[27,9],"Sheet60":[27,9],"Sheet61":[27,9]}}"""
+
+# 基准数据反解：
+#   SUMMARY_ROWS[行] = [序号, 构件分区, 子表, 新构件编号, 楼层/部位, 含量(kg/m³)]
+#   GT_VOLUME[行] / GT_WEIGHT[行] = 该行应取到的砼体积 / 总重量合计
+#   SUB_BASE[子表] = {wl 合计标签格, wc 合计数值格, wv 合计数值,
+#                     vh/vc/vv 砼体积标题格/数值格/数值, cwh/cwc/cwv 砼重量(t),
+#                     szh/szc/szv 构件尺寸, rc/rr/rv 第一节重量(kg)列/行/值,
+#                     ah 附件表头行, av 附件三行内容, tb 智能表格, mg 合并区域}
+_B = json.loads(_BASELINE_JSON)
+SUMMARY_ROWS = dict((int(k), v) for k, v in _B['SUMMARY_ROWS'].items())
+GT_VOLUME = dict((int(k), v) for k, v in _B['GT_VOLUME'].items())
+GT_WEIGHT = dict((int(k), v) for k, v in _B['GT_WEIGHT'].items())
+SUMMARY_WIDTHS = _B['SUMMARY_WIDTHS']
+SUMMARY_ROW_HEIGHTS = dict((int(k), v) for k, v in _B['SUMMARY_ROW_HEIGHTS'].items())
+SUMMARY_MERGED = _B['SUMMARY_MERGED']
+SUB_WIDTHS = _B['SUB_WIDTHS']
+SUB_BASE = _B['SUB_BASE']
+# 各子表既有的已用区域范围 {子表: [最大行, 最大列]}，用于识别新增的辅助行/辅助列
+SUB_DIMS = _B['SUB_DIMS']
 
 
-def _find_target_file(dir_path: str) -> str | None:
-    """在脚本所在目录中定位待评估的 Excel 文档。
+# 常规结构行分组：D 列体积 / 第 10 行合计 共 35 行；E 列体积 / 第 11 行合计 共 21 行
+GROUP_REGULAR = [5] + list(range(8, 41)) + [42]
+GROUP_SHIFTED = [7] + list(range(43, 63))
+assert len(GROUP_REGULAR) == 35 and len(GROUP_SHIFTED) == 21
 
-    - 忽略 Office 打开时产生的锁定文件（以 "~$" 开头）；
-    - 若同目录存在多个 xls/xlsx/xlsm 文件，优先选择文件名包含 "完成版" 的文件，
-      否则取按名称排序后的第一个。
-    """
-    if not os.path.isdir(dir_path):
+def _norm(value):
+    """单元格文本归一化：去首尾空白、去内部空格，便于与既有文字比对。"""
+    if value is None:
+        return ''
+    return str(value).strip().replace(' ', '').replace('　', '')
+
+
+def _is_num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _num_eq(a, b, tol=1e-6):
+    return _is_num(a) and _is_num(b) and abs(float(a) - float(b)) <= tol
+
+
+def _is_formula(value):
+    return isinstance(value, str) and value.startswith('=')
+
+
+def _is_error_text(value):
+    return isinstance(value, str) and value.strip().upper() in ERROR_TEXTS
+
+
+def _direct_ref(formula):
+    """从 ='Sheet1'!H19 / =Sheet1!$H$19 这类直接跨表引用中取出 (工作表名, 单元格)；
+    非直接引用（含 SUM/INDEX/INDIRECT 等）返回 None，交由缓存值处理。"""
+    if not _is_formula(formula):
         return None
-    candidates: list[str] = []
-    for name in sorted(os.listdir(dir_path)):
-        if name.startswith("~$"):
-            continue
-        ext = os.path.splitext(name)[1].lower()
-        if ext in SUPPORTED_EXTS:
-            candidates.append(os.path.join(dir_path, name))
-    if not candidates:
+    m = re.fullmatch(r"=\s*'?([^'=!]+)'?!\$?([A-Za-z]{1,3})\$?(\d+)\s*", formula.strip())
+    if not m:
         return None
-    for path in candidates:
-        if "完成版" in os.path.basename(path):
-            return path
-    return candidates[0]
+    return m.group(1), '%s%s' % (m.group(2).upper(), m.group(3))
 
 
-def _check_result_to_item(result: CheckResult) -> dict[str, Any]:
-    return {
-        "rule": scoring_text(result.label),
-        "max_delta": result.score,
-        "delta": result.score if result.passed else 0,
-        "hit": result.passed,
-        "detail": "",
-    }
+def _effective(ws_f, ws_v, coord, wb_f):
+    """取单元格"在表格软件里显示出来"的值：常量直接返回；公式优先用缓存值，
+    缓存值缺失（工作簿从未被表格软件重算过）时再按直接引用自行取源单元格。"""
+    raw = ws_f[coord].value
+    if not _is_formula(raw):
+        return raw
+    cached = ws_v[coord].value
+    if cached is not None and not _is_error_text(cached):
+        return cached
+    ref = _direct_ref(raw)
+    if ref and ref[0] in wb_f.sheetnames:
+        return wb_f[ref[0]][ref[1]].value
+    return cached
 
 
-def evaluate(dir_path: str) -> dict[str, Any]:
-    """统一入口：接收脚本所在目录路径，返回结构化评分字典。
+def _rgb(color):
+    """取颜色对象"显示出来的那个颜色"——只保留后 6 位 RGB，忽略 alpha 位写法差异
+    （FF203864 与 203864 都归一为 203864）；主题色/索引色等无 rgb 时返回 ''。"""
+    if color is None:
+        return ''
+    rgb = getattr(color, 'rgb', None)
+    if not isinstance(rgb, str) or len(rgb) < 6:
+        return ''
+    return rgb[-6:].upper()
 
-    脚本自行在 dir_path 目录中定位并打开被评估的 Excel 文档；调用方无需再传
-    文档文件名。返回结构遵循《脚本接口差异与统一建议.md》§2.2。
-    """
-    report: dict[str, Any] = {
+
+def _table_map(ws):
+    """工作表内智能表格对象：{名称: 引用区域}。"""
+    return dict((name, ws.tables[name].ref) for name in ws.tables)
+
+
+def _merged_list(ws):
+    return sorted(str(rng) for rng in ws.merged_cells.ranges)
+
+
+def _open_workbooks(file_path):
+    """同时打开"公式视图"与"缓存值视图"两份工作簿。"""
+    wb_f = openpyxl.load_workbook(file_path, data_only=False)
+    wb_v = openpyxl.load_workbook(file_path, data_only=True)
+    return wb_f, wb_v
+
+
+def evaluate(dir_path):
+    """按 §2.2 约定，返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估的
+    工作簿（忽略以 ~$ 开头的表格软件临时锁文件）。目录不存在或目录内没有工作簿时，
+    返回"未找到文件"的空结果（各评分字段留空/归零）；其余脚本自身崩溃由通用兜底
+    捕获并返回 status='error'。"""
+    result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
@@ -595,51 +222,555 @@ def evaluate(dir_path: str) -> dict[str, Any]:
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": MAX_SCORE,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        target = _find_target_file(dir_path)
-        if target is None:
-            report["status"] = "error"
-            report["error"] = f"目录 {dir_path!r} 中未找到 xlsx或.xlsm 文件"
-            return report
-        report["file_name"] = os.path.basename(target)
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError('目录不存在或不是目录：%s' % dir_path)
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith(SUPPORTED_EXTS) and not f.startswith('~$')
+            and os.path.isfile(os.path.join(dir_path, f))
+        )
+        if not cands:
+            raise FileNotFoundError('目录中未找到 .xlsx 文件：%s' % dir_path)
+        # 目录内有多个工作簿时优先取文件名含"完成/汇总"的那个，其余作为减分项证据
+        target = cands[0]
+        for name in cands:
+            if '完成' in name or '汇总' in name:
+                target = name
+                break
+        file_path = os.path.join(dir_path, target)
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, dir_path, result)
+    except FileNotFoundError as exc:
+        # 未找到待评文件：不进入维度判定，dim1_pass 留空，分值一并归零
+        result["file_name"] = ""
+        result["status"] = "error"
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = '脚本运行异常：%s: %s' % (type(exc).__name__, exc)
+        result["dim1_pass"] = False
+        result["dim1_reason"] = ('维度一未通过：文件无法打开或解析（%s: %s），完成度总分记 0'
+                                % (type(exc).__name__, exc))
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
 
-        ext = os.path.splitext(target)[1].lower()
-        if ext not in SUPPORTED_EXTS:
-            report["dim1_reason"] = f"D1-1 交付文件为xlsx或.xlsm格式，文件可正常打开：当前扩展名 {ext!r}"
-            return report
 
-        try:
-            wb_formula, wb_values = load_workbooks(target)
-        except Exception as exc:
-            report["dim1_reason"] = f"D1-1 交付文件为xlsx或.xlsm格式，文件可正常打开：打开失败：{exc}"
-            return report
+def _evaluate_impl(file_path, dir_path, result):
+    """维度一 + 维度二的评估主体；内部按顺序构造 results / details 两个列表，
+    末尾按 _MAX_DELTAS_ORDER 反解成结构化 dim2_items 填入 result。"""
+    wb_f, wb_v = _open_workbooks(file_path)
+    results = []
+    details = []
 
-        d1_results = dimension1_checks(target, wb_formula, wb_values)
-        if not all(r.passed for r in d1_results):
-            fails = [
-                r.label + (f"（{r.detail}）" if r.detail else "")
-                for r in d1_results
-                if not r.passed
-            ]
-            report["dim1_reason"] = "; ".join(fails)
-            return report
+    def add(hit, max_delta, rule, detail=''):
+        """追加一条评分项：加分项命中记 +max_delta，减分项命中记 -|max_delta|。"""
+        sign = '+' if max_delta > 0 else '-'
+        results.append('%s%d：%s' % (sign, abs(max_delta) if hit else 0, rule))
+        details.append(detail)
 
-        report["dim1_pass"] = True
-        d2_results = dimension2_checks(wb_formula, wb_values)
-        items = [_check_result_to_item(r) for r in d2_results]
-        report["dim2_items"] = items
-        report["total_score"] = sum(item["delta"] for item in items)
-        return report
-    except Exception as exc:  # 兜底：任何未预期异常都归为 status=error
-        report["status"] = "error"
-        report["error"] = f"{type(exc).__name__}: {exc}"
-        return report
+    # ========== 维度1：可用与可修改性 ==========
+    d1_fail = []
+    if SUMMARY_SHEET not in wb_f.sheetnames:
+        d1_fail.append('未找到"汇总"工作表')
+        ws_f = ws_v = None
+    else:
+        ws_f = wb_f[SUMMARY_SHEET]
+        ws_v = wb_v[SUMMARY_SHEET]
+    missing_child = [s for s in CHILD_SHEETS if s not in wb_f.sheetnames]
+    if len(missing_child) > 5:
+        d1_fail.append('子表大量丢失：缺少 %d 张（如 %s）' % (len(missing_child), '、'.join(missing_child[:5])))
+    if ws_f is not None:
+        if ws_f.max_row < 62 or ws_f.max_column < 9:
+            d1_fail.append('汇总表行列结构不足 62 行 9 列（实为 %d 行 %d 列）'
+                           % (ws_f.max_row, ws_f.max_column))
+        else:
+            seq_bad = [r for r in range(3, 63) if not _num_eq(ws_f.cell(r, 1).value, r - 2)]
+            if seq_bad:
+                d1_fail.append('汇总表 A 列序号 1~60 错行/缺失，共 %d 行不符（如第 %s 行）'
+                               % (len(seq_bad), '、'.join(str(x) for x in seq_bad[:5])))
+            name_bad = [r for r in range(3, 63)
+                        if _norm(ws_f.cell(r, 3).value) != _norm(SUMMARY_ROWS[r][2])]
+            if len(name_bad) > 5:
+                d1_fail.append('汇总表 C 列子表名大面积串列/丢失，共 %d 行不符' % len(name_bad))
+            err_cells = [ws_f.cell(r, c).coordinate for r in range(3, 63) for c in (6, 7)
+                         if _is_error_text(_effective(ws_f, ws_v, ws_f.cell(r, c).coordinate, wb_f))
+                         or _is_error_text(ws_f.cell(r, c).value)]
+            if len(err_cells) > 12:
+                d1_fail.append('F/G 列大面积错误值，共 %d 个（如 %s）'
+                               % (len(err_cells), '、'.join(err_cells[:5])))
+    if d1_fail:
+        result["dim1_pass"] = False
+        # dim1_reason 统一带上「维度一未通过：…」前缀与计分后果，便于直接作为错误摘要展示
+        result["dim1_reason"] = '维度一未通过：%s，完成度总分记 0' % '；'.join(d1_fail)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+    result["dim1_pass"] = True
+    result["dim1_reason"] = '工作簿可正常打开，工作表齐全，汇总表为 62 行 9 列结构，F/G 列无大面积错误值'
+
+    # ========== 维度2：完成度评分 ==========
+    # F、G 两列一律按"在表格软件中显示出来的值"判定：写死数值直接取，写跨表引用
+    # 公式则取缓存值、缓存值缺失时按直接引用回源，二者均视为达标写法。
+    vol = dict((r, _effective(ws_f, ws_v, 'F%d' % r, wb_f)) for r in range(3, 63))
+    wgt = dict((r, _effective(ws_f, ws_v, 'G%d' % r, wb_f)) for r in range(3, 63))
+
+    def _hit_rows(rows, got, table):
+        """返回 rows 中取值不等于基准的行号列表（容差 5e-4，兼容 3 位小数）。"""
+        return [r for r in rows if not _num_eq(got[r], table[r], 5e-4)]
+
+    def _fmt(rows):
+        return '、'.join('第%d行' % r for r in rows[:6]) + ('……' if len(rows) > 6 else '')
+
+    # —— 加分项 01~06：砼体积(m³) 列（汇总表 F3:F62）——
+    for row, delta, note in ((3, 5, '该行来源子表的体积列标题带有多余后缀、且体积数值位于第三节表格的 H 列，需按语义而非固定列号定位'),
+                             (4, 3, '该行来源子表的体积数值位于第三节表格的 E 列，节标题位于第 18 行'),
+                             (6, 3, '该行来源子表的体积数值位于第三节表格的 B 列，即紧邻构件类型右侧'),
+                             (41, 5, '该行来源子表的体积数值位于第三节表格的 F 列，且该子表整体结构上移、表格列数扩展至 J 列')):
+        good = _num_eq(vol[row], GT_VOLUME[row], 5e-4)
+        add(good, delta, 'F%d = %s（%s）' % (row, GT_VOLUME[row], note),
+            '' if good else 'F%d 实为 %r，应为 %s' % (row, vol[row], GT_VOLUME[row]))
+
+    miss = _hit_rows(GROUP_REGULAR, vol, GT_VOLUME)
+    add(not miss, 3, 'F5、F8:F12、F13:F40、F42 共 35 行取值全部正确（体积数值位于第三节表格 D 列的常规结构，'
+                     '如 F19 = %s、F38 = %s）' % (GT_VOLUME[19], GT_VOLUME[38]),
+        '' if not miss else '%d 行不符：%s' % (len(miss), _fmt(miss)))
+    miss = _hit_rows(GROUP_SHIFTED, vol, GT_VOLUME)
+    add(not miss, 3, 'F7、F43:F62 共 21 行取值全部正确（体积数值位于第三节表格 E 列、且节标题下移两行的结构，'
+                     '如 F43 = %s、F62 = %s）' % (GT_VOLUME[43], GT_VOLUME[62]),
+        '' if not miss else '%d 行不符：%s' % (len(miss), _fmt(miss)))
+
+    # —— 加分项 07~12：总重量合计(kg) 列（汇总表 G3:G62）——
+    for row, delta, note in ((3, 5, '该行来源子表未设合计行，合计标签与数值位于第 2 行构件信息区'),
+                             (4, 5, '该行来源子表的合计标签位于合并行右端 I 列、数值反向位于左端 A 列'),
+                             (6, 3, '该行来源子表的合计数值紧邻标签右侧 B 列，而非行末'),
+                             (41, 5, '该行来源子表的合计以配筋表新增列的列标题 + 其下方纵向数值形式给出')):
+        good = _num_eq(wgt[row], GT_WEIGHT[row], 5e-4)
+        add(good, delta, 'G%d = %s（%s）' % (row, GT_WEIGHT[row], note),
+            '' if good else 'G%d 实为 %r，应为 %s' % (row, wgt[row], GT_WEIGHT[row]))
+
+    miss = _hit_rows(GROUP_REGULAR, wgt, GT_WEIGHT)
+    add(not miss, 3, 'G5、G8:G40、G42 共 35 行取值全部正确（合计标签位于第 10 行行首、数值位于同行 I 列的常规结构，'
+                     '如 G19 = %s、G39 = %s）' % (GT_WEIGHT[19], GT_WEIGHT[39]),
+        '' if not miss else '%d 行不符：%s' % (len(miss), _fmt(miss)))
+    miss = _hit_rows(GROUP_SHIFTED, wgt, GT_WEIGHT)
+    add(not miss, 3, 'G7、G43:G62 共 21 行取值全部正确（合计行下移至第 11 行、数值位于同行 I 列的结构，'
+                     '如 G43 = %s、G62 = %s）' % (GT_WEIGHT[43], GT_WEIGHT[62]),
+        '' if not miss else '%d 行不符：%s' % (len(miss), _fmt(miss)))
+
+    # —— 加分项 13~18：整体完成质量 ——
+    # 13：120 个单元格全部有值，无空单元格、无错误值、无"待补充/N/A"之类占位文字
+    blanks, errs, holders = [], [], []
+    for r in range(3, 63):
+        for col, got in (('F', vol[r]), ('G', wgt[r])):
+            coord = '%s%d' % (col, r)
+            raw = ws_f[coord].value
+            if got is None or (isinstance(got, str) and not got.strip()):
+                blanks.append(coord)
+            elif _is_error_text(got) or _is_error_text(raw):
+                errs.append(coord)
+            elif isinstance(got, str) and any(p in got.upper() for p in PLACEHOLDER_TEXTS):
+                holders.append(coord)
+    good = not (blanks or errs or holders)
+    add(good, 5, 'F3:F62 与 G3:G62 共 120 个单元格全部有值，无空单元格、无错误值、'
+                 '无"待补充/N/A"之类占位文字',
+        '' if good else '空 %d 个、错误值 %d 个、占位文字 %d 个（如 %s）'
+        % (len(blanks), len(errs), len(holders), '、'.join((blanks + errs + holders)[:5])))
+
+    # 14：抽查 10 行，G÷F 保留两位后与同行 H 列"含量(kg/m³)"既有数值一致
+    shift_bad = []
+    for r in SPOT_ROWS:
+        base_h = SUMMARY_ROWS[r][5]
+        if not (_is_num(vol[r]) and _is_num(wgt[r])) or not vol[r]:
+            shift_bad.append(r)
+        elif not _num_eq(round(float(wgt[r]) / float(vol[r]), 2), base_h, 5e-3):
+            shift_bad.append(r)
+    add(not shift_bad, 3, '抽查任意 10 行，G 列数值 ÷ F 列数值并保留两位小数后与同行 H 列'
+                          '"含量(kg/m³)"数值一致（证明两列取数互相匹配、未发生行错位）',
+        '' if not shift_bad else '%d 行不匹配：%s' % (len(shift_bad), _fmt(shift_bad)))
+
+    # 15：F、G 列结果为 3 位小数数值形式（数值本身在 3 位小数内可精确表示）
+    not3 = [('%s%d' % (col, r)) for r in range(3, 63) for col, got in (('F', vol[r]), ('G', wgt[r]))
+            if not (_is_num(got) and abs(float(got) - round(float(got), 3)) < 1e-9)]
+    add(not not3, 1, 'F 列结果为 3 位小数数值形式（如 %s、%s、%s），G 列结果为 3 位小数数值形式'
+                     '（如 %s、%s、%s）' % (GT_VOLUME[3], GT_VOLUME[19], GT_VOLUME[41],
+                                          GT_WEIGHT[3], GT_WEIGHT[19], GT_WEIGHT[62]),
+        '' if not not3 else '%d 个单元格非 3 位小数数值：%s' % (len(not3), '、'.join(not3[:5])))
+
+    # 16：写入的是数值或可正常求值的公式，而非文本型数字
+    as_text = []
+    for r in range(3, 63):
+        for col, got in (('F', vol[r]), ('G', wgt[r])):
+            coord = '%s%d' % (col, r)
+            raw = ws_f[coord].value
+            if raw is None:
+                as_text.append(coord)
+            elif isinstance(raw, str) and not _is_formula(raw):
+                as_text.append(coord)
+            elif _is_formula(raw) and not _is_num(got):
+                as_text.append(coord)
+    add(not as_text, 1, 'F、G 列写入的是数值或可正常求值的公式，而非文本型数字'
+                        '（单元格不出现前导单引号、不出现左对齐的文本数字）',
+        '' if not as_text else '%d 个单元格为空、为文本或公式无法求值：%s'
+        % (len(as_text), '、'.join(as_text[:5])))
+
+    # —— 减分项 17~20：汇总表中不应改动的列 ——
+    # 17：H3:H62"含量(kg/m³)"显示出来的数值应与各行既有的两位小数数值一致。
+    #     只判定"数据对不对"：单元格里是写死数值还是公式一律不论，按求值结果
+    #     保留两位小数后比对，一致即视为未被破坏。
+    h_bad = []
+    for r in range(3, 63):
+        eff = _effective(ws_f, ws_v, 'H%d' % r, wb_f)
+        if not _is_num(eff) or not _num_eq(round(float(eff), 2), SUMMARY_ROWS[r][5], 5e-9):
+            h_bad.append('H%d' % r)
+    add(bool(h_bad), -3, '汇总表 H3:H62"含量(kg/m³)"显示出来的数值不再是各行既有的两位小数数值'
+                         '（依次为 %s、%s、%s、%s …… %s、%s、%s），即被清空、被改为其他数值或被重算为不同结果'
+                         '（单元格里是写死数值还是公式不论，只要显示结果与既有数值一致即不扣分）'
+        % (SUMMARY_ROWS[3][5], SUMMARY_ROWS[4][5], SUMMARY_ROWS[5][5], SUMMARY_ROWS[6][5],
+           SUMMARY_ROWS[60][5], SUMMARY_ROWS[61][5], SUMMARY_ROWS[62][5]),
+        '' if not h_bad else '%d 个单元格与既有数值不一致：%s（H3 求值结果为 %r）'
+        % (len(h_bad), '、'.join(h_bad[:5]), _effective(ws_f, ws_v, 'H3', wb_f)))
+
+    # 18：A 列序号、B 列构件分区、D 列新构件编号、E 列楼层/部位、I 列备注（空）
+    #     C 列子表名单列成项（见 19），此处不重复判定。
+    col_bad = []
+    for r in range(3, 63):
+        for idx, col in ((0, 1), (1, 2), (3, 4), (4, 5)):
+            if _norm(ws_f.cell(r, col).value) != _norm(SUMMARY_ROWS[r][idx]):
+                col_bad.append(ws_f.cell(r, col).coordinate)
+        if _norm(ws_f.cell(r, 9).value) != '':
+            col_bad.append(ws_f.cell(r, 9).coordinate)
+    add(bool(col_bad), -1, '汇总表 A3:A62 序号 1~60、B 列构件分区（A区标准段/B区转换段/C区机电段/D区装配段/'
+                           'E区加强段循环）、D 列新构件编号 PC-GZ-001~PC-GZ-060、E 列楼层/部位、'
+                           'I 列备注（保持为空）中任一列内容被改动',
+        '' if not col_bad else '%d 个单元格被改动：%s' % (len(col_bad), '、'.join(col_bad[:6])))
+
+    # 19：C 列 60 行子表名应依次为 Sheet1~Sheet10、Sheet12~Sheet61（缺号 Sheet11 不补），
+    #     即与各行实际取数来源工作表一一对应，不因工作表编号中断而整体错行。
+    map_bad = []
+    for r in range(3, 63):
+        want = _norm(SUMMARY_ROWS[r][2])
+        if _norm(ws_f.cell(r, 3).value) != want:
+            map_bad.append('C%d 实为 %r（应为 %s）' % (r, ws_f.cell(r, 3).value, want))
+    add(bool(map_bad), -1, '汇总表 C 列 60 行子表名不再依次为 Sheet1~Sheet10、Sheet12~Sheet61，'
+                           '即与各行实际取数来源工作表不再一一对应（如第 13 行不再是 Sheet12、'
+                           '第 41 行不再是 Sheet40，或补上缺号 Sheet11 使整体错行）',
+        '' if not map_bad else '%d 处不符：%s' % (len(map_bad), '；'.join(map_bad[:4])))
+
+    # 20：第 1 行标题文字与 A1:I1 合并区域、第 2 行 9 个表头文字
+    head_bad = []
+    if _norm(ws_f['A1'].value) != _norm(SUMMARY_TITLE):
+        head_bad.append('A1 标题实为 %r' % ws_f['A1'].value)
+    if 'A1:I1' not in _merged_list(ws_f):
+        head_bad.append('A1:I1 合并区域缺失')
+    for i, want in enumerate(SUMMARY_HEADERS):
+        got = ws_f.cell(2, i + 1).value
+        if _norm(got) != _norm(want):
+            head_bad.append('%s 实为 %r' % (ws_f.cell(2, i + 1).coordinate, got))
+    add(bool(head_bad), -1, '汇总表第 1 行标题文字"%s"或 A1:I1 合并区域被改动，或第 2 行 9 个表头文字'
+                            '（%s）被改写' % (SUMMARY_TITLE, '/'.join(SUMMARY_HEADERS)),
+        '' if not head_bad else '；'.join(head_bad[:4]))
+
+    # —— 减分项 21~27：子表内容（应原样保留，仅作为取数来源）——
+    present = [s for s in CHILD_SHEETS if s in wb_f.sheetnames]
+
+    # 21：任一子表"总重量合计"数值被改写、清空或替换为引用公式
+    w_bad = []
+    for s in present:
+        b = SUB_BASE[s]
+        cell = wb_f[s][b['wc']]
+        if _is_formula(cell.value) or not _num_eq(cell.value, b['wv'], 5e-9):
+            w_bad.append('%s!%s' % (s, b['wc']))
+        if _norm(wb_f[s][b['wl']].value) != '总重量合计':
+            w_bad.append('%s!%s(标签)' % (s, b['wl']))
+    add(bool(w_bad), -3, '任一子表中的"总重量合计"数值（%s、%s、%s …… %s、%s）被改写、清空或替换为引用公式'
+        % (SUB_BASE['Sheet1']['wv'], SUB_BASE['Sheet2']['wv'], SUB_BASE['Sheet3']['wv'],
+           SUB_BASE['Sheet60']['wv'], SUB_BASE['Sheet61']['wv']),
+        '' if not w_bad else '%d 处被改动：%s' % (len(w_bad), '、'.join(w_bad[:5])))
+
+    # 22：任一子表第三节的砼体积、砼重量(t)、构件尺寸，或第一节配筋明细重量(kg) 列被改写、清空
+    c_bad = []
+    for s in present:
+        b, wsx = SUB_BASE[s], wb_f[s]
+        for key in ('v', 'cw'):
+            cell = wsx[b[key + 'c']]
+            if _is_formula(cell.value) or not _num_eq(cell.value, b[key + 'v'], 5e-9):
+                c_bad.append('%s!%s' % (s, b[key + 'c']))
+        if _norm(wsx[b['szc']].value) != _norm(b['szv']):
+            c_bad.append('%s!%s' % (s, b['szc']))
+        for row, want in zip(b['rr'], b['rv']):
+            cell = wsx['%s%d' % (b['rc'], row)]
+            if _is_formula(cell.value) or not _num_eq(cell.value, want, 5e-9):
+                c_bad.append('%s!%s%d' % (s, b['rc'], row))
+    add(bool(c_bad), -3, '任一子表第三节的砼体积数值、砼重量(t)、构件尺寸，或第一节配筋明细的重量(kg) '
+                         '列数值被改写、清空',
+        '' if not c_bad else '%d 处被改动：%s' % (len(c_bad), '、'.join(c_bad[:5])))
+
+    # 23：任一子表第二节"附件配置清单"条目（定位垫块/预埋套管/识别铭牌等）被删除或改写
+    a_bad = []
+    for s in present:
+        b, wsx = SUB_BASE[s], wb_f[s]
+        for k, want_row in enumerate(b['av']):
+            for c, want in enumerate(want_row):
+                cell = wsx.cell(b['ah'] + 1 + k, c + 1)
+                if _norm(cell.value) != _norm(want):
+                    a_bad.append('%s!%s' % (s, cell.coordinate))
+    add(bool(a_bad), -3, '任一子表的第二节"附件配置清单"条目（定位垫块/预埋套管/识别铭牌等）被删除或改写',
+        '' if not a_bad else '%d 处被改动：%s' % (len(a_bad), '、'.join(a_bad[:5])))
+
+    # 24：全簿 178 个智能表格对象数量减少，或其引用区域被改变
+    tbl_total = sum(len(_table_map(wb_f[s])) for s in wb_f.sheetnames)
+    tbl_bad = []
+    for s in present:
+        got, want = _table_map(wb_f[s]), SUB_BASE[s]['tb']
+        for name, ref in want.items():
+            if name not in got:
+                tbl_bad.append('%s!%s 缺失' % (s, name))
+            elif str(got[name]).upper() != str(ref).upper():
+                tbl_bad.append('%s!%s 区域 %s→%s' % (s, name, ref, got[name]))
+    bad = bool(tbl_bad) or tbl_total != TOTAL_TABLES
+    add(bad, -3, '全簿 %d 个智能表格对象（命名为 T_Sheet编号_Rebar / T_Sheet编号_Acc / T_Sheet编号_Con）'
+                 '数量减少，或其引用区域被改变' % TOTAL_TABLES,
+        '' if not bad else '实为 %d 个；%s' % (tbl_total, '；'.join(tbl_bad[:4]) or '数量不符'))
+
+    # 25：智能表格对象的自动筛选被清除，或筛选范围与表格区域不一致。
+    #     只判定"显示出来的筛选还在不在、范围对不对"：筛选节点上的写库差异
+    #     （命名空间前缀、表格软件自有扩展属性等）不影响筛选的实际表现，不算改动。
+    af_bad = []
+    for s in present:
+        wsx = wb_f[s]
+        for name in wsx.tables:
+            tbl = wsx.tables[name]
+            af = getattr(tbl, 'autoFilter', None)
+            if af is None or not getattr(af, 'ref', None):
+                af_bad.append('%s!%s 无筛选' % (s, name))
+            elif str(af.ref).upper() != str(tbl.ref).upper():
+                af_bad.append('%s!%s 筛选范围 %s≠表格区域 %s' % (s, name, af.ref, tbl.ref))
+    add(bool(af_bad), -1, '智能表格对象的自动筛选被清除，或筛选范围与表格区域不一致',
+        '' if not af_bad else '筛选异常 %d 处：%s' % (len(af_bad), '；'.join(af_bad[:4])))
+
+    # 26：全簿 298 处合并单元格数量或范围发生改变
+    mg_total = sum(len(_merged_list(wb_f[s])) for s in wb_f.sheetnames)
+    mg_bad = []
+    if _merged_list(ws_f) != sorted(SUMMARY_MERGED):
+        mg_bad.append('汇总：%s' % _merged_list(ws_f))
+    for s in present:
+        got, want = _merged_list(wb_f[s]), sorted(SUB_BASE[s]['mg'])
+        if got != want:
+            mg_bad.append('%s：%s≠%s' % (s, got, want))
+    bad = bool(mg_bad) or mg_total != TOTAL_MERGED
+    add(bad, -1, '全簿 %d 处合并单元格（各子表 A1:I1 及三个节标题所在整行合并、含合计行的整行合并等）'
+                 '数量或范围发生改变' % TOTAL_MERGED,
+        '' if not bad else '实为 %d 处；%s' % (mg_total, '；'.join(mg_bad[:2]) or '数量不符'))
+
+    # 27：工作表数量不为 61 个，或工作表名称、排列顺序被改动
+    bad = (wb_f.sheetnames != EXPECTED_SHEETS)
+    extra = [s for s in wb_f.sheetnames if s not in EXPECTED_SHEETS]
+    add(bad, -1, '工作表数量不为 %d 个，或工作表名称、排列顺序被改动（新增空白工作表、补建缺号工作表、'
+                 '追加说明/日志工作表均计）' % len(EXPECTED_SHEETS),
+        '' if not bad else '实为 %d 个；新增 %s；缺失 %s'
+        % (len(wb_f.sheetnames), extra or '无', missing_child or '无'))
+
+    # —— 减分项 28~34：格式与外观 ——
+    # 28：标题、表头、数据区显示出来的字体色与填充色（只比对后 6 位 RGB，
+    #     8 位 ARGB 与 6 位 RGB 写法不论，全簿计一次）
+    argb_bad = []
+    if _rgb(ws_f['A1'].font.color) != TITLE_FONT_RGB:
+        argb_bad.append('A1 字体色 %s' % _rgb(ws_f['A1'].font.color))
+    if _rgb(ws_f['A1'].fill.fgColor) != TITLE_FILL_RGB:
+        argb_bad.append('A1 填充色 %s' % _rgb(ws_f['A1'].fill.fgColor))
+    for c in range(1, 10):
+        want = HEADER_FILL_B_RGB if 6 <= c <= 8 else HEADER_FILL_A_RGB
+        got = _rgb(ws_f.cell(2, c).fill.fgColor)
+        if got != want:
+            argb_bad.append('%s 填充色 %s' % (ws_f.cell(2, c).coordinate, got))
+    for r in range(3, 63):
+        want_fill = DATA_FILL_ODD_RGB if r % 2 else DATA_FILL_EVEN_RGB
+        for c in range(1, 10):
+            cell = ws_f.cell(r, c)
+            if _rgb(cell.font.color) != DATA_FONT_RGB:
+                argb_bad.append('%s 字体色 %s' % (cell.coordinate, _rgb(cell.font.color)))
+            if _rgb(cell.fill.fgColor) != want_fill:
+                argb_bad.append('%s 填充色 %s' % (cell.coordinate, _rgb(cell.fill.fgColor)))
+    add(bool(argb_bad), -1, '汇总表 A1 字体颜色不满足 RGB = %s、填充色不满足 RGB = %s，或表头行填充色 '
+                            '%s / %s、数据区字体色 %s 与隔行填充色 %s / %s 被改为其他颜色'
+                            '（只看显示出来的颜色，8 位 ARGB 与 6 位 RGB 写法不论；全簿计一次）'
+        % (TITLE_FONT_RGB, TITLE_FILL_RGB, HEADER_FILL_A_RGB, HEADER_FILL_B_RGB,
+           DATA_FONT_RGB, DATA_FILL_ODD_RGB, DATA_FILL_EVEN_RGB),
+        '' if not argb_bad else '%d 处不符：%s' % (len(argb_bad), '、'.join(argb_bad[:5])))
+
+    # 29：F、G 列数字格式应为 0.000，H 列应为 0.00
+    fmt_bad = []
+    for r in range(3, 63):
+        for c, want in ((6, '0.000'), (7, '0.000'), (8, '0.00')):
+            got = ws_f.cell(r, c).number_format
+            if got != want:
+                fmt_bad.append('%s=%s' % (ws_f.cell(r, c).coordinate, got))
+    add(bool(fmt_bad), -1, '汇总表 F、G 列数字格式不满足"0.000"，或 H 列数字格式不满足"0.00"',
+        '' if not fmt_bad else '%d 个单元格不符：%s' % (len(fmt_bad), '、'.join(fmt_bad[:5])))
+
+    # 30：数据区水平居中 + 垂直居中，四边细实线边框（thin）
+    al_bad = []
+    for r in range(3, 63):
+        for c in range(1, 10):
+            cell = ws_f.cell(r, c)
+            if cell.alignment.horizontal != 'center' or cell.alignment.vertical != 'center':
+                al_bad.append('%s 对齐 %s/%s' % (cell.coordinate, cell.alignment.horizontal,
+                                                cell.alignment.vertical))
+            if any(getattr(cell.border, side).style != 'thin'
+                   for side in ('left', 'right', 'top', 'bottom')):
+                al_bad.append('%s 边框缺失' % cell.coordinate)
+    add(bool(al_bad), -1, '汇总表数据区单元格对齐方式不满足水平居中 + 垂直居中，或四边细实线边框（thin）被去除',
+        '' if not al_bad else '%d 处不符：%s' % (len(al_bad), '、'.join(al_bad[:5])))
+
+    # 31：汇总表列宽与各子表列宽（浮点精度漂移不计，容差 0.05）
+    wd_bad = []
+    for col, want in SUMMARY_WIDTHS.items():
+        got = ws_f.column_dimensions[col].width
+        if got is None or abs(float(got) - float(want)) > WIDTH_TOL:
+            wd_bad.append('汇总!%s %s→%s' % (col, round(float(want), 2), got))
+    for s in present:
+        for col, want in SUB_WIDTHS[s].items():
+            got = wb_f[s].column_dimensions[col].width
+            if got is None or abs(float(got) - float(want)) > WIDTH_TOL:
+                wd_bad.append('%s!%s %s→%s' % (s, col, round(float(want), 2), got))
+    add(bool(wd_bad), -1, '汇总表列宽不满足 A=25.71、B=8.21、C=5.92、D=8.88、E=7.94、F=8.48、G=11.71、'
+                          'H=9.29、I=3.5，或任一子表列宽被自动调整'
+                          '（如某子表 A=13.34、B=14.51、C=21.68、E=12.51 等既有值被改变）',
+        '' if not wd_bad else '%d 列不符：%s' % (len(wd_bad), '、'.join(wd_bad[:5])))
+
+    # 32：汇总表行高，以及每张工作表的默认行高 13.5 / 默认列宽 9
+    ht_bad = []
+    for r, want in SUMMARY_ROW_HEIGHTS.items():
+        got = ws_f.row_dimensions[r].height
+        if got is None or abs(float(got) - float(want)) > HEIGHT_TOL:
+            ht_bad.append('汇总!第%d行 %s→%s' % (r, want, got))
+    for s in wb_f.sheetnames:
+        fmt = wb_f[s].sheet_format
+        if not _num_eq(fmt.defaultRowHeight, DEFAULT_ROW_HEIGHT, 1e-6):
+            ht_bad.append('%s 默认行高 %s' % (s, fmt.defaultRowHeight))
+        if not _num_eq(fmt.defaultColWidth, DEFAULT_COL_WIDTH, 1e-6):
+            ht_bad.append('%s 默认列宽 %s' % (s, fmt.defaultColWidth))
+    add(bool(ht_bad), -1, '汇总表行高不满足第 1 行 32、第 2 行 42、第 5 行 42、第 8 行 24、其余数据行 33 磅，'
+                          '或任一工作表默认行高不满足 13.5、默认列宽不满足 9',
+        '' if not ht_bad else '%d 处不符：%s' % (len(ht_bad), '、'.join(ht_bad[:5])))
+
+    # 33：任一工作表的网格线由隐藏状态被改为显示状态
+    grid_bad = [s for s in wb_f.sheetnames if wb_f[s].sheet_view.showGridLines is not False]
+    add(bool(grid_bad), -1, '任一工作表的网格线由隐藏状态被改为显示状态',
+        '' if not grid_bad else '%d 张工作表网格线可见：%s' % (len(grid_bad), '、'.join(grid_bad[:5])))
+
+    # 34：页边距、页面方向/纸张/打印区域
+    pg_bad = []
+    for s in wb_f.sheetnames:
+        wsx = wb_f[s]
+        pm = wsx.page_margins
+        got = (pm.left, pm.right, pm.top, pm.bottom, pm.header, pm.footer)
+        if any(g is None or abs(float(g) - w) > 1e-6 for g, w in zip(got, PAGE_MARGINS)):
+            pg_bad.append('%s 页边距 %s' % (s, got))
+        if wsx.page_setup.orientation not in (None, 'portrait'):
+            pg_bad.append('%s 页面方向 %s' % (s, wsx.page_setup.orientation))
+        if wsx.page_setup.paperSize not in (None, 9):
+            pg_bad.append('%s 纸张 %s' % (s, wsx.page_setup.paperSize))
+        if wsx.print_area:
+            pg_bad.append('%s 打印区域 %s' % (s, wsx.print_area))
+    add(bool(pg_bad), -1, '任一工作表的页边距不满足左右 0.7、上下 0.75、页眉页脚 0.3，'
+                          '或页面方向/纸张/打印区域被改动',
+        '' if not pg_bad else '%d 处不符：%s' % (len(pg_bad), '、'.join(pg_bad[:4])))
 
 
-if __name__ == "__main__":
-    # 仅用于本地调试：默认使用脚本所在目录，也可通过命令行参数指定其他目录。
-    debug_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    print(json.dumps(evaluate(debug_dir), ensure_ascii=False, indent=2))
+    # —— 减分项 35~37：交付物整洁度 ——
+    # 35：交付目录遗留脚本/临时表/中间产物/说明文件，或同一任务输出为多个工作簿
+    # 评测脚本自身（officeval_*_verifier.py）、表格软件锁文件与 __pycache__ 不计
+    leftovers, books = [], []
+    for name in sorted(os.listdir(dir_path)):
+        low = name.lower()
+        if name.startswith('~$') or low == '__pycache__':
+            continue
+        if re.match(r'^officeval_.*verifier\.py$', low):
+            continue
+        if low.endswith(SUPPORTED_EXTS):
+            books.append(name)
+            continue
+        leftovers.append(name)
+    if len(books) > 1:
+        leftovers.extend(books[1:])
+    add(bool(leftovers), -1, '交付目录中遗留脚本、临时表、中间产物或说明文件（.py / .csv / .json / .md 等），'
+                             '或同一任务输出为多个工作簿文件',
+        '' if not leftovers else '%d 个多余文件：%s' % (len(leftovers), '、'.join(leftovers[:5])))
+
+    # 36：新增指令未要求的说明文字、批注、辅助列、辅助行或标色提示
+    extra_bad = []
+    for s in wb_f.sheetnames:
+        wsx = wb_f[s]
+        for row in wsx.iter_rows():
+            for cell in row:
+                if cell.comment is not None:
+                    extra_bad.append('%s!%s 批注' % (s, cell.coordinate))
+    for r in range(63, ws_f.max_row + 1):
+        for c in range(1, ws_f.max_column + 1):
+            if _norm(ws_f.cell(r, c).value):
+                extra_bad.append('汇总!%s 辅助行' % ws_f.cell(r, c).coordinate)
+    for c in range(10, ws_f.max_column + 1):
+        for r in range(1, 63):
+            if _norm(ws_f.cell(r, c).value):
+                extra_bad.append('汇总!%s 辅助列' % ws_f.cell(r, c).coordinate)
+    for s in present:
+        wsx = wb_f[s]
+        base_r, base_c = SUB_DIMS[s]
+        for row in wsx.iter_rows(min_row=1, max_row=wsx.max_row, max_col=wsx.max_column):
+            for cell in row:
+                if not _norm(cell.value):
+                    continue
+                if cell.row > base_r or cell.column > base_c:
+                    extra_bad.append('%s!%s 新增内容' % (s, cell.coordinate))
+
+    add(bool(extra_bad), -1, '在汇总表或任一子表中新增指令未要求的说明文字、批注、辅助列、辅助行或标色提示',
+        '' if not extra_bad else '%d 处新增：%s' % (len(extra_bad), '、'.join(extra_bad[:5])))
+
+    # 37：汇总表应仍为 A1:I62 的 62 行 9 列结构，未新增汇总行、小计行或辅助列
+    shape_bad = (ws_f.max_row != 62 or ws_f.max_column != 9)
+    add(shape_bad, -1, '汇总表不再是 A1:I62 的 62 行 9 列结构，如在第 62 行之后新增汇总行、'
+                       '小计行，或在 I 列之后新增辅助列',
+        '' if not shape_bad else '汇总表实为 %d 行 %d 列'
+        % (ws_f.max_row, ws_f.max_column))
+
+    # ========== 结果反解为结构化 dim2_items ==========
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError('评分项数量与 _MAX_DELTAS_ORDER 不一致：%d != %d'
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    total = 0
+    # details 仅保留各判定处的取证说明供排查，不再随结果返回
+    for raw, _detail, max_delta in zip(results, details, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition('：')
+        got = int(head.replace('+', '').replace('-', '').strip())
+        hit = got > 0
+        # 加分项：命中记 +max_delta；减分项：命中记 -|max_delta|（即 max_delta 本身）
+        delta = max_delta if hit else 0
+        total += delta
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": hit,
+        })
+    result["dim2_items"] = dim2_items
+    result["total_score"] = max(0, total)
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+if __name__ == '__main__':
+    # 本地调试入口：默认评估脚本所在目录，也可显式传入待评估目录。
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))

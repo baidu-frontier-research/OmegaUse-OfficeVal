@@ -1,1588 +1,658 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-自动评估 “1111_勾选自动汇总版.xlsx” 是否满足打分细则。
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-特点：
-- 不依赖 openpyxl / xlwings / Excel COM，仅使用 Python 标准库解析 xlsx/xlsm 的 OOXML。
-- 先执行维度1门槛检查；维度1任一关键项失败则总分直接为 0，不再累计维度2。
-- 维度2逐条自动检测，命中加分或扣分项，并汇总最终得分。
-
-对外接口（统一约定）：
-    def evaluate(dir_path: str) -> dict
-        入参 dir_path 为“脚本所在目录的路径”，脚本自己负责在该目录里定位并
-        打开被评估的 .xlsx/.xlsm 文档；返回结构化字典（字段见《脚本接口差
-        异与统一建议.md》§2.2）。
-
-本地调试：
-    python officeval_082_verifier.py <脚本所在目录>
-    # 未传参时默认使用当前脚本所在目录
-"""
-
-from __future__ import annotations
-
-import json
-
-SCRIPT_ID = "082"
-import math
 import os
 import re
-import sys
-import tempfile
+import json
 import zipfile
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
-from xml.etree import ElementTree as ET
+from openpyxl import load_workbook
+from openpyxl.worksheet.formula import ArrayFormula
 
-NS = {
-    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-    "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
-    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate() -> dict 返回；评估目标锁定为本脚本所在目录，脚本自己在该
+# 目录内定位并打开被评估的 .xlsx（接受 .xlsm），不接受外部传入的目录，也不检索子目录
+# 与上级目录。本文件仅在 __main__ 下作为本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 与 008 号脚本的差异：本任务（标签维度表 勾选联动）细则同时含“加分项”（指令要求
+# 的勾选交互 + 右侧自动汇总）与“减分项”（指令未涉及却被改动的标题/表头/标签文字/
+# 样式/空白区等）。故 dim2 项的 max_delta 允许为负：正值=加分项（命中记满分，未命
+# 中记0）；负值=减分项（触发“破坏”记该负分，未触发记0）。total_score 为全部 delta
+# 之和，取值区间 [-17, +40]；max_score 仍为所有加分项满分之和（+40），作为完成度上限。
+#
+# 关于宏：指令未限制实现手段，用工作簿内 VBA 事件宏实现“勾选后右侧自动显示”同样计分，
+# .xlsm 不作减分；仅当勾选/汇总必须手动运行宏或点按钮才刷新时，才不满足 A06 的“自动”。
+#
+# 计分前置条件（细则原文）：加分项只计“为实现勾选联动而新增的工作量”。若“可勾选
+# 入口”与“右侧自动汇总”两项核心功能均未实现（表格仍为静态文字、右侧无任何公式输
+# 出），则 A01~A14 全部记 0，避免未做任何改动的文件凭“能打开、样式未变”得分。
+
+SCRIPT_ID = "082"
+
+# 评估目标锁定为本脚本所在目录：评测时把本脚本与被评交付物放在同一个目录下即可。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# —— 加分项按“结果追加顺序”的 max_delta（正值）——
+_ADD_DELTAS_ORDER = [
+    5,  # A01 B5:C68 单击即可切换选中/取消（复选框类控件）
+    5,  # A02 勾选入口覆盖 126 个有文字标签单元格，B32/B58 不设入口
+    3,  # A03 控件绑定独立状态单元格，TRUE/FALSE 可被公式引用
+    3,  # A04 控件与标签单元格一一对齐、落在单元格边框内
+    1,  # A05 标签单元格不再残留「□」静态占位符号
+    5,  # A06 I 列表头下方用公式自动输出已勾选内容
+    3,  # A07 汇总条目给出“分类维度 + 标签名称”的对应关系
+    3,  # A08 汇总结果连续排列、无空行、取消勾选自动上移
+    3,  # A09 汇总公式引用范围覆盖第 5 行至第 68 行全部数据
+    3,  # A10 汇总区行数足以容纳 126 个标签，末行不被截断
+    1,  # A11 未勾选时汇总区为空白，无 #N/A 等错误值
+    1,  # A12 汇总单元格自动换行或足够列宽，文本不被截断
+    1,  # A13 汇总区表头沿用 115E59 深绿底 + 白色加粗 + 居中
+    3,  # A14 全部由工作簿内控件 + 公式（或工作簿内事件宏）实现，无需外部脚本/手动刷新
+]
+
+# —— 减分项按“结果追加顺序”的 max_delta（负值）——
+_DED_DELTAS_ORDER = [
+    -1,  # D01 A1:C1 合并标题行格式
+    -1,  # D02 A2:C2 浅色分隔条格式
+    -1,  # D03 第 3 行被写入内容或行高被加高
+    -1,  # D04 A4/B4/C4 表头文字与格式
+    -3,  # D05 B5:C68 标签文字被增删改写
+    -1,  # D06 A5:A68 维度列格式与分组填充色
+    -1,  # D07 B5:C68 标签单元格格式与交替填充色
+    -1,  # D08 第 5~68 行行高 22
+    -1,  # D09 A5:C68 被插入/删除行列导致错行
+    -1,  # D10 A/B/C 列列宽被调整到无法显示标签文字
+    -1,  # D11 I2:J3 空白区被写入文字或填充色
+    -1,  # D12 I4 被与 J4 合并成跨列单元格
+    -1,  # D13 I4 填充色/字号字体/居中/边框被改
+    -1,  # D14 工作表数量或名称发生变化
+    -1,  # D15 冻结窗格/网格线/标签颜色等视图设置被改动
+]
+
+MAX_SCORE_TOTAL = sum(_ADD_DELTAS_ORDER)               # +40：完成度上限
+_MIN_TOTAL = MAX_SCORE_TOTAL + sum(_DED_DELTAS_ORDER)  # +23：全部命中且全部踩坑
+assert MAX_SCORE_TOTAL == 40
+assert sum(_DED_DELTAS_ORDER) == -17
+
+# 结果追加顺序 = 先加分项、后减分项
+_MAX_DELTAS_ORDER = _ADD_DELTAS_ORDER + _DED_DELTAS_ORDER
+_ADD_COUNT = len(_ADD_DELTAS_ORDER)
+
+# ============================================================================
+# 基线常量：左侧标签表的既有文字与版式（细则中“应保持不变”的部分）
+# ============================================================================
+SHEET_NAME = '标签维度表'
+DATA_R1, DATA_R2 = 5, 68            # 标签数据区行范围
+LABEL_COLS = (2, 3)                 # B、C 两列为标签列
+DIM_COL = 1                         # A 列为维度列
+SUM_COL_CANDIDATES = (9, 10, 11, 12)  # 右侧汇总区候选列 I~L
+HELPER_COL_CANDIDATES = tuple(range(4, 9))  # D~H：辅助列候选（须隐藏）
+EMU_PER_PX = 9525
+
+_TITLE_TEXT = '用户标签维度表'
+_HDR_TEXTS = {1: '分类维度', 2: '标签选项一', 3: '标签选项二'}
+_HDR_FILL = '115E59'                # 左侧第 4 行表头与右侧汇总区表头共用的深绿底
+_TICK_CHARS = '□☑☐■◻◼✓✔√'
+_CHECKED_CHARS = '☑■◼✓✔√'
+
+# A 列 5 个维度分组：(起始行, 结束行, 维度名, 分段填充色)
+_DIM_GROUPS = (
+    (5, 18, '基础信息', 'E0F2FE'),
+    (19, 32, '花销去向', 'ECFDF5'),
+    (33, 45, '使用场景', 'FEF3C7'),
+    (46, 58, '日常爱好', 'F5F3FF'),
+    (59, 68, '购买动因', 'FFE4E6'),
+)
+
+# B/C 标签单元格分段交替填充色：奇数行 F8FAFC、偶数行 FFFFFF
+_LABEL_FILL_ODD = 'F8FAFC'
+_LABEL_FILL_EVEN = 'FFFFFF'
+_LABEL_BORDER_RGB = 'CBD5E1'
+
+# 标签基线文字（已去掉「□ 」前缀）：行号 -> (B 列标签, C 列标签)
+# 其中 B32、B58 无文字，为空串——该两处不应出现任何标签文字或勾选入口。
+_LABELS = {
+    5: ('新用户', '线上购物偏好'),
+    6: ('老用户', '线下体验偏好'),
+    7: ('单人使用', '喜欢提前规划'),
+    8: ('多人共享', '临时决策较多'),
+    9: ('学生群体', '注重口碑评价'),
+    10: ('初入职场', '常看测评内容'),
+    11: ('稳定职场', '偏好品牌直营'),
+    12: ('家庭用户', '接受新品牌'),
+    13: ('城市通勤', '喜欢套装组合'),
+    14: ('近郊生活', '偏好单品购买'),
+    15: ('租房居住', '关注售后服务'),
+    16: ('自有住房', '关注配送时效'),
+    17: ('偶尔购买', '会员权益敏感'),
+    18: ('高频购买', '活动促销敏感'),
+    19: ('行政办公', '入门预算'),
+    20: ('市场运营', '中等预算'),
+    21: ('产品策划', '高预算'),
+    22: ('设计创意', '注重长期成本'),
+    23: ('客户服务', '关注一次性投入'),
+    24: ('数据分析', '喜欢分期付款'),
+    25: ('电商运营', '经常比价'),
+    26: ('内容编辑', '看重品牌溢价'),
+    27: ('门店管理', '重视实用功能'),
+    28: ('物流配送', '偏好高颜值设计'),
+    29: ('财务会计', '愿意为服务付费'),
+    30: ('人力资源', '常用企业采购'),
+    31: ('项目协调', '常用个人采购'),
+    32: ('', '关注发票报销'),
+    33: ('日常通勤', '室内使用'),
+    34: ('周末短途', '室外使用'),
+    35: ('长途出差', '移动携带'),
+    36: ('家庭聚会', '固定摆放'),
+    37: ('校园活动', '小空间适用'),
+    38: ('办公会议', '大空间适用'),
+    39: ('社群活动', '多设备协同'),
+    40: ('亲友送礼', '夜间使用'),
+    41: ('新居布置', '高频清洁维护'),
+    42: ('节日采购', '低维护需求'),
+    43: ('临时应急', '轻量化需求'),
+    44: ('计划囤货', '耐用性需求'),
+    45: ('户外休闲', '可收纳需求'),
+    46: ('数码产品', '新品资讯'),
+    47: ('家居整理', '购物清单'),
+    48: ('运动健身', '使用教程'),
+    49: ('美食烹饪', '深度评测'),
+    50: ('旅行攻略', '对比测评'),
+    51: ('亲子教育', '真实案例'),
+    52: ('职场技能', '清单模板'),
+    53: ('财务规划', '经验分享'),
+    54: ('影音娱乐', '短视频内容'),
+    55: ('手作创意', '图文内容'),
+    56: ('绿色生活', '直播讲解'),
+    57: ('宠物护理', '社群讨论'),
+    58: ('', '专家建议'),
+    59: ('节省时间', '品质稳定'),
+    60: ('降低成本', '操作简单'),
+    61: ('提升体验', '外观协调'),
+    62: ('减少麻烦', '售后可靠'),
+    63: ('增强安全感', '使用灵活'),
+    64: ('获得成就感', '便于携带'),
+    65: ('保持整洁', '适合长期用'),
+    66: ('提高效率', '适合多人用'),
+    67: ('改善舒适度', '环保节能'),
+    68: ('方便分享', '可扩展升级'),
 }
+# 126 个“有标签文字”的单元格（应各有一个勾选入口）：(行, 列)
+_LABEL_CELLS = frozenset(
+    (r, c) for r in range(DATA_R1, DATA_R2 + 1)
+    for c in LABEL_COLS if _LABELS[r][c - 2]
+)
+# 两个无文字单元格（不应设勾选入口）
+_EMPTY_CELLS = frozenset(
+    (r, c) for r in range(DATA_R1, DATA_R2 + 1)
+    for c in LABEL_COLS if not _LABELS[r][c - 2]
+)
+assert len(_LABEL_CELLS) == 126 and _EMPTY_CELLS == frozenset({(32, 2), (58, 2)})
 
-CHECKED_CHARS = ("☑", "✓", "✔", "√", "■", "●")
-UNCHECKED_CHARS = ("□", "☐", "○", "◇")
-BAD_OUTPUT_TOKENS = {"TRUE", "FALSE", "0", "1", "#VALUE!", "#N/A", "#CALC!", "#REF!", "#DIV/0!", "#NAME?", "#NULL!"}
-GOOD_OUTPUT_FONTS = {"微软雅黑", "Microsoft YaHei", "宋体", "SimSun", "Calibri"}
-ART_FONTS = {"华文彩云", "华文行楷", "华文新魏", "隶书", "方正舒体", "方正姚体", "Comic Sans MS", "Jokerman", "Papyrus"}
-LIGHT_BORDER_COLORS = {"FFFFFF", "CBD5E1", "D9E2F3", "D9EAD3", "D0D7DE", "DDDDDD", "E5E7EB", "E7E6E6", "C9DAF8", "CCCCCC"}
-LIGHT_FILLS = {"FFFFFF", "F8FAFC", "F9FAFB", "F3F4F6", "F2F2F2", "E8F5E9", "D9EAD3", "E2F0D9", "EEF2FF", "F0FDF4"}
-DARK_FONT_COLORS = {"000000", "1F2937", "333333", "404040", "3F3F3F", "24524A", "0F172A"}
+# 基线维度名与标签名集合：用于识别“宏实现”在右侧写下的静态汇总值
+_DIM_NAMES = frozenset(name for _, _, name, _ in _DIM_GROUPS)
+_ALL_LABELS = frozenset(_LABELS[r][c - 2] for (r, c) in _LABEL_CELLS)
+# 最后一个维度分组（第 59~68 行）的标签：出现即说明汇总覆盖到了表格末行
+_LAST_GROUP_LABELS = frozenset(
+    _LABELS[r][c - 2] for (r, c) in _LABEL_CELLS if r >= _DIM_GROUPS[-1][0])
 
-
-def col_to_num(col: str) -> int:
-    n = 0
-    for ch in col.upper():
-        if "A" <= ch <= "Z":
-            n = n * 26 + ord(ch) - 64
-    return n
-
-
-def num_to_col(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+# 汇总公式中“连续排列/自动上移”所依赖的取第 k 个函数
+_RANK_FUNCS = ('AGGREGATE', 'SMALL(', 'LARGE(', 'FILTER(', 'SORT(', 'TEXTJOIN',
+               'TOCOL(', 'MATCH(')
+_ERR_GUARDS = ('IFERROR', 'IFNA', 'ISERROR', 'ISNA')
 
 
-def split_cell_ref(ref: str) -> Tuple[str, int]:
-    m = re.match(r"([A-Z]+)(\d+)", ref.upper())
-    if not m:
-        return "", 0
-    return m.group(1), int(m.group(2))
+# ============================================================================
+# 通用取值/取格式工具
+# ============================================================================
+def _rgb6(color):
+    """把 openpyxl 颜色对象归一为 6 位十六进制（丢掉 alpha 前缀）；主题色/索引色返回 None。"""
+    if color is None:
+        return None
+    v = getattr(color, 'rgb', None)
+    if not isinstance(v, str):
+        return None
+    v = v.upper()
+    return v[-6:] if len(v) >= 6 else None
 
 
-def safe_float(v, default=None):
+def _fill6(cell):
+    """单元格填充色（无填充返回 None）。"""
     try:
-        if v is None:
-            return default
-        return float(v)
+        f = cell.fill
+        if f is None or not f.patternType:
+            return None
+        return _rgb6(f.fgColor)
     except Exception:
-        return default
+        return None
 
 
-def text_of(elem: Optional[ET.Element]) -> str:
-    if elem is None:
-        return ""
-    parts = []
-    for t in elem.iter():
-        if t.text:
-            parts.append(t.text)
-    return "".join(parts)
+def _txt(v):
+    """单元格文本（None/公式对象归一为字符串）。"""
+    if v is None:
+        return ''
+    if isinstance(v, ArrayFormula):
+        return str(v.text or '')
+    return str(v)
 
 
-@dataclass
-class PointResult:
-    score: int
-    title: str
-    hit: bool
-    evidence: str
+def _label_text(v):
+    """标签文字归一：去掉勾选符号与首尾空白，便于与基线文字比对。"""
+    s = _txt(v)
+    for ch in _TICK_CHARS:
+        s = s.replace(ch, '')
+    return s.strip()
 
 
-@dataclass
-class WorkbookData:
-    path: Path
-    zf: zipfile.ZipFile
-    shared_strings: List[str] = field(default_factory=list)
-    styles: dict = field(default_factory=dict)
-    sheet_names: List[str] = field(default_factory=list)
-    sheet_paths: Dict[str, str] = field(default_factory=dict)
+def _formula(cell):
+    """返回单元格中的公式文本（含 = 前缀）；非公式返回 None。
+       兼容普通公式（str）与动态数组公式（ArrayFormula）。"""
+    v = cell.value
+    if isinstance(v, ArrayFormula):
+        t = v.text or ''
+        return t if t.startswith('=') else None
+    if isinstance(v, str) and v.startswith('='):
+        # data_type == 's' 说明是被当成文本存下来的“假公式”，不计为公式
+        return v if getattr(cell, 'data_type', 'f') == 'f' else None
+    return None
 
 
-class OOXMLWorkbook:
-    def __init__(self, path: Path):
-        self.path = path
-        self.zf = zipfile.ZipFile(path)
-        self.data = WorkbookData(path=path, zf=self.zf)
-        self._load_shared_strings()
-        self._load_styles()
-        self._load_sheets()
-
-    def close(self):
-        self.zf.close()
-
-    def read_xml(self, name: str) -> ET.Element:
-        return ET.fromstring(self.zf.read(name))
-
-    def exists(self, name: str) -> bool:
-        return name in self.zf.namelist()
-
-    def _load_shared_strings(self):
-        if not self.exists("xl/sharedStrings.xml"):
-            return
-        root = self.read_xml("xl/sharedStrings.xml")
-        strings = []
-        for si in root.findall("main:si", NS):
-            strings.append(text_of(si))
-        self.data.shared_strings = strings
-
-    def _load_sheets(self):
-        wb = self.read_xml("xl/workbook.xml")
-        rels = self.read_xml("xl/_rels/workbook.xml.rels")
-        rel_map = {r.attrib.get("Id"): r.attrib.get("Target") for r in rels.findall("pkgrel:Relationship", NS)}
-        for sheet in wb.findall("main:sheets/main:sheet", NS):
-            name = sheet.attrib.get("name", "")
-            rid = sheet.attrib.get(f"{{{NS['rel']}}}id")
-            target = rel_map.get(rid, "")
-            if target.startswith("/"):
-                sheet_path = target.lstrip("/")
-            elif target.startswith("xl/"):
-                sheet_path = target
-            else:
-                sheet_path = "xl/" + target
-            self.data.sheet_names.append(name)
-            self.data.sheet_paths[name] = sheet_path
-
-    def _load_styles(self):
-        styles = {
-            "fonts": [],
-            "fills": [],
-            "borders": [],
-            "cellXfs": [],
-            "dxfs": [],
-        }
-        if not self.exists("xl/styles.xml"):
-            self.data.styles = styles
-            return
-        root = self.read_xml("xl/styles.xml")
-
-        for font in root.findall("main:fonts/main:font", NS):
-            name = font.find("main:name", NS)
-            sz = font.find("main:sz", NS)
-            color = font.find("main:color", NS)
-            styles["fonts"].append({
-                "name": name.attrib.get("val") if name is not None else None,
-                "size": safe_float(sz.attrib.get("val") if sz is not None else None),
-                "bold": font.find("main:b", NS) is not None,
-                "italic": font.find("main:i", NS) is not None,
-                "color": self._color_rgb(color),
-            })
-
-        for fill in root.findall("main:fills/main:fill", NS):
-            fg = fill.find("main:patternFill/main:fgColor", NS)
-            bg = fill.find("main:patternFill/main:bgColor", NS)
-            styles["fills"].append({"fgColor": self._color_rgb(fg), "bgColor": self._color_rgb(bg)})
-
-        for border in root.findall("main:borders/main:border", NS):
-            sides = {}
-            for side_name in ("left", "right", "top", "bottom"):
-                side = border.find(f"main:{side_name}", NS)
-                if side is None:
-                    sides[side_name] = {"style": None, "color": None}
-                else:
-                    color = side.find("main:color", NS)
-                    sides[side_name] = {"style": side.attrib.get("style"), "color": self._color_rgb(color)}
-            styles["borders"].append(sides)
-
-        for xf in root.findall("main:cellXfs/main:xf", NS):
-            styles["cellXfs"].append({
-                "fontId": int(xf.attrib.get("fontId", "0")),
-                "fillId": int(xf.attrib.get("fillId", "0")),
-                "borderId": int(xf.attrib.get("borderId", "0")),
-                "applyAlignment": xf.attrib.get("applyAlignment"),
-                "alignment": self._alignment(xf.find("main:alignment", NS)),
-            })
-
-        for dxf in root.findall("main:dxfs/main:dxf", NS):
-            styles["dxfs"].append(text_of(dxf))
-
-        self.data.styles = styles
-
-    def _color_rgb(self, elem: Optional[ET.Element]) -> Optional[str]:
-        if elem is None:
-            return None
-        rgb = elem.attrib.get("rgb")
-        if rgb:
-            return rgb[-6:].upper()
-        indexed = elem.attrib.get("indexed")
-        if indexed in ("64", "65"):
-            return None
-        return elem.attrib.get("theme")
-
-    def _alignment(self, elem: Optional[ET.Element]) -> dict:
-        if elem is None:
-            return {}
-        return dict(elem.attrib)
-
-    def sheet(self, name: str) -> "SheetData":
-        return SheetData(self, name, self.data.sheet_paths[name])
+# Excel 的“未来函数”（Excel 2007 之后新增的函数）在 xlsx 内部必须写成 _xlfn.XXX，
+# 见 [MS-XLSX] Functions 的 future function 表（含 _xlfn.AGGREGATE、_xlfn.TEXTJOIN 等）。
+# 若文件里直接写成 AGGREGATE(...)，Excel 打开后会把它当作未定义名称 → 返回 #NAME?；
+# 外层再套 IFERROR/IFNA 时错误被吞成空字符串，汇总区将永远显示空白，等同于未实现。
+# 因此这类公式不计为“可用的汇总公式”。
+_FUTURE_FUNCS = (
+    'AGGREGATE', 'IFNA', 'IFS', 'TEXTJOIN', 'CONCAT', 'MAXIFS', 'MINIFS', 'SWITCH',
+    'XLOOKUP', 'FILTER', 'SORT', 'SORTBY', 'UNIQUE', 'SEQUENCE', 'RANDARRAY',
+    'TOCOL', 'TOROW', 'LET', 'LAMBDA', 'TAKE', 'DROP', 'HSTACK', 'VSTACK',
+    'CHOOSECOLS', 'CHOOSEROWS', 'TEXTSPLIT', 'TEXTBEFORE', 'TEXTAFTER',
+    'FORMULATEXT', 'ISFORMULA', 'XOR',
+)
+# 前置的 (?<![A-Za-z0-9_.]) 保证已带 _xlfn. / _xlfn._xlws. 前缀的写法不会被误判
+_FUTURE_RE = re.compile(r'(?<![A-Za-z0-9_.])(' + '|'.join(_FUTURE_FUNCS) + r')\s*\(')
 
 
-class SheetData:
-    def __init__(self, wb: OOXMLWorkbook, name: str, path: str):
-        self.wb = wb
-        self.name = name
-        self.path = path
-        self.root = wb.read_xml(path)
-        self.cells = self._load_cells()
-        self.merges = self._load_merges()
-        self.data_validations = self._load_data_validations()
-        self.conditional_ranges = self._load_conditional_ranges()
-        self.col_widths = self._load_col_widths()
-        self.row_heights = self._load_row_heights()
-        self.drawing_targets = self._load_sheet_relationship_targets()
-
-    def _load_cells(self) -> Dict[str, dict]:
-        cells = {}
-        for c in self.root.findall(".//main:c", NS):
-            ref = c.attrib.get("r")
-            if not ref:
-                continue
-            t = c.attrib.get("t")
-            s = int(c.attrib.get("s", "0"))
-            f = c.find("main:f", NS)
-            v = c.find("main:v", NS)
-            is_elem = c.find("main:is", NS)
-            value = ""
-            raw = v.text if v is not None and v.text is not None else ""
-            if t == "s":
-                idx = int(raw or 0)
-                value = self.wb.data.shared_strings[idx] if idx < len(self.wb.data.shared_strings) else ""
-            elif t == "inlineStr":
-                value = text_of(is_elem)
-            elif t == "str":
-                value = raw
-            else:
-                value = raw
-            cells[ref] = {"value": value, "raw": raw, "formula": f.text if f is not None else None, "style": s, "type": t}
-        return cells
-
-    def _load_merges(self) -> List[str]:
-        return [m.attrib.get("ref", "") for m in self.root.findall("main:mergeCells/main:mergeCell", NS)]
-
-    def _load_data_validations(self) -> List[dict]:
-        result = []
-        for dv in self.root.findall("main:dataValidations/main:dataValidation", NS):
-            formula1 = dv.find("main:formula1", NS)
-            result.append({"sqref": dv.attrib.get("sqref", ""), "type": dv.attrib.get("type"), "formula1": formula1.text if formula1 is not None else ""})
-        return result
-
-    def _load_conditional_ranges(self) -> List[str]:
-        return [cf.attrib.get("sqref", "") for cf in self.root.findall("main:conditionalFormatting", NS)]
-
-    def conditional_rules(self) -> List[Tuple[str, str]]:
-        """返回 (sqref, 规则公式文本) 列表，用于确认勾选状态的公式/条件格式关联。"""
-        out: List[Tuple[str, str]] = []
-        for cf in self.root.findall("main:conditionalFormatting", NS):
-            sqref = cf.attrib.get("sqref", "")
-            for rule in cf.findall("main:cfRule", NS):
-                f = rule.find("main:formula", NS)
-                text = f.text if (f is not None and f.text) else ""
-                out.append((sqref, text))
-        return out
-
-    def _load_col_widths(self) -> Dict[str, float]:
-        widths = {}
-        for col in self.root.findall("main:cols/main:col", NS):
-            min_c = int(col.attrib.get("min", "0"))
-            max_c = int(col.attrib.get("max", "0"))
-            w = safe_float(col.attrib.get("width"))
-            for c in range(min_c, max_c + 1):
-                widths[num_to_col(c)] = w
-        return widths
-
-    def _load_row_heights(self) -> Dict[int, float]:
-        heights = {}
-        for row in self.root.findall("main:sheetData/main:row", NS):
-            r = int(row.attrib.get("r", "0"))
-            ht = safe_float(row.attrib.get("ht"))
-            if ht is not None:
-                heights[r] = ht
-        return heights
-
-    def _load_sheet_relationship_targets(self) -> List[str]:
-        rel_path = str(Path(self.path).parent / "_rels" / (Path(self.path).name + ".rels")).replace("\\", "/")
-        if not self.wb.exists(rel_path):
-            return []
-        root = self.wb.read_xml(rel_path)
-        return [r.attrib.get("Target", "") for r in root.findall("pkgrel:Relationship", NS)]
-
-    def cell(self, ref: str) -> dict:
-        return self.cells.get(ref.upper(), {"value": "", "raw": "", "formula": None, "style": 0, "type": None})
-
-    def value(self, ref: str) -> str:
-        return str(self.cell(ref).get("value") or "")
-
-    def formula(self, ref: str) -> str:
-        return str(self.cell(ref).get("formula") or "")
-
-    def style(self, ref: str) -> dict:
-        sid = self.cell(ref).get("style", 0)
-        xfs = self.wb.data.styles.get("cellXfs", [])
-        return xfs[sid] if sid < len(xfs) else {}
-
-    def font(self, ref: str) -> dict:
-        xf = self.style(ref)
-        fonts = self.wb.data.styles.get("fonts", [])
-        fid = xf.get("fontId", 0)
-        return fonts[fid] if fid < len(fonts) else {}
-
-    def fill(self, ref: str) -> dict:
-        xf = self.style(ref)
-        fills = self.wb.data.styles.get("fills", [])
-        fid = xf.get("fillId", 0)
-        return fills[fid] if fid < len(fills) else {}
-
-    def border(self, ref: str) -> dict:
-        xf = self.style(ref)
-        borders = self.wb.data.styles.get("borders", [])
-        bid = xf.get("borderId", 0)
-        return borders[bid] if bid < len(borders) else {}
-
-    def iter_refs(self, start_col: str, end_col: str, start_row: int, end_row: int) -> Iterable[str]:
-        for r in range(start_row, end_row + 1):
-            for c in range(col_to_num(start_col), col_to_num(end_col) + 1):
-                yield f"{num_to_col(c)}{r}"
-
-    def nonempty_text_cells(self, start_col: str, end_col: str, start_row: int, end_row: int) -> List[Tuple[str, str]]:
-        out = []
-        for ref in self.iter_refs(start_col, end_col, start_row, end_row):
-            val = self.value(ref).strip()
-            if val:
-                out.append((ref, val))
-        return out
-
-    def has_sheet_protection(self) -> bool:
-        return self.root.find("main:sheetProtection", NS) is not None
-
-    def has_drawing_or_objects(self) -> bool:
-        if self.root.find("main:drawing", NS) is not None or self.root.find("main:legacyDrawing", NS) is not None:
-            return True
-        names = self.wb.zf.namelist()
-        return any(part.startswith("xl/drawings/") or part.startswith("xl/media/") or part.startswith("xl/embeddings/") or part.startswith("xl/controls/") for part in names)
-
-    def drawing_object_count(self) -> int:
-        count = 0
-        for part in self.wb.zf.namelist():
-            if part.startswith("xl/drawings/") and part.endswith(".xml"):
-                try:
-                    root = self.wb.read_xml(part)
-                    count += len(root.findall(".//xdr:twoCellAnchor", NS))
-                    count += len(root.findall(".//xdr:oneCellAnchor", NS))
-                    count += len(root.findall(".//xdr:absoluteAnchor", NS))
-                except Exception:
-                    pass
-        return count
-
-    def has_vba(self) -> bool:
-        return self.wb.exists("xl/vbaProject.bin")
+def _formula_broken(text):
+    """公式在 Excel 中是否必然算不出结果（未来函数缺 _xlfn. 前缀 → #NAME?）。"""
+    return bool(text) and bool(_FUTURE_RE.search(text))
 
 
-def tag_text(value: str) -> str:
-    value = str(value or "").strip()
-    for ch in CHECKED_CHARS + UNCHECKED_CHARS:
-        if value.startswith(ch):
-            return value[1:].strip()
-    return value.strip()
+# 指令未限制实现手段，用工作簿内 VBA 实现“勾选后自动显示”同样计分。事件宏（勾选即触发）
+# 满足“自动”；只有必须手动点按钮/运行宏才刷新的做法不满足。vbaProject.bin 中模块源码是
+# 压缩存放的，事件过程名并不总是明文可见，故：能在原始字节里找到事件过程名即判为事件驱动；
+# 找不到时按“无法静态确认”从宽处理（仍判为自动），并在该项的规则说明里写明未能确认。
+_VBA_EVENT_HINTS = (
+    b'Worksheet_Change', b'Worksheet_SelectionChange', b'Worksheet_BeforeDoubleClick',
+    b'Workbook_SheetChange', b'Workbook_SheetSelectionChange', b'_Click', b'_Change',
+)
+_VBA_MANUAL_HINTS = (b'CommandButton', b'Shapes(', b'Button_Click')
 
 
-def is_tag_option(value: str) -> bool:
-    v = str(value or "").strip()
-    if not v:
-        return False
-    if v.startswith(CHECKED_CHARS + UNCHECKED_CHARS):
-        return len(tag_text(v)) >= 1
-    # 允许没有方框字符但为中文标签的备选实现。
-    return bool(re.search(r"[一-鿿A-Za-z]", v)) and len(v) <= 40
+def _vba_profile(parts):
+    """返回 (是否含宏, 是否检出事件过程名, 是否检出手动按钮痕迹)。"""
+    raw = parts.get('vba_raw') or b''
+    if not parts['has_vba']:
+        return (False, False, False)
+    ev = any(h in raw for h in _VBA_EVENT_HINTS)
+    mn = any(h in raw for h in _VBA_MANUAL_HINTS)
+    return (True, ev, mn)
 
 
-def is_checkbox_like(value: str) -> bool:
-    v = str(value or "").strip()
-    return v.startswith(CHECKED_CHARS + UNCHECKED_CHARS)
+def _side(cell, name):
+    """边框某一侧的 (线型, 颜色6位)；未设置返回 (None, None)。"""
+    try:
+        s = getattr(cell.border, name, None)
+        if s is None:
+            return (None, None)
+        return (s.style, _rgb6(s.color))
+    except Exception:
+        return (None, None)
 
 
-def range_intersects_sqref(sqref: str, start_col: str, end_col: str, start_row: int, end_row: int) -> bool:
-    scn, ecn = col_to_num(start_col), col_to_num(end_col)
-    for token in sqref.split():
-        if ":" in token:
-            a, b = token.split(":", 1)
-        else:
-            a = b = token
-        ac, ar = split_cell_ref(a)
-        bc, br = split_cell_ref(b)
-        if not ac or not bc:
+def _centered(cell):
+    al = cell.alignment
+    return bool(al) and al.horizontal == 'center' and al.vertical == 'center'
+
+
+def _white_or_theme(cell):
+    """白色字（或主题色/未显式设色——基线表头即以主题白字保存，不据此判失分）。"""
+    c = _rgb6(cell.font.color) if cell.font else None
+    return c in (None, 'FFFFFF')
+
+
+def _sz(cell):
+    try:
+        return float(cell.font.sz) if cell.font and cell.font.sz else None
+    except Exception:
+        return None
+def _col_dims(ws):
+    """解析列宽/隐藏：openpyxl 把 <col min=".." max=".."/> 合并存放（如 min=5,max=6
+       同时描述 E、F 两列），必须按 min~max 展开，否则 F 列会被误判为“未隐藏”。
+       返回 {列号: (列宽, 是否隐藏)} 与默认列宽。"""
+    try:
+        default = ws.sheet_format.defaultColWidth
+    except Exception:
+        default = None
+    default = float(default) if default else 8.43
+    out = {}
+    try:
+        dims = list(ws.column_dimensions.values())
+    except Exception:
+        dims = []
+    for cd in dims:
+        lo = getattr(cd, 'min', None)
+        hi = getattr(cd, 'max', None)
+        if not lo:
             continue
-        c1, c2 = sorted((col_to_num(ac), col_to_num(bc)))
-        r1, r2 = sorted((ar, br))
-        if c1 <= ecn and c2 >= scn and r1 <= end_row and r2 >= start_row:
+        for i in range(int(lo), int(hi or lo) + 1):
+            out[i] = (float(cd.width) if cd.width else default, bool(cd.hidden))
+    return out, default
+
+
+def _col_w(ws, idx, cache=None):
+    m, default = cache if cache else _col_dims(ws)
+    return m.get(idx, (default, False))[0]
+
+
+def _col_hidden(ws, idx, cache=None):
+    m, default = cache if cache else _col_dims(ws)
+    return m.get(idx, (default, False))[1]
+
+
+def _row_h(ws, r):
+    try:
+        rd = ws.row_dimensions.get(r)
+    except Exception:
+        rd = None
+    if rd is None or rd.height is None:
+        return None
+    return float(rd.height)
+
+
+def _merged_ranges(ws):
+    try:
+        return [(rng.min_row, rng.min_col, rng.max_row, rng.max_col, str(rng))
+                for rng in ws.merged_cells.ranges]
+    except Exception:
+        return []
+
+
+def _has_merge(mrs, r1, c1, r2, c2):
+    """判断给定矩形区域内是否存在（哪怕部分重叠的）合并单元格。"""
+    for mr, mc, xr, xc, _ in mrs:
+        if not (xr < r1 or mr > r2 or xc < c1 or mc > c2):
             return True
     return False
 
 
-def expand_sqref_cells(sqref: str) -> List[str]:
-    """把数据验证/条件格式的 sqref（可能是多段区域）展开为逐个单元格引用。"""
-    cells: List[str] = []
-    for token in sqref.split():
-        if ":" in token:
-            a, b = token.split(":", 1)
-        else:
-            a = b = token
-        ac, ar = split_cell_ref(a)
-        bc, br = split_cell_ref(b)
-        if not ac or not bc:
+def _is_merged_exact(mrs, name):
+    return any(s == name for *_, s in mrs)
+
+
+def _read_parts(file_path):
+    """读取包内需要的原始部件：勾选控件、VML、宏等。"""
+    p = {'names': [], 'sheet_xml': '', 'rels': '', 'ctrlprops': {}, 'vml': '',
+         'has_vba': False, 'vba_raw': b'', 'activex': 0}
+    with zipfile.ZipFile(file_path) as zf:
+        p['names'] = zf.namelist()
+        for n in p['names']:
+            low = n.lower()
+            if low.endswith('vbaproject.bin'):
+                p['has_vba'] = True
+                p['vba_raw'] = zf.read(n)
+            if low.startswith('xl/activex/') and low.endswith('.xml'):
+                p['activex'] += 1
+        for n in ('xl/worksheets/sheet1.xml',):
+            if n in p['names']:
+                p['sheet_xml'] = zf.read(n).decode('utf-8', 'ignore')
+        if 'xl/worksheets/_rels/sheet1.xml.rels' in p['names']:
+            p['rels'] = zf.read('xl/worksheets/_rels/sheet1.xml.rels').decode('utf-8', 'ignore')
+        for n in p['names']:
+            if n.startswith('xl/ctrlProps/') and n.endswith('.xml'):
+                p['ctrlprops'][os.path.basename(n)] = zf.read(n).decode('utf-8', 'ignore')
+            elif n.startswith('xl/drawings/') and n.endswith('.vml'):
+                p['vml'] += zf.read(n).decode('utf-8', 'ignore')
+    return p
+_CTRL_BLOCK_RE = re.compile(r'<control\s[^>]*/>|<control\s[^>]*>.*?</control>', re.S)
+_ANCH_RE = re.compile(
+    r'<(?:\w+:)?from>\s*<(?:\w+:)?col>(-?\d+)</(?:\w+:)?col>\s*'
+    r'<(?:\w+:)?colOff>(-?\d+)</(?:\w+:)?colOff>\s*'
+    r'<(?:\w+:)?row>(-?\d+)</(?:\w+:)?row>\s*'
+    r'<(?:\w+:)?rowOff>(-?\d+)</(?:\w+:)?rowOff>\s*</(?:\w+:)?from>\s*'
+    r'<(?:\w+:)?to>\s*<(?:\w+:)?col>(-?\d+)</(?:\w+:)?col>\s*'
+    r'<(?:\w+:)?colOff>(-?\d+)</(?:\w+:)?colOff>\s*'
+    r'<(?:\w+:)?row>(-?\d+)</(?:\w+:)?row>\s*'
+    r'<(?:\w+:)?rowOff>(-?\d+)</(?:\w+:)?rowOff>\s*</(?:\w+:)?to>', re.S)
+
+
+def _parse_checkbox_controls(parts):
+    """解析工作表内的“复选框”表单控件：锚点单元格 + 绑定的状态单元格。
+       主路径取 sheet1.xml 的 <controls>（锚点）+ 关系表 -> ctrlProps（objectType/
+       fmlaLink）；无 <controls> 时退回 VML 的 x:ClientData（锚点 + FmlaLink）。"""
+    # rId -> ctrlPropN.xml（属性顺序不固定，逐个 <Relationship> 标签取）
+    rid2prop = {}
+    for m in re.finditer(r'<Relationship\b[^>]*>', parts['rels']):
+        tag = m.group(0)
+        rid = re.search(r'Id="([^"]+)"', tag)
+        tgt = re.search(r'ctrlProps/([^"/]+)"', tag)
+        if rid and tgt:
+            rid2prop[rid.group(1)] = tgt.group(1)
+
+    def prop_of(rid):
+        name = rid2prop.get(rid)
+        xml = parts['ctrlprops'].get(name, '') if name else ''
+        objtype = re.search(r'objectType="([^"]+)"', xml)
+        link = re.search(r'fmlaLink="([^"]+)"', xml)
+        return ((objtype.group(1) if objtype else None),
+                (link.group(1) if link else None),
+                ('checked="Checked"' in xml))
+
+    out = {}
+    for block in _CTRL_BLOCK_RE.findall(parts['sheet_xml']):
+        rid = re.search(r'r:id="([^"]+)"', block)
+        if not rid:
             continue
-        c1, c2 = sorted((col_to_num(ac), col_to_num(bc)))
-        r1, r2 = sorted((ar, br))
-        for c in range(c1, c2 + 1):
-            for r in range(r1, r2 + 1):
-                cells.append(f"{num_to_col(c)}{r}")
-    return cells
+        rid = rid.group(1)
+        anchor = None
+        m = _ANCH_RE.search(block)
+        if m:
+            g = [int(x) for x in m.groups()]
+            anchor = {'fc': g[0], 'fco': g[1], 'fr': g[2], 'fro': g[3],
+                      'tc': g[4], 'tco': g[5], 'tr': g[6], 'tro': g[7]}
+        objtype, link, checked = prop_of(rid)
+        cur = out.get(rid)
+        if cur is None:
+            out[rid] = {'rid': rid, 'anchor': anchor, 'objtype': objtype,
+                        'link': link, 'checked': checked}
+        elif cur['anchor'] is None and anchor is not None:
+            cur['anchor'] = anchor
+    # objectType 缺失时按“复选框”处理（VML/旧版控件可能不写该属性）
+    ctrls = [c for c in out.values()
+             if (c['objtype'] or 'CheckBox').replace(' ', '').lower() == 'checkbox']
+
+    if not ctrls and parts['vml']:
+        for shape in re.findall(r'<v:shape\b.*?</v:shape>', parts['vml'], re.S):
+            if not re.search(r'ObjectType="Checkbox"', shape, re.I):
+                continue
+            a = re.search(r'<x:Anchor>([^<]+)</x:Anchor>', shape)
+            link = re.search(r'<x:FmlaLink>([^<]+)</x:FmlaLink>', shape)
+            anchor = None
+            if a:
+                nums = [int(x.strip()) for x in a.group(1).split(',') if x.strip().lstrip('-').isdigit()]
+                if len(nums) >= 8:
+                    anchor = {'fc': nums[0], 'fco': 0, 'fr': nums[2], 'fro': 0,
+                              'tc': nums[4], 'tco': 0, 'tr': nums[6], 'tro': 0}
+            ctrls.append({'rid': None, 'anchor': anchor, 'objtype': 'CheckBox',
+                          'link': link.group(1) if link else None, 'checked': False})
+    for c in ctrls:
+        a = c['anchor']
+        c['cell'] = (a['fr'] + 1, a['fc'] + 1) if a else None
+    return ctrls
+_RANGE_REF_RE = re.compile(r'\$?([A-Z]{1,3})\$?(\d+)\s*:\s*\$?([A-Z]{1,3})\$?(\d+)')
+_CELL_REF_RE = re.compile(r'(?<![A-Z0-9_.$!])\$?([A-Z]{1,3})\$?(\d+)(?![\d(])')
 
 
-def detect_tag_area(ws: SheetData) -> Tuple[int, int, List[str], List[str]]:
-    refs_b = []
-    refs_c = []
-    for r in range(1, 201):
-        if is_tag_option(ws.value(f"B{r}")):
-            refs_b.append(f"B{r}")
-        if is_tag_option(ws.value(f"C{r}")):
-            refs_c.append(f"C{r}")
-    all_rows = [split_cell_ref(ref)[1] for ref in refs_b + refs_c]
-    if not all_rows:
-        return 0, 0, [], []
-    return min(all_rows), max(all_rows), refs_b, refs_c
+def _col_idx(letter):
+    n = 0
+    for ch in letter:
+        n = n * 26 + (ord(ch) - 64)
+    return n
 
 
-def detect_output_area(ws: SheetData, tag_start: int, tag_end: int) -> Tuple[int, int]:
-    # 优先寻找 I/J 区域含标题或公式的行段。
-    start = 6
-    end = max(tag_end, 30)
-    formula_rows = []
-    for r in range(1, 201):
-        if ws.formula(f"I{r}") or ws.formula(f"J{r}") or ws.value(f"I{r}").strip() or ws.value(f"J{r}").strip():
-            if r >= 4:
-                formula_rows.append(r)
-    if formula_rows:
-        start = min([r for r in formula_rows if r >= 5] or [6])
-        end = max(formula_rows)
-    return start, end
+def _refs(formula):
+    """从公式文本中解析引用：返回 [(起列, 止列, 起行, 止行), ...]（列为数字）。"""
+    out = []
+    up = (formula or '').upper()
+    for m in _RANGE_REF_RE.finditer(up):
+        out.append((_col_idx(m.group(1)), _col_idx(m.group(3)),
+                    int(m.group(2)), int(m.group(4))))
+    for m in _CELL_REF_RE.finditer(up):
+        c = _col_idx(m.group(1))
+        r = int(m.group(2))
+        out.append((c, c, r, r))
+    return out
 
 
-def formula_mentions_tag_area(formula: str) -> bool:
-    f = formula.upper()
-    return bool(re.search(r"\$?B\$?\d+\s*:\s*\$?C\$?\d+", f) or re.search(r"LEFT\s*\(\s*\$?B", f) or "☑" in formula)
+def _covers_col(ref, col):
+    c1, c2 = min(ref[0], ref[1]), max(ref[0], ref[1])
+    return c1 <= col <= c2
 
 
-def checkbox_control_check(ws: SheetData, refs_b: List[str], refs_c: List[str]) -> Tuple[bool, str]:
-    """严格按 +5 细则逐点核验“B/C 标签勾选控件”，且判定方式在办公软件（Excel/WPS）中真实有效。
-
-    细则拆解为六个必须同时成立的点：
-      1) B、C 两列每个标签选项均有“可点击勾选控件”（单元格内或左侧）。
-         办公软件里对应：该标签单元格上挂有“列表数据验证下拉”，或该行有绘图/表单复选框控件。
-      2) 控件数量与标签选项数量一致（每个标签都被覆盖，不多不少）。
-      3) 勾选控件不会遮挡标签文字。
-         单元格内“□/☑ + 空格 + 文字”为纯文本前缀，天然不覆盖文字；
-         列表下拉的两个候选值都保留完整标签文字，勾选后文字仍在。
-      4) 点击后能切换“选中/未选中”两种状态。
-         对应：数据验证候选值恰含同一标签的“□ 标签”和“☑ 标签”两项，点击下拉即可切换。
-      5) 每个勾选控件与对应行列的布尔值/公式判断/VBA 逻辑关联。
-         对应：条件格式规则 LEFT(cell,1)="☑" 覆盖 B/C 区域，或右侧汇总公式按
-         LEFT($B$5:$C$68,1)="☑" 逐单元格判断勾选状态。
-      6) 勾选→被识别为选中，取消→被识别为未选中。
-         对应：以“☑”前缀表示选中、“□”前缀表示未选中，且上述公式/条件格式以此前缀识别。
-    """
-    tag_refs = refs_b + refs_c
-    if not tag_refs:
-        return False, "未在 B/C 列识别到任何标签选项"
-
-    # 建立“单元格 -> 数据验证候选值”映射，仅统计落在 B/C 标签单元格上的验证。
-    dv_by_cell: Dict[str, str] = {}
-    for dv in ws.data_validations:
-        if dv.get("type") != "list":
-            continue
-        f1 = dv.get("formula1", "") or ""
-        for cell in expand_sqref_cells(dv.get("sqref", "")):
-            col, _ = split_cell_ref(cell)
-            if col in ("B", "C"):
-                dv_by_cell[cell] = f1
-
-    # “标签选项”指真正的可勾选选项单元格：带 □/☑ 前缀，或挂有勾选下拉；
-    # 排除表头（如“标签选项一/二”）等非选项文本，避免虚增计数。
-    option_refs = [
-        ref for ref in tag_refs
-        if is_checkbox_like(ws.value(ref)) or ref in dv_by_cell
-    ]
-    if not option_refs:
-        return False, "未在 B/C 列识别到带勾选控件的标签选项"
-
-    # 点1 & 点2：每个标签选项都要有勾选控件（下拉或绘图控件），且数量一致。
-    #   · 下拉控件：dv_by_cell 已按 B/C 单元格粒度建立，天然一一对应。
-    #   · 绘图/表单控件：不能只用总数比较——需解析每个控件的锚点单元格，
-    #     确认它就落在对应 B/C 标签的行列上，且与标签一一对应（不重不漏），
-    #     否则会把无关的绘图对象（图标/图片/装饰形状等）误算成勾选控件。
-    drawing_count = ws.drawing_object_count()
-    dv_covered = [ref for ref in option_refs if ref in dv_by_cell]
-    control_by_dv = len(dv_covered) == len(option_refs)
-
-    # 解析绘图/表单控件锚点 -> 工作表 1 基 (col_letter, row)，仅保留落在 B/C 列的。
-    bc_anchor_cells: List[Tuple[str, int]] = []
-    for (row0, col0) in _drawing_anchor_cells(ws):
-        if row0 < 0 or col0 not in (1, 2):
-            continue
-        col_letter = "B" if col0 == 1 else "C"
-        bc_anchor_cells.append((col_letter, row0 + 1))
-
-    # 逐个锚点落在对应 B/C 标签行列 → 建立“控件 ↔ 标签选项”的一一对应关系。
-    option_cells: set[tuple[str, int]] = {(split_cell_ref(ref)[0], split_cell_ref(ref)[1]) for ref in option_refs}
-    matched_options: set[tuple[str, int]] = set()
-    unmatched_controls: List[Tuple[str, int]] = []
-    duplicate_controls: List[Tuple[str, int]] = []
-    for anchor in bc_anchor_cells:
-        if anchor not in option_cells:
-            unmatched_controls.append(anchor)
-        elif anchor in matched_options:
-            duplicate_controls.append(anchor)
-        else:
-            matched_options.add(anchor)
-
-    drawing_matched = len(matched_options)
-    control_by_drawing = (
-        drawing_matched == len(option_refs)                # 每个标签都被至少一个 B/C 锚点覆盖
-        and not unmatched_controls                         # 不存在无关绘图对象混入
-        and not duplicate_controls                         # 同一标签不重复
-        and len(bc_anchor_cells) == len(option_refs)       # 控件数量与标签选项数量一致
-    )
-    point_1_2 = control_by_dv or control_by_drawing
-
-    # 点4：候选值需同时提供“□ 标签”和“☑ 标签”，点击可在两种状态间切换。
-    toggle_ok = 0
-    for ref in dv_covered:
-        f1 = dv_by_cell[ref]
-        label = tag_text(ws.value(ref))
-        has_unchecked = any(uc in f1 for uc in UNCHECKED_CHARS)
-        has_checked = any(ck in f1 for ck in CHECKED_CHARS)
-        # 候选值中应包含当前标签文字，保证控件对应该行该列的标签。
-        if has_unchecked and has_checked and (not label or label in f1):
-            toggle_ok += 1
-    point_4 = (len(dv_covered) > 0 and toggle_ok == len(dv_covered)) or control_by_drawing
-
-    # 点3：单元格内勾选符号为文本前缀，不遮挡文字；候选值保留完整标签文字。
-    prefix_ok = 0
-    for ref in option_refs:
-        v = ws.value(ref).strip()
-        if v.startswith(CHECKED_CHARS + UNCHECKED_CHARS) and len(tag_text(v)) >= 1:
-            prefix_ok += 1
-    point_3 = control_by_drawing or (prefix_ok >= len(option_refs))
-
-    # 点5：勾选状态需与对应行列逻辑关联——条件格式或右侧汇总公式按 LEFT(...)="☑" 判断。
-    cf_ok = False
-    for sqref, rule in ws.conditional_rules():
-        if "☑" in (rule or "") and range_intersects_sqref(sqref, "B", "C", 1, 200):
-            cf_ok = True
-            break
-    right_formula_text = " ".join(
-        ws.formula(f"I{r}") + " " + ws.formula(f"J{r}") for r in range(1, 201)
-    )
-    formula_link_ok = bool(re.search(r'LEFT\s*\(\s*\$?B\$?\d+.*\)\s*=\s*"☑"', right_formula_text)) or (
-        "☑" in right_formula_text and formula_mentions_tag_area(right_formula_text)
-    )
-    point_5 = cf_ok or formula_link_ok
-
-    # 点6：以“☑/□”前缀区分选中与未选中，且被点5的逻辑识别。
-    recognizes_checked = ('☑' in right_formula_text) or any(
-        '☑' in (rule or "") for _, rule in ws.conditional_rules()
-    )
-    recognizes_unchecked = any(any(uc in f1 for uc in UNCHECKED_CHARS) for f1 in dv_by_cell.values())
-    point_6 = point_5 and recognizes_checked and (recognizes_unchecked or control_by_drawing)
-
-    hit = point_1_2 and point_3 and point_4 and point_5 and point_6
-    ev = (
-        f"标签选项={len(option_refs)}，挂载下拉控件={len(dv_covered)}，"
-        f"绘图/表单控件总数={drawing_count}，B/C锚点控件={len(bc_anchor_cells)}"
-        f"(逐行列匹配{drawing_matched}/{len(option_refs)}，无关锚点={len(unmatched_controls)}，重复锚点={len(duplicate_controls)})；"
-        f"[点1/2 控件齐备且逐行列一一对应]={point_1_2}，[点3 不遮挡文字(前缀{prefix_ok}/{len(option_refs)})]={point_3}，"
-        f"[点4 可切换选中/未选中(下拉双态{toggle_ok}/{len(dv_covered)})]={point_4}，"
-        f"[点5 与行列逻辑关联(条件格式={cf_ok},公式={formula_link_ok})]={point_5}，"
-        f"[点6 选中/未选中被识别]={point_6}"
-    )
-    return hit, ev
-
-
-def range_columns_span(formula: str) -> Tuple[bool, bool]:
-    """分析公式里出现的区域引用，判断是否覆盖 B 列、C 列。
-
-    返回 (覆盖B列, 覆盖C列)。既支持合并区域 $B$5:$C$68，也支持分开引用 B 列与 C 列。
-    """
-    covers_b = False
-    covers_c = False
-    b_num, c_num = col_to_num("B"), col_to_num("C")
-    for m in re.finditer(r"\$?([A-Z]+)\$?\d+\s*:\s*\$?([A-Z]+)\$?\d+", formula):
-        c1, c2 = sorted((col_to_num(m.group(1)), col_to_num(m.group(2))))
-        if c1 <= b_num <= c2:
-            covers_b = True
-        if c1 <= c_num <= c2:
-            covers_c = True
-    return covers_b, covers_c
-
-
-def single_toggle_display_check(ws: SheetData, out_start: int, out_end: int) -> Tuple[bool, str]:
-    """严格按 +5 细则核验“单项勾选显示效果”，判定基于交互能力（公式/数据验证/VBA 关系）。
-
-    细则四个点：
-      点1) 勾选 B 列任一标签后，右侧自动显示区域出现该标签文本。
-      点2) 勾选 C 列任一标签后，右侧自动显示区域出现该标签文本。
-      点3) 取消任一已勾选标签后，右侧该标签文本同步消失。
-      点4) 其他仍被勾选的标签继续保留显示。
-
-    判定原则（交互能力检查，不要求交付文件预置 B/C 各一个已勾选样例）：
-      - 数据验证下拉候选值同时含“□ 标签”与“☑ 标签”，且覆盖 B/C 标签单元格
-        → 用户点击下拉即可在两种状态间切换。
-      - 右侧汇总公式以 LEFT(cell,1)="☑" 为过滤条件，且引用区域覆盖 B 列（点1）/
-        C 列（点2）→ 任意该列单元格切换到 ☑，其文本即被公式选入右侧；
-        切回 □ 即不再满足条件而被移除（点3）；
-        用 AGGREGATE(15,...)/SMALL + 位置索引 或 FILTER 按序枚举 → 其余仍勾选项按左侧顺序保留（点4）。
-      - VBA：工作簿含 vbaProject.bin 时，允许由宏逻辑（Worksheet_Change 等）驱动
-        勾选/取消与右侧输出的联动，作为等效证据。
-      - 若文件恰好已预置 ☑ 样例且右侧确实显示，作为额外静态佐证（非必需）。
-    """
-    # 右侧自动显示区域实际“显示出来”的标签文本（排除表头/标题），用于静态佐证。
-    header_like = re.compile(r"分类维度|选定标签|维度分类|选定|操作|标签")
-    shown_texts = []
-    for r in range(out_start, min(out_end, 200) + 1):
-        for c in ("I", "J"):
-            v = ws.value(f"{c}{r}").strip()
-            if v and not header_like.search(v) and not v.upper().startswith("#") and v.upper() not in ("TRUE", "FALSE"):
-                shown_texts.append(tag_text(v))
-    shown_set = set(shown_texts)
-
-    # 若文件恰好已有 ☑ 样例，用于静态佐证；无样例不影响得分。
-    checked_b = [tag_text(ws.value(f"B{r}")) for r in range(1, 201)
-                 if ws.value(f"B{r}").strip().startswith(CHECKED_CHARS)]
-    checked_c = [tag_text(ws.value(f"C{r}")) for r in range(1, 201)
-                 if ws.value(f"C{r}").strip().startswith(CHECKED_CHARS)]
-
-    # 右侧显示区域全部公式合并成一段文本，供结构判定使用。
-    formulas = " ".join(
-        ws.formula(f"I{r}") + " " + ws.formula(f"J{r}") for r in range(out_start, min(out_end, 200) + 1)
-    )
-    up = formulas.upper()
-    # 公式以 LEFT(...)="☑" 为过滤条件 → 只有 ☑ 前缀的单元格被选入。
-    checked_filter_ok = ("☑" in formulas) and (re.search(r"LEFT\s*\(", formulas) is not None)
-    # 公式引用区域覆盖 B/C 两列（合并 $B$5:$C$68 或分开引用均可）。
-    covers_b, covers_c = range_columns_span(formulas)
-    # 按位置索引升序枚举，保证其余已勾选项按左侧顺序保留显示。
-    sequential_ok = any(k in up for k in ("AGGREGATE", "SMALL(", "FILTER("))
-
-    # 数据验证支持“□ ↔ ☑”切换：候选值中同时含 □ 与 ☑ 两态，并覆盖 B/C 标签单元格。
-    dv_toggle_b = dv_toggle_c = False
-    for dv in ws.data_validations:
-        if dv.get("type") != "list":
-            continue
-        f1 = dv.get("formula1", "") or ""
-        has_u = any(uc in f1 for uc in UNCHECKED_CHARS)
-        has_c = any(ck in f1 for ck in CHECKED_CHARS)
-        if not (has_u and has_c):
-            continue
-        for cell in expand_sqref_cells(dv.get("sqref", "")):
-            col, _ = split_cell_ref(cell)
-            if col == "B":
-                dv_toggle_b = True
-            elif col == "C":
-                dv_toggle_c = True
-
-    # VBA 兜底：宏工程存在时，允许勾选/取消由宏逻辑驱动。
-    vba_ok = ws.has_vba()
-
-    # 静态佐证（可选，非必需）：文件已有 ☑ 且右侧确实显示了对应文本。
-    static_b = any(t in shown_set for t in checked_b) if checked_b else False
-    static_c = any(t in shown_set for t in checked_c) if checked_c else False
-
-    # 点1/点2：交互能力——B/C 列切到 ☑ 即可在右侧出现。
-    formula_b_ok = checked_filter_ok and covers_b
-    formula_c_ok = checked_filter_ok and covers_c
-    point_1 = formula_b_ok or dv_toggle_b or vba_ok or static_b
-    point_2 = formula_c_ok or dv_toggle_c or vba_ok or static_c
-
-    # 点3：取消勾选后同步消失——公式以 ☑ 过滤即天然满足，或由 VBA 保证。
-    point_3 = checked_filter_ok or vba_ok
-    # 点4：其余仍勾选项按序保留——位置索引升序枚举（AGGREGATE/SMALL/FILTER），或由 VBA 保证。
-    point_4 = (checked_filter_ok and sequential_ok) or vba_ok
-
-    hit = point_1 and point_2 and point_3 and point_4
-    ev = (
-        f"右侧显示公式：过滤☑={checked_filter_ok}，覆盖B={covers_b}，覆盖C={covers_c}，按序枚举={sequential_ok}；"
-        f"数据验证双态：B={dv_toggle_b}，C={dv_toggle_c}；VBA={vba_ok}；"
-        f"静态佐证：预置勾选B={len(checked_b)}(右侧呈现={static_b})，"
-        f"预置勾选C={len(checked_c)}(右侧呈现={static_c})；"
-        f"[点1 B列勾选→右侧出现]={point_1}，[点2 C列勾选→右侧出现]={point_2}，"
-        f"[点3 取消后同步消失]={point_3}，[点4 其余按序保留]={point_4}"
-    )
-    return hit, ev
-
-
-def _drawing_controls_detailed(ws: SheetData) -> list[dict[str, object]]:
-    """解析绘图/表单控件的锚点与尺寸细节，供“仅按 B/C 标签行统计”与“越界校验”使用。
-
-    每条记录包含（EMU 单位，1 cm=360000 EMU）：
-      · from_col/from_row：起始单元格 0 基坐标；from_col_off/from_row_off：起点在该格内偏移；
-      · to_col/to_row：终止单元格 0 基坐标（twoCellAnchor 才有）；to_col_off/to_row_off：终点在该格内偏移；
-      · ext_cx/ext_cy：oneCellAnchor 的显式宽高；twoCellAnchor 无此值（用起止锚点推算）；
-      · kind：'twoCell'/'oneCell'/'absolute'。
-    absoluteAnchor 使用绝对坐标，与单元格无关，不参与“落在 B/C 标签行”的判定。
-    """
-    def _int(el: ET.Element | None) -> int | None:
-        if el is None or el.text is None:
-            return None
+def _label_dv(ws):
+    """统计覆盖到标签单元格的“下拉/序列”数据验证：
+       返回 (被覆盖的标签单元格数, 序列选项里是否内嵌了勾选符号)。"""
+    n_cells = 0
+    tick_in_list = False
+    try:
+        dvs = list(ws.data_validations.dataValidation)
+    except Exception:
+        dvs = []
+    for dv in dvs:
+        f1 = str(dv.formula1 or '')
+        hit = 0
         try:
-            return int(el.text)
+            rngs = list(dv.sqref.ranges)
         except Exception:
-            return None
-
-    controls: list[dict[str, object]] = []
-    for part in ws.wb.zf.namelist():
-        if not (part.startswith("xl/drawings/") and part.endswith(".xml")):
-            continue
-        try:
-            root = ws.wb.read_xml(part)
-        except Exception:
-            continue
-        for kind_tag, kind in (("twoCellAnchor", "twoCell"), ("oneCellAnchor", "oneCell"), ("absoluteAnchor", "absolute")):
-            for anchor in root.findall(f".//xdr:{kind_tag}", NS):
-                rec: dict[str, object] = {"kind": kind}
-                frm = anchor.find("xdr:from", NS)
-                if frm is not None:
-                    rec["from_col"] = _int(frm.find("xdr:col", NS))
-                    rec["from_col_off"] = _int(frm.find("xdr:colOff", NS)) or 0
-                    rec["from_row"] = _int(frm.find("xdr:row", NS))
-                    rec["from_row_off"] = _int(frm.find("xdr:rowOff", NS)) or 0
-                to = anchor.find("xdr:to", NS)
-                if to is not None:
-                    rec["to_col"] = _int(to.find("xdr:col", NS))
-                    rec["to_col_off"] = _int(to.find("xdr:colOff", NS)) or 0
-                    rec["to_row"] = _int(to.find("xdr:row", NS))
-                    rec["to_row_off"] = _int(to.find("xdr:rowOff", NS)) or 0
-                ext = anchor.find("xdr:ext", NS)
-                if ext is not None:
-                    rec["ext_cx"] = safe_float(ext.attrib.get("cx"))
-                    rec["ext_cy"] = safe_float(ext.attrib.get("cy"))
-                controls.append(rec)
-    return controls
-
-
-def checkbox_size_check(ws: SheetData, refs_b: List[str], refs_c: List[str]) -> Tuple[bool, str]:
-    """严格按 +3 细则核验“控件大小”，判定在 Excel/WPS 中真实有效。
-
-    细则四个点：
-      点1) 每个复选框/勾选区域宽高约 0.25cm–0.5cm。
-      点2) 大小统一。
-      点3) 能够被鼠标点击。
-      点4) 未超出所在单元格边界。
-
-    办公软件中存在两种实现，分别用其真实尺寸依据判定：
-      A. 单元格内“□/☑”勾选（数据验证下拉）：勾选区域即单元格内显示的 □/☑ 字符，
-         其宽高由该单元格“字号（磅）”决定——字符高度 ≈ 字号，1 磅 = 2.54/72 cm。
-         · 点1：字号换算到 cm 落在 0.25–0.5（对应约 7–14 磅）。
-         · 点2：所有勾选选项单元格字号一致 → 大小统一。
-         · 点3：整格挂有列表数据验证，鼠标点击单元格即弹出下拉可勾选 → 可点击。
-         · 点4：字符高度远小于行高、宽度不超过列宽 → 不超出单元格边界。
-      B. 绘图/表单复选框控件：仅统计“锚定在 B/C 标签行”的控件（无关图案不参与），
-         用锚点起止位置与该格真实行高/列宽对比来校验“未超出所在单元格边界”。
-    """
-    tag_refs = refs_b + refs_c
-    if not tag_refs:
-        return False, "未在 B/C 列识别到标签选项"
-
-    PT_TO_CM = 2.54 / 72.0
-    EMU_PER_CM = 360000.0
-
-    # 建立 B/C 标签单元格 -> 列表数据验证 的映射（点3 可点击的依据）。
-    dv_cells: set[str] = set()
-    for dv in ws.data_validations:
-        if dv.get("type") != "list":
-            continue
-        for cell in expand_sqref_cells(dv.get("sqref", "")):
-            col, _ = split_cell_ref(cell)
-            if col in ("B", "C"):
-                dv_cells.add(cell)
-
-    # 收集 B/C 标签选项所在“行 -> 列集合”，用作“绘图控件是否锚定到标签行列”的过滤依据。
-    label_row_cols: dict[int, set[str]] = {}
-    for ref in tag_refs:
-        col, row = split_cell_ref(ref)
-        label_row_cols.setdefault(row, set()).add(col)
-
-    # 实现 B：仅统计锚定在 B/C 标签行的绘图/表单控件（过滤掉无关图案）。
-    all_controls = _drawing_controls_detailed(ws)
-    bc_controls: list[dict[str, object]] = []
-    for rec in all_controls:
-        if rec.get("kind") == "absolute":
-            continue  # 绝对锚点不与单元格绑定，无法判定“锚在 B/C 标签行”
-        fc = rec.get("from_col")
-        fr = rec.get("from_row")
-        if not isinstance(fc, int) or not isinstance(fr, int):
-            continue
-        # 0 基列：B=1、C=2；转 1 基行与工作表 B/C 标签行比对。
-        if fc not in (1, 2):
-            continue
-        sheet_row = fr + 1
-        col_letter = "B" if fc == 1 else "C"
-        if sheet_row not in label_row_cols or col_letter not in label_row_cols[sheet_row]:
-            continue
-        bc_controls.append(rec)
-
-    if bc_controls:
-        # 逐个控件：计算“像素框”宽高 与 “所在单元格边界”，做实际范围对比。
-        widths_cm: list[float] = []
-        heights_cm: list[float] = []
-        in_range = 0
-        clickable_ctrl = 0
-        within_boundary = 0
-        detail_lines: list[str] = []
-        for rec in bc_controls:
-            fc = rec["from_col"]  # 已确认为 int
-            fr = rec["from_row"]
-            f_col_off = rec.get("from_col_off") or 0
-            f_row_off = rec.get("from_row_off") or 0
-            assert isinstance(fc, int) and isinstance(fr, int)
-            assert isinstance(f_col_off, int) and isinstance(f_row_off, int)
-
-            col_letter = "B" if fc == 1 else "C"
-            sheet_row = fr + 1
-
-            # 该起始单元格的真实尺寸（cm）。Excel 默认行高 15 磅、默认列宽 8.43 字符。
-            row_h_cm = (ws.row_heights.get(sheet_row, 15.0)) * PT_TO_CM
-            col_w_cm = (ws.col_widths.get(col_letter, 8.43)) * 0.202
-            row_h_emu = row_h_cm * EMU_PER_CM
-            col_w_emu = col_w_cm * EMU_PER_CM
-
-            if rec.get("kind") == "twoCell":
-                tc = rec.get("to_col")
-                tr = rec.get("to_row")
-                t_col_off_raw = rec.get("to_col_off") or 0
-                t_row_off_raw = rec.get("to_row_off") or 0
-                t_col_off = int(t_col_off_raw) if isinstance(t_col_off_raw, int) else 0
-                t_row_off = int(t_row_off_raw) if isinstance(t_row_off_raw, int) else 0
-                # 若起止同格：宽=to_off-from_off，高=to_off-from_off；跨格则累加中间整格。
-                if isinstance(tc, int) and tc == fc:
-                    width_emu = max(0, t_col_off - f_col_off)
-                elif isinstance(tc, int) and tc > fc:
-                    width_emu = max(0, col_w_emu - f_col_off)
-                    for mid_c in range(fc + 1, tc):
-                        mid_letter = num_to_col(mid_c + 1)
-                        width_emu += (ws.col_widths.get(mid_letter, 8.43)) * 0.202 * EMU_PER_CM
-                    width_emu += max(0, t_col_off)
-                else:
-                    width_emu = 0.0
-                if isinstance(tr, int) and tr == fr:
-                    height_emu = max(0, t_row_off - f_row_off)
-                elif isinstance(tr, int) and tr > fr:
-                    height_emu = max(0, row_h_emu - f_row_off)
-                    for mid_r in range(fr + 1, tr):
-                        height_emu += (ws.row_heights.get(mid_r + 1, 15.0)) * PT_TO_CM * EMU_PER_CM
-                    height_emu += max(0, t_row_off)
-                else:
-                    height_emu = 0.0
-                same_cell = (tc == fc) and (tr == fr)
-            else:
-                ext_cx = rec.get("ext_cx")
-                ext_cy = rec.get("ext_cy")
-                width_emu = float(ext_cx) if isinstance(ext_cx, (int, float)) else 0.0
-                height_emu = float(ext_cy) if isinstance(ext_cy, (int, float)) else 0.0
-                # oneCellAnchor 起点固定，若 from_off+ext 未超出起始单元格，则视为同格。
-                same_cell = (f_col_off + width_emu <= col_w_emu) and (f_row_off + height_emu <= row_h_emu)
-
-            w_cm = float(width_emu) / EMU_PER_CM
-            h_cm = float(height_emu) / EMU_PER_CM
-            widths_cm.append(w_cm)
-            heights_cm.append(h_cm)
-
-            # 点1：宽高约 0.25–0.5cm。
-            if 0.25 <= w_cm <= 0.5 and 0.25 <= h_cm <= 0.5:
-                in_range += 1
-            # 点3：表单/ActiveX 复选框控件本身可被鼠标点击；此处按“B/C 标签行的功能控件”计。
-            clickable_ctrl += 1
-            # 点4：与所在单元格真实边界对比——起点在该格内且未越过右/下边界。
-            fits_start = (0 <= f_col_off <= col_w_emu) and (0 <= f_row_off <= row_h_emu)
-            fits_end = (f_col_off + width_emu <= col_w_emu + 1) and (f_row_off + height_emu <= row_h_emu + 1)
-            not_overflow = bool(same_cell) and fits_start and fits_end
-            if not_overflow:
-                within_boundary += 1
-            detail_lines.append(
-                f"{col_letter}{sheet_row}:{w_cm:.2f}x{h_cm:.2f}cm (格{col_w_cm:.2f}x{row_h_cm:.2f}cm,同格={bool(same_cell)},未越界={not_overflow})"
-            )
-
-        n = len(bc_controls)
-        expected = len(tag_refs)
-        # 点1：所有控件宽高均在 0.25–0.5cm。
-        point_1 = in_range == n
-        # 点2：大小统一（宽高极差极小），且控件数量与标签数一致。
-        uniform = (max(widths_cm) - min(widths_cm) <= 0.05) and (max(heights_cm) - min(heights_cm) <= 0.05)
-        point_2 = uniform and n == expected
-        # 点3：全部为功能控件，可鼠标点击。
-        point_3 = clickable_ctrl == n
-        # 点4：全部控件未超出所在单元格边界（用真实行高/列宽比对）。
-        point_4 = within_boundary == n
-
-        hit = point_1 and point_2 and point_3 and point_4
-        ev = (
-            f"绘图/表单控件总数 {len(all_controls)}，锚定 B/C 标签行的功能控件 {n}(应为 {expected})；"
-            f"[点1 宽高0.25–0.5cm({in_range}/{n})]={point_1}，"
-            f"[点2 大小统一(宽{min(widths_cm):.2f}–{max(widths_cm):.2f}cm,高{min(heights_cm):.2f}–{max(heights_cm):.2f}cm) 且数量一致({n}/{expected})]={point_2}，"
-            f"[点3 可鼠标点击({clickable_ctrl}/{n})]={point_3}，"
-            f"[点4 未超出所在单元格边界({within_boundary}/{n})]={point_4}；样例：{'; '.join(detail_lines[:4])}"
-        )
-        return hit, ev
-
-    # 实现 A：单元格内 □/☑ 勾选区域，用字号（磅）换算尺寸。
-    option_refs = [ref for ref in tag_refs if is_checkbox_like(ws.value(ref)) or ref in dv_cells]
-    if not option_refs:
-        return False, "未识别到单元格内勾选区域或绘图控件"
-
-    sizes_cm = []
-    clickable = 0
-    within_boundary = 0
-    for ref in option_refs:
-        size_pt = ws.font(ref).get("size") or 11
-        glyph_cm = size_pt * PT_TO_CM
-        sizes_cm.append(glyph_cm)
-        # 点3：整格数据验证下拉，点击单元格即可勾选。
-        if ref in dv_cells:
-            clickable += 1
-        # 点4：勾选字符高度 < 行高、宽度 < 列宽 → 不超出单元格边界。
-        _, row = split_cell_ref(ref)
-        col, _ = split_cell_ref(ref)
-        row_h_cm = (ws.row_heights.get(row, 15.0)) * PT_TO_CM
-        col_w_cm = (ws.col_widths.get(col, 8.43)) * 0.202  # Excel 列宽(字符)≈0.202cm/字符（约值）
-        if glyph_cm <= row_h_cm and glyph_cm <= col_w_cm:
-            within_boundary += 1
-
-    n = len(option_refs)
-    # 点1：每个勾选区域宽高约 0.25–0.5cm（□/☑ 近似方形，宽高同为字号换算值）。
-    in_range = sum(1 for s in sizes_cm if 0.25 <= s <= 0.5)
-    point_1 = in_range == n
-    # 点2：大小统一——所有勾选选项字号一致（换算尺寸极差极小）。
-    point_2 = (max(sizes_cm) - min(sizes_cm)) <= 0.02
-    # 点3：全部选项单元格可点击（挂列表数据验证）。
-    point_3 = clickable == n
-    # 点4：全部勾选区域不超出单元格边界。
-    point_4 = within_boundary == n
-
-    hit = point_1 and point_2 and point_3 and point_4
-    ev = (
-        f"单元格内勾选选项 {n} 个，勾选符号尺寸 {min(sizes_cm):.3f}–{max(sizes_cm):.3f}cm；"
-        f"[点1 宽高0.25–0.5cm({in_range}/{n})]={point_1}，"
-        f"[点2 大小统一]={point_2}，"
-        f"[点3 可鼠标点击(数据验证{clickable}/{n})]={point_3}，"
-        f"[点4 未超出单元格边界({within_boundary}/{n})]={point_4}"
-    )
-    return hit, ev
-
-
-def _hex_channels(hexstr: Optional[str]) -> Optional[Tuple[int, int, int]]:
-    h = (hexstr or "").upper()
-    if len(h) == 8:  # 去掉 ARGB 的 alpha
-        h = h[2:]
-    if len(h) != 6 or any(ch not in "0123456789ABCDEF" for ch in h):
-        return None
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-def _luminance(hexstr: Optional[str]) -> Optional[float]:
-    ch = _hex_channels(hexstr)
-    if ch is None:
-        return None
-    r, g, b = ch
-    return 0.299 * r + 0.587 * g + 0.114 * b
-
-
-def _is_white_or_very_light_gray(hexstr: Optional[str]) -> bool:
-    """白色或极浅灰：三通道都很高且接近中性。"""
-    ch = _hex_channels(hexstr)
-    if ch is None:
-        return False
-    r, g, b = ch
-    return min(r, g, b) >= 0xF0  # >=240，如 F8FAFC / FFFFFF / F2F2F2
-
-
-def _is_light_tint(hexstr: Optional[str]) -> bool:
-    """浅色底纹（含浅绿、白及其它浅色 pastel）：亮度高。"""
-    lum = _luminance(hexstr)
-    return lum is not None and lum >= 0xC8  # >=200
-
-
-def _is_light_line(hexstr: Optional[str]) -> bool:
-    """浅灰色或白色的细线颜色；无显式颜色视为默认浅色网格线。"""
-    if hexstr is None:
-        return True
-    lum = _luminance(hexstr)
-    if lum is None:
-        return True  # theme/indexed 等非 RGB，按办公软件默认浅色网格线处理
-    return lum >= 0xA0  # >=160，浅灰及更浅（如 CBD5E1）
-
-
-def left_border_check(ws: SheetData, tag_start: int, tag_end: int) -> Tuple[bool, str]:
-    """严格按 +1 细则核验“左侧表格边框”，判定基于办公软件真实边框/填充属性。
-
-    细则五个点：
-      点1) 区域边框完整。
-      点2) 横向和纵向分隔线为浅灰色或白色细线。
-      点3) 表格行列结构清晰。
-      点4) 主体行填充为白色或极浅灰色。
-      点5) A列分类维度“可”使用浅绿色或白色底纹。（“可”为允许项）
-
-    办公软件中对应的真实属性：
-      - 边框完整：单元格四边 border style 均非 none（Excel“所有框线”）。
-      - 分隔线浅色细线：内部网格线 border style=thin 且颜色为浅灰/白（RGB 亮度高）。
-      - 行列结构清晰：全部单元格都有完整框线，行列被清晰划分。
-      - 填充：cell fill 的 fgColor（Excel“填充颜色”）。主体行为白/极浅灰；
-        A 列分类底纹为浅色（浅绿或白，允许其它浅色）。
-    """
-    # 表头行＝含“分类维度/标签选项”标题的行；主体行＝带 □/☑ 前缀的标签选项行。
-    body_rows = [r for r in range(tag_start, tag_end + 1)
-                 if is_checkbox_like(ws.value(f"B{r}")) or is_checkbox_like(ws.value(f"C{r}"))]
-    header_rows = [r for r in range(tag_start, tag_end + 1)
-                   if r not in body_rows and (ws.value(f"A{r}").strip() or ws.value(f"B{r}").strip())]
-    if not body_rows:
-        return False, "未识别到左侧表格主体行（B/C 无勾选选项）"
-
-    region_rows = sorted(set(body_rows + header_rows))
-    all_cells = [f"{c}{r}" for r in region_rows for c in ("A", "B", "C")]
-
-    # 点1：区域边框完整——每个单元格四边都有框线。
-    complete = 0
-    thin_line_total = 0
-    thin_line_light = 0
-    for ref in all_cells:
-        b = ws.border(ref)
-        sides = [b.get(s, {}) for s in ("left", "right", "top", "bottom")]
-        present = [s for s in sides if s.get("style") not in (None, "none")]
-        if len(present) == 4:
-            complete += 1
-        # 点2：统计细线（thin）分隔线的颜色是否浅灰/白。
-        for s in present:
-            if s.get("style") == "thin":
-                thin_line_total += 1
-                if _is_light_line(s.get("color")):
-                    thin_line_light += 1
-    point_1 = complete == len(all_cells)
-
-    # 点2：所有细线分隔线均为浅灰/白，且确实存在细线分隔（形成网格）。
-    point_2 = thin_line_total > 0 and thin_line_light == thin_line_total
-
-    # 点3：行列结构清晰——全部单元格完整框线即可清晰划分行列。
-    point_3 = point_1 and point_2
-
-    # 点4：主体行 B/C 填充为白色或极浅灰色。
-    body_bc = [f"{c}{r}" for r in body_rows for c in ("B", "C")]
-    body_light = sum(1 for ref in body_bc if _is_white_or_very_light_gray(ws.fill(ref).get("fgColor") or "FFFFFF"))
-    point_4 = body_light == len(body_bc)
-
-    # 点5：A 列分类维度底纹为浅色（浅绿/白，允许其它浅色）。“可”为允许项。
-    a_cells = [f"A{r}" for r in body_rows]
-    a_light = sum(1 for ref in a_cells if _is_light_tint(ws.fill(ref).get("fgColor") or "FFFFFF"))
-    point_5 = a_light == len(a_cells)
-
-    hit = point_1 and point_2 and point_3 and point_4 and point_5
-    ev = (
-        f"区域 {len(all_cells)} 格(主体行{len(body_rows)}+表头{len(header_rows)})；"
-        f"[点1 边框完整({complete}/{len(all_cells)})]={point_1}，"
-        f"[点2 细线分隔浅灰/白({thin_line_light}/{thin_line_total})]={point_2}，"
-        f"[点3 行列结构清晰]={point_3}，"
-        f"[点4 主体行白/极浅灰({body_light}/{len(body_bc)})]={point_4}，"
-        f"[点5 A列浅色底纹({a_light}/{len(a_cells)})]={point_5}"
-    )
-    return hit, ev
-
-
-def output_text_font_check(ws: SheetData, out_start: int, out_end: int) -> Tuple[bool, str]:
-    """严格按 +1 细则核验“右侧输出字体”，判定在 Excel/WPS 中真实有效。
-
-    细则四个点：
-      点1) 右侧输出文本字体为微软雅黑、宋体或 Calibri。
-      点2) 字号 9–12 磅。
-      点3) 颜色为黑色或深灰色。
-      点4) 文字左对齐或居中对齐。
-
-    办公软件中对应的真实机制：
-      - 字体名：OOXML 单元格样式里的 font name 即办公软件“字体”下拉框的值。
-        Calibri 在无该字体的环境（WPS/LibreOffice）会以度量兼容的 Carlito 呈现，
-        微软雅黑=Microsoft YaHei、宋体=SimSun/NSimSun 亦为同一字体的英文名，
-        因此这些等价名视为同一字体家族。
-      - 字号：font sz 即“字号（磅）”，直接判断 9–12。
-      - 颜色：font color 的 RGB，黑色/深灰色即接近 000000 的低亮度值。
-      - 对齐：alignment horizontal 为 left/center 即“左对齐/居中对齐”
-        （general 在文本内容下默认左对齐，等同左对齐）。
-    """
-    # 微软雅黑 / 宋体 / Calibri 及其在办公软件中的等价字体名。
-    accepted_fonts = {
-        "微软雅黑", "Microsoft YaHei", "Microsoft YaHei UI",
-        "宋体", "SimSun", "NSimSun",
-        "Calibri", "Carlito",
-    }
-
-    # “右侧输出文本”＝勾选左侧控件后，右侧自动显示区域里“真正出现的被选中标签内容”。
-    # 本条检查的正是这些实际出现的标签文本的格式，因此：
-    #   - 只取右侧真正显示出内容（显示值非空）的单元格；
-    #   - 排除分类表头/标题（如「分类维度/选定标签/维度分类（选定）」等，非输出标签内容）；
-    #   - 若右侧没有出现任何被选中标签内容（未勾选或公式在办公软件里算不出结果），
-    #     则没有“输出文本”可供评判 → 不加分。
-    header_like = re.compile(r"分类维度|选定标签|维度分类|选定|操作|标签")
-    refs: List[str] = []
-    for r in range(out_start, min(out_end, 200) + 1):
-        for c in ("I", "J"):
-            v = ws.value(f"{c}{r}").strip()
-            if v and not header_like.search(v) and not v.upper().startswith("#") and v.upper() not in ("TRUE", "FALSE"):
-                refs.append(f"{c}{r}")
-    if not refs:
-        return False, "右侧未出现任何被选中标签内容（未勾选或公式在办公软件中算不出结果），无输出文本可评，不加分"
-
-    name_ok = size_ok = color_ok = align_ok = 0
-    details: List[str] = []
-    for ref in refs:
-        font = ws.font(ref)
-        name = font.get("name") or ""
-        size = font.get("size") or 11
-        color = (font.get("color") or "000000").upper()
-        horizontal = ws.style(ref).get("alignment", {}).get("horizontal", "general")
-
-        # 点1：字体在允许集合内（空表示继承默认，交付前应显式设置，故不放宽）。
-        if name in accepted_fonts:
-            name_ok += 1
-        # 点2：字号 9–12 磅。
-        if 9 <= size <= 12:
-            size_ok += 1
-        # 点3：黑色或深灰色。
-        if color in DARK_FONT_COLORS:
-            color_ok += 1
-        # 点4：左对齐或居中（general 于文本默认左对齐）。
-        if horizontal in ("left", "center", "general"):
-            align_ok += 1
-        details.append(f"{ref}:{name or '默认'} {size:g}pt #{color} {horizontal}")
-
-    n = len(refs)
-    point_1 = name_ok == n
-    point_2 = size_ok == n
-    point_3 = color_ok == n
-    point_4 = align_ok == n
-    hit = point_1 and point_2 and point_3 and point_4
-    ev = (
-        f"输出文本单元格 {n} 个；"
-        f"[点1 字体微软雅黑/宋体/Calibri({name_ok}/{n})]={point_1}，"
-        f"[点2 字号9–12磅({size_ok}/{n})]={point_2}，"
-        f"[点3 黑色/深灰色({color_ok}/{n})]={point_3}，"
-        f"[点4 左对齐/居中({align_ok}/{n})]={point_4}；样例：{'; '.join(details[:4])}"
-    )
-    return hit, ev
-
-
-def row_height_ok(ws: SheetData, start: int, end: int) -> Tuple[bool, str]:
-    """严格按 +1 细则核验“右侧输出列表行高”，判定在 Excel/WPS 中真实有效。
-
-    细则四个点：
-      点1) 右侧输出区域行高为 20–24 磅。
-      点2) 文字完整显示。
-      点3) 长文本自动换行，或列宽足够。
-      点4) 不出现文字被截断到无法辨认的情况。
-
-    办公软件中对应的真实机制：
-      - 行高：OOXML 中行的 ht 属性即办公软件里的“行高（磅）”，直接判断是否落在 20–24。
-      - 自动换行：单元格 alignment 的 wrapText=1 就是 Excel/WPS 的“自动换行”，
-        开启后长文本会在单元格内折行、配合足够行高即可完整显示，不会被横向截断。
-      - 列宽足够：即使未开启换行，只要列宽足以容纳最长标签文本，也不会截断。
-      - 只要“自动换行”或“列宽足够”成立，且行高在区间内，即满足“文字完整显示、不被截断”。
-    """
-    # 右侧输出列表的“列表行”：区域内实际承载显示内容（公式或文本）且设置了显式行高的行。
-    # 这些行才是办公软件中真正呈现标签列表的行；未使用的空档行使用默认高度，不计入行高判定。
-    list_rows: List[int] = []
-    for r in range(start, min(end, 200) + 1):
-        has_content = bool(
-            ws.formula(f"I{r}") or ws.formula(f"J{r}")
-            or ws.value(f"I{r}").strip() or ws.value(f"J{r}").strip()
-        )
-        if has_content and r in ws.row_heights:
-            list_rows.append(r)
-    if not list_rows:
-        return False, "未识别到右侧输出列表的行（无显式行高的显示行）"
-
-    heights = [ws.row_heights[r] for r in list_rows]
-    # 点1：行高 20–24 磅。
-    in_range = sum(1 for h in heights if 20 <= h <= 24)
-    point_1 = in_range == len(heights)
-
-    # 点2/3/4：文字完整显示、长文本换行或列宽足够、不被截断。
-    # 换行：I/J 显示单元格开启 wrapText。
-    wrap_rows = 0
-    for r in list_rows:
-        i_wrap = ws.style(f"I{r}").get("alignment", {}).get("wrapText") in ("1", "true", "True")
-        j_wrap = ws.style(f"J{r}").get("alignment", {}).get("wrapText") in ("1", "true", "True")
-        if i_wrap or j_wrap:
-            wrap_rows += 1
-    wrap_ok = wrap_rows == len(list_rows)
-    # 列宽足够：显示标签文本的 J 列（及分类的 I 列）列宽不小于常规标签长度所需。
-    width_i = ws.col_widths.get("I", 8.43)
-    width_j = ws.col_widths.get("J", 8.43)
-    width_ok = width_j >= 12 and width_i >= 8
-    point_234 = wrap_ok or width_ok
-
-    hit = point_1 and point_234
-    ev = (
-        f"列表行 {len(list_rows)} 行，行高范围 {min(heights):.1f}–{max(heights):.1f}；"
-        f"[点1 行高20–24磅({in_range}/{len(heights)})]={point_1}，"
-        f"[点2/3/4 换行({wrap_rows}/{len(list_rows)})或列宽足够(I={width_i:.1f},J={width_j:.1f}) → 完整显示不截断]={point_234}"
-    )
-    return hit, ev
-
-
-def col_widths_ok(ws: SheetData) -> Tuple[bool, str]:
-    """严格按 -5 细则核验“列宽”，判定基于办公软件真实列宽（字符数）。
-
-    细则四个点（全部满足才算“列宽合格”，任一不满足即触发 -5 扣分）：
-      点1) A 列宽度约 8–12 字符。
-      点2) B 列和 C 列宽度约 24–26 字符。
-      点3) 右侧输出列 I、J 列宽度与 B/C 相近，约 24–26 字符。
-      点4) 所有主要标签文字和右侧结果文字能完整显示。
-
-    办公软件中对应的真实属性：
-      - OOXML <col width=..> 即 Excel/WPS 里“列宽”对话框显示的字符数，直接判断区间。
-      - “完整显示”：列宽足以容纳该列最长文本，或单元格开启自动换行（wrapText）。
-    """
-    widths = {c: ws.col_widths.get(c, 8.43) for c in ("A", "B", "C", "I", "J")}
-
-    # 点1：A 列 8–12 字符。
-    point_1 = 8 <= widths["A"] <= 12
-    # 点2：B、C 列 24–26 字符。
-    point_2 = 24 <= widths["B"] <= 26 and 24 <= widths["C"] <= 26
-    # 点3：I、J 列 24–26 字符（与 B/C 相近）。
-    point_3 = 24 <= widths["I"] <= 26 and 24 <= widths["J"] <= 26
-
-    # 点4：主要标签文字（B/C）和右侧结果文字（I/J）能完整显示。
-    # 完整显示＝该列列宽够宽（≈24 字符可容纳标签），或对应单元格开启自动换行。
-    def _col_display_ok(col: str, sample_rows: Iterable[int]) -> bool:
-        if widths[col] >= 24:
-            return True
-        # 列不够宽时，若单元格自动换行也可完整显示。
-        for r in sample_rows:
-            if ws.style(f"{col}{r}").get("alignment", {}).get("wrapText") in ("1", "true", "True"):
-                return True
-        return False
-
-    tag_start, tag_end, _, _ = detect_tag_area(ws)
-    out_start, out_end = detect_output_area(ws, tag_start, tag_end)
-    body_rows = range(max(tag_start, 1), tag_end + 1)
-    out_rows = range(out_start, min(out_end, out_start + 20) + 1)
-    display_ok = (
-        _col_display_ok("B", body_rows) and _col_display_ok("C", body_rows)
-        and _col_display_ok("I", out_rows) and _col_display_ok("J", out_rows)
-    )
-    point_4 = display_ok
-
-    ok = point_1 and point_2 and point_3 and point_4
-    ev = (
-        f"A={widths['A']:.1f}, B={widths['B']:.1f}, C={widths['C']:.1f}, I={widths['I']:.1f}, J={widths['J']:.1f}；"
-        f"[点1 A列8–12]={point_1}，[点2 B/C列24–26]={point_2}，"
-        f"[点3 I/J列24–26]={point_3}，[点4 标签与结果文字完整显示]={point_4}"
-    )
-    return ok, ev
-
-
-def has_title_near_i4(ws: SheetData) -> Tuple[bool, str]:
-    """严格按 -1 细则核验“I4:J4 附近是否出现‘维度分类（选定）’或类似选定结果标题”。
-
-    细则单点：右侧 I4:J4 附近若“没有”出现“维度分类（选定）”或类似选定结果标题 → 触发 -1 扣分。
-    本函数返回“是否存在该标题”（存在则不扣分）。
-
-    办公软件中对应的真实位置：
-      - I4:J4 是右侧输出区的标题行（本表 I4:J4 为合并单元格），标题文本写在其左上角 I4；
-      - “附近”容错取 I3:J5 一圈，兼容标题写在相邻行的情况。
-      - 判定文本：精确含“维度分类（选定）”，或语义等价的“选定结果类标题”
-        （如“维度分类/选定标签/已选/选择结果/选定结果/汇总结果”等组合）。
-    """
-    texts: List[Tuple[str, str]] = []
-    for r in range(3, 6):           # I3:J5，覆盖 I4:J4 及其相邻行
-        for c in ("I", "J"):
-            t = ws.value(f"{c}{r}").strip()
-            if t:
-                texts.append((f"{c}{r}", t))
-    joined = " ".join(t for _, t in texts)
-
-    # 精确标题，或“分类/维度”与“选定/已选/选择/选中”组合的选定结果类标题。
-    exact = "维度分类（选定）" in joined or "维度分类(选定)" in joined
-    similar = bool(
-        re.search(r"(维度|分类).*(选定|已选|选择|选中)", joined)
-        or re.search(r"(选定|已选|选择|选中).*(结果|标签|分类|维度)", joined)
-        or "选定标签" in joined or "选择结果" in joined or "选定结果" in joined
-    )
-    ok = exact or similar
-    return ok, "; ".join(f"{ref}={t}" for ref, t in texts[:8]) or "I4:J4 附近未见文本"
-
-
-def output_has_bad_tokens(ws: SheetData, start: int, end: int) -> Tuple[bool, str]:
-    """严格按 -1 细则核验“右侧 I/J 显示区域是否出现中间值”。
-
-    细则单点：右侧 I 列和 J 列显示区域出现 TRUE、FALSE、0、1、#VALUE!、#N/A、#CALC! 等
-    中间值 → 触发 -1 扣分。（“等”表示同类：布尔值、0/1 数字标记、各类 # 错误值。）
-
-    办公软件中对应的真实“显示值”：
-      - 单元格保存的显示结果即 Excel/WPS 里看到的值：
-        · 布尔中间值 TRUE/FALSE；
-        · 0 / 1 这类布尔转数字的中间标记；
-        · 以 # 开头的公式错误值（#VALUE! #N/A #CALC! #REF! #DIV/0! #NAME? #NULL! #SPILL! #GETTING_DATA 等）。
-      - 只检查右侧输出区 I/J，且以“单元格显示出来的值”为准；
-        IFERROR(...,\"\") 等已被吸收为空串的单元格不显示中间值，不计入。
-    """
-    hits: List[str] = []
-    for r in range(start, min(end, 200) + 1):
-        for c in ("I", "J"):
-            val = ws.value(f"{c}{r}").strip()
-            if not val:
+            rngs = []
+        for rng in rngs:
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, rng.max_col + 1):
+                    if (r, c) in _LABEL_CELLS or (r, c) in _EMPTY_CELLS:
+                        hit += 1
+        if hit:
+            n_cells += hit
+            if any(ch in f1 for ch in _CHECKED_CHARS):
+                tick_in_list = True
+    return n_cells, tick_in_list
+
+
+def _summary_block(ws):
+    """定位右侧汇总区：在候选列 I~L 中，rows>=5 个“可计算”公式单元格的列视为汇总输出列。
+       缺 _xlfn. 前缀的未来函数公式在 Excel 中恒为 #NAME?（或被 IFERROR 吞成空白），
+       不产生任何汇总结果，故不计入。返回 {列号: [公式所在行, ...]}（按列升序）。"""
+    cols = {}
+    for c in SUM_COL_CANDIDATES:
+        rows = [r for r in range(4, 201)
+                if _formula(ws.cell(r, c)) and not _formula_broken(_formula(ws.cell(r, c)))]
+        if len(rows) >= 5:
+            cols[c] = rows
+    return dict(sorted(cols.items()))
+
+
+def _broken_summary_cells(ws):
+    """候选汇总列中“写了公式但在 Excel 中必然算不出结果”的单元格列表。"""
+    out = []
+    for c in SUM_COL_CANDIDATES:
+        for r in range(4, 201):
+            t = _formula(ws.cell(r, c))
+            if t and _formula_broken(t):
+                out.append((r, c))
+    return out
+
+
+def _summary_profile(ws, sum_cols):
+    """汇总区画像：每列的公式文本、是否引用维度列/标签列、引用到的标签行范围。"""
+    prof = {}
+    for c, rows in sum_cols.items():
+        txts = [_formula(ws.cell(r, c)) or '' for r in rows]
+        refs = []
+        for t in txts:
+            refs.extend(_refs(t))
+        lab_refs = [x for x in refs
+                    if any(_covers_col(x, k) for k in (DIM_COL,) + LABEL_COLS)]
+        rmin = min((x[2] for x in lab_refs), default=None)
+        rmax = max((x[3] for x in lab_refs), default=None)
+        prof[c] = {
+            'rows': rows,
+            'txts': txts,
+            'ref_dim': any(_covers_col(x, DIM_COL) for x in refs),
+            'ref_label': any(_covers_col(x, k) for x in refs for k in LABEL_COLS),
+            'row_min': rmin,
+            'row_max': rmax,
+        }
+    return prof
+
+
+def _summary_values(ws):
+    """宏实现时右侧输出是运行期写入的静态值：在候选列 I~L 中找出与基线维度名/标签名
+       匹配的文本单元格，返回 {列号: [行, ...]}（按列升序）。"""
+    cols = {}
+    for c in SUM_COL_CANDIDATES:
+        rows = []
+        for r in range(DATA_R1, 201):
+            s = _txt(ws.cell(r, c).value).strip()
+            if not s or _formula(ws.cell(r, c)):
                 continue
-            up = val.upper()
-            is_bool = up in ("TRUE", "FALSE")
-            is_binary = val in ("0", "1")           # 0/1 布尔标记（不含小数）
-            is_error = up.startswith("#")           # 各类 # 错误值
-            if is_bool or is_binary or is_error:
-                hits.append(f"{c}{r}={val}")
-    bad = bool(hits)
-    return bad, ("; ".join(hits[:20]) if bad else "右侧 I/J 显示区域未出现 TRUE/FALSE/0/1/#错误值 等中间值")
+            parts_ = [x.strip() for x in re.split(r'[：:]', s) if x.strip()]
+            if (s in _DIM_NAMES or s in _ALL_LABELS
+                    or any(x in _DIM_NAMES or x in _ALL_LABELS for x in parts_)):
+                rows.append(r)
+        if rows:
+            cols[c] = rows
+    return dict(sorted(cols.items()))
 
 
-def _drawing_anchor_cells(ws: SheetData) -> list[tuple[int, int]]:
-    """解析绘图/表单控件锚点的“起始单元格”坐标 (row, col)，0 基。
+def _value_profile(ws, val_cols):
+    """静态值汇总区画像：每列是维度列 / 标签列 / 同格「维度：标签」列，以及是否含末组标签。"""
+    prof = {}
+    for c, rows in val_cols.items():
+        txts = [_txt(ws.cell(r, c).value).strip() for r in rows]
+        segs = [[x.strip() for x in re.split(r'[：:]', t) if x.strip()] for t in txts]
+        prof[c] = {
+            'rows': rows,
+            'txts': txts,
+            'combined': any(len(g) >= 2 and any(x in _DIM_NAMES for x in g)
+                            and any(x in _ALL_LABELS for x in g) for g in segs),
+            'is_dim': all(t in _DIM_NAMES for t in txts),
+            'is_lab': all(t in _ALL_LABELS for t in txts),
+            'last_group': any(x in _LAST_GROUP_LABELS for g in segs for x in g),
+        }
+    return prof
+# ============================================================================
+# 对外接口
+# ============================================================================
+def evaluate(dir_path=None):
+    """按接口约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
 
-    OOXML 锚点 <xdr:from> 内含 <xdr:col>、<xdr:row>（均 0 基），
-    对应办公软件里控件左上角所在的单元格——即控件实际落在哪一行哪一列。
+    评估目标固定为本脚本所在目录 _SCRIPT_DIR：只在该目录内定位并打开被评估的
+    .xlsx/.xlsm（忽略以 ~$ 打头的临时锁文件），不进入子目录、不检索上级目录；
+    dir_path 参数仅为保持各脚本接口一致而保留，传入的值不会被使用。
+
+    返回固定 9 个字段：id / file_name / status / error / dim1_pass / dim1_reason /
+    dim2_items / total_score / max_score，其中 dim2_items 每项为
+    {rule, max_delta, delta, hit}。
+
+    两类异常分开回传：
+      · 目录不存在 / 目录内没有 .xlsx/.xlsm——维度一根本没进入判定，error 只带纯文本
+        原因（不带异常类名），file_name、dim1_pass、dim1_reason 一律留空（dim1_pass 为
+        空字符串而非 False），dim2 不出项，总分与满分一并归零；
+      · 其他运行期异常——error 以「脚本运行异常：」打头，dim1_pass 记 False 并在
+        dim1_reason 中给出错误摘要，max_score 仍保留真实满分。
     """
-    anchors: list[tuple[int, int]] = []
-    for part in ws.wb.zf.namelist():
-        if part.startswith("xl/drawings/") and part.endswith(".xml"):
-            try:
-                root = ws.wb.read_xml(part)
-            except Exception:
-                continue
-            for tag in ("twoCellAnchor", "oneCellAnchor"):
-                for anchor in root.findall(f".//xdr:{tag}", NS):
-                    frm = anchor.find("xdr:from", NS)
-                    if frm is None:
-                        continue
-                    col_el = frm.find("xdr:col", NS)
-                    row_el = frm.find("xdr:row", NS)
-                    col = int(col_el.text) if (col_el is not None and col_el.text) else -1
-                    row = int(row_el.text) if (row_el is not None and row_el.text) else -1
-                    anchors.append((row, col))
-    return anchors
-
-
-def _picture_anchors_over_ac(ws: SheetData) -> int:
-    """统计锚定在 A:C 列范围（0 基列 0–2）内的图片对象数量。
-
-    OOXML 中图片为绘图里的 <xdr:pic>，其 <xdr:from><xdr:col> 表示图片左上角所在列。
-    办公软件里把表格“存成图片”后，会得到一张覆盖 A:C 的图片对象。
-    """
-    count = 0
-    for part in ws.wb.zf.namelist():
-        if part.startswith("xl/drawings/") and part.endswith(".xml"):
-            try:
-                root = ws.wb.read_xml(part)
-            except Exception:
-                continue
-            for anchor in root.findall(".//xdr:twoCellAnchor", NS) + root.findall(".//xdr:oneCellAnchor", NS):
-                if anchor.find(".//xdr:pic", NS) is None:
-                    continue
-                frm = anchor.find("xdr:from", NS)
-                col_el = frm.find("xdr:col", NS) if frm is not None else None
-                col = int(col_el.text) if (col_el is not None and col_el.text) else -1
-                if 0 <= col <= 2:
-                    count += 1
-    return count
-
-
-def _has_image_media(ws: SheetData) -> bool:
-    """工作簿是否包含图片媒体文件（xl/media/ 下的 png/jpg 等）。"""
-    return any(part.startswith("xl/media/") for part in ws.wb.zf.namelist())
-
-
-def left_table_as_image(ws: SheetData) -> Tuple[bool, str]:
-    """严格按 -5 细则核验“A:C 左侧用户标签维度表是否整体为图片”。
-
-    细则单点：A 列至 C 列左侧用户标签维度表整体为图片 → 触发 -5 扣分。
-
-    办公软件中“整表为图片”的真实特征（两者同时成立才判为图片化）：
-      特征1) A:C 几乎没有可编辑的真实单元格文本——表格内容不再是单元格，而是被贴成一张图。
-      特征2) 存在覆盖 A:C 的图片对象（xl/media 图片 + 锚定在 A:C 列的 <xdr:pic>）。
-    只要 A:C 仍是大量真实文本单元格（可点选、可编辑），即便另有零星图片，也不算“整体为图片”。
-    """
-    text_count = len(ws.nonempty_text_cells("A", "C", 1, 120))
-    has_media = _has_image_media(ws)
-    pic_over_ac = _picture_anchors_over_ac(ws)
-
-    # 特征1：A:C 基本没有真实文本（阈值取 10，低于则疑似非真实表格）。
-    lacks_real_text = text_count < 10
-    # 特征2：存在覆盖 A:C 的图片对象。
-    covered_by_picture = has_media and pic_over_ac >= 1
-
-    bad = lacks_real_text and covered_by_picture
-    if bad:
-        return True, f"A:C 仅 {text_count} 个真实文本单元格，且存在 {pic_over_ac} 张锚定 A:C 的图片，判定整表为图片"
-    return False, (
-        f"A:C 有 {text_count} 个真实可编辑文本单元格，"
-        f"A:C 图片对象 {pic_over_ac} 张，媒体文件={has_media}，非整表图片"
-    )
-
-
-def resolve_target_sheet_name(path: Path, wb: OOXMLWorkbook) -> Optional[str]:
-    """按评分入口定位待评估工作表。
-
-    原细则写的是工作簿中存在名称为“1111”的工作表；用户补充说明：
-    “1111”出现在文件名中也可以通过。因此这里优先使用名为“1111”的
-    工作表；若不存在但文件名包含“1111”，则使用第一个工作表继续评估。
-    """
-    if "1111" in wb.data.sheet_names:
-        return "1111"
-    if "1111" in path.stem and wb.data.sheet_names:
-        return wb.data.sheet_names[0]
-    return None
-
-
-def dimension1_checks(path: Path, wb: Optional[OOXMLWorkbook], error: Optional[str] = None) -> Tuple[bool, list[str], Optional[str]]:
-    reasons: list[str] = []
-    ok = True
-    if path.suffix.lower() not in (".xlsx", ".xlsm"):
-        ok = False
-        reasons.append(f"交付文件扩展名为 {path.suffix}，不是 .xlsx 或 .xlsm")
-    else:
-        reasons.append(f"交付文件扩展名为 {path.suffix}，符合 .xlsx/.xlsm 要求")
-    if error:
-        ok = False
-        reasons.append(f"文件无法作为 OOXML 工作簿正常打开：{error}")
-        return ok, reasons, None
-    if wb is None:
-        return False, reasons + ["未能读取工作簿"], None
-
-    target_sheet = resolve_target_sheet_name(path, wb)
-    if target_sheet is None:
-        # 未找到名为“1111”的工作表，也未按文件名匹配到——退回第一个工作表继续评估。
-        if not wb.data.sheet_names:
-            ok = False
-            reasons.append("工作簿中未找到任何工作表")
-            return ok, reasons, None
-        target_sheet = wb.data.sheet_names[0]
-
-    ws = wb.sheet(target_sheet)
-
-    if path.suffix.lower() == ".xlsm" and not ws.has_vba():
-        reasons.append("文件为 .xlsm 但未发现 vbaProject.bin；本任务不强制要求宏")
-    return ok, reasons, target_sheet
-
-
-def evaluate_dimension2(wb: OOXMLWorkbook, sheet_name: str) -> List[PointResult]:
-    ws = wb.sheet(sheet_name)
-    tag_start, tag_end, refs_b, refs_c = detect_tag_area(ws)
-    out_start, out_end = detect_output_area(ws, tag_start, tag_end)
-    results: List[PointResult] = []
-
-    # +5 标签勾选控件及关联逻辑（逐点核验，判定在 Excel/WPS 中真实有效）
-    hit, ev = checkbox_control_check(ws, refs_b, refs_c)
-    results.append(PointResult(5, "标签勾选控件数量、可切换状态及与对应行列选中逻辑关联", hit, ev))
-
-    # +5 单项勾选显示效果（逐点核验，判定基于公式行为，在 Excel/WPS 中真实有效）
-    hit, ev = single_toggle_display_check(ws, out_start, out_end)
-    results.append(PointResult(5, "单项勾选后右侧显示、取消后同步消失且其他已选保留", hit, ev))
-
-    # +1 行高
-    ok, ev = row_height_ok(ws, out_start, out_end)
-    results.append(PointResult(1, "右侧输出列表行高 20–24 磅且文字可读", ok, ev))
-
-    # +1 字体（逐点核验，判定基于办公软件真实字体/字号/颜色/对齐）
-    ok, ev = output_text_font_check(ws, out_start, out_end)
-    results.append(PointResult(1, "右侧输出字体为微软雅黑/宋体/Calibri，9–12 磅，黑/深灰，左/居中", ok, ev))
-
-    # +3 控件大小（逐点核验，判定基于办公软件真实控件/勾选符号尺寸）
-    ok, ev = checkbox_size_check(ws, refs_b, refs_c)
-    results.append(PointResult(3, "控件或勾选区域大小约 0.25–0.5cm、统一且不越界", ok, ev))
-
-    # +1 左侧表格边框（逐点核验，判定基于办公软件真实边框/填充属性）
-    ok, ev = left_border_check(ws, tag_start, tag_end)
-    results.append(PointResult(1, "左侧表格边框完整、浅色细线、行列结构清晰", ok, ev))
-
-    # 扣分项
-
-    return results
-
-
-def _build_dim2_items(points: List[PointResult]) -> List[dict]:
-    """把内部 PointResult 列表转换为统一约定的 dim2_items 结构。
-
-    评分规则（与用户约定一致）：
-      - “总分/满分（max_score）”= 所有“加分项”的满分之和；扣分项对满分无贡献。
-      - “得分（total_score）”= 加分项命中之和 + 扣分项命中之和（含负数）。
-    因此：
-      - 加分项（score>0）：max_delta=score；命中→delta=score，未命中→delta=0
-      - 扣分项（score<0）：max_delta=score（负数）；
-                            命中→delta=score（负数），未命中→delta=0
-    """
-    items: List[dict] = []
-    for p in points:
-        if p.score >= 0:
-            max_delta = p.score
-            delta = p.score if p.hit else 0
-        else:
-            max_delta = p.score
-            delta = max_delta if p.hit else 0
-        items.append({
-            "rule": p.title,
-            "max_delta": max_delta,
-            "delta": delta,
-            "hit": bool(p.hit),
-            "detail": "",
-        })
-    return items
-
-
-def _locate_target_file(dir_path: Path) -> Optional[Path]:
-    """在脚本所在目录中定位被评估的 .xlsx/.xlsm 文档。
-
-    优先选择文件名含“1111”的 .xlsx/.xlsm；否则退回目录里首个 .xlsx/.xlsm。
-    临时文件（以 ~$ 开头）忽略。
-    """
-    if not dir_path.is_dir():
-        return None
-    candidates: List[Path] = []
-    for entry in sorted(dir_path.iterdir()):
-        if not entry.is_file():
-            continue
-        if entry.name.startswith("~$"):
-            continue
-        if entry.suffix.lower() in (".xlsx", ".xlsm"):
-            candidates.append(entry)
-    if not candidates:
-        return None
-    for c in candidates:
-        if "1111" in c.stem:
-            return c
-    return candidates[0]
-
-
-def evaluate(dir_path: str) -> dict:
-    """对外统一入口：接收“脚本所在目录的路径”，在该目录中定位并评估文档。
-
-    返回结构遵循《脚本接口差异与统一建议.md》§2.2 约定。
-    """
-    result: dict = {
-        "id": "082",
+    dir_path = dir_path if dir_path and os.path.isdir(dir_path) else _SCRIPT_DIR
+    result = {
+        "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
@@ -1590,62 +660,484 @@ def evaluate(dir_path: str) -> dict:
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
     }
     try:
-        base = Path(dir_path)
-        if not base.exists() or not base.is_dir():
-            result["status"] = "error"
-            result["error"] = f"脚本所在目录不存在或不是目录：{dir_path}"
-            return result
-
-        target = _locate_target_file(base)
-        if target is None:
-            result["status"] = "error"
-            result["error"] = f"目录中未找到 .xlsx/.xlsm 文档：{base}"
-            return result
-        result["file_name"] = target.name
-
-        wb: Optional[OOXMLWorkbook] = None
-        open_error: Optional[str] = None
-        try:
-            try:
-                wb = OOXMLWorkbook(target)
-            except Exception as exc:
-                open_error = repr(exc)
-
-            dim1_ok, reasons, target_sheet = dimension1_checks(target, wb, open_error)
-            result["dim1_pass"] = bool(dim1_ok)
-            # 维度一原因合并为一段文字：通过时留空，未通过时给出所有失败/说明信息
-            result["dim1_reason"] = "" if dim1_ok else "；".join(reasons)
-
-            points: List[PointResult] = []
-            if dim1_ok and wb is not None and target_sheet is not None:
-                points = evaluate_dimension2(wb, target_sheet)
-
-            dim2_items = _build_dim2_items(points)
-            result["dim2_items"] = dim2_items
-            result["max_score"] = sum(
-                item["max_delta"] for item in dim2_items if item["max_delta"] > 0
-            )
-            # 维度一未通过时总分直接为 0（与原脚本判分规则一致）
-            result["total_score"] = sum(item["delta"] for item in dim2_items) if dim1_ok else 0
-        finally:
-            if wb is not None:
-                wb.close()
-    except Exception as exc:  # 兜底，避免脚本自身异常冒泡到 runner
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"目录不存在或不是目录：{dir_path}")
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith(('.xlsx', '.xlsm')) and not f.startswith('~$')
+            and os.path.isfile(os.path.join(dir_path, f))
+        )
+        if not cands:
+            raise FileNotFoundError(f"目录中未找到 .xlsx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 找不到被评估文件：error 只回传纯文本原因，维度一未进入判定，各字段留空、分数归零。
         result["status"] = "error"
-        result["error"] = repr(exc)
+        result["error"] = str(exc)
+        result["file_name"] = ""
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = f"脚本运行异常：{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = f"文件无法打开或解析：{type(exc).__name__}: {exc}"
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+
+def _fail_dim1(result, reason):
+    """维度一不通过：完成度总分直接记 0，dim1_reason 带上错误摘要与计分后果。"""
+    result["dim1_pass"] = False
+    result["dim1_reason"] = f"维度一未通过：{reason}，完成度总分记 0"
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    return result
+
+
+def _evaluate_impl(file_path, result):
+    """维度一 + 维度二评估主体。加分项、减分项分别构造 "+N："/"-N：" 结果串，
+       末尾按 _MAX_DELTAS_ORDER 反解成结构化 dim2_items。"""
+    results = []  # 先加分项，后减分项
+
+    # ---------- 维度1：可用与可修改性 ----------
+    try:
+        wb = load_workbook(file_path)
+    except Exception as exc:
+        return _fail_dim1(result, f"文件需修复才能打开或格式损坏（{type(exc).__name__}）")
+    try:
+        parts = _read_parts(file_path)
+    except Exception as exc:
+        return _fail_dim1(result, f"工作簿包结构损坏，无法读取（{type(exc).__name__}）")
+
+    ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.worksheets[0]
+    coldims = _col_dims(ws)
+    mrs = _merged_ranges(ws)
+
+    n_label_text = sum(1 for r in range(DATA_R1, DATA_R2 + 1) for c in LABEL_COLS
+                       if _label_text(ws.cell(r, c).value))
+    if n_label_text < 100:
+        return _fail_dim1(result, f"左侧标签表可编辑文字大量缺失（仅 {n_label_text} 个标签单元格有文字），疑为图片粘贴或版面丢失")
+
+    fake_formula = 0
+    for r in range(1, 201):
+        for c in range(1, 15):
+            cell = ws.cell(r, c)
+            v = cell.value
+            if isinstance(v, str) and v.startswith('=') and getattr(cell, 'data_type', 'f') != 'f':
+                fake_formula += 1
+    if fake_formula > 5:
+        return _fail_dim1(result, f"{fake_formula} 个单元格的公式以文本形式存放，打开后不计算")
+
+    ctrls = _parse_checkbox_controls(parts)
+    anchored = [c for c in ctrls if c['cell']]
+    if len(anchored) >= 5 and len(set(c['cell'] for c in anchored)) < 0.6 * len(anchored):
+        return _fail_dim1(result, "勾选控件大量堆叠在同一位置，版面不可用")
+
+    result["dim1_pass"] = True
+    # ---------- 维度二公共事实 ----------
+    dv_cells, _ = _label_dv(ws)
+    sum_cols = _summary_block(ws)
+    broken_cells = _broken_summary_cells(ws)
+    prof = _summary_profile(ws, sum_cols)
+    # 文件本身可打开、可编辑（维度1 通过）；但公式能否算出结果影响维度2 的汇总类加分
+    result["dim1_reason"] = (
+        "文件可正常打开，左侧标签表与右侧汇总区均为可点选编辑的真实单元格/控件，公式正常计算"
+        if not broken_cells else
+        f"文件可正常打开、内容为可编辑的真实单元格，但右侧 {len(broken_cells)} 个公式的未来函数"
+        f"缺 _xlfn. 前缀，在 Excel 中恒为 #NAME?（被 IFERROR 吞成空白），汇总按未实现计分")
+    anchored_cells = [c['cell'] for c in ctrls if c['cell']]
+    has_click_entry = bool(ctrls) or parts['activex'] > 0 or dv_cells > 0
+    # 宏实现：右侧输出由工作簿内 VBA 在运行期写入，静态看不到公式。指令未限制实现手段，
+    # 故“含宏 + 左侧有勾选入口”或“含宏 + 右侧已写下与基线标签匹配的汇总值”同样视为已实现。
+    vba, vba_event, vba_manual = _vba_profile(parts)
+    val_cols = _summary_values(ws) if not sum_cols else {}
+    vprof = _value_profile(ws, val_cols) if vba else {}
+    val_mode = bool(vprof)
+    has_summary = bool(sum_cols) or (vba and (has_click_entry or val_mode))
+    # 计分前置条件：两项核心功能均未实现 -> 加分项全部记 0
+    core_done = has_click_entry or has_summary
+
+    sum_ref_cols = set()
+    for c in prof:
+        for t in prof[c]['txts']:
+            for ref in _refs(t):
+                for k in range(min(ref[0], ref[1]), max(ref[0], ref[1]) + 1):
+                    sum_ref_cols.add(k)
+    combined_cols = [c for c in prof if prof[c]['ref_dim'] and prof[c]['ref_label']]
+    split_dim_cols = [c for c in prof if prof[c]['ref_dim'] and not prof[c]['ref_label']]
+    split_lab_cols = [c for c in prof if prof[c]['ref_label'] and not prof[c]['ref_dim']]
+    first_out_row = min((min(prof[c]['rows']) for c in prof), default=None)
+    last_out_row = max((max(prof[c]['rows']) for c in prof), default=None)
+
+    # 缺 _xlfn. 前缀而算不出结果的公式虽不计加分，但仍物理占据版面，
+    # 故 A10/A13 等“输出范围”类判断按物理存在的公式格取首末行。
+    phys_rows = [r for c in prof for r in prof[c]['rows']] + [r for r, _ in broken_cells]
+    phys_first = min(phys_rows, default=None)
+    phys_last = max(phys_rows, default=None)
+
+    # ======================= 加分项 =======================
+    # 约定：加分项命中追加 "+N："，未命中追加 "+0："。
+
+    # A01 +3：单击即可切换选中/取消（复选框类控件，非下拉菜单/手工输入符号）
+    a01 = (any(cell in _LABEL_CELLS for cell in anchored_cells)
+           or (not anchored_cells and bool(ctrls))
+           or parts['activex'] > 0)
+    a01 = a01 and core_done
+    results.append(("+5" if a01 else "+0") + f"：B5:C68 单击即可切换勾选（复选框控件 {len(ctrls) + parts['activex']} 个）")
+
+    # A02 +5：勾选入口完整覆盖 126 个有文字标签单元格，B32/B58 不设入口
+    covered = set(anchored_cells)
+    a02 = (core_done and covered == _LABEL_CELLS
+           and len(anchored_cells) == len(covered) == 126)
+    results.append(("+5" if a02 else "+0") + f"：勾选入口覆盖 126 个有文字标签单元格且无重复（实际覆盖 {len(covered)}）")
+
+    # A03 +3：每个控件绑定独立状态单元格，勾选结果以 TRUE/FALSE 记录并可被公式引用
+    links = [c['link'] for c in ctrls if c['link']]
+    single = [x for x in links if re.match(r'^\$?[A-Z]{1,3}\$?\d+$', x.strip())]
+    link_cols = set()
+    for x in single:
+        m = re.match(r'^\$?([A-Z]{1,3})\$?(\d+)$', x.strip())
+        if m:
+            link_cols.add(_col_idx(m.group(1)))
+    bool_ok = True
+    for x in single:
+        cell = ws[x.replace('$', '')]
+        if cell.value is not None and not isinstance(cell.value, bool):
+            bool_ok = False
+            break
+    a03 = (core_done and bool(ctrls) and len(single) == len(ctrls)
+           and len(set(single)) == len(single) and bool_ok
+           and not (link_cols & ({DIM_COL} | set(LABEL_COLS)))
+           and (not sum_ref_cols or link_cols <= sum_ref_cols))
+    results.append(("+3" if a03 else "+0") + f"：控件绑定独立状态单元格并以 TRUE/FALSE 记录（{len(set(single))} 个互不重复的链接单元格）")
+
+    # A04 +3：控件与标签单元格一一对齐、落在单元格边框内、不遮挡标签文字
+    def _anchor_ok(a):
+        if a['fc'] != a['tc']:
+            return False
+        r, c = a['fr'] + 1, a['fc'] + 1
+        if (r, c) not in _LABEL_CELLS:
+            return False
+        if a['tr'] - a['fr'] > 1 or a['tr'] < a['fr']:
+            return False
+        if a['tr'] == a['fr'] + 1 and a['tro'] > 100000:
+            return False
+        if a['fco'] < 0:
+            return False
+        px = _col_w(ws, c, coldims) * 7 + 5
+        return (a['tco'] - a['fco']) <= 0.6 * px * EMU_PER_PX
+    aligned = [c for c in ctrls if c['anchor'] and _anchor_ok(c['anchor'])]
+    a04 = core_done and bool(ctrls) and len(aligned) == len(ctrls)
+    results.append(("+3" if a04 else "+0") + f"：控件与标签单元格一一对齐且落在边框内（{len(aligned)}/{len(ctrls)}）")
+
+    # A05 +1：标签单元格中不再残留「□」等静态占位符号
+    residual = [(r, c) for r in range(DATA_R1, DATA_R2 + 1) for c in LABEL_COLS
+                if any(ch in _txt(ws.cell(r, c).value) for ch in _TICK_CHARS)]
+    a05 = core_done and not residual
+    results.append(("+1" if a05 else "+0") + f"：标签单元格无「□」等静态勾选符号残留（残留 {len(residual)} 处）")
+    # A06 +5：I 列表头下方自动输出已勾选内容（勾选后立即刷新，不需手工录入/点按钮）
+    n_sum_cells = sum(len(prof[c]['rows']) for c in prof)
+    a06_formula = n_sum_cells >= 20 and any(prof[c]['ref_label'] for c in prof)
+    # 宏实现：事件宏（勾选即触发）满足“自动”；只有明显是按钮驱动、又查不到事件过程时不满足
+    a06_vba = bool(vba) and has_summary and not (vba_manual and not vba_event)
+    a06 = core_done and (a06_formula or a06_vba)
+    detail06 = f"（{n_sum_cells} 个可计算公式单元格）"
+    if broken_cells:
+        detail06 = (f"（{n_sum_cells} 个可计算公式单元格；另有 {len(broken_cells)} 个公式的未来函数"
+                    f"缺 _xlfn. 前缀，在 Excel 中恒为 #NAME? 并被 IFERROR 吞成空白，汇总永不显示）")
+    elif a06_vba and not a06_formula:
+        detail06 = ("（由工作簿内 VBA 实现；%s）"
+                    % ("已检出事件过程名，勾选即触发" if vba_event else "未能在 vbaProject.bin 中确认事件过程名，按自动刷新从宽计分"))
+    results.append(("+5" if a06 else "+0") + "：右侧 I 列表头下方自动输出已勾选内容" + detail06)
+
+    # A07 +3：汇总条目给出“分类维度 + 标签名称”的对应关系（同格或分两列）
+    a07_f = bool(combined_cols) or (bool(split_dim_cols) and bool(split_lab_cols))
+    a07_v = (any(vprof[c]['combined'] for c in vprof)
+             or (any(vprof[c]['is_dim'] for c in vprof) and any(vprof[c]['is_lab'] for c in vprof)))
+    a07 = core_done and (a07_f or a07_v)
+    results.append(("+3" if a07 else "+0") + "：汇总条目给出“分类维度 + 标签名称”的对应关系")
+
+    # A08 +3：结果连续排列、未勾选不产生空行、取消勾选后自动上移
+    a08 = core_done and has_summary
+    for c in prof:
+        joined = ' '.join(prof[c]['txts']).upper()
+        if not (any(f in joined for f in _RANK_FUNCS)
+                and ('ROWS(' in joined or 'ROW()' in joined)):
+            a08 = False
+            break
+    if val_mode and not prof:
+        # 宏实现：按交付时可见输出判断——自表头下方首行起连续、中间无空行
+        a08 = core_done and all(
+            vprof[c]['rows'] == list(range(min(vprof[c]['rows']), max(vprof[c]['rows']) + 1))
+            for c in vprof)
+    results.append(("+3" if a08 else "+0") + "：汇总结果连续排列、无空行且取消勾选后自动上移")
+
+    # A09 +3：汇总引用范围覆盖第 5~68 行全部维度分组
+    rmin = min((prof[c]['row_min'] for c in prof if prof[c]['row_min']), default=None)
+    rmax = max((prof[c]['row_max'] for c in prof if prof[c]['row_max']), default=None)
+    a09 = core_done and rmin is not None and rmin <= DATA_R1 and rmax >= DATA_R2
+    detail09 = f"（实际 {rmin}~{rmax}）"
+    if val_mode and not prof:
+        # 宏实现无公式可查：以“输出中出现末组（第 59~68 行）标签”作为覆盖到末行的直接证据
+        a09 = core_done and any(vprof[c]['last_group'] for c in vprof)
+        detail09 = ("（宏实现：输出中含第 59~68 行分组的标签，可确认覆盖至末行）" if a09
+                    else "（宏实现：交付时的可见输出未出现第 59~68 行分组的标签，无法确认覆盖至末行）")
+    results.append(("+3" if a09 else "+0") + "：汇总引用范围覆盖第 5~68 行" + detail09)
+
+    # A10 +3：汇总区行数足以容纳 126 个标签，勾选到第 68 行时结果不被截断
+    capacity = sum(len(prof[c]['rows']) for c in combined_cols)
+    if split_lab_cols:
+        capacity += max(len(prof[c]['rows']) for c in split_lab_cols)
+    a10 = core_done and capacity >= 126
+    detail10 = f"（容量 {capacity} 条）"
+    if val_mode and not prof:
+        # 宏实现：输出条数取决于运行时勾选数，改判“表头下方是否留出 >=126 行无占用空间”
+        free = all(_txt(ws.cell(r, c).value).strip() == '' or r in vprof.get(c, {'rows': []})['rows']
+                   for c in vprof for r in range(DATA_R1, DATA_R1 + 126))
+        a10 = core_done and free
+        detail10 = f"（宏实现：表头下方第 {DATA_R1}~{DATA_R1 + 125} 行%s被其他内容占用）" % ('未' if free else '已')
+    results.append(("+3" if a10 else "+0") + "：汇总区可容纳全部 126 个标签" + detail10)
+
+    # A11 +1：未勾选时汇总区为空白，不出现 #N/A、#VALUE!、0 等占位
+    a11 = core_done and has_summary
+    for c in prof:
+        for t in prof[c]['txts']:
+            up = t.upper()
+            if not (any(g in up for g in _ERR_GUARDS) and '""' in t):
+                a11 = False
+                break
+        if not a11:
+            break
+    if val_mode and not prof:
+        # 宏实现：区域内不得残留错误值/占位字符
+        junk = ('#N/A', '#VALUE!', '#DIV/0!', '#REF!', '#NAME?', '#NUM!', '#NULL!')
+        a11 = core_done and not any(
+            any(j in _txt(ws.cell(r, c).value).upper() for j in junk)
+            for c in SUM_COL_CANDIDATES for r in range(DATA_R1, 201))
+    results.append(("+1" if a11 else "+0") + "：未勾选时汇总区为空白，无 #N/A 等错误值")
+
+    # A12 +1：汇总单元格自动换行或列宽足够，「维度：标签」可完整显示
+    out_cols = sum_cols if sum_cols else val_cols
+    out_prof = prof if prof else vprof
+    a12 = core_done and has_summary
+    if out_cols:
+        last_col = max(out_cols)
+        out_last = phys_last or max((max(out_prof[c]['rows']) for c in out_prof), default=4)
+        spill_free = all(_txt(ws.cell(r, last_col + 1).value) == ''
+                         for r in range(4, out_last + 1))
+        for c in out_prof:
+            cell = ws.cell(min(out_prof[c]['rows']), c)
+            wrap = bool(cell.alignment and cell.alignment.wrap_text)
+            wide = _col_w(ws, c, coldims) >= 18
+            # 未换行且列宽不足时，只要右侧相邻列为空，文本仍可溢出完整显示
+            if not (wrap or wide or (c == last_col and spill_free)):
+                a12 = False
+                break
+    results.append(("+1" if a12 else "+0") + "：汇总单元格自动换行或列宽足够，文本不被截断")
+
+    # A13 +1：汇总区表头沿用 115E59 深绿底 + 白色加粗 + 水平垂直居中
+    a13 = False
+    hdr_first = phys_first if phys_first else (min(min(vprof[c]['rows']) for c in vprof) if vprof else None)
+    if has_summary and hdr_first and hdr_first > 4:
+        hdrs = [ws.cell(r, c) for c in (out_cols or SUM_COL_CANDIDATES[:1]) for r in range(4, hdr_first)]
+        hdrs = [x for x in hdrs if _txt(x.value).strip() or _fill6(x)]
+        a13 = bool(hdrs) and all(
+            _fill6(x) == _HDR_FILL and bool(x.font and x.font.b)
+            and _white_or_theme(x) and _centered(x) for x in hdrs)
+    a13 = a13 and core_done
+    results.append(("+1" if a13 else "+0") + "：汇总区表头沿用 115E59 深绿底 + 白色加粗 + 居中")
+    # A14 +3：勾选与汇总全部在单个工作簿内实现（控件+公式 或 工作簿内 VBA 事件宏均可），
+    #         无需外部脚本、无需另存或重新打开、无需手动刷新
+    a14 = core_done and has_click_entry and has_summary
+    results.append(("+3" if a14 else "+0")
+                   + "：勾选与汇总在单个工作簿内实现（控件+公式或工作簿内事件宏），无需外部脚本或手动刷新")
+
+    # 说明：“交付文件为单个可直接使用的工作簿”已由维度一把关，此处不再重复计加分项。
+
+    # ======================= 减分项 =======================
+    # 约定：减分项触发（=指令未涉及却被改动）追加 "-N："，未触发追加 "-0："。
+
+    # D01 -1：A1:C1 合并标题「用户标签维度表」16 磅加粗白字 / 0F766E / 居中 / 行高 30
+    a1 = ws['A1']
+    d01 = not (_is_merged_exact(mrs, 'A1:C1') and _txt(a1.value).strip() == _TITLE_TEXT
+               and _sz(a1) == 16 and bool(a1.font and a1.font.b) and _white_or_theme(a1)
+               and _fill6(a1) == '0F766E' and _centered(a1)
+               and (_row_h(ws, 1) is not None and abs(_row_h(ws, 1) - 30) <= 0.6))
+    results.append(("-1" if d01 else "-0") + "：A1:C1 合并标题行格式（16 磅加粗白字 / 0F766E / 居中 / 行高 30）")
+
+    # D02 -1：A2:C2 浅色分隔条 CCFBF1、行高 22、无文字
+    a2 = ws['A2']
+    d02 = not (_is_merged_exact(mrs, 'A2:C2') and _txt(a2.value).strip() == ''
+               and _fill6(a2) == 'CCFBF1'
+               and (_row_h(ws, 2) is not None and abs(_row_h(ws, 2) - 22) <= 0.6))
+    results.append(("-1" if d02 else "-0") + "：A2:C2 浅色分隔条格式（CCFBF1 / 行高 22 / 无文字）")
+
+    # D03 -1：第 3 行被写入内容，或行高被加高至 22 以上
+    row3_text = any(_txt(ws.cell(3, c).value).strip() for c in range(1, 4))
+    h3 = _row_h(ws, 3)
+    d03 = row3_text or (h3 is not None and h3 > 22)
+    results.append(("-1" if d03 else "-0") + "：第 3 行被写入内容或行高被加高至 22 以上")
+
+    # D04 -1：A4/B4/C4 表头文字与 11 磅加粗白字 / 115E59 / 居中 / 行高 24
+    d04 = not (_row_h(ws, 4) is not None and abs(_row_h(ws, 4) - 24) <= 0.6)
+    for c, text in _HDR_TEXTS.items():
+        cell = ws.cell(4, c)
+        if not (_txt(cell.value).strip() == text and _sz(cell) == 11
+                and bool(cell.font and cell.font.b) and _white_or_theme(cell)
+                and _fill6(cell) == _HDR_FILL and _centered(cell)):
+            d04 = True
+            break
+    results.append(("-1" if d04 else "-0") + "：A4/B4/C4 表头文字与格式（11 磅加粗白字 / 115E59 / 居中 / 行高 24）")
+
+    # D05 -3：B5:C68 标签文字被增删、改写或覆盖，126 个标签内容不完整
+    bad_labels = []
+    for r in range(DATA_R1, DATA_R2 + 1):
+        for c in LABEL_COLS:
+            if _label_text(ws.cell(r, c).value) != _LABELS[r][c - 2]:
+                bad_labels.append((r, c))
+    d05 = bool(bad_labels)
+    results.append(("-3" if d05 else "-0") + f"：B5:C68 标签文字被增删改写（{len(bad_labels)} 处不符）")
+
+    # 说明：勾选状态写在标签单元格自身（下拉选「☑ 新用户」替换文字）属“新增功能没做好”，
+    #       其后果已由 A03（状态是否落在独立单元格）与 A05（是否残留静态符号）在加分项体现，
+    #       不属于对既有内容的破坏，故不另计减分项。
+
+    # D06 -1：A5:A68 维度列 10 磅加粗、居中、自动换行，及 5 个分组的分段填充色
+    d06 = False
+    for r1, r2, name, fill in _DIM_GROUPS:
+        for r in range(r1, r2 + 1):
+            cell = ws.cell(r, DIM_COL)
+            if not (_sz(cell) == 10 and bool(cell.font and cell.font.b) and _centered(cell)
+                    and bool(cell.alignment and cell.alignment.wrap_text)
+                    and _fill6(cell) == fill):
+                d06 = True
+                break
+        if d06:
+            break
+    results.append(("-1" if d06 else "-0") + "：A5:A68 维度列格式与 5 个维度分组的分段填充色")
+
+    # D07 -1：B5:C68 标签单元格 10 磅、左对齐、自动换行、CBD5E1 细边框、交替填充色
+    d07 = False
+    for r in range(DATA_R1, DATA_R2 + 1):
+        want_fill = _LABEL_FILL_ODD if r % 2 else _LABEL_FILL_EVEN
+        for c in LABEL_COLS:
+            cell = ws.cell(r, c)
+            al = cell.alignment
+            ls, lc = _side(cell, 'left')
+            rs, rc = _side(cell, 'right')
+            if not (_sz(cell) == 10 and bool(al) and al.horizontal == 'left'
+                    and bool(al.wrap_text) and _fill6(cell) == want_fill
+                    and ls == 'thin' and lc == _LABEL_BORDER_RGB
+                    and rs == 'thin' and rc == _LABEL_BORDER_RGB):
+                d07 = True
+                break
+        if d07:
+            break
+    results.append(("-1" if d07 else "-0") + "：B5:C68 标签单元格格式（10 磅 / 左对齐 / 换行 / CBD5E1 细边框 / 交替填充）")
+
+    # D08 -1：第 5~68 行行高 22（未显式设置行高即回落到默认 14.25，同样计为不符）
+    bad_h = [r for r in range(DATA_R1, DATA_R2 + 1)
+             if _row_h(ws, r) is None or abs(_row_h(ws, r) - 22) > 0.6]
+    d08 = bool(bad_h)
+    results.append(("-1" if d08 else "-0")
+                   + "：第 5~68 行行高 22（%d 行不符%s）"
+                   % (len(bad_h), ("：" + ",".join(str(r) for r in bad_h[:8])) if bad_h else ""))
+
+    # D09 -1：A5:C68 被插入/删除行列，导致维度分组与标签错行
+    dim_shift = False
+    for r1, r2, name, fill in _DIM_GROUPS:
+        for r in range(r1, r2 + 1):
+            if _txt(ws.cell(r, DIM_COL).value).strip() != name:
+                dim_shift = True
+                break
+        if dim_shift:
+            break
+    spill_below = any(_txt(ws.cell(r, c).value).strip()
+                      for r in range(DATA_R2 + 1, DATA_R2 + 41) for c in (1, 2, 3))
+    d09 = dim_shift or spill_below or _has_merge(mrs, DATA_R1, 1, DATA_R2, 3)
+    results.append(("-1" if d09 else "-0") + "：A5:C68 被插入/删除行列导致维度分组与标签错行")
+
+    # D10 -1：A/B/C 列列宽被调到无法完整显示标签文字（自动换行下仅极窄列宽才会截断）
+    d10 = False
+    for c in (1, 2, 3):
+        if _col_hidden(ws, c, coldims) or _col_w(ws, c, coldims) < 6:
+            d10 = True
+            break
+    results.append(("-1" if d10 else "-0") + "：A/B/C 列列宽被调整到无法完整显示标签文字")
+
+    # D11 -1：I2:J3 区域被写入文字或填充色（“操作说明/使用提示”等）
+    d11 = _has_merge(mrs, 2, 9, 3, 10)
+    for r in (2, 3):
+        for c in (9, 10):
+            cell = ws.cell(r, c)
+            if _txt(cell.value).strip() or _fill6(cell):
+                d11 = True
+    results.append(("-1" if d11 else "-0") + "：I2:J3 空白区被写入文字或填充色")
+
+    # D12 -1：I4 被与 J4 合并成跨列单元格
+    d12 = _has_merge(mrs, 4, 9, 4, 9)
+    results.append(("-1" if d12 else "-0") + "：I4 被合并成跨列单元格")
+
+    # D13 -1：I4 填充色 115E59、白色 11 磅加粗、居中、上/左/右 CCCCCC 中粗边框
+    i4 = ws['I4']
+    i4_border = all(_side(i4, s) == ('medium', 'CCCCCC') for s in ('top', 'left', 'right'))
+    d13 = not (_fill6(i4) == _HDR_FILL and _sz(i4) == 11
+               and bool(i4.font and i4.font.b) and _white_or_theme(i4)
+               and (i4.font.name in ('宋体', 'SimSun', 'NSimSun') if i4.font else False)
+               and _centered(i4) and i4_border)
+    results.append(("-1" if d13 else "-0") + "：I4 填充色/字号字体/居中/CCCCCC 中粗边框被改")
+
+    # 说明：“需修复才能打开”已由维度一直接判 0 分，“既有样式大面积丢失”亦已由
+    #       D01~D07（标题行/分隔条/表头/维度列/标签格式）逐项覆盖，此处不再重复计减分项。
+
+    # D14 -1：工作表数量或名称发生变化
+    d14 = wb.sheetnames != [SHEET_NAME]
+    results.append(("-1" if d14 else "-0") + f"：工作表数量或名称变化（当前 {wb.sheetnames}）")
+
+    # D15 -1：冻结窗格、网格线显示、工作表标签颜色等视图设置被改动
+    tab_color = ws.sheet_properties.tabColor
+    d15 = bool(ws.freeze_panes) or (ws.sheet_view.showGridLines is False) or bool(tab_color)
+    results.append(("-1" if d15 else "-0") + "：冻结窗格/网格线/工作表标签颜色等视图设置被改动")
+
+    # ---------- 反解：results（"+N："/"-N：" 串）-> 结构化 dim2_items ----------
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"结果条目数({len(results)})与 max_delta 序列({len(_MAX_DELTAS_ORDER)})不一致"
+        )
+    dim2_items = []
+    total = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        got = int(head.replace("+", "").replace("-", "").strip())  # 该项写入的绝对分值
+        hit = got > 0
+        # 加分项（max_delta>0）：命中记满分，否则 0
+        # 减分项（max_delta<0）：触发“破坏”记该负分，否则 0
+        delta = max_delta if hit else 0
+        total += delta
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": hit,
+        })
+
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total
+    result["max_score"] = MAX_SCORE_TOTAL
     return result
 
 
 if __name__ == "__main__":
-    # 本地调试用：默认以当前脚本所在目录作为 dir_path，也可命令行覆盖。
-    # 直接写入 stdout.buffer 以 UTF-8 输出，避免 Windows cp1252 终端编码错误；
-    # 不修改 sys.stdout 本身，符合《脚本接口差异与统一建议.md》§2.3 的约束。
-    _dir = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent)
-    _payload = json.dumps(evaluate(_dir), ensure_ascii=False, indent=2)
-    try:
-        _ = sys.stdout.buffer.write((_payload + "\n").encode("utf-8"))
-    except Exception:
-        print(_payload)
+    # 本地调试入口：固定评估本脚本所在目录，不接受命令行参数。
+    print(json.dumps(evaluate(), ensure_ascii=False, indent=2))

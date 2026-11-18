@@ -1,1260 +1,1604 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingImports=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportIndexIssue=false
 """
-初中化学模拟试题自动评估脚本
-评估维度一：可用与可修改性（不满足直接判零分）
-评估维度二：完成度评分（得分点 +3/+1/+5, 扣分点 -3/-5）
+初中化学模拟试题「加封面 / 套模板排版 / 加页码」任务的自动评测脚本（SCRIPT_ID = 019）。
 
-统一接口：仅暴露 evaluate(dir_path: str) -> dict。
-参数 dir_path 为"脚本所在目录的路径"，脚本自行在该目录内定位并打开被评估的 .docx。
-返回结构见项目《脚本接口差异与统一建议.md》§2.2。
+本模块不修改全局 sys.stdout，也不 print 主结果。主结果统一由 evaluate(dir_path) -> dict
+返回；入参为"脚本所在目录的路径"，脚本会在该目录下自动寻找待评的 .docx 文件。
+本文件仅在 __main__ 下作为本地调试入口，把 evaluate() 的返回值按 JSON 打印出来。
+
+维度2 共 35 条：加分项 17 条（指令下达的任务，满分 +51）、减分项 18 条（指令未要求
+而多做的破坏性修改，下限 -36）。加分项命中记 "+N"、未命中记 "+0"；减分项命中（即
+确实出现了破坏）记 "-N"、未出现记 "-0"。两类条目在 _MAX_DELTAS_ORDER 中以正负号区分。
+
+本脚本不做任何排版渲染，所有判定均基于 OOXML 静态解析。原先依赖真实分页的条目改为
+可静态验证的结构判据（页码域类型、分节与 pgNumType 起编设置）；确实只能在排版后才能
+测量的量（页底连续空白高度）按"加分需证据、减分需证据"降级：加分项判为未命中，
+减分项判为未出现。
 """
+
 import os
+import re
 import sys
 import json
+import traceback
+
+from docx import Document
+from docx.oxml.ns import qn
+from lxml import etree
+
 
 SCRIPT_ID = "019"
-
-# ============================================================
-# 模块级"当前上下文"
-# 由 evaluate() 在运行时赋值；各 _check_xxx 函数依赖它们读取 Word 文档。
-# ============================================================
-DOC_PATH = None
-doc = None
-
-# 评分累积状态（每次 evaluate() 开始时重置）
-hit_points = []
-dim1_passed = True
-dim1_reason_parts = []
-
-def add_hit(desc, score):
-    hit_points.append((desc, score))
-
-def dim1_fail(reason):
-    global dim1_passed
-    dim1_passed = False
-    dim1_reason_parts.append(reason)
-
-# ============================================================
-# 辅助函数与常量
-# ============================================================
-EMU_PER_CM = 360000
-CM_PER_PT = 2.54 / 72.0    # 1点 = 1/72英寸
-TOL_CM = 0.05              # Word UI 输入 2.5cm 与 twips 往返后偏差 < 0.001cm，0.05cm 足够严格
-TARGET_TITLE = '初中化学模拟试题'
-FIELD_LABELS = ['报送单位：', '学科：', '命题人：', '命题人联系电话：']
-
-def emu_to_cm(emu):
-    return emu / EMU_PER_CM
-
-def get_east_asian_font(run):
-    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-    rpr = run._element.find('.//w:rPr', ns)
-    if rpr is not None:
-        rfonts = rpr.find('w:rFonts', ns)
-        if rfonts is not None:
-            return rfonts.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}eastAsia')
-    return None
-
-def get_run_info(run):
-    fn = run.font.name
-    ea = get_east_asian_font(run)
-    fs = run.font.size
-    fb = run.font.bold
-    return fn, ea, fs, fb
-
-# ============================================================
-# Word COM 共享会话
-# 多条评分规则需要 Word 布局引擎的真实渲染值（页码、坐标、生效字体等）。
-# 为避免反复 Dispatch/Open/Quit 造成 Word 多会话不稳定，这里在一次
-# evaluate() 内共享同一个 Word.Application 实例与已打开的文档；由
-# evaluate() 在结束时统一调用 _close_word()。
-# ============================================================
-_word_app = None
-_word_doc = None
-
-def _get_word_doc():
-    """返回共享的 Word 文档对象；首次调用时启动 Word、打开文档并重排分页。
-
-    若 win32com 不可用或打开失败，抛异常，由各 _check_*_via_com() 的
-    except 分支捕获并返回 None，从而回退到 python-docx 实现。
-    """
-    global _word_app, _word_doc
-    if _word_doc is not None:
-        return _word_doc
-    import win32com.client  # 仅在启用 COM 时导入，避免非 Windows 环境的 ImportError
-    _word_app = win32com.client.Dispatch('Word.Application')
-    _word_app.Visible = False
-    _word_app.DisplayAlerts = False
-    _word_doc = _word_app.Documents.Open(DOC_PATH)
-    _word_doc.Repaginate()
-    return _word_doc
-
-def _close_word():
-    """关闭共享 Word 会话；由 evaluate() 在 finally 中调用。"""
-    global _word_app, _word_doc
-    try:
-        if _word_doc is not None:
-            _word_doc.Close(SaveChanges=0)
-    except Exception:
-        pass
-    try:
-        if _word_app is not None:
-            _word_app.Quit()
-    except Exception:
-        pass
-    _word_doc = None
-    _word_app = None
-
-def _check_a4_and_margins_via_docx():
-    """备选：python-docx 检查所有节。"""
-    for sec in doc.sections:
-        pw = emu_to_cm(sec.page_width)
-        ph = emu_to_cm(sec.page_height)
-        if not (abs(pw - 21.0) < TOL_CM and abs(ph - 29.7) < TOL_CM):
-            return False
-        if abs(emu_to_cm(sec.top_margin)    - 2.5) >= TOL_CM: return False
-        if abs(emu_to_cm(sec.bottom_margin) - 2.5) >= TOL_CM: return False
-        if abs(emu_to_cm(sec.left_margin)   - 2.5) >= TOL_CM: return False
-        if abs(emu_to_cm(sec.right_margin)  - 2.5) >= TOL_CM: return False
-    return True
-
-def _rule_01() -> None:
-    _com_result = None  # COM 多会话不稳定，统一使用 python-docx fallback
-    a4_and_margins_ok = _com_result if _com_result is not None else _check_a4_and_margins_via_docx()
-    if a4_and_margins_ok:
-        add_hit('试卷采用A4纸张，页边距设置为上2.5厘米、下2.5厘米、左2.5厘米、右2.5厘米', +3)
-
-# 第1页为封面页，"注意事项"和"第一部分 选择题"这两个标题出现在第2页
-# 细则3个点：(1) 第1页是封面 (2) "注意事项"在第2页 (3) "第一部分 选择题"在第2页
-# 用 Word COM 直接取每个文本在办公软件中实际所在的页码
-def _check_cover_and_page2_titles():
-    # 判定"封面页"的锚点：细则未列举封面内容，此处沿用文档自身特征（报送单位为封面必填字段）
-    # 但只要求它落在第1页；标题定位则严格用 Word 的 wdActiveEndPageNumber
-    wdActiveEndPageNumber = 3
-    try:
-        wd_c = _get_word_doc()
-
-        def page_of(keyword, whole_word=False):
-            find_rng = wd_c.Content.Duplicate
-            f = find_rng.Find
-            f.ClearFormatting()
-            f.Text = keyword
-            f.Forward = True
-            f.Wrap = 0  # wdFindStop
-            f.MatchWholeWord = whole_word
-            f.MatchCase = True
-            if f.Execute():
-                return int(find_rng.Information(wdActiveEndPageNumber))
-            return None
-
-        # (1) 第1页封面：以"报送单位"落在第1页作为封面存在证据
-        cover_p = page_of('报送单位')
-        cover_on_p1 = (cover_p == 1)
-
-        # (2) "注意事项" 在第2页
-        zhu_p = page_of('注意事项')
-        zhu_on_p2 = (zhu_p == 2)
-
-        # (3) "第一部分 选择题" 在第2页：细则未限定"第一部分"和"选择题"之间空格数，
-        #     用"段落文本同时包含二者"的方式定位，避免因空格个数不匹配而漏检
-        first_p = None
-        rng2 = wd_c.Content.Duplicate
-        f2 = rng2.Find
-        f2.ClearFormatting()
-        f2.Text = '第一部分'
-        f2.Forward = True
-        f2.Wrap = 0
-        f2.MatchCase = True
-        while f2.Execute():
-            para_txt = (rng2.Paragraphs(1).Range.Text or '').rstrip('\r\x07\n')
-            if '选择题' in para_txt:
-                first_p = int(rng2.Information(wdActiveEndPageNumber))
-                break
-            # 前进游标，防止死循环
-            rng2.Start = rng2.End
-            rng2.End = wd_c.Content.End
-        first_on_p2 = (first_p == 2)
-
-        return cover_on_p1 and zhu_on_p2 and first_on_p2
-    except Exception:
-        return None
-
-def _check_cover_and_page2_titles_fallback():
-    # 备选：无 COM 时按分页符定位。分页符前的段落属于上一页。
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    para_page = []
-    cur_page = 1
-    for p in doc.paragraphs:
-        para_page.append(cur_page)
-        # 段落内如出现 type=page 的 br，则后续段落进入下一页
-        for br in p._element.findall(f'.//{{{ns_w}}}br'):
-            if br.get(f'{{{ns_w}}}type') == 'page':
-                cur_page += 1
-        # 段落属性中的 pageBreakBefore 也算换页（影响当前段落所在页）
-    cover_on_p1 = False
-    zhu_on_p2 = False
-    first_on_p2 = False
-    for i, p in enumerate(doc.paragraphs):
-        t = p.text.strip()
-        if '报送单位' in t and para_page[i] == 1:
-            cover_on_p1 = True
-        if t == '注意事项' and para_page[i] == 2:
-            zhu_on_p2 = True
-        if '第一部分' in t and '选择题' in t and para_page[i] == 2:
-            first_on_p2 = True
-    return cover_on_p1 and zhu_on_p2 and first_on_p2
-
-def _rule_02() -> None:
-    # 启用 Word COM 用 wdActiveEndPageNumber 取真实渲染页码；COM 不可用时回退到 XML 分页符启发式
-    _cover_result = _check_cover_and_page2_titles()
-    cover_p2_ok = _cover_result if _cover_result is not None else _check_cover_and_page2_titles_fallback()
-    if cover_p2_ok:
-        add_hit('第1页为封面页，"注意事项"和"第一部分 选择题"这两个标题出现在第2页', +1)
-
-# 除了封面页，其余页页脚位置出现页码，页码格式例如："化学试题 第1页 共5页"，居中显示
-# 细则4个点：(1) 封面页无该页码 (2) 其余页页脚有页码 (3) 格式"化学试题 第X页 共Y页" (4) 居中
-def _check_footer_page_number_fallback():
-    import re
-    pat = re.compile(r'化学试题\s*第\s*\d+\s*页\s*共\s*\d+\s*页')
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-    # 备选：python-docx 检查页脚模板文本（PAGE/NUMPAGES 字段以字段结果或字段代码呈现，此处只校验静态文本框架 + 居中）
-    def footer_ok(footer):
-        txt = ''
-        centered = False
-        for p in footer.paragraphs:
-            # 收集含字段结果的文本
-            for node in p._element.iter():
-                tag = node.tag.split('}')[-1]
-                if tag == 't' and node.text:
-                    txt += node.text
-            pPr = p._element.find(f'{{{ns_w}}}pPr')
-            if pPr is not None:
-                jc = pPr.find(f'{{{ns_w}}}jc')
-                if jc is not None and jc.get(f'{{{ns_w}}}val') == 'center':
-                    centered = True
-        # 由于 python-docx 拿不到字段解析后的数字，退化为"含框架 + 居中"判定
-        has_frame = ('化学试题' in txt) and ('第' in txt) and ('页' in txt) and ('共' in txt)
-        return has_frame and centered
-
-    if len(doc.sections) < 2:
-        return False
-    # 封面所在节：假定为第一节，其 first-page footer（或 primary footer）不应含此页码
-    sec0 = doc.sections[0]
-    sec0.different_first_page_header_footer  # 触发属性
-    cover_footer_text = ''
-    for p in sec0.first_page_footer.paragraphs:
-        cover_footer_text += p.text
-    if pat.search(cover_footer_text):
-        # 封面页脚不应有此格式
-        pass  # 允许，只要正文页脚 OK；严格判定见 COM 路径
-    # 后续节的主页脚需 OK
-    for sec in doc.sections[1:]:
-        if not footer_ok(sec.footer):
-            return False
-    return True
-
-def _rule_03() -> None:
-    _footer_result = None  # 使用确定性的文档结构 fallback
-    footer_ok_flag = _footer_result if _footer_result is not None else _check_footer_page_number_fallback()
-    if footer_ok_flag:
-        add_hit('除了封面页，其余页页脚位置出现页码，页码格式例如："化学试题 第1页 共5页"，居中显示', +3)
-
-# 封面页中部包含竖排标题"初中化学模拟试题"，文字按"初/中/化/学/模/拟/试/题"自上而下单独成行排列
-# 细则4个点：(1) 位于封面页（第1页）(2) 位于封面页中部 (3) 标题文字为"初中化学模拟试题"
-#           (4) 按"初/中/化/学/模/拟/试/题"自上而下单独成行排列
-
-def _check_vertical_title_via_com():
-    wdActiveEndPageNumber   = 3
-    wdVerticalPositionRelativeToPage = 7  # Information index → 段落顶端在页内的纵向位置（磅）
-    wdStatisticPages        = 2
-
-    try:
-        wd_v = _get_word_doc()
-
-        # 依次查找每个字，要求：
-        #   - 都在第1页
-        #   - 每次命中所在段落的完整文本 == 该单字（"单独成行"）
-        #   - 8 次命中的段落顶端纵向位置严格递增（"自上而下"）
-        chars = list(TARGET_TITLE)
-        found_positions = []   # (y_pt, para_start)
-        prev_end = 0
-        for ch in chars:
-            rng = wd_v.Content.Duplicate
-            rng.Start = prev_end
-            f = rng.Find
-            f.ClearFormatting()
-            f.Text = ch
-            f.Forward = True
-            f.Wrap = 0
-            f.MatchCase = True
-            hit = f.Execute()
-            if not hit:
-                return False
-            # (1) 第1页
-            if int(rng.Information(wdActiveEndPageNumber)) != 1:
-                return False
-            para = rng.Paragraphs(1)
-            para_text = (para.Range.Text or '').rstrip('\r\x07\n')
-            # (4a) 单独成行：段落文本 == 这一个字
-            if para_text.strip() != ch:
-                return False
-            y = float(rng.Information(wdVerticalPositionRelativeToPage))
-            found_positions.append(y)
-            prev_end = rng.End
-
-        # (4b) 自上而下：Y 值严格递增
-        for a, b in zip(found_positions, found_positions[1:]):
-            if not (b > a):
-                return False
-
-        # (2) 位于封面页"中部"：页高 842pt (A4)，上下留白按 15%~85% 判定
-        page_h_pt = wd_v.Sections(1).PageSetup.PageHeight
-        y_top = found_positions[0]
-        y_bot = found_positions[-1]
-        if not (page_h_pt * 0.15 <= y_top and y_bot <= page_h_pt * 0.85):
-            return False
-
-        return True
-    except Exception:
-        return None
-
-def _check_vertical_title_fallback():
-    # 备选：按段落顺序找到 8 个连续段落，文本分别为 初/中/化/学/模/拟/试/题
-    paras = doc.paragraphs
-    N = len(TARGET_TITLE)
-    for i in range(len(paras) - N + 1):
-        if all(paras[i + j].text.strip() == TARGET_TITLE[j] for j in range(N)):
-            return True
-    return False
-
-def _rule_04() -> None:
-    # 启用 Word COM：定位每个字的真实页码与页内 Y 坐标，校验"第1页 + 单独成行 + 自上而下 + 中部"
-    _vt_result = _check_vertical_title_via_com()
-    has_vertical = _vt_result if _vt_result is not None else _check_vertical_title_fallback()
-    if has_vertical:
-        add_hit('封面页中部包含竖排标题"初中化学模拟试题"，文字按"初/中/化/学/模/拟/试/题"自上而下单独成行排列', +3)
-
-# 封面竖排标题字体为不加粗黑体或者加粗宋体，字号为二号到小三号，位于页面从上至下2/3的区域并水平居中
-# 细则4个点：(1) 字体：不加粗黑体 或 加粗宋体
-#           (2) 字号：二号(22pt) ~ 小三号(15pt)
-#           (3) 位于页面从上至下 2/3 的区域（即整体处于页面上方 2/3 的范围内）
-#           (4) 水平居中
-def _check_vertical_title_style_via_com():
-    wdActiveEndPageNumber            = 3
-    wdVerticalPositionRelativeToPage = 7
-    wdAlignParagraphCenter           = 1
-    try:
-        wd_s = _get_word_doc()
-
-        chars = list(TARGET_TITLE)
-        prev_end = 0
-        y_positions = []
-        page_h_pt = wd_s.Sections(1).PageSetup.PageHeight
-
-        for ch in chars:
-            rng = wd_s.Content.Duplicate
-            rng.Start = prev_end
-            f = rng.Find
-            f.ClearFormatting()
-            f.Text = ch
-            f.Forward = True
-            f.Wrap = 0
-            f.MatchCase = True
-            if not f.Execute():
-                return False
-            # 该字必须在第1页
-            if int(rng.Information(wdActiveEndPageNumber)) != 1:
-                return False
-
-            # 字体信息（取该字符的 Font）
-            font = rng.Font
-            # Word: True=-1, False=0, Undefined=9999999
-            bold = int(font.Bold)
-            size = float(font.Size)         # 磅
-            name_ascii    = (font.Name       or '').strip()
-            name_far_east = (font.NameFarEast or '').strip()
-
-            # 中文取 FarEast，回退到 Name
-            cn_name = name_far_east or name_ascii
-
-            # (1) 不加粗黑体 或 加粗宋体
-            is_heiti_not_bold = ('黑体' in cn_name or 'SimHei' in cn_name) and (bold == 0)
-            is_song_bold      = ('宋体' in cn_name or 'SimSun' in cn_name) and (bold == -1)
-            if not (is_heiti_not_bold or is_song_bold):
-                return False
-
-            # (2) 二号(22pt) ~ 小三号(15pt)
-            if not (15.0 - 0.01 <= size <= 22.0 + 0.01):
-                return False
-
-            # (4) 水平居中：该字所在段落对齐方式
-            if int(rng.Paragraphs(1).Alignment) != wdAlignParagraphCenter:
-                return False
-
-            y_positions.append(float(rng.Information(wdVerticalPositionRelativeToPage)))
-            prev_end = rng.End
-
-        # (3) 整体位于页面从上至下 2/3 的区域内：所有字的 Y 位置 <= 页高 * 2/3
-        # Y 是段落顶端相对页顶的磅值；末字顶端也必须落在 2/3 线之上
-        limit = page_h_pt * (2.0 / 3.0)
-        if not all(0 <= y <= limit for y in y_positions):
-            return False
-
-        return True
-    except Exception:
-        return None
-
-def _check_vertical_title_style_fallback():
-    # 备选：python-docx 只能校验字号 + 字体 + 加粗 + 段落居中，无法拿到页内 Y 坐标
-    paras = doc.paragraphs
-    N = len(TARGET_TITLE)
-    for i in range(len(paras) - N + 1):
-        if not all(paras[i + j].text.strip() == TARGET_TITLE[j] for j in range(N)):
-            continue
-        ok = True
-        for j in range(N):
-            p = paras[i + j]
-            if p.alignment != 1:  # 居中
-                ok = False; break
-            if not p.runs:
-                ok = False; break
-            r = p.runs[0]
-            fn, ea, fs, fb = get_run_info(r)
-            cn = ea or fn or ''
-            bold = bool(fb)
-            is_heiti_not_bold = ('黑体' in cn or 'SimHei' in cn) and (not bold)
-            is_song_bold      = ('宋体' in cn or 'SimSun' in cn) and bold
-            if not (is_heiti_not_bold or is_song_bold):
-                ok = False; break
-            if fs is not None and not (15.0 - 0.01 <= fs.pt <= 22.0 + 0.01):
-                ok = False; break
-        if ok:
-            return True
-    return False
-
-def _rule_05() -> None:
-    # 启用 Word COM：逐字校验第1页、页内 Y 坐标落在上方 2/3 区域，并校验字体/字号/居中
-    _vts_result = _check_vertical_title_style_via_com()
-    vt_style_ok = _vts_result if _vts_result is not None else _check_vertical_title_style_fallback()
-    if vt_style_ok:
-        add_hit('封面竖排标题"初中化学模拟试题"字体为不加粗黑体或者加粗宋体，字号为二号到小三号，位于页面从上至下2/3的区域并水平居中', +3)
-
-# 封面下半部分依次出现"报送单位：""学科：""命题人：""命题人联系电话："这四个文本，且每个文本单独成行，四个字段
-# 细则5个点：(1) 位于封面页（第1页）(2) 位于封面下半部分（下方 1/2）
-#           (3) 四个文本按此顺序出现："报送单位：""学科：""命题人：""命题人联系电话："（含冒号）
-#           (4) 每个文本单独成行 (5) 是四个字段
-
-def _check_four_fields_via_com():
-    wdActiveEndPageNumber            = 3
-    wdFirstCharacterLineNumber       = 10
-    wdVerticalPositionRelativeToPage = 7
-    try:
-        wd_ff = _get_word_doc()
-
-        page_h_pt = wd_ff.Sections(1).PageSetup.PageHeight
-        half_line = page_h_pt / 2.0
-
-        # 页 1 的行数上界：扫描所有页 1 段落的最大行号
-        max_line_p1 = 0
-        for para in wd_ff.Paragraphs:
-            pr = para.Range
-            if int(pr.Information(wdActiveEndPageNumber)) > 1:
-                break
-            try:
-                ln = int(pr.Information(wdFirstCharacterLineNumber))
-                if ln > max_line_p1:
-                    max_line_p1 = ln
-            except Exception:
-                pass
-        # 若 COM 拿不到行号则退回 40 行（A4 小四号常规值）
-        if max_line_p1 <= 0:
-            max_line_p1 = 40
-        half_line_no = max_line_p1 / 2.0
-
-        prev_end = 0
-        y_list = []
-        line_no_list = []
-        for label in FIELD_LABELS:
-            # 允许中文冒号"："或英文":"结尾
-            found = False
-            for label_variant in [label, label.replace('：', ':')]:
-                rng = wd_ff.Content.Duplicate
-                rng.Start = prev_end
-                f = rng.Find
-                f.ClearFormatting()
-                f.Text = label_variant
-                f.Forward = True
-                f.Wrap = 0
-                f.MatchCase = True
-                if f.Execute():
-                    found = True
-                    break
-            if not found:
-                return False
-
-            # (1) 在第1页
-            if int(rng.Information(wdActiveEndPageNumber)) != 1:
-                return False
-
-            # (2) "封面下半部分"：优先按 Y 判，若 Y 与页内其它段落高度一致（表明 COM
-            #     报的 Y 不可信）则回退到"行号 > 页 1 中线行号"
-            y = float(rng.Information(wdVerticalPositionRelativeToPage))
-            try:
-                ln = int(rng.Information(wdFirstCharacterLineNumber))
-            except Exception:
-                ln = 0
-            y_list.append(y)
-            line_no_list.append(ln)
-
-            # (4) 单独成行：段落文本去掉命中的字段标签后，剩余内容只能是"横线占位 / 空白"，
-            #     不得含任何其他可见内容（其他字段、标题或正文）——严格实现 rubric 的"单独成行"
-            para = rng.Paragraphs(1)
-            para_text = (para.Range.Text or '').rstrip('\r\x07\n')
-            remainder = para_text.replace(label_variant, '', 1)
-            # 允许作为"横线/空白"占位保留的字符：半/全角空格、制表符、下划线、连字符、长横线、点
-            ALLOWED_FILL = set(' \t　_＿-—–─﹍._·．')
-            if any(ch not in ALLOWED_FILL for ch in remainder):
-                return False
-            # 前进游标（用段落结束位置，避免同段内其他字重复命中）
-            prev_end = para.Range.End
-
-        # (2) 下半部分：Y 检查 vs 行号检查（Y 若可信优先用 Y，否则用行号）
-        y_all_same = (max(y_list) - min(y_list) < 0.5)  # 4 段 Y 完全相同 → COM Y 不可信
-        if y_all_same:
-            if not all(ln >= half_line_no for ln in line_no_list):
-                return False
-        else:
-            if not all(y >= half_line for y in y_list):
-                return False
-
-        # (3) 顺序：Find 按 prev_end 单向前进，若成功即为文档顺序
-        return True
-    except Exception:
-        return None
-
-def _check_four_fields_fallback():
-    # 备选：python-docx 按段落顺序找 4 个 label，各段仅出现该 label（可有下划线/空白）
-    order_idx = []
-    used = set()
-    for i, p in enumerate(doc.paragraphs):
-        t = p.text
-        for k, label in enumerate(FIELD_LABELS):
-            if k in used:
-                continue
-            variants = [label, label.replace('：', ':')]
-            if any(v in t for v in variants):
-                # 单独成行：段落中不得含其他字段
-                others = [x for x in FIELD_LABELS if x != label]
-                others_all = others + [x.replace('：', ':') for x in others]
-                if any(o and o in t for o in others_all):
-                    return False
-                order_idx.append((k, i))
-                used.add(k)
-                break
-    if len(order_idx) != 4:
-        return False
-    # 顺序：k 与段落 index 同增
-    for (k1, i1), (k2, i2) in zip(order_idx, order_idx[1:]):
-        if not (k2 == k1 + 1 and i2 > i1):
-            return False
-    return True
-
-def _rule_06() -> None:
-    # 启用 Word COM：逐字段校验真实页码=1、Y 坐标在页面下半部、且段落除字段和横线/空白外无其他内容
-    _ff_result = _check_four_fields_via_com()
-    four_fields_ok = _ff_result if _ff_result is not None else _check_four_fields_fallback()
-    if four_fields_ok:
-        add_hit('封面下半部分依次出现"报送单位：""学科：""命题人：""命题人联系电话："这四个文本，且每个文本单独成行，四个字段', +3)
-
-# 封面页"报送单位：""学科：""命题人：""命题人联系电话："四个文本右侧均有横线且与文本之间有1-4个空格；
-# 横线为黑色或深色细实线；横线长度约5-8厘米；四条横线右侧对齐
-# 细则5个点：(1) 每个字段右侧都有横线
-#           (2) 文本与横线之间有 1~4 个空格
-#           (3) 横线为黑色或深色细实线
-#           (4) 横线长度约 5~8 厘米
-#           (5) 四条横线右侧对齐
-def _check_field_underlines_via_com():
-    wdActiveEndPageNumber              = 3
-    wdHorizontalPositionRelativeToPage = 5
-    wdUnderlineNone                    = 0
-    wdUnderlineSingle                  = 1
-    wdUnderlineWords                   = 2
-    wdLineStyleSingle                  = 1
-    PT_PER_CM                          = 72.0 / 2.54  # ≈ 28.3465
-
-    def is_dark_color(rgb_int):
-        # Word Font.Color 为 wdColor（BGR 长整型），-1 表示自动（默认黑）
-        if rgb_int is None:
-            return True
-        if rgb_int == -1 or rgb_int == 0:  # 自动 或 纯黑
-            return True
-        b = (rgb_int >> 16) & 0xFF
-        g = (rgb_int >> 8)  & 0xFF
-        r = (rgb_int)       & 0xFF
-        # 深色：RGB 分量最大值 <= 96（近黑/深灰/深蓝等）
-        return max(r, g, b) <= 96
-
-    try:
-        wd_u = _get_word_doc()
-
-        prev_end = 0
-        line_left_xs  = []
-        line_right_xs = []
-
-        for label in FIELD_LABELS:
-            # 定位到该字段
-            found = False
-            for lv in [label, label.replace('：', ':')]:
-                rng = wd_u.Content.Duplicate
-                rng.Start = prev_end
-                f = rng.Find
-                f.ClearFormatting()
-                f.Text = lv
-                f.Forward = True
-                f.Wrap = 0
-                f.MatchCase = True
-                if f.Execute():
-                    found = True
-                    break
-            if not found:
-                return False
-            if int(rng.Information(wdActiveEndPageNumber)) != 1:
-                return False
-
-            para = rng.Paragraphs(1)
-            para_rng = para.Range
-            # 段落内 label 后的部分：从 label 结束位置到段落末（去掉 \r）
-            after_start = rng.End
-            after_end   = para_rng.End - 1 if para_rng.End > para_rng.Start else para_rng.End
-            if after_end <= after_start:
-                return False
-            after_rng = wd_u.Range(after_start, after_end)
-            after_text = after_rng.Text or ''
-
-            # (2) 与横线之间有 1~4 个空格：label 结束后紧跟的空白字符个数（半角空格/全角空格）
-            i = 0
-            space_cnt = 0
-            while i < len(after_text) and after_text[i] in (' ', '　'):
-                space_cnt += 1
-                i += 1
-            if not (1 <= space_cnt <= 4):
-                return False
-
-            # 横线正文起始位置（跳过前导空格）
-            line_start_off = after_start + i
-            if line_start_off >= after_end:
-                return False
-
-            # 判定横线主体：优先"下划线格式的字符（含空格）"，其次"下划线字符 _ / ＿"
-            # 取横线开始处一个字符探测其 Underline 属性
-            probe = wd_u.Range(line_start_off, line_start_off + 1)
-            probe_underline = int(probe.Font.Underline)
-            probe_ul_style  = probe.Font.UnderlineColor  # 仅参考
-            probe_color     = probe.Font.Color
-
-            line_chars_end = line_start_off
-            uses_format_underline = (probe_underline in (wdUnderlineSingle, wdUnderlineWords))
-            uses_underscore_char = False
-
-            if uses_format_underline:
-                # 从 line_start_off 起，连续处于下划线格式的字符都算横线
-                k = line_start_off
-                while k < after_end:
-                    ch_rng = wd_u.Range(k, k + 1)
-                    if int(ch_rng.Font.Underline) in (wdUnderlineSingle, wdUnderlineWords):
-                        k += 1
-                    else:
-                        break
-                line_chars_end = k
-                # (3) 颜色：单下划线（细实线）+ 深色/黑色
-                if probe_underline != wdUnderlineSingle:
-                    return False
-                if not is_dark_color(int(probe_color)):
-                    return False
-            else:
-                # 兜底：下划线字符 _ / ＿ 组成的横线
-                rest = after_text[i:]
-                run_len = 0
-                while run_len < len(rest) and rest[run_len] in ('_', '＿'):
-                    run_len += 1
-                if run_len == 0:
-                    return False
-                uses_underscore_char = True
-                line_chars_end = line_start_off + run_len
-                # (3) 颜色：字符颜色深色
-                probe2 = wd_u.Range(line_start_off, line_start_off + 1)
-                if not is_dark_color(int(probe2.Font.Color)):
-                    return False
-
-            # 横线左端 / 右端页面 X（磅）
-            left_probe  = wd_u.Range(line_start_off, line_start_off + 1)
-            right_probe = wd_u.Range(line_chars_end - 1, line_chars_end)
-            x_left  = float(left_probe.Information(wdHorizontalPositionRelativeToPage))
-            # 右端取"最后一个横线字符右边界" = 定位到 line_chars_end 处
-            end_collapse = wd_u.Range(line_chars_end, line_chars_end)
-            x_right = float(end_collapse.Information(wdHorizontalPositionRelativeToPage))
-
-            # (4) 长度 5~8cm（含端点，容差 0.05cm）
-            length_cm = (x_right - x_left) / PT_PER_CM
-            if not (5.0 - 0.05 <= length_cm <= 8.0 + 0.05):
-                return False
-
-            line_left_xs.append(x_left)
-            line_right_xs.append(x_right)
-            prev_end = para_rng.End
-
-        # (5) 四条横线右侧对齐：右端 X 差 <= 1pt
-        if max(line_right_xs) - min(line_right_xs) > 1.0:
-            return False
-
-        return True
-    except Exception:
-        return None
-
-def _check_field_underlines_fallback():
-    # 备选：python-docx 校验下划线格式或下划线字符 + 空格数 + 长度粗估
-    from docx.shared import RGBColor
-    lens_cm = []
-    right_ends_est = []
-    for i, p in enumerate(doc.paragraphs):
-        t = p.text
-        which = None
-        for label in FIELD_LABELS:
-            if label in t or label.replace('：', ':') in t:
-                which = label
-                break
-        if not which:
-            continue
-        # 取 label 后的文本
-        idx = t.find(which)
-        if idx < 0:
-            idx = t.find(which.replace('：', ':'))
-        after = t[idx + len(which):]
-        # 空格数
-        j = 0
-        while j < len(after) and after[j] in (' ', '　'):
-            j += 1
-        if not (1 <= j <= 4):
-            return False
-        # 横线字符 或 下划线格式
-        rest = after[j:]
-        underscore_len = 0
-        for c in rest:
-            if c in ('_', '＿'):
-                underscore_len += 1
-            else:
-                break
-        has_fmt_ul = False
-        for r in p.runs:
-            if r.font.underline:
-                has_fmt_ul = True
-                break
-        if underscore_len == 0 and not has_fmt_ul:
-            return False
-        # 长度粗估：12pt 下划线字符 ≈ 0.21cm
-        est_cm = underscore_len * 0.21 if underscore_len > 0 else 6.0
-        if not (5.0 - 0.5 <= est_cm <= 8.0 + 0.5):
-            return False
-        lens_cm.append(est_cm)
-        right_ends_est.append(idx + len(which) + j + underscore_len)
-    if len(lens_cm) != 4:
-        return False
-    # 右端对齐：粗估右端字符位置一致（<=2 字符差）
-    if max(right_ends_est) - min(right_ends_est) > 2:
-        return False
-    return True
-
-def _rule_08() -> None:
-    # 启用 Word COM：校验下划线线型(单实线)/颜色(黑或深色)/真实厘米长度(5~8cm)/右端X对齐
-    _ul_result = _check_field_underlines_via_com()
-    underlines_ok = _ul_result if _ul_result is not None else _check_field_underlines_fallback()
-    if underlines_ok:
-        add_hit('封面页"报送单位：""学科：""命题人：""命题人联系电话："四个文本右侧均有横线且与文本之间有1-4个空格；横线为黑色或深色细实线；横线长度约5-8厘米；四条横线右侧对齐', +3)
-
-# 封面页除标题外其余文本：中文字体为宋体、小四号，英文和阿拉伯数字为Times New Roman、小四号
-# 细则5个点：(1) 范围：封面页（第1页）除竖排标题"初中化学模拟试题"外的所有文本
-#           (2) 中文字体：宋体（含 SimSun）
-#           (3) 中文字号：小四号（12pt）
-#           (4) 英文和阿拉伯数字字体：Times New Roman
-#           (5) 英文和阿拉伯数字字号：小四号（12pt）
-def _check_cover_body_font_fallback():
-    XIAOSI_PT = 12.0
-    def is_chinese(ch): return '一' <= ch <= '鿿'
-    def is_en_num(ch):
-        return ('A' <= ch <= 'Z') or ('a' <= ch <= 'z') or ('0' <= ch <= '9')
-
-    # 估算前 ~ 30 段视为封面页；单字段落若命中标题字则跳过
-    title_chars = set(TARGET_TITLE)
-    scanned = 0
-    for p in doc.paragraphs[:60]:
-        t = p.text
-        if not t.strip():
-            continue
-        if len(t.strip()) == 1 and t.strip() in title_chars:
-            continue
-        scanned += 1
-        for r in p.runs:
-            rt = r.text
-            if not rt:
-                continue
-            fn, ea, fs, fb = get_run_info(r)
-            size_pt = fs.pt if fs is not None else None
-            for ch in rt:
-                if ch in ('_', '＿', ' ', '　', '\t', '\r', '\n'):
-                    continue
-                if is_chinese(ch):
-                    cn = ea or fn or ''
-                    if not ('宋体' in cn or 'SimSun' in cn):
-                        return False
-                    if size_pt is not None and abs(size_pt - XIAOSI_PT) > 0.01:
-                        return False
-                elif is_en_num(ch):
-                    name = fn or ''
-                    if 'Times New Roman' not in name:
-                        return False
-                    if size_pt is not None and abs(size_pt - XIAOSI_PT) > 0.01:
-                        return False
-        if scanned > 30:
-            break
-    return True
-
-def _rule_09() -> None:
-    _cbf_result = None  # 使用确定性的文档结构 fallback
-    cover_font_ok = _cbf_result if _cbf_result is not None else _check_cover_body_font_fallback()
-    if cover_font_ok:
-        add_hit('封面页除标题外其余文本：中文字体为宋体、小四号，英文和阿拉伯数字为Times New Roman、小四号', +3)
-
-# 第2页存在标题"初中化学模拟试题"，该标题字体为黑体、三号、不加粗
-# 细则5个点：(1) 位于第2页  (2) 存在标题文本"初中化学模拟试题"（作为一整段，非竖排单字）
-#           (3) 字体：黑体  (4) 字号：三号（16pt）  (5) 不加粗
-def _check_page2_title_fallback():
-    # 备选：python-docx 按段落顺序找"整段 == 目标标题"，靠分页符估算页码
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    cur_page = 1
-    for p in doc.paragraphs:
-        if p.text.strip() == TARGET_TITLE and cur_page == 2:
-            for r in p.runs:
-                for ch in r.text:
-                    if not ('一' <= ch <= '鿿'):
-                        continue
-                    fn, ea, fs, fb = get_run_info(r)
-                    cn = ea or fn or ''
-                    if not ('黑体' in cn or 'SimHei' in cn):
-                        return False
-                    if fs is not None and abs(fs.pt - 16.0) > 0.01:
-                        return False
-                    if fb:
-                        return False
-            return True
-        for br in p._element.findall(f'.//{{{ns_w}}}br'):
-            if br.get(f'{{{ns_w}}}type') == 'page':
-                cur_page += 1
-    return False
-
-def _rule_10() -> None:
-    _p2t_result = None  # 使用确定性的文档结构 fallback
-    page2_title_ok = _p2t_result if _p2t_result is not None else _check_page2_title_fallback()
-    if page2_title_ok:
-        add_hit('第2页存在标题"初中化学模拟试题"，该标题字体为黑体、三号、不加粗', +1)
-
-# 第2页标题"初中化学模拟试题"居中显示、1.5倍行距
-# 细则3个点：(1) 定位第2页整段为"初中化学模拟试题"的标题段落
-#           (2) 居中显示
-#           (3) 1.5倍行距
-def _check_page2_title_layout_via_com():
-    wdActiveEndPageNumber   = 3
-    wdAlignParagraphCenter  = 1
-    wdLineSpace1pt5         = 1
-    wdLineSpaceMultiple     = 5
-    try:
-        wd_a = _get_word_doc()
-
-        target_para = None
-        for para in wd_a.Paragraphs:
-            ptxt = (para.Range.Text or '').rstrip('\r\x07\n')
-            if ptxt.strip() == TARGET_TITLE:
-                if int(para.Range.Information(wdActiveEndPageNumber)) == 2:
-                    target_para = para
-                    break
-        if target_para is None:
-            return False
-
-        # (2) 居中显示：段落对齐方式
-        if int(target_para.Alignment) != wdAlignParagraphCenter:
-            return False
-
-        # (3) 1.5倍行距：LineSpacingRule = wdLineSpace1pt5，或 Multiple 且倍数=1.5
-        rule = int(target_para.LineSpacingRule)
-        if rule == wdLineSpace1pt5:
-            return True
-        if rule == wdLineSpaceMultiple:
-            # Word 中 Multiple 规则下 LineSpacing 磅值 = 12 * 倍数
-            multiplier = float(target_para.LineSpacing) / 12.0
-            if abs(multiplier - 1.5) < 0.01:
-                return True
-        return False
-    except Exception:
-        return None
-
-def _check_page2_title_layout_fallback():
-    # 备选：python-docx，按分页符估算页码
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    cur_page = 1
-    for p in doc.paragraphs:
-        if p.text.strip() == TARGET_TITLE and cur_page == 2:
-            # 居中：段落对齐 == CENTER (1)
-            if p.alignment != 1:
-                return False
-            # 1.5 倍行距：line = 240 * 倍数（240 twips = 1 行）
-            pPr = p._element.find(f'{{{ns_w}}}pPr')
-            if pPr is None:
-                return False
-            sp = pPr.find(f'{{{ns_w}}}spacing')
-            if sp is None:
-                return False
-            line = sp.get(f'{{{ns_w}}}line')
-            line_rule = sp.get(f'{{{ns_w}}}lineRule')
-            if line is None:
-                return False
-            # lineRule: auto=倍数, exact/atLeast=磅值*20
-            if line_rule in (None, 'auto'):
-                multiplier = int(line) / 240.0
-                return abs(multiplier - 1.5) < 0.01
-            return False
-        for br in p._element.findall(f'.//{{{ns_w}}}br'):
-            if br.get(f'{{{ns_w}}}type') == 'page':
-                cur_page += 1
-    return False
-
-def _rule_11() -> None:
-    # 启用 Word COM：用 wdActiveEndPageNumber 取真实第2页；LineSpacingRule 兼容 1pt5 与 Multiple(1.5)
-    _p2l_result = _check_page2_title_layout_via_com()
-    page2_title_layout_ok = _p2l_result if _p2l_result is not None else _check_page2_title_layout_fallback()
-    if page2_title_layout_ok:
-        add_hit('第2页标题"初中化学模拟试题"居中显示、1.5倍行距', +1)
-
-# 从第2页至尾页除标题以外其他文本：中文文本字体统一为宋体小四号，适用于题干、注意事项、分值表文字、
-# 题目说明和主观题文字；英文和数字字体为Times New Roman、小四号
-# 细则5个点：(1) 范围：第2页至尾页  (2) 排除范围：标题段落
-#           (3) 中文：宋体  (4) 英文和数字：Times New Roman  (5) 字号：小四号(12pt)
-def _is_title_paragraph(ptxt):
-    """判断是否为标题段落（不参与本条评分）：
-       - 第2页大标题"初中化学模拟试题"
-       - 副标题："注意事项" / "第X部分 …题" 形式（选择题/非选择题/简答题/实验探究题/计算题 等） / "参考答案"
-    """
-    import re
-    s = ptxt.strip()
-    if not s:
-        return True   # 空段落不评
-    if s == TARGET_TITLE:
-        return True
-    if s == '注意事项':
-        return True
-    # 第X部分 …题 （允许"（共N小题，共M分）"这类尾注附在同段）
-    if re.match(r'^第[一二三四五六七八九十]+部分[\s　]+[^\s　（(]{1,20}题', s):
-        return True
-    if s == '参考答案' or (s.startswith('参考答案') and len(s) <= 20):
-        return True
-    return False
-
-def _check_body_font_fallback():
-    # 备选：python-docx，按 <w:br type="page"> 累加页码
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    XIAOSI_PT = 12.0
-
-    def is_chinese(ch): return '一' <= ch <= '鿿'
-    def is_en_num(ch):
-        return ('A' <= ch <= 'Z') or ('a' <= ch <= 'z') or ('0' <= ch <= '9')
-
-    cur_page = 1
-    for p in doc.paragraphs:
-        if cur_page >= 2 and not _is_title_paragraph(p.text):
-            for r in p.runs:
-                rt = r.text
-                if not rt:
-                    continue
-                fn, ea, fs, fb = get_run_info(r)
-                size_pt = fs.pt if fs is not None else None
-                for ch in rt:
-                    if ch in ('_', '＿', ' ', '　', '\t', '\r', '\n'):
-                        continue
-                    if is_chinese(ch):
-                        cn = ea or fn or ''
-                        if not ('宋体' in cn or 'SimSun' in cn):
-                            return False
-                        if size_pt is not None and abs(size_pt - XIAOSI_PT) > 0.01:
-                            return False
-                    elif is_en_num(ch):
-                        name = fn or ''
-                        if 'Times New Roman' not in name:
-                            return False
-                        if size_pt is not None and abs(size_pt - XIAOSI_PT) > 0.01:
-                            return False
-        for br in p._element.findall(f'.//{{{ns_w}}}br'):
-            if br.get(f'{{{ns_w}}}type') == 'page':
-                cur_page += 1
-    return True
-
-def _rule_12() -> None:
-    _bf_result = None  # 使用确定性的文档结构 fallback
-    body_font_ok = _bf_result if _bf_result is not None else _check_body_font_fallback()
-    if body_font_ok:
-        add_hit('从第2页至尾页除标题以外其他文本：中文文本字体统一为宋体小四号，适用于题干、注意事项、分值表文字、题目说明和主观题文字；英文和数字字体为Times New Roman、小四号', +5)
-
-# 从第2页至尾页：除主标题"初中化学模拟试题"外其余标题字体采用黑体、小三号、不加粗
-# 细则4个点：(1) 范围：第2页至尾页
-#           (2) 排除：主标题"初中化学模拟试题"
-#           (3) 对象：其余标题段落（注意事项 / 第一部分 选择题 / 第二部分 非选择题 / 参考答案 等）
-#           (4) 字体黑体 + 字号小三号(15pt) + 不加粗
-def _is_subtitle_paragraph(ptxt):
-    s = ptxt.strip()
-    if not s:
-        return False
-    if s == TARGET_TITLE:
-        return False
-    if s == '注意事项':
-        return True
-    if ('第一部分' in s) and ('选择题' in s) and len(s) <= 30:
-        return True
-    if ('第二部分' in s) and ('非选择题' in s) and len(s) <= 30:
-        return True
-    if s == '参考答案' or (s.startswith('参考答案') and len(s) <= 20):
-        return True
-    return False
-
-def _check_subtitles_style_fallback():
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    XIAOSAN_PT = 15.0
-    cur_page = 1
-    subtitle_found = 0
-    for p in doc.paragraphs:
-        if cur_page >= 2 and _is_subtitle_paragraph(p.text):
-            subtitle_found += 1
-            for r in p.runs:
-                for ch in r.text:
-                    if not ('一' <= ch <= '鿿'):
-                        continue
-                    fn, ea, fs, fb = get_run_info(r)
-                    cn = ea or fn or ''
-                    if not ('黑体' in cn or 'SimHei' in cn):
-                        return False
-                    if fs is not None and abs(fs.pt - XIAOSAN_PT) > 0.01:
-                        return False
-                    if fb:
-                        return False
-        for br in p._element.findall(f'.//{{{ns_w}}}br'):
-            if br.get(f'{{{ns_w}}}type') == 'page':
-                cur_page += 1
-    return subtitle_found > 0
-
-def _rule_13() -> None:
-    _st_result = None  # 使用确定性的文档结构 fallback
-    subtitles_ok = _st_result if _st_result is not None else _check_subtitles_style_fallback()
-    if subtitles_ok:
-        add_hit('从第2页至尾页：除主标题"初中化学模拟试题"外其余标题字体采用黑体、小三号、不加粗', +3)
-
-# 解题过程下方横线满足以下任意一条：整体数量不是6条；长度不是在15-17厘米之间；所有横线长度不一致  →  -3
-# 细则3个触发条件（任一命中即扣分）：
-#   (a) 整体数量不是 6 条
-#   (b) 长度不是在 15~17 厘米之间（存在任一条不在该区间）
-#   (c) 所有横线长度不一致（六条之间存在长度差异）
-def _collect_answer_underlines_fallback():
-    """备选：按下划线字符估算（12pt SimSun 下 `_` 约 0.21cm）。"""
-    lengths = []
-    for p in doc.paragraphs:
-        body = p.text.strip(' 　\t')
-        if len(body) >= 20 and all(c in ('_', '＿') for c in body):
-            lengths.append(len(body) * 0.21)
-    return lengths
-
-def _rule_14() -> None:
-    lengths = _collect_answer_underlines_fallback()
-
-    # 触发条件 (a) 数量不是 6
-    count_bad = (len(lengths) != 6)
-    # 触发条件 (b) 存在任一长度不在 [15, 17] cm
-    length_bad = any(not (15.0 - 0.05 <= l <= 17.0 + 0.05) for l in lengths) if lengths else True
-    # 触发条件 (c) 六条之间长度不一致（最大差 > 0.05cm）
-    consistency_bad = (len(lengths) >= 2 and (max(lengths) - min(lengths)) > 0.05)
-
-    if count_bad or length_bad or consistency_bad:
-        add_hit('解题过程下方横线满足以下任意一条：整体数量不是6条；长度不是在15-17厘米之间；所有横线长度不一致', -3)
-
-# 试题中页面出现大于等于1/3空白  →  -5
-# 细则2个要点：(1) 范围：试题中的页面（从第2页开始的所有正文页）
-#             (2) 触发：任一页面出现 ≥ 1/3 的空白
-# 判定策略：按办公软件真实分页 + 段落在页内的实际 Y 坐标，计算每页"未被内容覆盖的最大连续空白高度"
-#   ─ 顶部空白：正文区顶端 → 首个非空内容顶端
-#   ─ 底部空白：末个非空内容底端 → 正文区底端
-#   ─ 中间空白：任意两段之间的空隙（当前段底端 → 下一段顶端）
-#   ─ 空白页：该页无任何非空段落 → 直接命中
-def _check_page_blank_ge_one_third_fallback():
-    # 备选：无 COM 时按连续空白段落估算
-    max_consec_empty = 0
-    cur = 0
-    for p in doc.paragraphs:
-        if p.text.strip() == '':
-            cur += 1
-            if cur > max_consec_empty:
-                max_consec_empty = cur
-        else:
-            cur = 0
-    # 小四号 12pt 单倍行距下每页约 35~40 行，1/3 ≈ 12 行
-    return max_consec_empty >= 12
-
-def _rule_15() -> None:
-    _bl_result = None  # 使用确定性的文档结构 fallback
-    page_has_large_blank = _bl_result if _bl_result is not None else _check_page_blank_ge_one_third_fallback()
-    if page_has_large_blank:
-        add_hit('试题中页面出现大于等于1/3空白', -5)
-
-# ============================================================
-# 维度一：可用与可修改性
-# ============================================================
-def _run_dim1_checks() -> None:
-    """打开文档并运行维度一检查；失败时通过 dim1_fail() 记录原因。
-    亦负责将 module-global `doc` 赋值为 python-docx Document，供下方 fallback 使用。"""
-    global doc
-
-    # (1) 文件必须能被 python-docx 打开
-    try:
-        import docx as _docx
-        doc = _docx.Document(DOC_PATH)
-    except Exception as e:
-        dim1_fail(f"文件无法正常打开：{e}")
-        return
-
-    # (2) 页数：使用 XML 分页符估算，避免本脚本多次创建 Word COM 会话。
-    ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    page_count = 1
-    for p in doc.paragraphs:
-        for br in p._element.findall(f'.//{{{ns_w}}}br'):
-            if br.get(f'{{{ns_w}}}type') == 'page':
-                page_count += 1
-
-    if page_count < 2:
-        dim1_fail(f"文档页数不足：仅 {page_count} 页")
-
-
-# ============================================================
-# 主入口 evaluate() 与 15 条评分规则元信息
-# ============================================================
-def evaluate(dir_path: str) -> dict:
-    """入口：dir_path 为脚本所在目录，脚本自行在该目录内定位并打开 .docx。"""
-    global DOC_PATH, doc, hit_points, dim1_passed, dim1_reason_parts
-    # 重置状态
-    hit_points = []
-    dim1_passed = True
-    dim1_reason_parts = []
-    DOC_PATH = None
-    doc = None
-
-    file_name = ""
-    # 计算正向满分（用于 max_score / error 情形）
-    positive_max = sum(d for _, d in _RULE_TABLE if d > 0)
-
-    try:
-        # 定位目录中的 .docx（忽略 ~$ 临时锁定文件）
-        if not os.path.isdir(dir_path):
-            raise FileNotFoundError(f"目录不存在：{dir_path}")
-        docx_files = [
-            f for f in os.listdir(dir_path)
-            if f.lower().endswith('.docx') and not f.startswith('~$')
-        ]
-        if not docx_files:
-            raise FileNotFoundError(f"目录内未找到 .docx 文件：{dir_path}")
-        # 若多份文档存在，取字典序第一个（与批量 runner 约定一致）
-        docx_files.sort()
-        file_name = docx_files[0]
-        DOC_PATH = os.path.join(dir_path, file_name)
-
-        # 维度一
-        _run_dim1_checks()
-        if not dim1_passed:
-            return {
-                "id": "019",
-                "file_name": file_name,
-                "status": "ok",
-                "error": None,
-                "dim1_pass": False,
-                "dim1_reason": "；".join(dim1_reason_parts),
-                "dim2_items": [],
-                "total_score": 0,
-                "max_score": positive_max,
-            }
-
-        # 维度二：依次触发全部 15 条评分规则
-        for _, _, fn in _SCORE_RULES:
-            fn()
-
-        # 汇总 dim2_items（命中 + 未命中都要列）
-        hit_map = {desc: score for desc, score in hit_points}
-        dim2_items = []
-        for desc, max_delta, _ in _SCORE_RULES:
-            hit = desc in hit_map
-            delta = hit_map[desc] if hit else 0
-            dim2_items.append({
-                "rule": desc,
-                "max_delta": max_delta,
-                "delta": delta,
-                "hit": hit,
-                "detail": "",
-            })
-
-        total_score = sum(item["delta"] for item in dim2_items)
-        return {
-            "id": "019",
-            "file_name": file_name,
-            "status": "ok",
-            "error": None,
-            "dim1_pass": True,
-            "dim1_reason": "",
-            "dim2_items": dim2_items,
-            "total_score": total_score,
-            "max_score": positive_max,
-        }
-    except Exception as exc:
-        return {
-            "id": "019",
-            "file_name": file_name,
-            "status": "error",
-            "error": f"{type(exc).__name__}: {exc}",
-            "dim1_pass": False,
-            "dim1_reason": "",
-            "dim2_items": [],
-            "total_score": 0,
-            "max_score": positive_max,
-        }
-    finally:
-        # 无论成功/异常/维度一短路，都需释放共享的 Word COM 会话
-        _close_word()
-
-
-# 15 条评分规则的元信息（用于生成 dim2_items 矩阵）
-# 每一项：(rule_desc, max_delta, trigger_fn)
-_SCORE_RULES = [
-    ("试卷采用A4纸张，页边距设置为上2.5厘米、下2.5厘米、左2.5厘米、右2.5厘米", +3, _rule_01),
-    ("第1页为封面页，\"注意事项\"和\"第一部分 选择题\"这两个标题出现在第2页", +1, _rule_02),
-    ("除了封面页，其余页页脚位置出现页码，页码格式例如：\"化学试题 第1页 共5页\"，居中显示", +3, _rule_03),
-    ("封面页中部包含竖排标题\"初中化学模拟试题\"，文字按\"初/中/化/学/模/拟/试/题\"自上而下单独成行排列", +3, _rule_04),
-    ("封面竖排标题\"初中化学模拟试题\"字体为不加粗黑体或者加粗宋体，字号为二号到小三号，位于页面从上至下2/3的区域并水平居中", +3, _rule_05),
-    ("封面下半部分依次出现\"报送单位：\"\"学科：\"\"命题人：\"\"命题人联系电话：\"这四个文本，且每个文本单独成行，四个字段", +3, _rule_06),
-    ("封面页\"报送单位：\"\"学科：\"\"命题人：\"\"命题人联系电话：\"四个文本右侧均有横线且与文本之间有1-4个空格；横线为黑色或深色细实线；横线长度约5-8厘米；四条横线右侧对齐", +3, _rule_08),
-    ("封面页除标题外其余文本：中文字体为宋体、小四号，英文和阿拉伯数字为Times New Roman、小四号", +3, _rule_09),
-    ("第2页存在标题\"初中化学模拟试题\"，该标题字体为黑体、三号、不加粗", +1, _rule_10),
-    ("第2页标题\"初中化学模拟试题\"居中显示、1.5倍行距", +1, _rule_11),
-    ("从第2页至尾页除标题以外其他文本：中文文本字体统一为宋体小四号，适用于题干、注意事项、分值表文字、题目说明和主观题文字；英文和数字字体为Times New Roman、小四号", +5, _rule_12),
-    ("从第2页至尾页：除主标题\"初中化学模拟试题\"外其余标题字体采用黑体、小三号、不加粗", +3, _rule_13),
-    ("解题过程下方横线满足以下任意一条：整体数量不是6条；长度不是在15-17厘米之间；所有横线长度不一致", -3, _rule_14),
-    ("试题中页面出现大于等于1/3空白", -5, _rule_15),
+MAX_SCORE_TOTAL = 51
+MIN_SCORE_TOTAL = -36
+
+_MAX_DELTAS_ORDER = [
+    5,   # 01 封面单独成页、正文另起一页
+    5,   # 02 封面主标题真正竖排
+    1,   # 03 封面主标题加粗、≥18磅、水平居中
+    1,   # 04 封面四项填写项齐全
+    5,   # 05 四项填空横线为下划线格式且≥5cm
+    1,   # 06 四项位于封面下半部、左端对齐
+    1,   # 07 卷内主题标题 黑体三号居中
+    5,   # 08 正文中文 宋体小四
+    3,   # 09 正文西文数字 Times New Roman 小四
+    1,   # 10 页脚"化学试题 第x页 共x页"
+    3,   # 11 当前页序号用 PAGE 域
+    3,   # 12 "共x页"与正文实际页数一致
+    5,   # 13 封面页不显示页码
+    3,   # 14 正文首页页码从"第1页"开始
+    1,   # 15 页脚居中、9-12磅、宋体+Times New Roman
+    5,   # 16 A4 纵向 + 上下左右 2.5cm 页边距
+    3,   # 17 正文段间距0行、行距1.5倍
+    -3,  # 18 第25题表格"用于食品包装袋内作保护气"被改写
+    -3,  # 19 6张示意图未全部保留在对应题目下
+    -3,  # 20 图2/图3/图5 非等比缩放
+    -1,  # 21 图2 未独占一个居中段落
+    -3,  # 22 正文页底出现 >5cm 连续空白
+    -3,  # 23 第31题 6行作答横线折行
+    -1,  # 24 化学式/相对原子质量内被插入多余空格
+    -1,  # 25 卷内主题标题未加粗
+    -3,  # 26 5处分部标题不再是 黑体13.5磅加粗
+    -3,  # 27 题号分值表结构/数值被破坏
+    -3,  # 28 选择题 20 小题或 ABCD 选项不全
+    -1,  # 29 第21-31题题号不连续
+    -1,  # 30 分值标注缺失
+    -1,  # 31 第25题表格 5行2列/表头被破坏
+    -3,  # 32 参考答案标题及 4 段答案未完整保留
+    -1,  # 33 参考答案未与正文分页
+    -1,  # 34 末尾缺少单独居中的"（试卷结束）"
+    -1,  # 35 封面出现多余内容
 ]
 
-# 兼容 evaluate() 里的引用别名
-_RULE_TABLE = [(desc, delta) for desc, delta, _ in _SCORE_RULES]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+assert sum(d for d in _MAX_DELTAS_ORDER if d < 0) == MIN_SCORE_TOTAL
+
+
+# ========== 常量 ==========
+
+_P = qn("w:p")
+_TBL = qn("w:tbl")
+_TR = qn("w:tr")
+_TC = qn("w:tc")
+_R = qn("w:r")
+_T = qn("w:t")
+_BR = qn("w:br")
+_TAB = qn("w:tab")
+_PPR = qn("w:pPr")
+_RPR = qn("w:rPr")
+_SECTPR = qn("w:sectPr")
+_VAL = qn("w:val")
+_TYPE = qn("w:type")
+_EMBED = qn("r:embed")
+
+NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+NS_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_FALLBACK = "{%s}Fallback" % NS_MC
+_ALT_CONTENT = "{%s}AlternateContent" % NS_MC
+_DRAWING = qn("w:drawing")
+_PICT = qn("w:pict")
+
+EMU_PER_CM = 360000.0
+TWIPS_PER_CM = 566.9291
+PT_PER_CM = 28.34646
+
+STRICT_SONGTI = ("宋体", "SimSun", "NSimSun", "宋体-简", "Songti SC", "STSong")
+STRICT_HEITI = ("黑体", "SimHei", "黑体-简", "Heiti SC", "STHeiti")
+TIMES = ("times new roman", "timesnewroman", "times")
+
+TITLE_TEXT = "初中化学模拟试题"
+ANSWER_TITLE = "参考答案与评分建议"
+END_MARK = "（试卷结束）"
+COVER_FIELDS = (
+    ("报送单位", r"报送单位\s*[:：]"),
+    ("学科", r"^\s*学科\s*[:：]"),
+    ("命题人", r"^\s*命题人\s*[:：]"),
+    ("命题人联系电话", r"命题人联系电话\s*[:：]"),
+)
+SECTION_HEADS = ("注意事项", "第一部分", "第二部分", "第三部分", "第四部分")
+UNDERLINE_MIN_CM = 5.0
+ANSWER_PARTS = ("一、选择题", "二、填空题", "三、实验探究题", "四、综合应用与计算题")
+EXPECTED_SCORE_MARKS = 32          # 输入试题中"（x分）"类分值标注的总数
+EXPECTED_FIG_ANCHORS = [5, 24, 27, 28, 29, 30]   # 6 张示意图应挂在的题号
+FIG_ASPECTS = {2: 1.96, 3: 2.00, 5: 1.61}        # 图2/图3/图5 的应有宽高比（0基序号）
+QNUM_RE = re.compile(r"^\s*(\d{1,2})\s*[.．、]")
+SCORE_MARK_RE = re.compile(r"（[^）]{0,14}分）")
+FULLWIDTH_RE = re.compile(
+    "[ᄀ-ᅟ⺀-꓏ꥠ-꥿가-힣豈-﫿"
+    "︐-︙︰-﹯＀-｠￠-￦　-〾]"
+)
+CJK_RE = re.compile("[㐀-䶿一-鿿豈-﫿　-〿！-～]")
+LATIN_RE = re.compile(r"[A-Za-z0-9]")
+FORMULA_SPACE_PATTERNS = (
+    # 选项之间"…含O₂    B. …"式的多空格间隔属正常排版，故限定 1-2 个空格并排除选项标号
+    (r"[A-Za-z][₀-₉][ ]{1,2}(?![A-D]\s*[.．、])[A-Za-z]", "化学式内部被拆开（如 2H₂ O）"),
+    (r"[₀-₉][ ]{1,2}[↑↓]", "气体/沉淀符号前被插入空格（如 CO₂ ↑）"),
+    (r"[A-Za-z]-\d+\.[ ]{1,2}\d", "相对原子质量被拆开（如 Cl-35. 5）"),
+    (r"[A-Za-z][ ]{1,2}[₀-₉]", "元素符号与下标之间被插入空格"),
+    (r"[₀-₉][ ]{1,2}[²³⁴⁻⁺]", "离子符号内部被插入空格（如 O₂ ²⁻）"),
+)
+
+
+# ========== 基础 XML 工具 ==========
+
+def _walk(el):
+    """深度优先遍历子孙节点，跳过 mc:Fallback（VML 兼容分支），避免同一段文字被重复统计。"""
+    for child in el:
+        if child.tag == _FALLBACK:
+            continue
+        yield child
+        for sub in _walk(child):
+            yield sub
+
+
+def _text_of(el):
+    """取节点内的可见文字；w:tab -> \\t，w:br/w:cr -> \\n（含文本框内文字）。"""
+    parts = []
+    for node in _walk(el):
+        tag = node.tag
+        if tag == _T:
+            parts.append(node.text or "")
+        elif tag == _TAB:
+            parts.append("\t")
+        elif tag == _BR or tag == qn("w:cr"):
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _norm(text):
+    return re.sub(r"[ \t\u3000]+", " ", (text or "").replace("\n", " ")).strip()
+
+
+def _squeeze(text):
+    return re.sub(r"\s+", "", text or "")
+
+
+def _is_shape_holder(run):
+    """判断运行是否只是图形/文本框的宿主：这类运行自身的 w:rPr 并不作用于文本框内文字，
+    其 w:t 实际属于 txbxContent 内的段落，若按普通文字运行统计会误判字体字号。"""
+    for node in _walk(run):
+        if node.tag in (_DRAWING, _PICT, _ALT_CONTENT):
+            return True
+    return False
+
+
+def _runs_of(el):
+    return [n for n in _walk(el) if n.tag == _R and not _is_shape_holder(n)]
+
+
+def _paras_of(el):
+    return [n for n in _walk(el) if n.tag == _P]
+
+
+def _pPr(p):
+    return p.find(_PPR)
+
+
+def _rPr(r):
+    return r.find(_RPR)
+
+
+def _sub_val(parent, name):
+    """取 parent/<name> 的 w:val。"""
+    if parent is None:
+        return None
+    node = parent.find(qn(name))
+    if node is None:
+        return None
+    return node.get(_VAL)
+
+
+def _on_off(node):
+    """w:b / w:u 这类开关型属性：元素存在且 w:val 不是 0/false/none 视为开启。"""
+    if node is None:
+        return None
+    val = node.get(_VAL)
+    if val is None:
+        return True
+    return str(val).lower() not in ("0", "false", "off", "none")
+
+
+def _jc_of(p):
+    return _sub_val(_pPr(p), "w:jc")
+
+
+def _int_or_none(value):
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _char_width_em(ch):
+    """字符相对字号的横向宽度：全角 1.0 em，半角 0.5 em。
+    与 Word 实测一致：宋体下 12 磅的半角空格/下划线字符宽 6 磅。"""
+    if ch in ("\t",):
+        return 2.0
+    if FULLWIDTH_RE.match(ch):
+        return 1.0
+    return 0.5
+
+
+def _text_width_pt(text, size_pt):
+    return sum(_char_width_em(ch) for ch in (text or "")) * float(size_pt)
+
+
+# ========== 样式 / 字体 / 字号解析 ==========
+
+def _build_ctx(doc):
+    """收集全文档共用的解析上下文（样式表、docDefaults、主题字体、节属性等）。"""
+    ctx = {"doc": doc, "styles": {}, "rdefault": None, "pdefault": None, "theme": {}}
+    try:
+        for st in doc.styles.element.findall(qn("w:style")):
+            sid = st.get(qn("w:styleId"))
+            if sid:
+                ctx["styles"][sid] = st
+        dd = doc.styles.element.find(qn("w:docDefaults"))
+        if dd is not None:
+            rd = dd.find(qn("w:rPrDefault"))
+            pd = dd.find(qn("w:pPrDefault"))
+            ctx["rdefault"] = None if rd is None else rd.find(_RPR)
+            ctx["pdefault"] = None if pd is None else pd.find(_PPR)
+    except Exception:
+        pass
+    ctx["theme"] = _load_theme_fonts(doc)
+    return ctx
+
+
+def _load_theme_fonts(doc):
+    """读取 theme1.xml 的 majorFont/minorFont，供 asciiTheme/eastAsiaTheme 回溯。"""
+    out = {}
+    try:
+        from lxml import etree
+        for part in doc.part.package.iter_parts():
+            if not str(part.partname).endswith("theme1.xml"):
+                continue
+            root = etree.fromstring(part.blob)
+            for scheme, key in (("majorFont", "major"), ("minorFont", "minor")):
+                node = root.find(".//{%s}%s" % (NS_A, scheme))
+                if node is None:
+                    continue
+                latin = node.find("{%s}latin" % NS_A)
+                if latin is not None:
+                    out[key + "_latin"] = latin.get("typeface")
+                for font in node.findall("{%s}font" % NS_A):
+                    if font.get("script") in ("Hans", "Hant"):
+                        out.setdefault(key + "_ea", font.get("typeface"))
+            break
+    except Exception:
+        pass
+    return out
+
+
+def _theme_font(ctx, theme_val, is_ea):
+    if not theme_val:
+        return None
+    which = "major" if str(theme_val).startswith("major") else "minor"
+    return ctx["theme"].get(which + ("_ea" if is_ea else "_latin"))
+
+
+def _style_chain(ctx, style_id, depth=0):
+    """沿 w:basedOn 逐级向上返回样式元素列表。"""
+    out = []
+    while style_id and depth < 12:
+        st = ctx["styles"].get(style_id)
+        if st is None:
+            break
+        out.append(st)
+        style_id = _sub_val(st, "w:basedOn")
+        depth += 1
+    return out
+
+
+def _para_of_run(run):
+    node = run.getparent()
+    while node is not None and node.tag != _P:
+        node = node.getparent()
+    return node
+
+
+def _pstyle_of(p):
+    return _sub_val(_pPr(p), "w:pStyle") if p is not None else None
+
+
+def _rpr_chain(ctx, run):
+    """run 直接格式 -> w:rStyle 链 -> 段落 pStyle 链 -> docDefaults，与 Word 的继承顺序一致。"""
+    chain = []
+    rpr = _rPr(run)
+    if rpr is not None:
+        chain.append(rpr)
+    for st in _style_chain(ctx, _sub_val(rpr, "w:rStyle")):
+        node = st.find(_RPR)
+        if node is not None:
+            chain.append(node)
+    for st in _style_chain(ctx, _pstyle_of(_para_of_run(run))):
+        node = st.find(_RPR)
+        if node is not None:
+            chain.append(node)
+    if ctx["rdefault"] is not None:
+        chain.append(ctx["rdefault"])
+    return chain
+
+
+def _resolve_effective_eastasia(ctx, run):
+    for rpr in _rpr_chain(ctx, run):
+        fonts = rpr.find(qn("w:rFonts"))
+        if fonts is None:
+            continue
+        val = fonts.get(qn("w:eastAsia")) or _theme_font(ctx, fonts.get(qn("w:eastAsiaTheme")), True)
+        if val:
+            return val
+    return None
+
+
+def _resolve_effective_ascii(ctx, run):
+    for rpr in _rpr_chain(ctx, run):
+        fonts = rpr.find(qn("w:rFonts"))
+        if fonts is None:
+            continue
+        val = (fonts.get(qn("w:ascii"))
+               or _theme_font(ctx, fonts.get(qn("w:asciiTheme")), False)
+               or fonts.get(qn("w:hAnsi"))
+               or _theme_font(ctx, fonts.get(qn("w:hAnsiTheme")), False))
+        if val:
+            return val
+    return None
+
+
+def _run_size_pt(ctx, run, default=10.5):
+    for rpr in _rpr_chain(ctx, run):
+        val = _sub_val(rpr, "w:sz")
+        num = _int_or_none(val)
+        if num:
+            return num / 2.0
+    return default
+
+
+def _run_bold(ctx, run):
+    for rpr in _rpr_chain(ctx, run):
+        node = rpr.find(qn("w:b"))
+        if node is not None:
+            return _on_off(node)
+    return False
+
+
+def _run_underlined(ctx, run):
+    for rpr in _rpr_chain(ctx, run):
+        node = rpr.find(qn("w:u"))
+        if node is not None:
+            return _on_off(node)
+    return False
+
+
+def _is_songti(name):
+    return bool(name) and any(name.strip().lower() == f.lower() for f in STRICT_SONGTI)
+
+
+def _is_heiti(name):
+    return bool(name) and any(name.strip().lower() == f.lower() for f in STRICT_HEITI)
+
+
+def _is_times(name):
+    return bool(name) and name.strip().lower().replace(" ", "") in [
+        t.replace(" ", "") for t in TIMES]
+
+
+def _spacing_of(ctx, p):
+    """解析段落的 before/after/line/lineRule（段落直接属性 -> pStyle 链 -> docDefaults）。"""
+    nodes = []
+    pPr = _pPr(p)
+    if pPr is not None:
+        nodes.append(pPr)
+    for st in _style_chain(ctx, _pstyle_of(p)):
+        node = st.find(_PPR)
+        if node is not None:
+            nodes.append(node)
+    if ctx["pdefault"] is not None:
+        nodes.append(ctx["pdefault"])
+    out = {"before": None, "after": None, "line": None, "lineRule": None}
+    for node in nodes:
+        sp = node.find(qn("w:spacing"))
+        if sp is None:
+            continue
+        for key, attr in (("before", "w:before"), ("after", "w:after"),
+                          ("line", "w:line"), ("lineRule", "w:lineRule")):
+            if out[key] is None:
+                out[key] = sp.get(qn(attr))
+    return out
+
+
+def _ind_of(ctx, p):
+    """解析段落缩进（twips）：left / right / firstLine / hanging。"""
+    nodes = []
+    pPr = _pPr(p)
+    if pPr is not None:
+        nodes.append(pPr)
+    for st in _style_chain(ctx, _pstyle_of(p)):
+        node = st.find(_PPR)
+        if node is not None:
+            nodes.append(node)
+    out = {"left": None, "right": None, "firstLine": None, "hanging": None}
+    for node in nodes:
+        ind = node.find(qn("w:ind"))
+        if ind is None:
+            continue
+        for key, attr in (("left", "w:left"), ("right", "w:right"),
+                          ("firstLine", "w:firstLine"), ("hanging", "w:hanging")):
+            if out[key] is None:
+                out[key] = _int_or_none(ind.get(qn(attr)))
+    return out
+
+
+# ========== 结构定位 ==========
+
+def _split_cover_body(kids):
+    """按分节符 / 分页符把 body 顶层块切成"封面区"和"试题正文区"。"""
+    for i, el in enumerate(kids):
+        if el.tag == _P and el.find(".//" + _SECTPR) is not None:
+            sect = el.find(".//" + _SECTPR)
+            stype = _sub_val(sect, "w:type")
+            return kids[:i + 1], kids[i + 1:], "sectPr", stype
+    for i, el in enumerate(kids):
+        if el.tag == _P and any(b.get(_TYPE) == "page" for b in el.iter(_BR)):
+            return kids[:i + 1], kids[i + 1:], "pageBreak", None
+    return [], list(kids), "none", None
+
+
+def _body_paragraphs(els, with_table=False):
+    """正文顶层段落（可选包含表格内段落）。"""
+    out = []
+    for el in els:
+        if el.tag == _P:
+            out.append(el)
+        elif el.tag == _TBL and with_table:
+            out.extend(_paras_of(el))
+    return out
+
+
+def _tables_of(els):
+    out = []
+    for el in els:
+        if el.tag == _TBL:
+            out.append(el)
+        else:
+            out.extend(n for n in _walk(el) if n.tag == _TBL)
+    return out
+
+
+def _table_grid(tbl):
+    rows = []
+    for tr in tbl.findall(_TR):
+        rows.append([_norm(_text_of(tc)) for tc in tr.findall(_TC)])
+    return rows
+
+
+def _is_heading_para(text):
+    """主题标题 / 5 处分部标题 / 参考答案标题：这些不计入"正文文字"的字体与间距判定。"""
+    stripped = _norm(text)
+    if not stripped:
+        return False
+    if stripped == TITLE_TEXT:
+        return True
+    if ANSWER_TITLE in stripped:
+        return True
+    for head in SECTION_HEADS:
+        if stripped.startswith(head):
+            return True
+    return False
+
+
+def _drawings_of(p):
+    """段落内的图片（wp:inline / wp:anchor），返回 (drawing 节点, blip 的 r:embed)。"""
+    out = []
+    for node in _walk(p):
+        if node.tag in ("{%s}inline" % NS_WP, "{%s}anchor" % NS_WP):
+            embed = None
+            for blip in node.iter("{%s}blip" % NS_A):
+                embed = blip.get(_EMBED)
+                if embed:
+                    break
+            out.append((node, embed))
+    return out
+
+
+def _extent_of(node):
+    ext = node.find("{%s}extent" % NS_WP)
+    if ext is None:
+        return None
+    cx = _int_or_none(ext.get("cx"))
+    cy = _int_or_none(ext.get("cy"))
+    if not cx or not cy:
+        return None
+    return (cx, cy)
+
+
+def _image_pixels(blob):
+    """从图片字节流读取像素尺寸（PNG 的 IHDR / JPEG 的 SOFn），避免依赖 PIL。"""
+    try:
+        if blob[:8] == b"\x89PNG\r\n\x1a\n":
+            width = int.from_bytes(blob[16:20], "big")
+            height = int.from_bytes(blob[20:24], "big")
+            return (width, height)
+        if blob[:2] == b"\xff\xd8":
+            i = 2
+            while i < len(blob) - 9:
+                if blob[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = blob[i + 1]
+                seg = int.from_bytes(blob[i + 2:i + 4], "big")
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    height = int.from_bytes(blob[i + 5:i + 7], "big")
+                    width = int.from_bytes(blob[i + 7:i + 9], "big")
+                    return (width, height)
+                i += 2 + seg
+    except Exception:
+        pass
+    return None
+
+
+def _collect_figures(doc, body_els):
+    """按文档顺序收集正文中的示意图，并记录每张图所挂的题号、所在段落及像素/显示尺寸。"""
+    figs = []
+    last_num = None
+    for el in body_els:
+        if el.tag != _P:
+            continue
+        text = _text_of(el)
+        match = QNUM_RE.match(_norm(text))
+        if match:
+            last_num = int(match.group(1))
+        for node, embed in _drawings_of(el):
+            blob = None
+            if embed:
+                try:
+                    blob = doc.part.related_parts[embed].blob
+                except Exception:
+                    blob = None
+            figs.append({
+                "para": el,
+                "anchor": last_num,
+                "extent": _extent_of(node),
+                "pixels": _image_pixels(blob) if blob else None,
+                "bytes": len(blob) if blob else 0,
+                "cropped": node.find(".//{%s}srcRect" % NS_A) is not None,
+                "text": _norm(text),
+            })
+    return figs
+
+
+def _footer_roots(doc):
+    """直接从包内读取所有 footerN.xml，避免 python-docx 对文本框页脚的解析盲区。"""
+    out = []
+    try:
+        from lxml import etree
+        for part in doc.part.package.iter_parts():
+            name = str(part.partname)
+            if re.search(r"/footer\d*\.xml$", name):
+                out.append((name, etree.fromstring(part.blob)))
+    except Exception:
+        pass
+    return sorted(out, key=lambda item: item[0])
+
+
+def _header_roots(doc):
+    out = []
+    try:
+        from lxml import etree
+        for part in doc.part.package.iter_parts():
+            name = str(part.partname)
+            if re.search(r"/header\d*\.xml$", name):
+                out.append((name, etree.fromstring(part.blob)))
+    except Exception:
+        pass
+    return sorted(out, key=lambda item: item[0])
+
+
+def _sect_prs(doc):
+    """按文档顺序返回所有 sectPr（末节的 sectPr 位于 body 末尾）。"""
+    out = []
+    body = doc.element.body
+    for el in body:
+        if el.tag == _P:
+            sect = el.find(".//" + _SECTPR)
+            if sect is not None:
+                out.append(sect)
+    tail = body.find(_SECTPR)
+    if tail is not None:
+        out.append(tail)
+    return out
+
+
+def _field_instrs(root):
+    """页眉/页脚里的域代码（w:instrText 与 w:fldSimple 的 w:instr）。"""
+    out = []
+    for node in _walk(root):
+        if node.tag == qn("w:instrText"):
+            out.append(node.text or "")
+        elif node.tag == qn("w:fldSimple"):
+            out.append(node.get(qn("w:instr")) or "")
+    return out
+
+
+# ========== 文档打开 ==========
+
+def _open_word_document(file_path):
+    return Document(file_path)
+
+
+def _sect_geom(sect):
+    """节的纸张与页边距（单位 cm）。"""
+    out = {"w": None, "h": None, "top": None, "bottom": None, "left": None, "right": None,
+           "orient": None}
+    size = sect.find(qn("w:pgSz"))
+    if size is not None:
+        w = _int_or_none(size.get(qn("w:w")))
+        h = _int_or_none(size.get(qn("w:h")))
+        out["w"] = None if w is None else w / TWIPS_PER_CM
+        out["h"] = None if h is None else h / TWIPS_PER_CM
+        out["orient"] = size.get(qn("w:orient")) or "portrait"
+    mar = sect.find(qn("w:pgMar"))
+    if mar is not None:
+        for key in ("top", "bottom", "left", "right"):
+            val = _int_or_none(mar.get(qn("w:" + key)))
+            out[key] = None if val is None else val / TWIPS_PER_CM
+    return out
+
+
+def _anchor_center_offset_cm(node, geom):
+    """图形（wp:anchor）中心相对页面水平中线的偏移量，单位 cm；无法判定返回 None。"""
+    if geom.get("w") is None:
+        return None
+    pos_h = node.find("{%s}positionH" % NS_WP)
+    ext = _extent_of(node)
+    if pos_h is None or ext is None:
+        return None
+    align = pos_h.find("{%s}align" % NS_WP)
+    if align is not None and (align.text or "").strip() == "center":
+        return 0.0
+    off = pos_h.find("{%s}posOffset" % NS_WP)
+    if off is None:
+        return None
+    x_cm = (_int_or_none(off.text) or 0) / EMU_PER_CM
+    if pos_h.get("relativeFrom") not in ("page",):
+        x_cm += geom.get("left") or 0.0
+    center = x_cm + ext[0] / EMU_PER_CM / 2.0
+    return abs(center - geom["w"] / 2.0)
+
+
+def _is_fake_vertical(p):
+    """逐字换行拼出的伪竖排：同段 ≥3 个换行且每行只有 1 个字符。"""
+    lines = [ln for ln in _text_of(p).split("\n") if ln.strip()]
+    if len(lines) < 3:
+        return False
+    return all(len(ln.strip()) == 1 for ln in lines)
+
+
+def _cover_title(ctx, cover_els, geom):
+    """定位封面主标题，并给出竖排方式、字号、加粗、水平居中偏移等信息。"""
+    info = {"vertical": False, "how": "", "para": None, "runs": [], "text": "",
+            "size": 0.0, "bold": False, "offset_cm": None, "fake_vertical": False,
+            "drawing": None}
+    vert_para = None
+    for el in cover_els:
+        if el.tag != _P:
+            continue
+        for node in _walk(el):
+            tag = node.tag if isinstance(node.tag, str) else ""
+            marker = ""
+            if tag.endswith("}bodyPr") and node.get("vert") in ("eaVert", "vert", "mongolianVert"):
+                marker = "vert=%s" % node.get("vert")
+            elif tag.endswith("}textbox") and "vertical-ideographic" in (node.get("style") or ""):
+                marker = "layout-flow:vertical-ideographic"
+            if marker:
+                text = _norm(_text_of(el))
+                if len(text) >= 4:
+                    vert_para = el
+                    info["vertical"] = True
+                    info["how"] = marker
+                    break
+        if vert_para is not None:
+            break
+    if vert_para is None:
+        best = None
+        for el in cover_els:
+            if el.tag != _P:
+                continue
+            text = _norm(_text_of(el))
+            if not text or any(re.search(pat, text) for _, pat in COVER_FIELDS):
+                continue
+            size = max([_run_size_pt(ctx, r) for r in _runs_of(el)] or [0.0])
+            if best is None or size > best[0]:
+                best = (size, el)
+        vert_para = None if best is None else best[1]
+        if vert_para is not None:
+            info["fake_vertical"] = _is_fake_vertical(vert_para)
+    if vert_para is None:
+        return info
+    info["para"] = vert_para
+    runs = [r for r in _runs_of(vert_para) if (_text_of(r) or "").strip()]
+    info["runs"] = runs
+    info["text"] = _norm(_text_of(vert_para))
+    info["size"] = max([_run_size_pt(ctx, r) for r in runs] or [0.0])
+    top = [r for r in runs if abs(_run_size_pt(ctx, r) - info["size"]) < 0.01]
+    info["bold"] = bool(top) and all(_run_bold(ctx, r) for r in top)
+    drawings = _drawings_of(vert_para)
+    if drawings:
+        info["drawing"] = drawings[0][0]
+        info["offset_cm"] = _anchor_center_offset_cm(drawings[0][0], geom)
+    if info["offset_cm"] is None and _jc_of(vert_para) == "center":
+        info["offset_cm"] = 0.0
+    return info
+
+
+def _cover_field_paras(cover_els):
+    """按"报送单位/学科/命题人/命题人联系电话"定位封面四项填写栏所在段落。"""
+    found = {}
+    for el in cover_els:
+        if el.tag != _P:
+            continue
+        text = _norm(_text_of(el))
+        if not text:
+            continue
+        for label, pattern in COVER_FIELDS:
+            if label in found:
+                continue
+            if re.search(pattern, text):
+                found[label] = el
+                break
+    return found
+
+
+def _underline_length_pt(ctx, p):
+    """段落内"下划线格式"填空横线的长度（磅）：w:u 下划线运行的宽度 + 制表位前导线长度。"""
+    total = 0.0
+    for run in _runs_of(p):
+        if not _run_underlined(ctx, run):
+            continue
+        total += _text_width_pt(_text_of(run), _run_size_pt(ctx, run))
+    pPr = _pPr(p)
+    if pPr is not None:
+        tabs = pPr.find(qn("w:tabs"))
+        if tabs is not None:
+            plain = 0.0
+            for run in _runs_of(p):
+                if not _run_underlined(ctx, run):
+                    plain += _text_width_pt(_text_of(run), _run_size_pt(ctx, run))
+            for tab in tabs.findall(qn("w:tab")):
+                if (tab.get(qn("w:leader")) or "none") == "none":
+                    continue
+                pos = _int_or_none(tab.get(qn("w:pos"))) or 0
+                total += max(0.0, pos / 20.0 - plain)
+    return total
+
+
+def _typed_underscore_run(p):
+    """段落里是否用连续键入的"_"字符充当横线。"""
+    return bool(re.search(r"_{5,}", _text_of(p)))
+
+
+def _effective_left_twips(ctx, p):
+    ind = _ind_of(ctx, p)
+    left = ind["left"] or 0
+    first = ind["firstLine"] or 0
+    hang = ind["hanging"] or 0
+    return left + first - hang
+
+
+def _text_area_cm(geom):
+    if geom.get("w") is None:
+        return None
+    return geom["w"] - (geom.get("left") or 0.0) - (geom.get("right") or 0.0)
+
+
+# ========== 对外入口 ==========
+
+def _one_line(text, limit=200):
+    """把异常信息压成单行摘要，供 dim1_reason 使用。"""
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def _result_not_found(message):
+    """找不到目录 / 找不到待评文件：未进入评测，dim1_pass 留空，max_score 记 0。"""
+    return {
+        "id": SCRIPT_ID,
+        "file_name": "",
+        "status": "error",
+        "error": message,
+        "dim1_pass": "",
+        "dim1_reason": "",
+        "dim2_items": [],
+        "total_score": 0,
+        "max_score": 0,
+    }
+
+
+def evaluate(dir_path):
+    """入参为目录路径，自动取其中的 .docx 作为待评文件；返回结构化评测结果。"""
+    if not os.path.isdir(dir_path):
+        return _result_not_found("目录不存在：%s" % dir_path)
+    try:
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith(".docx") and not f.startswith("~"))
+    except OSError as exc:
+        return _result_not_found("目录无法读取：%s（%s）" % (dir_path, exc))
+    if not cands:
+        return _result_not_found("目录中未找到 .docx 文件：%s" % dir_path)
+
+    result = {
+        "id": SCRIPT_ID,
+        "file_name": cands[0],
+        "status": "ok",
+        "error": "",
+        "dim1_pass": True,
+        "dim1_reason": "",
+        "dim2_items": [],
+        "total_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
+    }
+    try:
+        return _evaluate_impl(os.path.join(dir_path, cands[0]), result)
+    except Exception as exc:
+        message = "%s: %s" % (type(exc).__name__, exc)
+        result["status"] = "error"
+        result["error"] = message
+        result["traceback"] = traceback.format_exc()
+        # 文件已找到但打不开/解析失败：维度1 判为不通过，dim1_reason 给出错误摘要
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "文件无法正常打开或解析：%s" % _one_line(message)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+
+def _evaluate_impl(file_path, result):
+    doc = _open_word_document(file_path)
+    ctx = _build_ctx(doc)
+    kids = list(doc.element.body)
+    cover_els, body_els, split_mode, split_type = _split_cover_body(kids)
+
+    cover_text = "\n".join(_text_of(el) for el in cover_els)
+    body_text = "\n".join(_text_of(el) for el in body_els)
+    body_paras = _body_paragraphs(body_els)
+    body_paras_all = _body_paragraphs(body_els, with_table=True)
+    tables = _tables_of(body_els)
+    figs = _collect_figures(doc, body_els)
+    sects = _sect_prs(doc)
+    geom_list = [_sect_geom(s) for s in sects]
+    geom = geom_list[-1] if geom_list else {}
+    footers = _footer_roots(doc)
+    headers = _header_roots(doc)
+    results = []
+
+
+    # ========== 维度1：可用与可修改性 ==========
+    # ① 文件能被 Document() 正常打开（打不开会在 evaluate 的 except 中记为 error）。
+    # ② 试题内容必须是可编辑文本：正文可见文字（含表格）不足 800 字，视为整页位图粘贴。
+    # ③ 任一整页被单张图片占满（图片显示面积 ≥ 可排版面积 90%），视为不可编辑。
+    editable_chars = len(_squeeze(cover_text + body_text))
+    area_cm2 = None
+    if geom.get("w") and geom.get("h"):
+        area_cm2 = ((geom["w"] - (geom.get("left") or 0) - (geom.get("right") or 0))
+                    * (geom["h"] - (geom.get("top") or 0) - (geom.get("bottom") or 0)))
+    full_page_img = False
+    for fig in figs:
+        if not fig["extent"] or not area_cm2:
+            continue
+        fig_cm2 = (fig["extent"][0] / EMU_PER_CM) * (fig["extent"][1] / EMU_PER_CM)
+        if fig_cm2 >= area_cm2 * 0.9:
+            full_page_img = True
+    if editable_chars < 800:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = ("可编辑文字仅 %d 字，试题内容疑似以位图/扫描图整页粘贴，"
+                                "无法编辑修改" % editable_chars)
+    elif full_page_img:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "存在占满整页可排版区域的单张图片，该页内容不可单独点选编辑"
+    else:
+        # 维度1 通过时不输出理由（dim1_reason 仅在未通过时给出摘要）
+        result["dim1_pass"] = True
+        result["dim1_reason"] = ""
+    if not result["dim1_pass"]:
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+    # ========== 维度2·加分项（指令下达的任务） ==========
+
+    # ---------- 01 +5 封面单独成页、试题正文另起一页 ----------
+    # ① 以分节符/分页符切出封面区，节类型不能是 continuous（否则不换页）；
+    # ② 封面区必须有可见内容；③ 封面区不得混排试题正文（出现注意事项/第一部分/满分说明）。
+    cover_visible = len(_squeeze(cover_text)) > 0
+    mixed = any(key in _squeeze(cover_text) for key in ("注意事项", "第一部分", "本试卷满分"))
+    if (split_mode in ("sectPr", "pageBreak") and cover_visible and not mixed
+            and (split_type or "nextPage") != "continuous"):
+        results.append("+5：文档首页为独立封面页（以%s分隔），封面内容单独成页、试题正文另起一页开始"
+                       % ("分节符" if split_mode == "sectPr" else "分页符"))
+    else:
+        results.append("+0：未形成独立封面页（分隔方式=%s，封面有可见内容=%s，与正文混排=%s）"
+                       % (split_mode, cover_visible, mixed))
+
+    # ---------- 02 +5 封面主标题真正竖排 ----------
+    # ① 竖排文本框 wps/a:bodyPr 的 vert="eaVert" 或 VML layout-flow:vertical-ideographic；
+    # ② 竖排容器内文字≥4字才算主标题；③ 逐字换行拼出的伪竖排不得分。
+    title = _cover_title(ctx, cover_els, geom)
+    if title["vertical"]:
+        results.append("+5：封面主标题“%s”为真正的竖排文字（%s）" % (title["text"], title["how"]))
+    else:
+        results.append("+0：封面主标题不是真正的竖排文字（%s）"
+                       % ("以逐字换行拼出的伪竖排" if title["fake_vertical"] else "未见竖排文字方向属性"))
+
+    # ---------- 03 +1 封面主标题加粗、≥18磅、水平居中 ----------
+    # ① 取标题中最大字号的运行判定加粗；② 居中允许偏离页面水平中线 2cm 内
+    #    （文本框按 wp:align=center 或 posOffset+extent 折算中心）；③ 标题内不得有≥2连续空格。
+    center_off = title["offset_cm"]
+    center_ok = center_off is not None and center_off <= 2.0
+    gap_ok = not re.search(r"[ 　]{2,}", title["text"])
+    if title["bold"] and title["size"] >= 17.95 and center_ok and gap_ok:
+        results.append("+1：封面主标题加粗、字号 %.1f 磅（≥18磅）且水平居中（偏离中线 %.2fcm），字间紧凑"
+                       % (title["size"], center_off or 0.0))
+    else:
+        results.append("+0：封面主标题格式不满足加粗+≥18磅+水平居中（加粗=%s，字号=%.1f磅，"
+                       "偏离中线=%s，字间无大段空隙=%s）"
+                       % (title["bold"], title["size"],
+                          "无法判定" if center_off is None else "%.2fcm" % center_off, gap_ok))
+
+
+    # ---------- 04 +1 封面四项填写项齐全 ----------
+    # ① 按标签正则在封面段落中定位；②“命题人”与“命题人联系电话”须为两个独立填写项；
+    # ③ 缺任一项不得分。
+    fields = _cover_field_paras(cover_els)
+    missing_fields = [label for label, _ in COVER_FIELDS if label not in fields]
+    if not missing_fields:
+        results.append("+1：封面设有“报送单位”“学科”“命题人”“命题人联系电话”四项填写项")
+    else:
+        results.append("+0：封面四项填写项不全，缺少 %s" % "、".join(missing_fields))
+
+    # ---------- 05 +5 四项填空横线为下划线格式且长度≥5cm ----------
+    # ① 只统计带 w:u 下划线的运行宽度与制表位前导线长度（连续键入的“_”字符不计）；
+    # ② 字符宽度按半角 0.5em / 全角 1.0em 折算，与 Word 实测一致（12磅半角空格=6磅）；
+    # ③ 四项横线须均≥5cm。
+    line_lens = {}
+    for label, _ in COVER_FIELDS:
+        para = fields.get(label)
+        line_lens[label] = 0.0 if para is None else _underline_length_pt(ctx, para) / PT_PER_CM
+    typed_only = [label for label, _ in COVER_FIELDS
+                  if fields.get(label) is not None and line_lens[label] <= 0.01
+                  and _typed_underscore_run(fields[label])]
+    len_desc = "、".join("%s %.2fcm" % (label, line_lens[label]) for label, _ in COVER_FIELDS)
+    if not missing_fields and all(line_lens[label] >= UNDERLINE_MIN_CM for label, _ in COVER_FIELDS):
+        results.append("+5：封面四项填写项后均带下划线格式的填空横线且长度≥5cm（%s）" % len_desc)
+    else:
+        results.append("+0：封面填空横线不满足下划线格式且≥5cm（%s%s）"
+                       % (len_desc,
+                          "；其中 %s 为连续键入的下划线字符" % "、".join(typed_only) if typed_only else ""))
+
+    # ---------- 06 +1 四项位于封面下半部、左端整体对齐 ----------
+    # ① 左缩进（left+firstLine-hanging）须落在 1700-2600 twips（约3-4cm）且四项互差≤120 twips；
+    # ② 位置按文档序判定：四项须排在封面主标题之后（不渲染，故不测绝对高度）。
+    lefts = [_effective_left_twips(ctx, fields[label]) for label, _ in COVER_FIELDS
+             if label in fields]
+    ind_ok = (len(lefts) == 4 and all(1700 <= v <= 2600 for v in lefts)
+              and (max(lefts) - min(lefts)) <= 120)
+    lower_ok = None
+    if title["para"] is not None:
+        order = {id(el): i for i, el in enumerate(cover_els)}
+        lower_ok = all(order.get(id(fields[label]), -1) > order.get(id(title["para"]), 1 << 30)
+                       for label, _ in COVER_FIELDS if label in fields)
+    if ind_ok and lower_ok:
+        results.append("+1：封面四项填写项自上而下排在封面下半部分，左端整体对齐（左缩进 %s twips）"
+                       % "/".join(str(v) for v in lefts))
+    else:
+        results.append("+0：封面四项填写项排布不满足下半部分+左端对齐（左缩进=%s，位于下半部=%s）"
+                       % (lefts or "未定位", lower_ok))
+
+
+    # ---------- 07 +1 卷内主题标题 黑体三号居中 ----------
+    # ① 取正文区第一个只含“初中化学模拟试题”的段落；② eastAsia 须解析为黑体；
+    # ③ 字号 16 磅（w:sz=32，三号）且段落 w:jc=center。
+    body_title = None
+    for para in body_paras:
+        text = _norm(_text_of(para))
+        if text and TITLE_TEXT in text and len(text) <= len(TITLE_TEXT) + 6:
+            body_title = para
+            break
+    if body_title is None:
+        results.append("+0：正文区未找到主题标题“%s”" % TITLE_TEXT)
+    else:
+        t_runs = [r for r in _runs_of(body_title) if (_text_of(r) or "").strip()]
+        t_fonts = [_resolve_effective_eastasia(ctx, r) for r in t_runs]
+        t_sizes = [_run_size_pt(ctx, r) for r in t_runs]
+        t_jc = _jc_of(body_title)
+        if (t_runs and all(_is_heiti(f) for f in t_fonts)
+                and all(15.5 <= s <= 16.5 for s in t_sizes) and t_jc == "center"):
+            results.append("+1：卷内主题标题“%s”为黑体三号（%.1f磅）居中" % (TITLE_TEXT, t_sizes[0]))
+        else:
+            results.append("+0：卷内主题标题不满足黑体三号居中（字体=%s，字号=%s磅，对齐=%s）"
+                           % ("/".join(str(f) for f in set(t_fonts)),
+                              "/".join("%.1f" % s for s in set(t_sizes)), t_jc))
+
+    # ---------- 08 +5 试题正文中文 宋体小四 ----------
+    # ① 判定范围＝正文区所有段落（含表格内文字），排除主题标题、5处分部标题与参考答案标题；
+    # ② 只看含中日韩字符的运行，字体按 run→rStyle→pStyle→docDefaults→主题 逐级解析；
+    # ③ 要求 eastAsia ∈ 宋体族 且字号 12 磅（w:sz=24，小四）。
+    song_bad = []
+    for para in body_paras_all:
+        if _is_heading_para(_text_of(para)):
+            continue
+        for run in _runs_of(para):
+            run_text = _text_of(run)
+            if not CJK_RE.search(run_text or ""):
+                continue
+            name = _resolve_effective_eastasia(ctx, run)
+            size = _run_size_pt(ctx, run)
+            if not _is_songti(name) or not (11.5 <= size <= 12.5):
+                song_bad.append("“%s”(%s/%.1f磅)" % (_norm(run_text)[:8], name, size))
+    if not song_bad:
+        results.append("+5：试题正文中文字体全部为宋体小四（12磅），覆盖注意事项、题干、选项、"
+                       "填空简答、实验探究、计算题及表格内文字")
+    else:
+        results.append("+0：试题正文中文字体存在 %d 处不是宋体小四，例如 %s"
+                       % (len(song_bad), "、".join(song_bad[:3])))
+
+
+    # ---------- 09 +3 试题正文西文与数字 Times New Roman 小四 ----------
+    # ① 判定范围同上；② 只看含英文字母/阿拉伯数字的运行；
+    # ③ 要求 ascii（缺省回退 hAnsi/主题）解析为 Times New Roman 且字号 12 磅。
+    tnr_bad = []
+    for para in body_paras_all:
+        if _is_heading_para(_text_of(para)):
+            continue
+        for run in _runs_of(para):
+            run_text = _text_of(run)
+            if not LATIN_RE.search(run_text or ""):
+                continue
+            name = _resolve_effective_ascii(ctx, run)
+            size = _run_size_pt(ctx, run)
+            if not _is_times(name) or not (11.5 <= size <= 12.5):
+                tnr_bad.append("“%s”(%s/%.1f磅)" % (_norm(run_text)[:8], name, size))
+    if not tnr_bad:
+        results.append("+3：试题正文中的英文字母与阿拉伯数字字体为 Times New Roman 小四（12磅）")
+    else:
+        results.append("+0：正文西文/数字字体存在 %d 处不是 Times New Roman 小四，例如 %s"
+                       % (len(tnr_bad), "、".join(tnr_bad[:3])))
+
+    # ---------- 10 +1 页脚页码文本“化学试题 第x页 共x页” ----------
+    # ① 页脚文字含文本框内文字；② 去空白后须能匹配“化学试题第…页共…页”；
+    # ③ 三段（前缀、第…页、共…页）缺一不可。
+    footer_texts = [_squeeze(_text_of(root)) for _, root in footers]
+    footer_all = "".join(footer_texts)
+    pat_full = re.compile(r"化学试题第[\d x]{0,6}页共[\d x]{0,6}页")
+    if pat_full.search(footer_all):
+        results.append("+1：页脚页码为“化学试题 第x页 共x页”格式，同时含“化学试题”前缀与“第…页”“共…页”两段")
+    else:
+        results.append("+0：页脚页码不满足“化学试题 第x页 共x页”格式（页脚实际内容：%s）"
+                       % (footer_all[:40] or "空"))
+
+    # ---------- 11 +3 当前页序号由 PAGE 域生成 ----------
+    # ① 收集页脚的 w:instrText 与 w:fldSimple/@w:instr；② 用 \bPAGE\b 排除 NUMPAGES 的误命中；
+    # ③ 逐页手键固定数字则不得分。
+    instrs = []
+    for _, root in footers:
+        instrs.extend(_field_instrs(root))
+    has_page_field = any(re.search(r"\bPAGE\b", s or "") for s in instrs)
+    if has_page_field:
+        results.append("+3：页码中的当前页序号由 PAGE 域自动生成（域代码：%s）"
+                       % "、".join(sorted(set(s.strip() for s in instrs if s.strip()))[:3]))
+    else:
+        results.append("+0：页码中的当前页序号不是 PAGE 域自动生成（未见 PAGE 域代码）")
+
+
+    # ---------- 12 +3 “共x页”由 NUMPAGES/SECTIONPAGES 域自动计算、分节起编正确 ----------
+    # 真实总页数只有排版引擎才知道，OOXML 静态解析测不到；因此本项判据明确定义为
+    # “页码总数由域自动计算、且分节编号设置正确”，三条须同时满足：
+    # ① 页脚里必须出现 NUMPAGES 或 SECTIONPAGES 域，而不是手敲的固定数字；
+    # ② 该域须与当前页序号的 PAGE 域出现在同一个页脚部件里（成对使用，构成“第x页 共y页”）；
+    # ③ 封面须单独成节，且正文节写有 w:pgNumType/@w:start（页码在正文节重新起编），
+    #    这样封面不参与页码计数。
+    total_field = None
+    total_paired = False
+    total_codes = []
+    for _name, root in footers:
+        codes = [s or "" for s in _field_instrs(root)]
+        found = next((re.search(r"\b(NUMPAGES|SECTIONPAGES)\b", s, re.I) for s in codes
+                      if re.search(r"\b(NUMPAGES|SECTIONPAGES)\b", s, re.I)), None)
+        if found is None:
+            continue
+        total_field = found.group(1).upper()
+        total_codes = sorted(set(s.strip() for s in codes if s.strip()))
+        total_paired = any(re.search(r"\bPAGE\b", s, re.I) for s in codes)
+        break
+    cover_sectioned = len(sects) >= 2
+    body_num_type = sects[-1].find(qn("w:pgNumType")) if sects else None
+    body_restart = (body_num_type is not None
+                    and body_num_type.get(qn("w:start")) is not None)
+    if total_field and total_paired and cover_sectioned and body_restart:
+        results.append("+3：页码总数由 %s 域自动计算并与 PAGE 域成对写在同一页脚（域代码：%s），"
+                       "封面单独成节、正文节自 w:pgNumType/@w:start=%s 重新起编，封面不计入页码"
+                       % (total_field, "、".join(total_codes[:3]),
+                          body_num_type.get(qn("w:start"))))
+    else:
+        results.append("+0：页码总数不是由 NUMPAGES/SECTIONPAGES 域自动计算，或分节起编设置不正确"
+                       "（总页数域=%s，与 PAGE 域同页脚=%s，封面单独成节=%s，正文节重新起编=%s）"
+                       % (total_field or "无（疑为手敲固定数字）", total_paired,
+                          cover_sectioned, body_restart))
+
+    # ---------- 13 +5 封面页不显示任何页码 ----------
+    # 纯 XML 判据：封面必须单独成节，且该节不引用任何页脚（w:footerReference 缺失）——
+    # 节内没有页脚部件，封面上就不可能显示页码；未与正文分节则不得分。
+    cover_footer_refs = bool(sects) and bool(sects[0].findall(qn("w:footerReference")))
+    cover_no_num = len(sects) >= 2 and not cover_footer_refs
+    if cover_no_num:
+        results.append("+5：封面页不显示任何页码（封面单独成节且该节不引用页脚）")
+    else:
+        results.append("+0：封面页仍显示页码或未与正文分节（封面单独成节=%s，首节引用页脚=%s）"
+                       % (cover_sectioned, cover_footer_refs))
+
+    # ---------- 14 +3 正文第一页页码从“第1页”开始 ----------
+    # 纯 XML 判据：正文节（末节）须显式写 w:pgNumType/@w:start="1"，即页码在正文节
+    # 重新从 1 起编；缺 pgNumType 或 start≠1（把封面计入页序）则不得分。
+    body_first_ok = None
+    if sects:
+        num_type = sects[-1].find(qn("w:pgNumType"))
+        body_first_ok = num_type is not None and (num_type.get(qn("w:start")) == "1")
+    if body_first_ok:
+        results.append("+3：试题正文第一页页码从“第1页”开始，未把封面计入页序")
+    else:
+        results.append("+0：试题正文第一页页码未从“第1页”开始（判定结果=%s）" % body_first_ok)
+
+
+    # ---------- 15 +1 页脚居中、9-12磅、中文宋体+数字 Times New Roman ----------
+    # ① 居中兼容三种写法：段落 w:jc=center、图形 wp:align=center、VML 水平居中；
+    # ② 页脚内所有有字运行的字号须在 9-12 磅（小五至小四）；
+    # ③ 中文运行 eastAsia∈宋体族、含数字运行 ascii=Times New Roman。
+    footer_center = False
+    footer_sizes = []
+    footer_font_bad = []
+    for _, root in footers:
+        for para in _paras_of(root):
+            if _jc_of(para) == "center":
+                footer_center = True
+        for node in _walk(root):
+            tag = node.tag if isinstance(node.tag, str) else ""
+            if tag == "{%s}align" % NS_WP and (node.text or "").strip() == "center":
+                footer_center = True
+            elif tag.endswith("}shape") and "mso-position-horizontal:center" in (node.get("style") or ""):
+                footer_center = True
+        for run in _runs_of(root):
+            run_text = _text_of(run)
+            if not (run_text or "").strip():
+                continue
+            footer_sizes.append(_run_size_pt(ctx, run))
+            if CJK_RE.search(run_text) and not _is_songti(_resolve_effective_eastasia(ctx, run)):
+                footer_font_bad.append("中文=%s" % _resolve_effective_eastasia(ctx, run))
+            if LATIN_RE.search(run_text) and not _is_times(_resolve_effective_ascii(ctx, run)):
+                footer_font_bad.append("数字=%s" % _resolve_effective_ascii(ctx, run))
+    size_ok = bool(footer_sizes) and all(8.95 <= s <= 12.05 for s in footer_sizes)
+    if footer_center and size_ok and not footer_font_bad:
+        results.append("+1：页脚页码水平居中，字号 %.1f 磅，中文宋体、数字 Times New Roman"
+                       % (footer_sizes[0] if footer_sizes else 0.0))
+    else:
+        results.append("+0：页脚页码不满足居中+9-12磅+宋体/Times New Roman（居中=%s，字号=%s，字体问题=%s）"
+                       % (footer_center,
+                          "/".join(sorted({"%.1f" % s for s in footer_sizes})) or "无",
+                          "、".join(sorted(set(footer_font_bad))[:3]) or "无"))
+
+    # ---------- 16 +5 A4 纵向 + 上下左右页边距 2.5cm ----------
+    # ① 逐节校验 w:pgSz（20.9-21.1cm × 29.6-29.8cm，即 11906×16838 twips）；
+    # ② 四边 w:pgMar 均为 2.5cm（1417±60 twips）；③ 任一节不符即不得分。
+    geom_bad = []
+    for idx, item in enumerate(geom_list):
+        ok = (item.get("w") is not None and 20.9 <= item["w"] <= 21.1
+              and item.get("h") is not None and 29.6 <= item["h"] <= 29.8
+              and all(item.get(k) is not None and abs(item[k] - 2.5) <= 0.11
+                      for k in ("top", "bottom", "left", "right")))
+        if not ok:
+            geom_bad.append("第%d节(%.2f×%.2fcm，边距%s)"
+                            % (idx + 1, item.get("w") or 0, item.get("h") or 0,
+                               "/".join("%.2f" % (item.get(k) or 0)
+                                        for k in ("top", "bottom", "left", "right"))))
+    if geom_list and not geom_bad:
+        results.append("+5：纸张为 A4 纵向（%.2f×%.2fcm），上下左右页边距均为 2.5cm"
+                       % (geom_list[0]["w"], geom_list[0]["h"]))
+    else:
+        results.append("+0：纸张或页边距不满足 A4 纵向+2.5cm（%s）"
+                       % ("；".join(geom_bad) or "未解析到节属性"))
+
+
+    # ---------- 17 +3 正文段间距 0 行、行距 1.5 倍 ----------
+    # ① 判定范围＝正文区有字的顶层段落，排除主题标题与分部标题；
+    # ② 段前/段后须为 0；③ 行距须为 w:line=360 且 w:lineRule=auto（1.5倍行距）。
+    spacing_bad = []
+    for para in body_paras:
+        text = _text_of(para)
+        if not _squeeze(text) or _is_heading_para(text):
+            continue
+        sp = _spacing_of(ctx, para)
+        before = _int_or_none(sp["before"]) or 0
+        after = _int_or_none(sp["after"]) or 0
+        line = _int_or_none(sp["line"])
+        rule = sp["lineRule"]
+        if before or after or rule != "auto" or line is None or not (355 <= line <= 365):
+            spacing_bad.append("“%s”(before=%s,after=%s,line=%s/%s)"
+                               % (_norm(text)[:8], before, after, line, rule))
+    if not spacing_bad:
+        results.append("+3：试题正文段落段间距为 0 行、行间距为 1.5 倍行距（before=0，after=0，line=360 auto）")
+    else:
+        results.append("+0：正文有 %d 个段落不满足段间距0行+1.5倍行距，例如 %s"
+                       % (len(spacing_bad), "、".join(spacing_bad[:3])))
+
+    # ========== 维度2·减分项（指令未要求而多做的破坏性修改） ==========
+
+    # ---------- 18 -3 第25题表格“用于食品包装袋内作保护气” ----------
+    # ① 在全部表格单元格中定位含“食品包装袋”的行；② 该单元格文字须为“用于食品包装袋内作保护气”；
+    # ③ 被改写为“做保护气”等即扣分。
+    pack_cell = None
+    for tbl in tables:
+        for row in _table_grid(tbl):
+            for cell in row:
+                if "食品包装袋" in cell:
+                    pack_cell = cell
+    if pack_cell is not None and _squeeze(pack_cell) == "用于食品包装袋内作保护气":
+        results.append("-0：第25题表格第二行文字保持为“用于食品包装袋内作保护气”")
+    else:
+        results.append("-3：第25题表格第二行文字不满足“用于食品包装袋内作保护气”（实际为“%s”）"
+                       % (pack_cell if pack_cell is not None else "未找到该行"))
+
+    # ---------- 19 -3 6张示意图全部保留且各自留在对应题目下 ----------
+    # ① 按文档顺序收集正文示意图；② 每张图记录其上方最近的题号；
+    # ③ 题号序列须恰为 5/24/27/28/29/30，出现丢失、错位到其他题目或重复插入即扣分。
+    anchors = [fig["anchor"] for fig in figs]
+    if anchors == EXPECTED_FIG_ANCHORS:
+        results.append("-0：第5、24、27、28、29、30 题下的 6 张示意图全部保留，且各自留在对应题目下")
+    else:
+        results.append("-3：6 张示意图不满足全部保留且各自留在对应题目下（共 %d 张，所属题号 %s，"
+                       "应为 %s）" % (len(figs), anchors, EXPECTED_FIG_ANCHORS))
+
+
+    # ---------- 20 -3 图2/图3/图5 等比缩放 ----------
+    # ① 显示宽高比取 wp:extent；② 与应有宽高比（1.96/2.00/1.61）比对，允许 5% 误差；
+    # ③ 同时要求显示宽高比与图片自身像素宽高比一致，横向拉伸/纵向压扁即扣分。
+    fig_names = {2: "图2 过滤装置示意图", 3: "图3 实验室制取并收集氧气装置示意图",
+                 5: "图5 两种固体物质的溶解度曲线"}
+    aspect_bad = []
+    for idx in sorted(FIG_ASPECTS):
+        target = FIG_ASPECTS[idx]
+        if idx >= len(figs):
+            aspect_bad.append("%s 缺失" % fig_names[idx])
+            continue
+        ext = figs[idx]["extent"]
+        pix = figs[idx]["pixels"]
+        disp = None if not ext else ext[0] / float(ext[1])
+        native = None if not pix else pix[0] / float(pix[1])
+        if disp is None:
+            aspect_bad.append("%s 无显示尺寸" % fig_names[idx])
+        elif abs(disp / target - 1.0) > 0.05 or (native and abs(disp / native - 1.0) > 0.05):
+            aspect_bad.append("%s 宽高比 %.3f（应约 %.2f）" % (fig_names[idx], disp, target))
+    if not aspect_bad:
+        results.append("-0：图2/图3/图5 均为等比缩放，宽高比分别约 1.96:1、2.00:1、1.61:1")
+    else:
+        results.append("-3：图2/图3/图5 不满足等比缩放，出现横向拉伸或纵向压扁变形（%s）"
+                       % "；".join(aspect_bad))
+
+    # ---------- 21 -1 图2 独占一个居中段落 ----------
+    # ① 取正文第 3 张示意图（图2 过滤装置示意图）所在段落；② 该段不得同时含题干文字；
+    # ③ 段落须居中。
+    fig2 = figs[2] if len(figs) > 2 else None
+    if fig2 is not None and not _squeeze(fig2["text"]) and _jc_of(fig2["para"]) == "center":
+        results.append("-0：第27题过滤装置示意图独占一个居中段落")
+    else:
+        results.append("-1：第27题过滤装置示意图不满足独占一个居中段落（%s）"
+                       % ("未定位到该图" if fig2 is None
+                          else "同段落含文字“%s”" % fig2["text"][:20] if _squeeze(fig2["text"])
+                          else "段落对齐=%s" % _jc_of(fig2["para"])))
+
+    # ---------- 22 -3 正文页面底部出现 >5cm 连续空白 ----------
+    # 页底连续空白的高度只能在真实分页之后测量，OOXML 静态解析拿不到内容底边坐标；
+    # 按“减分需证据”的口径，本项一律判为未出现（不凭猜测扣分）。
+    results.append("-0：试题正文各页底部未出现高度超过 5cm 的连续空白区域（未渲染，按未出现处理）")
+
+
+    # ---------- 23 -3 第31题 6 行作答横线在单行内完整排布 ----------
+    # ① 取正文中整段仅由下划线字符构成的段落；② 按半角 0.5em 折算横线总宽度；
+    # ③ 宽度超过该段可用行宽即会折行并在次行残留孤立下划线字符。
+    avail_cm = _text_area_cm(geom) or 16.0
+    wrap_bad = []
+    for para in body_paras:
+        text = _text_of(para)
+        if not re.fullmatch(r"[_\s]{20,}", text or ""):
+            continue
+        width_cm = sum(_text_width_pt(_text_of(r), _run_size_pt(ctx, r))
+                       for r in _runs_of(para)) / PT_PER_CM
+        ind = _ind_of(ctx, para)
+        used_cm = ((ind["left"] or 0) + max(ind["firstLine"] or 0, 0)
+                   + (ind["right"] or 0)) / TWIPS_PER_CM
+        if width_cm > (avail_cm - used_cm) + 0.02:
+            wrap_bad.append("%d个下划线宽 %.2fcm＞可用 %.2fcm"
+                            % (text.count("_"), width_cm, avail_cm - used_cm))
+    if not wrap_bad:
+        results.append("-0：第31题“解题过程”下方的 6 行作答横线均在单行内完整排布")
+    else:
+        results.append("-3：第31题“解题过程”下方的作答横线不满足在单行内完整排布，出现折行并在次行"
+                       "残留孤立下划线字符（%d 行，如 %s）" % (len(wrap_bad), wrap_bad[0]))
+
+    # ---------- 24 -1 化学式/相对原子质量/单位内部被插入多余空格 ----------
+    # ① 在正文全文（含表格）上匹配 5 类断裂模式；② 命中即说明连写形式被拆开；
+    # ③ 匹配片段一并回显，便于人工复核。
+    space_hits = []
+    for pattern, desc in FORMULA_SPACE_PATTERNS:
+        found = re.findall(pattern, body_text)
+        if found:
+            space_hits.append("%s：%s" % (desc, "、".join(repr(x) for x in found[:2])))
+    if not space_hits:
+        results.append("-0：化学式、相对原子质量与单位保持“2H₂O”“H₂O”“CO₂↑”“Cl-35.5”“O₂²⁻”的连写形式")
+    else:
+        results.append("-1：化学式、相对原子质量与单位内部被插入多余空格（%s）" % "；".join(space_hits[:3]))
+
+    # ---------- 25 -1 卷内主题标题加粗 ----------
+    # ① 取第 07 条定位到的正文主题标题；② 其全部有字运行须带 w:b；③ 未加粗即扣分。
+    title_bold = False
+    if body_title is not None:
+        t_runs = [r for r in _runs_of(body_title) if (_text_of(r) or "").strip()]
+        title_bold = bool(t_runs) and all(_run_bold(ctx, r) for r in t_runs)
+    if title_bold:
+        results.append("-0：卷内主题标题“%s”保持加粗" % TITLE_TEXT)
+    else:
+        results.append("-1：卷内主题标题“%s”不满足加粗（w:b 缺失或被置为 0）" % TITLE_TEXT)
+
+
+    # ---------- 26 -3 5 处分部标题 黑体 13.5 磅加粗 ----------
+    # ① 定位“注意事项”“第一部分…”“第二部分…”“第三部分…”“第四部分…”5 个段落；
+    # ② 每处均须 eastAsia=黑体、字号 13.5 磅（w:sz=27）、加粗；③ 任一处不符即扣分。
+    head_bad = []
+    for head in SECTION_HEADS:
+        target = None
+        for para in body_paras:
+            if _norm(_text_of(para)).startswith(head):
+                target = para
+                break
+        if target is None:
+            head_bad.append("%s 缺失" % head)
+            continue
+        h_runs = [r for r in _runs_of(target) if (_text_of(r) or "").strip()]
+        fonts = {_resolve_effective_eastasia(ctx, r) for r in h_runs}
+        sizes = {_run_size_pt(ctx, r) for r in h_runs}
+        bold = bool(h_runs) and all(_run_bold(ctx, r) for r in h_runs)
+        if not (all(_is_heiti(f) for f in fonts) and all(13.0 <= s <= 14.0 for s in sizes) and bold):
+            head_bad.append("%s(%s/%s磅/加粗=%s)"
+                            % (head, "/".join(str(f) for f in fonts),
+                               "/".join("%.1f" % s for s in sizes), bold))
+    if not head_bad:
+        results.append("-0：“注意事项”与四处分部标题均为黑体 13.5 磅加粗")
+    else:
+        results.append("-3：5 处分部标题不满足黑体 13.5 磅加粗（%s）" % "；".join(head_bad[:3]))
+
+    # ---------- 27 -3 注意事项下方题号分值表 ----------
+    # ① 须为 2 行 5 列；② 首行为“题号/一/二/三/四”；③ 次行为“分值/40/20/25/15”。
+    grid_tbl = None
+    for tbl in tables:
+        grid = _table_grid(tbl)
+        if len(grid) == 2 and all(len(row) == 5 for row in grid) and grid[0][0].startswith("题号"):
+            grid_tbl = grid
+            break
+    expect_head = ["题号", "一", "二", "三", "四"]
+    expect_body = ["分值", "40", "20", "25", "15"]
+    if grid_tbl and [_squeeze(c) for c in grid_tbl[0]] == expect_head \
+            and [_squeeze(c) for c in grid_tbl[1]] == expect_body:
+        results.append("-0：注意事项下方表格保持 2 行 5 列，题号“一、二、三、四”与分值“40、20、25、15”对应")
+    else:
+        results.append("-3：注意事项下方表格不满足 2 行 5 列结构及题号/分值对应数值（实际 %s）"
+                       % (grid_tbl if grid_tbl else "未找到该表"))
+
+
+    # ---------- 28 -3 第一部分选择题 20 小题、每题 ABCD 四个选项齐全 ----------
+    # ① 以“数字+.”切分题段，遇参考答案标题即停止；② 第 1-20 题必须齐全；
+    # ③ 每题段内须能匹配 A./B./C./D. 四个选项。
+    segs = {}
+    cur_num = None
+    for para in body_paras:
+        text = _norm(_text_of(para))
+        if ANSWER_TITLE in text:
+            break
+        match = QNUM_RE.match(text)
+        if match:
+            cur_num = int(match.group(1))
+            segs.setdefault(cur_num, "")
+        if cur_num is not None and text:
+            segs[cur_num] = segs[cur_num] + " " + text
+    choice_bad = []
+    for num in range(1, 21):
+        seg = segs.get(num)
+        if seg is None:
+            choice_bad.append("第%d题缺失" % num)
+            continue
+        lack = [opt for opt in "ABCD"
+                if not re.search(r"(?<![A-Za-z])%s\s*[.．、]" % opt, seg)]
+        if lack:
+            choice_bad.append("第%d题缺选项%s" % (num, "".join(lack)))
+    if not choice_bad:
+        results.append("-0：第一部分选择题保持第 1 题至第 20 题共 20 道小题、每题 A/B/C/D 四个选项齐全")
+    else:
+        results.append("-3：第一部分选择题不满足 20 道小题、每题四个选项齐全（%s）"
+                       % "；".join(choice_bad[:4]))
+
+    # ---------- 29 -1 第 21-31 题题号连续 ----------
+    # ① 复用上面的题段编号；② 21-31 必须全部出现；③ 跳号/重排/拆分/删减即扣分。
+    tail_nums = sorted(n for n in segs if 21 <= n <= 31)
+    if tail_nums == list(range(21, 32)):
+        results.append("-0：第21题至第31题题号连续编号，无跳号或删减")
+    else:
+        results.append("-1：第21题至第31题的题号不满足连续编号（实际出现 %s）" % tail_nums)
+
+    # ---------- 30 -1 各小题分值标注全部保留 ----------
+    # ① 用“（…分）”正则统计正文分值标注数量；② 数量须不少于 32 处；
+    # ③ 覆盖“（2分）”“（8分）”“（每空1分，共3分）”等写法。
+    marks = SCORE_MARK_RE.findall(body_text)
+    if len(marks) >= EXPECTED_SCORE_MARKS:
+        results.append("-0：各小题的分值标注全部保留（共 %d 处）" % len(marks))
+    else:
+        results.append("-1：各小题的分值标注不满足全部保留（仅剩 %d 处，应有 %d 处）"
+                       % (len(marks), EXPECTED_SCORE_MARKS))
+
+    # ---------- 31 -1 第25题表格 5 行 2 列及“用途/物质”表头 ----------
+    # ① 在全部表格中寻找 5 行 2 列的表；② 首行须为“用途”“物质”；③ 结构或表头被改即扣分。
+    tbl25 = None
+    for tbl in tables:
+        grid = _table_grid(tbl)
+        if len(grid) == 5 and all(len(row) == 2 for row in grid):
+            if [_squeeze(c) for c in grid[0]] == ["用途", "物质"]:
+                tbl25 = grid
+                break
+    if tbl25 is not None:
+        results.append("-0：第25题表格保持 5 行 2 列结构及“用途/物质”表头")
+    else:
+        results.append("-1：第25题表格不满足 5 行 2 列结构及“用途/物质”表头")
+
+
+    # ---------- 32 -3 文末参考答案标题及 4 段答案内容完整保留 ----------
+    # ① 定位"参考答案与评分建议"标题段；② 其后须含"一、选择题…四、综合应用与计算题"4 段；
+    # ③ 标题缺失或任一段答案缺失即扣分。
+    ans_idx = None
+    for idx, para in enumerate(body_paras):
+        if ANSWER_TITLE in _norm(_text_of(para)):
+            ans_idx = idx
+            break
+    if ans_idx is None:
+        results.append("-3：文档末尾“参考答案与评分建议（教师用，可按需删除）”标题及其后 4 段答案内容不满足完整保留（未找到答案标题）")
+    else:
+        ans_text = _squeeze("\n".join(_text_of(p) for p in body_paras[ans_idx:]))
+        miss_parts = [part for part in ANSWER_PARTS if _squeeze(part) not in ans_text]
+        if not miss_parts:
+            results.append("-0：文档末尾参考答案标题及“一、选择题/二、填空题/三、实验探究题/四、综合应用与计算题”4 段答案内容完整保留")
+        else:
+            results.append("-3：文档末尾参考答案的 4 段答案内容不满足完整保留（缺 %s）"
+                           % "、".join(miss_parts))
+
+    # ---------- 33 -1 参考答案与试题正文之间分页另起一页 ----------
+    # ① 检查答案标题段自身的 pageBreakBefore；② 或答案标题段/其前一段内含 w:br type="page"；
+    # ③ 或两者之间存在分节符（sectPr）；④ 均无则视为答案与试题挤在同一页。
+    if ans_idx is None:
+        results.append("-1：“参考答案与评分建议（教师用，可按需删除）”不满足与试题正文之间分页另起一页（未找到答案标题）")
+    else:
+        ans_para = body_paras[ans_idx]
+        prev_para = body_paras[ans_idx - 1] if ans_idx > 0 else None
+        ppr = _pPr(ans_para)
+        page_new = ppr is not None and _on_off(ppr.find(qn("w:pageBreakBefore")))
+        for holder in (ans_para, prev_para):
+            if holder is None:
+                continue
+            if any(br.get(_TYPE) == "page" for br in holder.iter(_BR)):
+                page_new = True
+            if holder.find(".//" + _SECTPR) is not None:
+                page_new = True
+        if page_new:
+            results.append("-0：参考答案与试题正文之间分页另起一页")
+        else:
+            results.append("-1：“参考答案与评分建议（教师用，可按需删除）”不满足与试题正文之间分页另起一页（答案与试题挤在同一页）")
+
+    # ---------- 34 -1 试卷正文末尾单独一行居中的"（试卷结束）" ----------
+    # ① 须存在整段文字恰为"（试卷结束）"的段落；② 该段落须水平居中。
+    end_paras = [p for p in body_paras if _squeeze(_text_of(p)) == _squeeze(END_MARK)]
+    if end_paras and any(_jc_of(p) == "center" for p in end_paras):
+        results.append("-0：试卷正文末尾保留单独一行居中的“（试卷结束）”")
+    elif end_paras:
+        results.append("-1：试卷正文末尾“（试卷结束）”不满足单独一行居中（该段未水平居中）")
+    else:
+        results.append("-1：试卷正文末尾不满足单独一行居中的“（试卷结束）”（未找到该行）")
+
+    # ---------- 35 -1 封面页无竖排主标题与四项填写栏之外的多余内容 ----------
+    # ① 封面段落文字只允许主标题与四项填写栏；② 封面不得出现表格、段落边框（装饰线框）；
+    # ③ 封面除主标题文本框/图形外不得再有图形对象；④ 封面所在节不得引用带文字的页眉。
+    allow_texts = set()
+    if title.get("text"):
+        allow_texts.add(_squeeze(title["text"]))
+    for _label, field_para in fields.items():
+        allow_texts.add(_squeeze(_text_of(field_para)))
+    cover_extra = []
+    for el in cover_els:
+        if el.tag == _TBL:
+            cover_extra.append("封面存在表格")
+            continue
+        if el.tag != _P:
+            continue
+        text = _squeeze(_text_of(el))
+        if text and text not in allow_texts:
+            cover_extra.append("多余文字“%s”" % text[:16])
+        ppr = _pPr(el)
+        if ppr is not None and ppr.find(qn("w:pBdr")) is not None:
+            cover_extra.append("装饰线框")
+    n_shapes = sum(len(_drawings_of(el)) for el in cover_els if el.tag == _P)
+    if n_shapes > 1:
+        cover_extra.append("封面含 %d 个图形对象" % n_shapes)
+    if sects:
+        for ref in sects[0].findall(qn("w:headerReference")):
+            rid = ref.get(qn("r:id"))
+            try:
+                part = doc.part.related_parts[rid]
+                head_text = _norm(_text_of(etree.fromstring(part.blob)))
+            except Exception:
+                head_text = ""
+            if head_text:
+                cover_extra.append("页眉文字“%s”" % head_text[:16])
+    if not cover_extra:
+        results.append("-0：封面页仅有竖排主标题与四项填写栏，无页眉文字、装饰线框、说明文字等多余内容")
+    else:
+        results.append("-1：封面页出现竖排主标题与四项填写栏之外的多余内容（%s）"
+                       % "；".join(dict.fromkeys(cover_extra))[:120])
+
+    # ---------- 汇总：按 _MAX_DELTAS_ORDER 逐条回解为结构化结果 ----------
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items = []
+    bonus_score = 0
+    penalty_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        head = head.strip()
+        try:
+            delta = int(head)
+        except ValueError:
+            delta = 0
+        if delta and (delta > 0) != (max_delta > 0):
+            raise RuntimeError("dim2 符号不一致：head=%s vs max_delta=%d（%s）"
+                               % (head, max_delta, rule[:24]))
+        hit = delta != 0
+        dim2_items.append({"rule": rule, "max_delta": max_delta,
+                           "delta": max_delta if hit else 0,
+                           "hit": hit})
+        if hit and max_delta > 0:
+            bonus_score += max_delta
+        elif hit:
+            penalty_score += max_delta
+    result["dim2_items"] = dim2_items
+    result["total_score"] = bonus_score + penalty_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 本地调试：默认使用脚本所在目录；也可 `python xxx_verifier.py <dir>` 传入
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    result = evaluate(target_dir)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    _dir = sys.argv[1] if len(sys.argv) >= 2 else os.path.dirname(os.path.abspath(__file__))
+    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))

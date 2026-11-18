@@ -1,994 +1,1365 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自动评估“分层作业设计_填充完成.xlsx”。
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-对外接口（批量运行器约定）：
-    evaluate(dir_path: str) -> dict
-    - 入参：脚本所在目录的路径；脚本自行在该目录内定位并打开被评估的文档
-    - 返回：见 §2.2 结构化字典（含维度一是否通过、维度二逐项得分、总分）
-
-本地调试：
-    python officeval_087_verifier.py [脚本所在目录路径]
-    未传参时默认使用脚本自身所在目录。
-
-脚本按评分细则分两阶段评估：
-1. 先检查“维度1：可用与可修改性”。任一关键要求不满足，直接给 0 分，
-   不再检查维度2。
-2. 维度1通过后，逐项检查“维度2：完成度评分细则”和扣分项，汇总为最终得分。
-
-说明：Excel 中“文字是否被裁切/图片是否遮挡”等视觉项无法做到与人工完全一致，
-本脚本采用可自动化的近似规则：检查行高、自动换行、图片锚点/尺寸、内容区域外
-是否出现明显多余内容、是否存在可能遮挡题干的大图片等，以满足评分意图。
-"""
-
-from __future__ import annotations
-
-import json
+import os
 import re
 import sys
+import json
 import zipfile
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, Optional, cast
 
 from openpyxl import load_workbook
-from openpyxl.cell.cell import MergedCell
-from openpyxl.utils import get_column_letter, range_boundaries
-
-TARGET_FILE = "分层作业设计_填充完成.xlsx"
-EXPECTED_SHEETS = ["Sheet1", "Sheet2", "Sheet3"]
-EXPECTED_MERGES = {
-    "A1:F1",
-    "B3:F3",
-    "C4:F4",
-    "C5:F5",
-    "C6:F6",
-    "A4:A6",
-    "A7:A9",
-    "B7:F9",
-}
-CONTENT_AREA = (1, 1, 9, 6)  # Sheet1!A1:F9
-EMU_PER_CM = 360000
-EMU_PER_INCH = 914400
-PX_PER_CM = 37.7952755906
-
-
-@dataclass
-class CheckResult:
-    score: int
-    name: str
-    passed: bool
-    detail: str
-
-
-def norm(value) -> str:
-    """规范化文本，降低换行、空格、全角空格差异带来的误判。"""
-    if value is None:
-        return ""
-    s = str(value)
-    s = s.replace("\r", "\n")
-    s = re.sub(r"[ \t　 ]+", "", s)
-    s = re.sub(r"\n+", "\n", s)
-    return s.strip()
-
-
-def compact(value) -> str:
-    return re.sub(r"\s+", "", norm(value))
-
-
-def contains_all(text: str, keywords: Iterable[str]) -> bool:
-    c = compact(text).lower()
-    return all(compact(k).lower() in c for k in keywords)
-
-
-def contains_any(text: str, keywords: Iterable[str]) -> bool:
-    c = compact(text).lower()
-    return any(compact(k).lower() in c for k in keywords)
-
-
-def loose_compact(value) -> str:
-    """去除空白及标点，只保留中文/字母/数字，用于宽松长句比对。"""
-    return re.sub(r"[^\w一-鿿]", "", compact(value).lower())
-
-
-def contains_loose_phrase(text: str, phrase: str) -> bool:
-    return loose_compact(phrase) in loose_compact(text)
-
-
-def contains_ordered_tokens(text: str, tokens: Iterable[str]) -> bool:
-    """要求 tokens 中每个片段按顺序出现在 text 的宽松压缩形式中。"""
-    c = loose_compact(text)
-    pos = 0
-    for token in tokens:
-        t = loose_compact(token)
-        idx = c.find(t, pos)
-        if idx < 0:
-            return False
-        pos = idx + len(t)
-    return True
-
-
-def cell_text(ws, ref: str) -> str:
-    return "" if ws[ref].value is None else str(ws[ref].value)
-
-
-def approx(actual: Optional[float], expected: float, tol: float = 0.25) -> bool:
-    return actual is not None and abs(float(actual) - expected) <= tol
-
-
-def in_range(value: Optional[float], low: float, high: float) -> bool:
-    return value is not None and low <= float(value) <= high
-
-
-def font_name_ok(cell, expected="宋体") -> bool:
-    return (cell.font.name or "") == expected
-
-
-def font_size_ok(cell, expected: float) -> bool:
-    return cell.font.sz is not None and abs(float(cell.font.sz) - expected) < 0.2
-
-
-def font_black_ok(cell) -> bool:
-    """判断黑色字体。未显式设置颜色时，Excel 默认通常为黑色，按通过处理。"""
-    color = cell.font.color
-    if color is None:
-        return True
-    if color.type == "rgb":
-        rgb = (color.rgb or "").upper()
-        return rgb in {"000000", "FF000000"}
-    if color.type in {"theme", "indexed", "auto"}:
-        # theme=1/indexed=64/auto 在模板中常表示默认黑色/自动色。
-        return True
-    return True
-
-
-def horizontal_ok(cell, expected: Optional[str]) -> bool:
-    return cell.alignment.horizontal == expected
-
-
-def vertical_ok(cell, expected: str) -> bool:
-    return cell.alignment.vertical == expected
-
-
-def wrap_ok(cell) -> bool:
-    return bool(cell.alignment.wrap_text or cell.alignment.wrapText)
-
-
-def merged_ranges(ws) -> set[str]:
-    return {str(rng) for rng in ws.merged_cells.ranges}
-
-
-def is_merged(ws, ref: str) -> bool:
-    return ref in merged_ranges(ws)
-
-
-def nonempty_cells(ws) -> list[str]:
-    refs = []
-    for row in ws.iter_rows():
-        for cell in row:
-            if isinstance(cell, MergedCell):
-                continue
-            if cell.value not in (None, ""):
-                refs.append(cell.coordinate)
-    return refs
-
-
-def is_blank_sheet(ws) -> bool:
-    return not nonempty_cells(ws) and len(ws.merged_cells.ranges) == 0 and len(getattr(ws, "_images", [])) == 0
-
-
-def anchor_bounds(img):
-    """返回图片锚点边界：(起始行, 起始列, 结束行, 结束列)，行列均为 1-based。"""
-    anchor = img.anchor
-    if isinstance(anchor, str):
-        m = re.match(r"([A-Z]+)(\d+)", anchor)
-        if not m:
-            return None
-        col_letters, row = m.groups()
-        col = 0
-        for ch in col_letters:
-            col = col * 26 + ord(ch) - ord("A") + 1
-        return int(row), col, int(row), col
-    if not hasattr(anchor, "_from"):
-        return None
-    start_row = anchor._from.row + 1
-    start_col = anchor._from.col + 1
-    if hasattr(anchor, "to") and anchor.to is not None:
-        end_row = anchor.to.row + 1
-        end_col = anchor.to.col + 1
-    else:
-        end_row = start_row
-        end_col = start_col
-    return start_row, start_col, end_row, end_col
-
-
-def img_size_cm(img) -> tuple[float, float]:
-    """尽量把图片尺寸换算为厘米。openpyxl 通常以像素保存 width/height。
-
-    注意：openpyxl 的 img.width/height 是否为像素依赖具体读取路径，且像素->厘米
-    换算依赖 DPI 假设（PX_PER_CM 固定按 96 DPI），并不可靠。只在无法从 drawing
-    XML 拿到精确 EMU 尺寸时，才把这里当作兜底近似值使用，优先使用
-    `get_drawing_image_specs` 返回的 `<xdr:ext>` EMU 尺寸。
-    """
-    width = getattr(img, "width", None)
-    height = getattr(img, "height", None)
-    if width is None or height is None:
-        return 0.0, 0.0
-    # 常见图片对象为像素尺寸。若是极大的 EMU 值，也做兼容。
-    if width > 10000 or height > 10000:
-        return width / EMU_PER_CM, height / EMU_PER_CM
-    return width / PX_PER_CM, height / PX_PER_CM
-
-
-def image_near_row_cols(img, rows: set[int], col_low: int = 3, col_high: int = 6) -> bool:
-    bounds = anchor_bounds(img)
-    if not bounds:
-        return False
-    sr, sc, er, ec = bounds
-    return bool(set(range(sr, er + 1)) & rows) and not (ec < col_low or sc > col_high)
-
-
-@dataclass
-class DrawingImageSpec:
-    """从 drawing XML 直接解析出的图片锚点信息（EMU 精度，不依赖像素/DPI）。"""
-
-    from_row: int  # 0-based，对应 openpyxl anchor._from.row
-    from_col: int  # 0-based
-    from_row_off: int  # EMU
-    from_col_off: int  # EMU
-    to_row: Optional[int]  # 0-based，twoCellAnchor 才有
-    to_col: Optional[int]
-    width_emu: Optional[int]  # oneCellAnchor/绝对锚点的 <xdr:ext cx>
-    height_emu: Optional[int]  # <xdr:ext cy>
-    embed_rid: Optional[str]  # <a:blip r:embed="rIdN">，用于与 openpyxl 图片对象一一对应
-
-    @property
-    def width_cm(self) -> float:
-        return (self.width_emu or 0) / EMU_PER_CM
-
-    @property
-    def height_cm(self) -> float:
-        return (self.height_emu or 0) / EMU_PER_CM
-
-
-def get_drawing_image_specs(path: Path, sheet_index: int) -> list[DrawingImageSpec]:
-    """读取 xl/drawings/drawingN.xml，解析每张图片（<xdr:pic>）的 EMU 精确尺寸与锚点。
-
-    办公软件保存图片时，真实的宽高以 EMU 存在 <xdr:ext cx="宽" cy="高"/> 里，
-    与 openpyxl 的 img.width/height（可能是像素、且换算依赖 DPI 假设）相比更可靠。
-    锚点既可能是 <xdr:twoCellAnchor>（有 from/to 两个格子），也可能是
-    <xdr:oneCellAnchor>（只有 from + ext 尺寸），这里两种都处理。
-    """
-    if not zipfile.is_zipfile(path):
-        return []
-    with zipfile.ZipFile(path) as z:
-        rels_name = f"xl/worksheets/_rels/sheet{sheet_index}.xml.rels"
-        if rels_name not in z.namelist():
-            return []
-        rels = z.read(rels_name).decode("utf-8", errors="replace")
-        m = re.search(r'Target="([^"]*drawings/drawing[^"]+\.xml)"', rels)
-        if not m:
-            return []
-        target = m.group(1)
-        drawing_name = "xl/" + target.lstrip("./").replace("../", "")
-        if drawing_name not in z.namelist():
-            candidates = [n for n in z.namelist() if n.endswith(Path(target).name)]
-            if not candidates:
-                return []
-            drawing_name = candidates[0]
-        xml = z.read(drawing_name).decode("utf-8", errors="replace")
-    specs: list[DrawingImageSpec] = []
-    blocks = re.findall(
-        r"<xdr:(twoCellAnchor|oneCellAnchor)[^>]*>(.*?)</xdr:\1>", xml, re.DOTALL
-    )
-    for _tag, block in blocks:
-        if not re.search(r"<xdr:pic[ >]", block):
-            continue  # 只关心图片，跳过纯形状/连接线锚点
-        m_from = re.search(
-            r"<xdr:from>\s*<xdr:col>(\d+)</xdr:col>\s*<xdr:colOff>(\d+)</xdr:colOff>\s*"
-            r"<xdr:row>(\d+)</xdr:row>\s*<xdr:rowOff>(\d+)</xdr:rowOff>",
-            block, re.DOTALL,
-        )
-        if not m_from:
-            continue
-        from_col, from_col_off, from_row, from_row_off = (int(x) for x in m_from.groups())
-        m_to = re.search(
-            r"<xdr:to>\s*<xdr:col>(\d+)</xdr:col>\s*<xdr:colOff>(\d+)</xdr:colOff>\s*"
-            r"<xdr:row>(\d+)</xdr:row>\s*<xdr:rowOff>(\d+)</xdr:rowOff>",
-            block, re.DOTALL,
-        )
-        to_row = to_col = None
-        if m_to:
-            to_col = int(m_to.group(1))
-            to_row = int(m_to.group(3))
-        m_ext = re.search(r'<xdr:ext\s+cx="(\d+)"\s+cy="(\d+)"', block)
-        width_emu = int(m_ext.group(1)) if m_ext else None
-        height_emu = int(m_ext.group(2)) if m_ext else None
-        m_rid = re.search(r'<a:blip[^>]*r:embed="(rId\d+)"', block)
-        embed_rid = m_rid.group(1) if m_rid else None
-        specs.append(DrawingImageSpec(
-            from_row=from_row, from_col=from_col,
-            from_row_off=from_row_off, from_col_off=from_col_off,
-            to_row=to_row, to_col=to_col,
-            width_emu=width_emu, height_emu=height_emu,
-            embed_rid=embed_rid,
-        ))
-    return specs
-
-
-def match_drawing_spec(img, specs: list[DrawingImageSpec]) -> Optional[DrawingImageSpec]:
-    """把 openpyxl 的 ws._images 里的图片对象，与 drawing XML 解析出的 spec 一一对应。
-
-    优先用锚点起始行列（0-based）匹配。同一单元格出现多图时，openpyxl 的图片
-    对象没有稳定暴露 drawing rId，这里选择该锚点下第一个未区分候选；评分逻辑
-    只需要判定是否存在符合第3题尺寸/位置的图片，不依赖逐张持久化身份。
-    """
-    anchor = getattr(img, "anchor", None)
-    if anchor is None or not hasattr(anchor, "_from"):
-        return None
-    from_row = anchor._from.row
-    from_col = anchor._from.col
-    candidates = [s for s in specs if s.from_row == from_row and s.from_col == from_col]
-    if not candidates:
-        return None
-    return candidates[0]
-
-
-def column_width_to_emu(width: Optional[float]) -> int:
-    """把 Excel 字符列宽近似换算为 EMU，用于浮动图片遮挡的几何判定。"""
-    if width is None:
-        width = 8.43
-    pixels = int(width * 7 + 5)  # Excel/OpenXML 常用近似：字符宽->像素
-    return int(pixels / PX_PER_CM * EMU_PER_CM)
-
-
-def row_height_to_emu(height_points: Optional[float]) -> int:
-    """把 Excel 行高（磅）换算为 EMU。"""
-    if height_points is None:
-        height_points = 15.0
-    return int(height_points / 72 * EMU_PER_INCH)
-
-
-def c5_landscape_not_covering_text(ws, spec: DrawingImageSpec) -> bool:
-    """基于 C5:F5 合并区域的几何位置近似判断图片未遮挡题干/填空文字。
-
-    openpyxl 不能直接给出单元格内换行文本的真实排版边界，这里使用 workbook 元数据
-    做可复现的近似：把 C5:F5 的左侧 35% 与上方 30% 视为题干/填空主要文本区，
-    山水草地插图必须主要位于右下侧，且不能从 C5 左上文本起始区展开。
-    """
-    merged_width_emu = sum(
-        column_width_to_emu(ws.column_dimensions[get_column_letter(col)].width)
-        for col in range(3, 7)
-    )
-    row_height_emu = row_height_to_emu(ws.row_dimensions[5].height)
-    image_left_emu = sum(
-        column_width_to_emu(ws.column_dimensions[get_column_letter(col)].width)
-        for col in range(3, spec.from_col + 1)
-    ) + spec.from_col_off if spec.from_col >= 3 else spec.from_col_off
-    image_top_emu = spec.from_row_off if spec.from_row == 4 else row_height_emu
-    image_right_emu = image_left_emu + (spec.width_emu or 0)
-    image_bottom_emu = image_top_emu + (spec.height_emu or 0)
-    text_right_emu = merged_width_emu * 0.35
-    text_bottom_emu = row_height_emu * 0.30
-    overlaps_text_zone = image_left_emu < text_right_emu and image_top_emu < text_bottom_emu
-    inside_merged_area = (
-        image_left_emu >= 0
-        and image_top_emu >= 0
-        and image_right_emu <= merged_width_emu * 1.03
-        and image_bottom_emu <= row_height_emu * 1.03
-    )
-    return inside_merged_area and not overlaps_text_zone
-
-
-def count_row_rect_shapes(path: Path, sheet_index: int, excel_row: int) -> int:
-    """统计 xlsx 中指定工作表 drawing 里锚定在指定 Excel 行的矩形形状数量。
-
-    办公软件里“田字格”通常用一个矩形加两条交叉连接线绘制，openpyxl 的
-    `ws._images` 只能拿到图片，无法拿到形状。这里直接读 xl/drawings/*.xml，
-    统计 `xdr:twoCellAnchor` 起点在指定行、内部为 `<xdr:sp>` 形状元素、
-    且 `prstGeom prst="rect"` 的形状数，作为该行田字格数量的近似判定。
-    需要排除 `<xdr:pic>`（图片自带外框矩形）与 `<xdr:cxnSp>`（连接线），
-    否则会把图片和田字格中的交叉线一起算进来。
-    """
-    # sheet_index: 1-based，对应 xl/worksheets/sheet{index}.xml
-    if not zipfile.is_zipfile(path):
-        return 0
-    with zipfile.ZipFile(path) as z:
-        # 通过 sheet 的 rels 找到对应的 drawing 路径
-        rels_name = f"xl/worksheets/_rels/sheet{sheet_index}.xml.rels"
-        if rels_name not in z.namelist():
-            return 0
-        rels = z.read(rels_name).decode("utf-8", errors="replace")
-        m = re.search(r'Target="([^"]*drawings/drawing[^"]+\.xml)"', rels)
-        if not m:
-            return 0
-        target = m.group(1)
-        # 相对路径归一：../drawings/drawingN.xml -> xl/drawings/drawingN.xml
-        drawing_name = "xl/" + target.lstrip("./").replace("../", "")
-        if drawing_name not in z.namelist():
-            # 兜底：模糊匹配
-            candidates = [n for n in z.namelist() if n.endswith(Path(target).name)]
-            if not candidates:
-                return 0
-            drawing_name = candidates[0]
-        xml = z.read(drawing_name).decode("utf-8", errors="replace")
-    # 每个 twoCellAnchor 块单独判定
-    count = 0
-    target_from_row = excel_row - 1  # drawing XML 里 row 是 0-based
-    blocks: list[str] = re.findall(r"<xdr:twoCellAnchor[^>]*>(.*?)</xdr:twoCellAnchor>", xml, re.DOTALL)
-    for block in blocks:
-        m_row = re.search(r"<xdr:from>.*?<xdr:row>(\d+)</xdr:row>", block, re.DOTALL)
-        if not m_row or int(m_row.group(1)) != target_from_row:
-            continue
-        # 仅统计真正的形状 <xdr:sp>，排除图片 <xdr:pic> 与连接线 <xdr:cxnSp>。
-        # 注意 <xdr:sp 是 <xdr:spPr> 的前缀，不能用作判定，需用 <xdr:sp> 或 <xdr:sp 后跟属性。
-        if not re.search(r"<xdr:sp[ >]", block):
-            continue
-        if 'prstGeom prst="rect"' in block:
-            count += 1
-    return count
-
-
-def load_workbook_editable(path: Path):
-    # 交付文件允许 .xlsx 或 .xlsm 格式；先用 zipfile 检查基本容器，避免非法伪装。
-    if path.suffix.lower() not in (".xlsx", ".xlsm"):
-        raise ValueError("文件扩展名不是 .xlsx 或 .xlsm")
-    if not zipfile.is_zipfile(path):
-        raise ValueError("文件不是有效的 xlsx/xlsm(zip) 容器")
-    wb = load_workbook(path)
-    return wb
-
-
-def dimension1_checks(path: Path, wb) -> list[tuple[bool, str]]:
-    checks: list[tuple[bool, str]] = []
-
-    ok_open = wb is not None
-    checks.append((ok_open, "交付文件为 .xlsx 或 .xlsm，且可正常打开。"))
-
-    return checks
-
-
-def add_result(results: list[CheckResult], score: int, name: str, passed: bool, detail: str = "") -> None:
-    results.append(CheckResult(score=score, name=name, passed=passed, detail=detail))
-
-
-def evaluate_dimension2(wb, path: Path | None = None) -> list[CheckResult]:
-    ws = wb["Sheet1"]
-    results: list[CheckResult] = []
-    # +5 列宽（细则规定的是办公软件里显示的“字符”列宽）：
-    #   A=12.75, B=14.63, C=13.13, D=17.38, E=12.25, F=15.5。
-    # openpyxl 的 ColumnDimension.width 读取到的就是 Excel 里显示的字符列宽值
-    # （即另存 xlsx 时写入 <col customWidth width="..."/> 的原始数值），并不需要
-    # 再减去 0.625 的内边距换算——之前固定减 0.625 会把刚好等于细则值的列
-    # （如 A=12.75）算成 12.12，从而误判不合格。这里直接用 stored width 与细则值比对。
-    expected_widths = {"A": 12.75, "B": 14.63, "C": 13.13, "D": 17.38, "E": 12.25, "F": 15.5}
-    actual_widths: dict[str, float | None] = {}
-    for col in expected_widths:
-        stored = cast(float | None, ws.column_dimensions[col].width)
-        actual_widths[col] = None if stored is None else round(float(stored), 2)
-    width_ok = all(approx(actual_widths[col], exp, tol=0.05) for col, exp in expected_widths.items())
-    add_result(results, 5, "列宽：A-F列宽固定符合细则", width_ok,
-               f"细则列宽={expected_widths}，实际列宽={actual_widths}")
-
-    # +1 标题区域 A1:F1（细则要求逐点踩到）：
-    #   1) 保持 A1:F1 合并状态（不取消合并）
-    #   2) 文本为“识字主题《四季小景》分层作业”
-    #   3) 字体宋体  4) 字号 18 磅  5) 加粗  6) 黑色字体
-    #   7) 水平居中  8) 垂直居中
-    #   9) 行高保持 39 磅（不因粘贴标题而调整行高）
-    # 说明：办公软件里“黑色”既可能是纯黑 RGB(000000)，也可能是主题色“文本1”，
-    #       两者在 Office 中显示均为黑色，font_black_ok 已按此处理。
-    #       行高强调“保持 39 磅、不调整”，故用较小容差精确判定。
-    c = ws["A1"]
-    title_checks = {
-        "A1:F1保持合并": is_merged(ws, "A1:F1"),
-        "文本=识字主题《四季小景》分层作业": compact(c.value) == compact("识字主题《四季小景》分层作业"),
-        "宋体": font_name_ok(c),
-        "18磅": font_size_ok(c, 18),
-        "加粗": bool(c.font.bold),
-        "黑色": font_black_ok(c),
-        "水平居中": horizontal_ok(c, "center"),
-        "垂直居中": vertical_ok(c, "center"),
-        "行高39磅": approx(ws.row_dimensions[1].height, 39, 0.1),
-    }
-    title_ok = all(title_checks.values())
-    add_result(results, 1, "标题区域 A1:F1 格式与文本", title_ok,
-               f"各点命中={title_checks}")
-
-    # +1 基本信息行 A2:F2（细则逐点踩到）：
-    #   1) A2 字段=“班级”  2) C2 字段=“任教教师”  3) E2 字段=“时间”
-    #   4) 三字段字体均为宋体  5) 11 磅  6) 加粗  7) 水平居中  8) 垂直居中
-    #   9) B2、D2、F2 填写区域保持空白
-    # 说明：细则未要求字段单元格的字体颜色，故不作颜色约束。
-    info_checks = {}
-    for ref, text in [("A2", "班级"), ("C2", "任教教师"), ("E2", "时间")]:
-        cell = ws[ref]
-        info_checks[f"{ref}={text}"] = compact(cell.value) == compact(text)
-        info_checks[f"{ref}宋体"] = font_name_ok(cell)
-        info_checks[f"{ref}11磅"] = font_size_ok(cell, 11)
-        info_checks[f"{ref}加粗"] = bool(cell.font.bold)
-        info_checks[f"{ref}水平居中"] = horizontal_ok(cell, "center")
-        info_checks[f"{ref}垂直居中"] = vertical_ok(cell, "center")
-    for ref in ["B2", "D2", "F2"]:
-        info_checks[f"{ref}空白"] = ws[ref].value in (None, "")
-    info_row_ok = all(info_checks.values())
-    add_result(results, 1, "基本信息行 A2/C2/E2 字段格式且 B2/D2/F2 空白", info_row_ok,
-               f"各点命中={info_checks}")
-
-    # +1 A3 作业简介标题（细则逐点踩到）：
-    #   1) 文本=“作业设计简介（学习目标、题型说明等）”
-    #   2) 宋体  3) 11 磅  4) 加粗
-    #   5) 自动换行  6) 水平居中  7) 垂直居中
-    # 说明：办公软件中文本可能带换行/全角括号差异，compact 已去除空白与换行，
-    #       故用 compact 精确比对文本，其余按细则逐项判定；细则未要求字体颜色，不作约束。
-    c = ws["A3"]
-    a3_checks = {
-        "文本=作业设计简介（学习目标、题型说明等）":
-            compact(c.value) == compact("作业设计简介（学习目标、题型说明等）"),
-        "宋体": font_name_ok(c),
-        "11磅": font_size_ok(c, 11),
-        "加粗": bool(c.font.bold),
-        "自动换行": wrap_ok(c),
-        "水平居中": horizontal_ok(c, "center"),
-        "垂直居中": vertical_ok(c, "center"),
-    }
-    intro_title_ok = all(a3_checks.values())
-    add_result(results, 1, "A3 作业简介标题", intro_title_ok, f"各点命中={a3_checks}")
-
-    # +1 B3:F3 作业简介内容（细则逐点踩到）：
-    #   1) 保持 B3:F3 合并状态
-    #   2) 文本=“识字主题《四季小景》分层作业；基础类、提升类为必做题，拓展类为选做题。”
-    #   3) 宋体  4) 11 磅  5) 常规字形（非加粗）
-    #   6) 行高保持 68 磅
-    #   7) 文字完整显示、不上下裁切——办公软件中该要求依赖“自动换行”开启，
-    #      否则多行文字会在固定行高内被上下裁切，故此处检查 wrap。
-    # 说明：细则未要求斜体/颜色/水平垂直对齐，均不作约束。
-    c = ws["B3"]
-    intro_text_expected = "识字主题《四季小景》分层作业；基础类、提升类为必做题，拓展类为选做题。"
-    b3_checks = {
-        "B3:F3保持合并": is_merged(ws, "B3:F3"),
-        "文本匹配": compact(c.value) == compact(intro_text_expected),
-        "宋体": font_name_ok(c),
-        "11磅": font_size_ok(c, 11),
-        "常规字形(非加粗)": not bool(c.font.bold),
-        "行高68磅": approx(ws.row_dimensions[3].height, 68, 0.1),
-        "自动换行(不裁切)": wrap_ok(c),
-    }
-    intro_content_ok = all(b3_checks.values())
-    add_result(results, 1, "B3:F3 作业简介内容", intro_content_ok,
-               f"各点命中={b3_checks}，实际文本：{cell_text(ws, 'B3')}")
-
-    # +1 A4:A6 层级总标题（细则逐点踩到）：
-    #   1) 保持 A4:A6 合并状态
-    #   2) 文本=“作业设计内容”  3) 宋体  4) 14 磅  5) 加粗
-    #   6) 水平居中  7) 垂直居中
-    # 说明：办公软件中该单元格常以竖排换行显示（作业\n设计\n内容），
-    #       compact 已去除空白/换行，故能正确还原比对；细则未要求字体颜色，不作约束。
-    c = ws["A4"]
-    a4_checks = {
-        "A4:A6保持合并": is_merged(ws, "A4:A6"),
-        "文本=作业设计内容": compact(c.value) == compact("作业设计内容"),
-        "宋体": font_name_ok(c),
-        "14磅": font_size_ok(c, 14),
-        "加粗": bool(c.font.bold),
-        "水平居中": horizontal_ok(c, "center"),
-        "垂直居中": vertical_ok(c, "center"),
-    }
-    design_title_ok = all(a4_checks.values())
-    add_result(results, 1, "A4:A6 层级总标题", design_title_ok, f"各点命中={a4_checks}")
-
-    # +1 B4 基础层标题（细则逐点踩到）：
-    #   1) 文本=“基础层作业设计”  2) 宋体  3) 11 磅  4) 加粗
-    #   5) 水平居中  6) 垂直居中
-    # 说明：细则未要求合并、行高、字体颜色，均不作约束。
-    c = ws["B4"]
-    b4_checks = {
-        "文本=基础层作业设计": compact(c.value) == compact("基础层作业设计"),
-        "宋体": font_name_ok(c),
-        "11磅": font_size_ok(c, 11),
-        "加粗": bool(c.font.bold),
-        "水平居中": horizontal_ok(c, "center"),
-        "垂直居中": vertical_ok(c, "center"),
-    }
-    add_result(results, 1, "B4 基础层标题", all(b4_checks.values()), f"各点命中={b4_checks}")
-
-    # +1 B5 提高层标题（细则逐点踩到）：
-    #   1) 文本=“提高层作业设计”  2) 宋体  3) 11 磅  4) 加粗
-    #   5) 水平居中  6) 垂直居中
-    # 说明：细则未要求合并、行高、字体颜色，均不作约束。
-    c = ws["B5"]
-    b5_checks = {
-        "文本=提高层作业设计": compact(c.value) == compact("提高层作业设计"),
-        "宋体": font_name_ok(c),
-        "11磅": font_size_ok(c, 11),
-        "加粗": bool(c.font.bold),
-        "水平居中": horizontal_ok(c, "center"),
-        "垂直居中": vertical_ok(c, "center"),
-    }
-    add_result(results, 1, "B5 提高层标题", all(b5_checks.values()), f"各点命中={b5_checks}")
-
-    # +1 B6 拓展层标题（细则逐点踩到）：
-    #   1) 文本=“拓展层作业设计”  2) 宋体  3) 11 磅  4) 加粗
-    #   5) 水平居中  6) 垂直居中
-    # 说明：细则未要求合并、行高、字体颜色，均不作约束。
-    c = ws["B6"]
-    b6_checks = {
-        "文本=拓展层作业设计": compact(c.value) == compact("拓展层作业设计"),
-        "宋体": font_name_ok(c),
-        "11磅": font_size_ok(c, 11),
-        "加粗": bool(c.font.bold),
-        "水平居中": horizontal_ok(c, "center"),
-        "垂直居中": vertical_ok(c, "center"),
-    }
-    add_result(results, 1, "B6 拓展层标题", all(b6_checks.values()), f"各点命中={b6_checks}")
-
-    # +5 C4:F4 基础层内容区域（细则逐点踩到）：
-    #   总体：1) 保持 C4:F4 合并状态
-    #        2) 完整填写“基础类”区域中的 4 道题
-    #        3) 单元格行高对应 250-350 磅
-    #   第1题：完整出现“1.给词语选择正确的读音画‘√’。”
-    #          及“晨露、清风、细雨、晚霞”的拼音选择内容与对应括号。
-    #   第2题：完整出现“2.看拼音，写词语。”及 qīng chén、xiǎo yǔ、hé fēng、
-    #          huā duǒ、niǎo ér、fēi 等拼音、句子填空内容及对应田字格。
-    #   第3题：完整出现“3.你能圈出这几个词中表示自然景物的字吗？”
-    #          及“晨露、细雨、晚霞”三个词语。
-    #   第4题：完整出现“4.连一连。”及“晨露、午阳、晚霞、夜风”和“亮、暖、红、轻”两组内容。
-    # 说明：办公软件中文本换行/空格不定，contains_all 已做压缩比对，可在 Office 有效。
-    #       第2题原判定只要求六个拼音再加“矩形形状数>=1”，过松：既没检查“句子
-    #       填空内容”，也没要求田字格数量与题目匹配。这里补充：
-    #       1) 句子填空关键词（花朵、鸟儿、飞入等描述春景的常见搭配词）；
-    #       2) 从“2.”截取到“3.”之前的文本片段，仅在该片段范围内统计矩形形状数/
-    #          “田字格”字样/长空白填空槽数量，避免误算到第1/3/4题的括号或形状；
-    #       3) 六个拼音对应六个字词填空，田字格数量应恰好为 6 个，不能再用 >=1。
-    base_text = cell_text(ws, "C4")
-    _m2 = re.search(r"2\s*[\.．、]", base_text)
-    _m3_base = re.search(r"3\s*[\.．、]", base_text)
-    if _m2 and _m3_base and _m3_base.start() > _m2.start():
-        q2_text = base_text[_m2.start():_m3_base.start()]
-    elif _m2:
-        q2_text = base_text[_m2.start():]
-    else:
-        q2_text = ""
-    q2_tianzige_word_count = q2_text.count("田字格")
-    q2_blank_slots = len(re.findall(r"[ 　_—－\-]{4,}", q2_text))
-    q2_rect_shape_count = count_row_rect_shapes(path, 1, 4) if path is not None else 0
-    q2_has_6_slots = q2_rect_shape_count == 6 or q2_tianzige_word_count == 6 or q2_blank_slots == 6
-    base_checks = {
-        "C4:F4保持合并": is_merged(ws, "C4:F4"),
-        "行高250-350磅": in_range(ws.row_dimensions[4].height, 250, 350),
-        "第1题题干": contains_all(base_text, ["1", "给词语选择正确的读音", "√"]),
-        "第1题词语拼音选择": contains_all(base_text, ["晨露", "清风", "细雨", "晚霞"]),
-        "第1题括号": contains_any(base_text, ["（", "(", "括号"]),
-        "第2题题干": contains_all(base_text, ["2", "看拼音", "写词语"]),
-        "第2题拼音填空": contains_all(base_text, ["qīng chén", "xiǎo yǔ", "hé fēng", "huā duǒ", "niǎo ér", "fēi"]),
-        "第2题句子填空内容": contains_all(q2_text, ["花", "鸟", "风", "雨"]),
-        "第2题含6个田字格填空": q2_has_6_slots,
-        "第3题题干": contains_all(base_text, ["3", "圈出", "自然景物"]),
-        "第3题三词": contains_all(base_text, ["晨露", "细雨", "晚霞"]),
-        "第4题题干": contains_all(base_text, ["4", "连一连"]),
-        "第4题左列": contains_all(base_text, ["晨露", "午阳", "晚霞", "夜风"]),
-        "第4题右列": contains_all(base_text, ["亮", "暖", "红", "轻"]),
-    }
-    base_ok = all(base_checks.values())
-    _base_detail = (
-        f"行高={ws.row_dimensions[4].height}，第2题矩形形状数={q2_rect_shape_count}，"
-        + f"田字格字样={q2_tianzige_word_count}，填空槽={q2_blank_slots}，"
-        + f"各点命中={base_checks}，实际文本前120字：{base_text[:120]}"
-    )
-    add_result(results, 5, "C4:F4 基础层4道题", base_ok, _base_detail)
-
-    # +5 C5:F5 提高层内容区域（细则逐点踩到）：
-    #   总体：1) 保持 C5:F5 合并状态
-    #        2) 完整填写“提升类”区域中的 3 道题
-    #        3) 行高 350-450 磅
-    #        4) 单元格内包含两张图片（提高层附近图片 ≥ 2）
-    #   第1题：完整出现“1.词语接龙。”及“清晨→（ ）→（ ）→（ ）”（清晨、箭头、括号）。
-    #   第2题：完整出现“2.照样子，看图说一说。”及“微风轻、小鸟、柳叶、溪水、纸鸢、云朵”及对应图片。
-    #   第3题：完整出现“3.仔细观察图片，填一填。”及包含 15 个田字格的填空语境及对应图片。
-    # 说明：办公软件里图片以浮动锚点存于该行区域，image_near_row_cols 判定其落在 C5:F5；
-    #       文本换行/空格不定，contains_all/any 已做压缩比对；
-    #       “田字格”在办公软件里通常用“矩形+两条交叉连接线”绘制，openpyxl 的
-    #       ws._images 只能拿到位图，无法拿到形状。因此这里读取底层 drawing xml，
-    #       统计锚定在 Excel 第 5 行的 prstGeom="rect" 矩形数作为田字格数量，
-    #       要求恰好 15 个。若无法读取 drawing（例如仅传入了 workbook），
-    #       则回退到文本层的“田字格”字样计数或长空白/下划线填空槽计数。
-    improve_text = cell_text(ws, "C5")
-    images_near_c5 = [img for img in getattr(ws, "_images", []) if image_near_row_cols(img, {5}, 3, 6)]
-    # 图片精确尺寸优先从 drawing xml 的 <xdr:ext> EMU 值读取（不依赖像素/DPI假设），
-    # 通过锚点起始行列把 ws._images 里的每个图片对象与对应的 drawing spec 绑定；
-    # 若绑定失败（例如非 xlsx 容器路径不可用），才回退到 img_size_cm 的像素近似换算。
-    drawing_specs = get_drawing_image_specs(path, 1) if path is not None else []
-    q3_image_candidates = []
-    q2_image_candidates = []
-    for img in images_near_c5:
-        spec = match_drawing_spec(img, drawing_specs)
-        if spec is not None and spec.width_emu and spec.height_emu:
-            width_cm, height_cm = spec.width_cm, spec.height_cm
-        else:
-            width_cm, height_cm = img_size_cm(img)
-        # 第3题的“山水草地插图”在后续细则中有明确尺寸要求，这里用尺寸识别其题目归属。
-        is_q3_image = in_range(width_cm, 5.5, 5.7) and in_range(height_cm, 2.7, 2.9)
-        if is_q3_image:
-            q3_image_candidates.append(img)
-        else:
-            q2_image_candidates.append(img)
-    # 第3题所在文本片段：从“3.”后开始截取，避免把第1/2题的括号计入田字格填空槽。
-    _m3 = re.search(r"3\s*[\.．、]", improve_text)
-    q3_text = improve_text[_m3.start():] if _m3 else ""
-    tianzige_word_count = q3_text.count("田字格")
-    blank_slots = len(re.findall(r"[ 　_—－\-]{4,}", q3_text))
-    rect_shape_count = count_row_rect_shapes(path, 1, 5) if path is not None else 0
-    # 15个田字格必须是底层 drawing 里的真实矩形，或文本里可数的明确填空槽；不能靠重复
-    # “田字格”字样15次通过，否则会把说明文字误判成实际作答区域。
-    q3_has_15_slots = rect_shape_count == 15 or blank_slots == 15
-    improve_checks = {
-        "C5:F5保持合并": is_merged(ws, "C5:F5"),
-        "行高350-450磅": in_range(ws.row_dimensions[5].height, 350, 450),
-        "包含两张图片": len(images_near_c5) >= 2,
-        "第1题题干": contains_all(improve_text, ["1", "词语接龙"]),
-        "第1题接龙内容": contains_all(improve_text, ["清晨"]) and contains_any(improve_text, ["→", "->"]) and contains_any(improve_text, ["（", "("]),
-        "第2题题干": contains_all(improve_text, ["2", "照样子", "看图说一说"]),
-        "第2题词语": contains_all(improve_text, ["微风轻", "小鸟", "柳叶", "溪水", "纸鸢", "云朵"]),
-        "第2题对应图片": len(q2_image_candidates) >= 1,
-        "第3题题干": contains_all(improve_text, ["3", "仔细观察图片", "填一填"]),
-        "第3题含15个田字格填空": q3_has_15_slots,
-        "第3题对应图片": len(q3_image_candidates) >= 1,
-    }
-    improve_ok = all(improve_checks.values())
-    _improve_detail = (
-        f"行高={ws.row_dimensions[5].height}，附近图片数={len(images_near_c5)}，"
-        f"第2题图片数={len(q2_image_candidates)}，第3题图片数={len(q3_image_candidates)}，"
-        + f"矩形形状数={rect_shape_count}，田字格字样={tianzige_word_count}，"
-        + f"填空槽={blank_slots}，各点命中={improve_checks}，实际文本前120字：{improve_text[:120]}"
-    )
-    add_result(results, 5, "C5:F5 提高层3道题、图片及必做要求", improve_ok, _improve_detail)
-
-    # +1 C5:F5 观察图片（细则逐点踩到）：
-    #   1) 山水草地插图放置在提高层第3题附近（图片锚点落在 C5:F5 区域内）
-    #   2) 图片宽 5.5-5.7cm  3) 图片高 2.7-2.9cm
-    #   4) 不遮挡题干和填空内容
-    # 说明：图片尺寸从 drawing xml 的 <xdr:ext cx/cy> EMU 值读取，避免固定
-    #       37.795 px/cm 的 DPI 假设；“山水草地插图”通过第3题绑定条件识别：
-    #       图片位于 C5:F5、第3题目标尺寸范围内，且通过几何计算避开 C5:F5 左上
-    #       文本主要区域。脱敏文件的媒体名通常不可用，因此不把随机文件名作为硬条件。
-    landscape_ok = False
-    landscape_details = []
-    for img in q3_image_candidates:
-        spec = match_drawing_spec(img, drawing_specs)
-        bounds = anchor_bounds(img)
-        if spec is not None and spec.width_emu and spec.height_emu:
-            w_cm, h_cm = spec.width_cm, spec.height_cm
-            size_source = "drawing-ext-emu"
-            no_cover = c5_landscape_not_covering_text(ws, spec)
-        else:
-            w_cm, h_cm = img_size_cm(img)
-            size_source = "openpyxl-fallback"
-            no_cover = False
-        size_ok = in_range(w_cm, 5.5, 5.7) and in_range(h_cm, 2.7, 2.9)
-        sr, sc, er, ec = bounds or (0, 0, 0, 0)
-        in_c5_area = bool({r for r in range(sr, er + 1)} & {5}) and sc >= 3 and ec <= 6
-        landscape_details.append({
-            "宽cm": round(w_cm, 2),
-            "高cm": round(h_cm, 2),
-            "尺寸来源": size_source,
-            "锚点": bounds,
-            "尺寸达标": size_ok,
-            "位于C5:F5": in_c5_area,
-            "未遮挡文本区": no_cover,
-        })
-        if size_ok and in_c5_area and no_cover:
-            landscape_ok = True
-    add_result(results, 1, "C5:F5 山水草地插图尺寸与位置", landscape_ok,
-               f"附近图片检查：{landscape_details}")
-
-    # +5 C6:F6 拓展层内容区域（细则逐点踩到）：
-    #   1) 保持 C6:F6 合并状态
-    #   2) 第1项完整出现“和家人到附近公园或校园走一走，记录三种自然景物，回到班级分享。”
-    #   3) 第2项完整出现“搜集两个描写季节的词语，和同学交流。”
-    # 说明：办公软件里文本换行/空格/标点不定，用 contains_loose_phrase 做去标点的
-    #       整句比对，并辅以按序 token 校验，保证“完整出现”而非零散关键词。
-    expand_text = cell_text(ws, "C6")
-    _task1 = "和家人到附近公园或校园走一走，记录三种自然景物，回到班级分享。"
-    _task2 = "搜集两个描写季节的词语，和同学交流。"
-    expand_checks = {
-        "C6:F6保持合并": is_merged(ws, "C6:F6"),
-        "第1项完整出现": contains_loose_phrase(expand_text, _task1) or contains_ordered_tokens(
-            expand_text, ["和家人", "附近公园", "校园", "走一走", "记录", "三种", "自然景物", "回到班级", "分享"]
-        ),
-        "第2项完整出现": contains_loose_phrase(expand_text, _task2) or contains_ordered_tokens(
-            expand_text, ["搜集", "两个", "描写季节", "词语", "同学交流"]
-        ),
-    }
-    expand_ok = all(expand_checks.values())
-    add_result(results, 5, "C6:F6 拓展层两项任务", expand_ok,
-               f"各点命中={expand_checks}，实际文本：{expand_text[:120]}")
-
-    # +1 A7:A9 反馈标题区域（细则逐点踩到）：
-    #   1) 保持 A7:A9 合并状态  2) 文本=“作业情况反馈”
-    #   3) 宋体  4) 11 磅  5) 加粗  6) 垂直居中
-    # 说明：细则只要求“垂直居中”，未要求水平对齐，故不检查水平居中；
-    #       亦未要求行高、字体颜色，均不作约束。
-    c = ws["A7"]
-    a7_checks = {
-        "A7:A9保持合并": is_merged(ws, "A7:A9"),
-        "文本=作业情况反馈": compact(c.value) == compact("作业情况反馈"),
-        "宋体": font_name_ok(c),
-        "11磅": font_size_ok(c, 11),
-        "加粗": bool(c.font.bold),
-        "垂直居中": vertical_ok(c, "center"),
-    }
-    add_result(results, 1, "A7:A9 反馈标题区域", all(a7_checks.values()), f"各点命中={a7_checks}")
-
-    # +3 B7:F9 反馈内容区域（细则逐点踩到）：
-    #   1) 保持 B7:F9 合并状态
-    #   2) 文本含“自我评价：今天我完成了__颗星，我已经累计了__颗星，请继续保持！”
-    #      —— 拆为：自我评价 / 今天我完成了…颗星 / 我已经累计了…颗星 / 请继续保持
-    #   3) “完成了”后带横线  4) “累计了”后带横线
-    #   5) 另起一行显示“教师评价：”（存在换行且含“教师评价”）
-    #   6) 宋体  7) 11 磅  8) 黑色  9) 自动换行  10) 左对齐或保持左对齐
-    # 说明：办公软件里横线可能是下划线/破折号/连字符，用字符类 [_—－-] 匹配；
-    #       左对齐在 Excel 中默认 horizontal=None 即左对齐，故 None 或 "left" 均视为通过。
-    #       rubric 只要求“完成了/累计了”后带有横线，未规定横线至少几个字符；此前
-    #       “…X颗星”判定用 {1,}，而“…后带横线”判定却写成 {2,}，两者标准不一致，
-    #       会把只填了单个横线字符（符合 rubric）的文档在后一条上误判为不合格。
-    #       这里统一为 {1,}（至少1个字符即算“带有横线”）。
-    feedback = cell_text(ws, "B7")
-    compact_fb = compact(feedback)
-    fb_checks = {
-        "B7:F9保持合并": is_merged(ws, "B7:F9"),
-        "含自我评价": contains_all(feedback, ["自我评价"]),
-        "完成了X颗星": re.search(r"今天我完成了[_—－\-]{1,}颗星", compact_fb) is not None,
-        "完成了后带横线": re.search(r"完成了[_—－\-]{1,}", compact_fb) is not None,
-        "累计了X颗星": re.search(r"我已经累计了[_—－\-]{1,}颗星", compact_fb) is not None,
-        "累计了后带横线": re.search(r"累计了[_—－\-]{1,}", compact_fb) is not None,
-        "含请继续保持": contains_all(feedback, ["请继续保持"]),
-        "另起一行教师评价": ("\n" in feedback) and contains_all(feedback, ["教师评价"]),
-        "宋体": font_name_ok(ws["B7"]),
-        "11磅": font_size_ok(ws["B7"], 11),
-        "黑色": font_black_ok(ws["B7"]),
-        "自动换行": wrap_ok(ws["B7"]),
-        "左对齐": ws["B7"].alignment.horizontal in (None, "left"),
-    }
-    feedback_ok = all(fb_checks.values())
-    add_result(results, 3, "B7:F9 反馈内容区域", feedback_ok, f"各点命中={fb_checks}，实际文本：{feedback}")
-
-    # +3 Sheet1 合并单元格（细则逐点踩到）：
-    #   要求恰好保持 8 个合并区域：A1:F1、B3:F3、C4:F4、C5:F5、C6:F6、A4:A6、
-    #   A7:A9、B7:F9，且不新增、不取消。
-    # 说明：办公软件中合并区域以左上:右下表示。以下同时校验“8 个都在”和“无多余”，
-    #       即当前合并集合与预期集合完全相等。
-    actual_merges = merged_ranges(ws)
-    missing = sorted(EXPECTED_MERGES - actual_merges)   # 被取消的
-    extra = sorted(actual_merges - EXPECTED_MERGES)     # 新增的
-    merge_checks = {
-        "8个合并区域齐全(无取消)": not missing,
-        "无新增合并区域": not extra,
-    }
-    exact_merges_ok = all(merge_checks.values())
-    add_result(results, 3, "Sheet1 8个合并单元格区域完全一致且无新增/取消", exact_merges_ok,
-               f"缺失(被取消)={missing}，多余(新增)={extra}，实际合并区域：{sorted(actual_merges)}")
-
-    return results
-
-
-def print_dimension2(results: list[CheckResult]) -> int:
-    total = 0
-    for r in results:
-        if r.passed:
-            total += r.score
-    return total
-
+from openpyxl.utils import range_boundaries, get_column_letter
+
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为“脚本所在目录的路径”，
+# 由脚本自己在该目录内定位并打开被评估的工作簿。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 任务：把“识字主题分层作业.xlsx”的题目内容粘贴进“分层作业设计.xlsx”模板，
+# 模板原始格式不得改变。作业内容既可以写在单元格里，也可以用浮动文本框/图片
+# 叠放在单元格上（两种都是人工可接受的交付形态），故本脚本先把每个填写区域
+# 还原成“视觉行”再做文本判定，见 _build_regions。
 
 SCRIPT_ID = "087"
+# 维度二加分项 max_delta 之和；也是维度一未通过时回填的 max_score（脚本没评上时为 0）
+MAX_SCORE_TOTAL = 73
+# 维度二减分项 max_delta 之和（负值），仅用于自检
+MAX_DEDUCT_TOTAL = -36
+
+# 维度二所有评分项按“结果追加顺序”的 max_delta 列表；末端把 results 里的
+# “+N：...”/“-N：...”字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 results.append(...) 的顺序严格一致；共 43 项，
+# 正项累加 = MAX_SCORE_TOTAL，负项累加 = MAX_DEDUCT_TOTAL。
+_MAX_DELTAS_ORDER = [
+    3,   # 01 标题/简介栏出现作业主题
+    3,   # 02 B3:F3 分层要求
+    3,   # 03 第1题题干 + 五个正确读音
+    3,   # 04 干扰读音行五项且括号与上行对齐
+    3,   # 05 五段词语在读音上方 + “游”处叶子图
+    1,   # 06 “2.看拼音，写词语。”
+    3,   # 07 qīng chén/xiǎo yǔ/hé fēng + 三个 2:1 田字格
+    3,   # 08 huā duǒ/niǎo ér/fēi + 2:1、2:1、1:1 田字格
+    5,   # 09 两个句子 + 5 处空缺留白
+    3,   # 10 “3.你能圈出…” + 晨露/细雨/晚霞
+    1,   # 11 “4.连一连。”
+    3,   # 12 连一连上下两行且同序项对应
+    1,   # 13 基础层 1234 顺序
+    3,   # 14 “1.词语接龙。”另起一行 + 三个括号
+    3,   # 15 “2.照样子，看图说一说。”
+    3,   # 16 山水插图（长宽比≈2）靠左且完整在格内
+    3,   # 17 插图右侧第一列 例/小鸟/柳叶/溪水
+    3,   # 18 第二列 纸鸢/云朵
+    1,   # 19 “3.仔细观察图片，填一填。”
+    3,   # 20 山水插图（长宽比≈1.5）靠左且完整在格内
+    5,   # 21 文段完整无缺字错字漏句
+    5,   # 22 文段 8 处空缺各有田字格
+    1,   # 23 提高层 123 顺序
+    3,   # 24 拓展层两题独立成段左对齐
+    3,   # 25 星星评价三段文字
+    1,   # 26 三段之间 2-8 字符留白
+    1,   # 27 自我评价/教师评价标签 + 可书写空行
+    -3,  # 28 使用区域与 8 处合并单元格
+    -3,  # 29 第二行标签 + B2/D2/F2 保持空白
+    -3,  # 30 A3 两行说明文字
+    -3,  # 31 A4:A6 “作业/设计/内容”及其字体
+    -3,  # 32 B4/B5/B6 分层标题 + A7 反馈标题
+    -3,  # 33 标题与各标签字体字号
+    -3,  # 34 A-F 列宽
+    -3,  # 35 各行行高
+    -3,  # 36 五处填写区自动换行
+    -3,  # 37 题目被概括/改写/自创表述
+    -1,  # 38 C4/C5/C6 内容左对齐
+    -1,  # 39 边框缺失或新增底纹/填充/彩色字体
+    -1,  # 40 纸张 A4 / 纵向
+    -1,  # 41 工作表数量及 Sheet2/Sheet3 留空
+    -1,  # 42 批注、水印、交付说明文字
+    -1,  # 43 图片变形、移出单元格、压住文字
+]
+assert len(_MAX_DELTAS_ORDER) == 43
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+assert sum(d for d in _MAX_DELTAS_ORDER if d < 0) == MAX_DEDUCT_TOTAL
+
+_EXT_OK = (".xlsx", ".xlsm")
+# 维度一不接受、但可能被误交的其它表格格式；命中时判维度一不通过，而不是报脚本异常。
+_EXT_REJECT = (".xls", ".xlsb", ".csv", ".ods", ".et")
+
+# 模板固有格式（减分项的比对基准）
+_MAIN_SHEET_IDX = 0
+_EXPECTED_DIMS = (1, 1, 6, 9)          # min_col, min_row, max_col, max_row
+_EXPECTED_MERGES = {
+    "A1:F1", "B3:F3", "C4:F4", "C5:F5", "C6:F6", "A4:A6", "A7:A9", "B7:F9",
+}
+_EXPECTED_COL_W = {"A": 13.38, "B": 15.25, "C": 13.75, "D": 18.00, "E": 12.88, "F": 16.13}
+_COL_W_TOL = 1.5
+_EXPECTED_ROW_H = {1: 39.0, 2: 41.0, 3: 68.0, 6: 174.0, 9: 30.0}
+_ROW_H_TOL = 1.5
+_ROW4_MIN_H = 162.0
+_ROW5_MIN_H = 172.0
+
+# 模板原有实线边框：每格按 左/右/上/下 记 "1"（有线）或 "0"（无线）。
+# 判定规则是“不得比模板更少”，多画（例如给第 1 行补一圈框线）不扣分。
+_TEMPLATE_BORDERS = {
+    1: ["0000", "0000", "0000", "0000", "0000", "0000"],
+    2: ["1111", "1111", "1111", "1111", "1111", "1111"],
+    3: ["1111", "1111", "0011", "0011", "0011", "0111"],
+    4: ["1111", "1111", "1111", "0011", "0011", "0111"],
+    5: ["1100", "1111", "1111", "0011", "0011", "0111"],
+    6: ["1101", "1111", "1111", "0011", "0011", "0111"],
+    7: ["1111", "1111", "0010", "0010", "0010", "0110"],
+    8: ["1100", "1000", "0000", "0000", "0000", "0100"],
+    9: ["1101", "1001", "0001", "0001", "0001", "0101"],
+}
+
+# 模板标签文字
+_LBL_ROW2 = {"A2": "班级", "C2": "任教教师", "E2": "时间"}
+_LBL_A3 = ["作业设计简介", "（学习目标、题型说明等）"]
+_LBL_A4 = ["作业", "设计", "内容"]
+_LBL_B456 = {"B4": "基础层作业设计", "B5": "提高层作业设计", "B6": "拓展层作业设计"}
+_LBL_A7 = "作业情况反馈"
+# 需为宋体 11 号加粗的标签格
+_BOLD11_CELLS = ("A2", "C2", "E2", "A3", "B4", "B5", "B6", "A7")
+
+_THEME = "识字主题《四季小景》分层作业"
+# 五组“词语 / 正确读音 / 干扰读音”
+_WORDS5 = ["晨露", "清风", "细雨", "晚霞", "游"]
+_READ_OK5 = ["chén lù", "qīng fēng", "xì yǔ", "wǎn xiá", "yóu"]
+_READ_NG5 = ["chēn lù", "qīn fēng", "xī yǔ", "xiá wǎn", "yǒu"]
+_PINYIN_G1 = ["qīng chén", "xiǎo yǔ", "hé fēng"]
+_PINYIN_G2 = ["huā duǒ", "niǎo ér", "fēi"]
+# 两个例句按空缺切分后的文字片段（第一句 2 处空缺、第二句 3 处空缺）。
+# 允许第二组拼音行插在两句中间（源文件即如此排版），故按顺序逐段比对。
+_SENT_SEGS = ["太阳从山后慢慢升起", "轻轻落在窗前", "送来阵阵", "清香",
+              "花园里的", "开得正好", "从树梢掠过", "进了安静的小院"]
+_LINK_ROW1 = ["晨露", "午阳", "晚霞", "夜风"]
+_LINK_ROW2 = ["亮", "暖", "红", "轻"]
+_COL1_ITEMS = ["小鸟", "柳叶", "溪水"]
+_COL2_ITEMS = ["纸鸢", "云朵"]
+# 观察填空文段按 8 处空缺切分后的 9 个片段（顺序比对，允许空缺处夹田字格）
+_PARA_SEGS = [
+    "清风吹过河岸边铺满了嫩嫩的",
+    "草地上点缀着五颜六色的",
+    "清亮的",
+    "中",
+    "慢慢游来游去还轻轻划出了",
+    "纹远处的",
+    "上开着浅浅的",
+    "一群小鸟正快活地",
+    "林间",
+]
+_EXT_TASKS = [
+    ["和家人", "公园", "校园", "记录三种自然景物", "班级分享"],
+    ["搜集两个描写季节的词语", "同学交流"],
+]
+_STAR_SEGS = ["今天我完成了", "颗星我已经累计了", "颗星请继续保持"]
+# 改写/自创表述关键词（命中即认为未逐题照录）
+_REWRITE_WORDS = ["辨音勾选", "情境填空", "参考要点", "看拼音写词", "圈景物字",
+                  "看图表达", "观察记录", "辨音、"]
+# 必须逐字出现的原始题干（缺 3 条以上视为概括改写）
+_ORIG_STEMS = [
+    "给词语选择正确的读音", "看拼音，写词语", "你能圈出这几个词中表示自然景物的字吗",
+    "连一连", "词语接龙", "照样子，看图说一说", "仔细观察图片，填一填",
+    "和家人到附近公园或校园走一走", "搜集两个描写季节的词语",
+]
+# 交付说明类文字
+_DELIVERY_WORDS = ["填充完成", "已按要求粘贴", "修改说明", "已完成填充", "填写说明",
+                   "交付说明", "水印"]
+
+# 几何换算：EMU -> 磅
+_EMU_PT = 12700.0
+# 半角字符宽度（宋体/微软雅黑 11 号约 5.5 磅），用于把浮动文本框的横向位置
+# 折算成“字符列”，从而与单元格内文字使用同一套坐标做对齐判定。
+_HALF_PT = 5.5
+_W_SPACE = 0.55        # 一个半角空格约占 0.55 个半角字符宽
+_LINE_H_DEF = 16.0     # 文本框默认行高（磅）
+_INSET_PT = 3.6        # 文本框默认上/左内边距（磅）
+
+# 田字格长宽比容差：约 2:1 记 2 个字格，约 1:1 记 1 个字格
+# （细则注：一个 2:1 田字格可用两个 1:1 田字格替换，反之亦然）
+_RATIO_2 = (1.60, 2.60)
+_RATIO_1 = (0.70, 1.40)
+_TIAN_MAX_PT = 70.0    # 田字格图片的最大边长，用来和插图区分
 
 
-def _locate_target_file(dir_path: Path) -> Optional[Path]:
-    """在给定目录内定位被评估文档：优先精确匹配 TARGET_FILE，其次退化为目录里的 .xlsx。"""
-    candidate = dir_path / TARGET_FILE
-    if candidate.exists():
-        return candidate
-    if dir_path.is_dir():
-        xlsxs = sorted(p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() == ".xlsx")
-        if xlsxs:
-            return xlsxs[0]
-    return None
+def _norm(s):
+    """统一空白与常见等价字符，保留标点。"""
+    if s is None:
+        return ""
+    t = str(s)
+    t = t.replace(chr(0x00A0), " ").replace(chr(0x2002), " ").replace(chr(0x2003), chr(0x3000))
+    t = t.replace(" ", " ").replace("　", "　")
+    t = t.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    t = t.replace("（", "（").replace("）", "）")
+    t = t.replace("✓", "√").replace("✔", "√")
+    t = re.sub(r"[ ]+\n", "\n", t)
+    return t
 
 
-def _build_error_report(file_name: str, error_msg: str) -> dict:
-    return {
+def _compact(s):
+    """去掉所有空白，保留标点；用于“文本原样出现”类判定。"""
+    return re.sub(r"[\s　]+", "", _norm(s))
+
+
+def _loose(s):
+    """去掉空白与全部标点/括号/下划线，只留文字与拼音；用于宽松比对。"""
+    t = _compact(s)
+    t = re.sub(r"[，。、；：？！“”‘’（）()\[\]【】《》…—\-_~·．.,;:!?\"'／/\\|]+", "", t)
+    return t
+
+
+def _contains_ordered(hay, tokens):
+    """tokens 是否按顺序出现在 hay 中。"""
+    pos = 0
+    for tk in tokens:
+        idx = hay.find(tk, pos)
+        if idx < 0:
+            return False
+        pos = idx + len(tk)
+    return True
+
+
+def _missing_ordered(hay, tokens):
+    """返回未按顺序命中的片段列表（用于把缺字/漏句写进说明）。"""
+    miss = []
+    pos = 0
+    for tk in tokens:
+        idx = hay.find(tk, pos)
+        if idx < 0:
+            miss.append(tk)
+        else:
+            pos = idx + len(tk)
+    return miss
+
+
+def _is_wide(ch):
+    o = ord(ch)
+    if ch == "　":
+        return True
+    return (0x1100 <= o <= 0x115F or 0x2190 <= o <= 0x2BFF or 0x2E80 <= o <= 0xA4CF
+            or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE6F
+            or 0xFF00 <= o <= 0xFF60 or 0xFFE0 <= o <= 0xFFE6)
+def _vis_w(s):
+    """文本的视觉宽度，单位＝半角字符。全角字 2、半角字 1、空格 0.55。"""
+    w = 0.0
+    for ch in _norm(s):
+        if ch == " ":
+            w += _W_SPACE
+        elif _is_wide(ch):
+            w += 2.0
+        else:
+            w += 1.0
+    return w
+
+
+class _Line(object):
+    """一条“视觉行”：由若干片段组成，片段可能来自单元格文字或浮动文本框。"""
+
+    __slots__ = ("y", "frags")
+
+    def __init__(self, y):
+        self.y = y
+        self.frags = []            # [(x_半角列, 文本)]
+
+    def sort(self):
+        self.frags.sort(key=lambda f: f[0])
+
+    @property
+    def text(self):
+        """按横向位置渲染成一行字符串（片段之间按间距补空格）。"""
+        out = ""
+        cur = 0.0
+        for x, t in self.frags:
+            pad = int(round(x - cur))
+            if out and pad < 1:
+                pad = 1
+            if not out and pad < 0:
+                pad = 0
+            out += " " * max(0, pad)
+            out += t
+            cur = x + _vis_w(t)
+        return out
+
+    def x_of(self, token, start=0.0):
+        """token 左边缘的横向位置（半角列），找不到返回 None。"""
+        for x, t in self.frags:
+            if x + _vis_w(t) < start:
+                continue
+            idx = t.find(token)
+            while idx >= 0:
+                xx = x + _vis_w(t[:idx])
+                if xx >= start - 0.01:
+                    return xx
+                idx = t.find(token, idx + 1)
+        return None
+def _spans(line, tokens):
+    """依次取出 tokens 在该行的 (左边缘, 宽度)；任一缺失则返回 None。"""
+    out = []
+    cursor = 0.0
+    for tk in tokens:
+        x = line.x_of(tk, cursor)
+        if x is None:
+            return None
+        out.append((x, _vis_w(tk)))
+        cursor = x + _vis_w(tk)
+    return out
+
+
+def _gaps_ok(spans, min_gap=1.05):
+    """相邻 token 之间的净间距是否都不小于 min_gap（约 2 个半角空格）。"""
+    for i in range(1, len(spans)):
+        if spans[i][0] - (spans[i - 1][0] + spans[i - 1][1]) < min_gap:
+            return False
+    return True
+
+
+class _Obj(object):
+    """一个浮动对象（图片或文本框），坐标已折算成磅。"""
+
+    __slots__ = ("kind", "x", "y", "w", "h", "paras", "col", "row")
+
+    def __init__(self, kind, x, y, w, h, paras, col, row):
+        self.kind = kind           # "pic" / "txt" / "shape"
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.paras = paras
+        self.col = col
+        self.row = row
+
+    @property
+    def ratio(self):
+        return (self.w / self.h) if self.h > 0 else 0.0
+
+    @property
+    def cells(self):
+        """当作田字格时折算的“字格数”：约 2:1 记 2，约 1:1 记 1，其余记 0。"""
+        r = self.ratio
+        if _RATIO_2[0] <= r <= _RATIO_2[1]:
+            return 2
+        if _RATIO_1[0] <= r <= _RATIO_1[1]:
+            return 1
+        return 0
+
+    @property
+    def is_tian(self):
+        return (self.kind != "txt" and self.cells > 0
+                and max(self.w, self.h) <= _TIAN_MAX_PT)
+def _mdw(wb):
+    """默认字体的最大数字宽度（像素）：中文字体 11 号为 8，Calibri 11 号为 7。
+    列宽单位就是它，浮动对象的横向定位必须用同一把尺子。"""
+    name, size = "", 11.0
+    try:
+        f = wb._fonts[0]
+        name = f.name or ""
+        size = float(f.sz or 11)
+    except Exception:
+        pass
+    if size >= 11 and not re.match(r"^(Calibri|Arial|Times|Aptos)", name, re.I):
+        return 8.0
+    return 7.0
+
+
+def _col_edges(ws, mdw, ncol=32):
+    """返回 0..ncol 列左边界的累计磅值（下标 0 基）。"""
+    default = ws.sheet_format.defaultColWidth or 8.43
+    edges = [0.0]
+    for i in range(1, ncol + 1):
+        letter = get_column_letter(i)
+        dim = ws.column_dimensions.get(letter)
+        w = dim.width if (dim is not None and dim.width) else default
+        edges.append(edges[-1] + int(float(w) * mdw + 5) * 0.75)
+    return edges
+
+
+def _row_edges(ws, nrow=64):
+    """返回 0..nrow 行上边界的累计磅值（下标 0 基）。"""
+    default = ws.sheet_format.defaultRowHeight or 14.4
+    edges = [0.0]
+    for r in range(1, nrow + 1):
+        dim = ws.row_dimensions.get(r)
+        h = dim.height if (dim is not None and dim.height) else default
+        edges.append(edges[-1] + float(h))
+    return edges
+
+
+def _unesc(s):
+    s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    s = s.replace("&apos;", "'").replace("&#10;", "\n").replace("&#13;", "")
+    return s.replace("&amp;", "&")
+
+
+_RE_ANCHOR = re.compile(r"<xdr:(oneCellAnchor|twoCellAnchor|absoluteAnchor)\b(.*?)</xdr:\1>", re.S)
+_RE_FROM = re.compile(r"<xdr:from>\s*<xdr:col>(-?\d+)</xdr:col>\s*<xdr:colOff>(-?\d+)</xdr:colOff>"
+                      r"\s*<xdr:row>(-?\d+)</xdr:row>\s*<xdr:rowOff>(-?\d+)</xdr:rowOff>", re.S)
+_RE_TO = re.compile(r"<xdr:to>\s*<xdr:col>(-?\d+)</xdr:col>\s*<xdr:colOff>(-?\d+)</xdr:colOff>"
+                    r"\s*<xdr:row>(-?\d+)</xdr:row>\s*<xdr:rowOff>(-?\d+)</xdr:rowOff>", re.S)
+_RE_EXT = re.compile(r"<xdr:ext\s+cx=\"(\d+)\"\s+cy=\"(\d+)\"")
+_RE_PARA = re.compile(r"<a:p\b.*?</a:p>|<a:p\s*/>", re.S)
+_RE_T = re.compile(r"<a:t>(.*?)</a:t>", re.S)
+def _sheet_parts(zf):
+    """按工作簿顺序返回每个 sheet 的 xml 部件名。"""
+    try:
+        wbx = zf.read("xl/workbook.xml").decode("utf-8", "ignore")
+        rels = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8", "ignore")
+    except KeyError:
+        return []
+    rmap = dict(re.findall(r"Id=\"([^\"]+)\"[^>]*?Target=\"([^\"]+)\"", rels))
+    out = []
+    for rid in re.findall(r"<sheet\b[^>]*r:id=\"([^\"]+)\"", wbx):
+        tgt = rmap.get(rid, "")
+        if not tgt:
+            out.append("")
+            continue
+        tgt = tgt.lstrip("/")
+        out.append(tgt if tgt.startswith("xl/") else "xl/" + tgt)
+    return out
+
+
+def _drawing_part(zf, sheet_part):
+    """某个 sheet 关联的 drawing 部件名，没有则返回 ""。"""
+    if not sheet_part:
+        return ""
+    rel = sheet_part.rsplit("/", 1)
+    rel_name = rel[0] + "/_rels/" + rel[1] + ".rels"
+    try:
+        rels = zf.read(rel_name).decode("utf-8", "ignore")
+    except KeyError:
+        return ""
+    m = re.search(r"Target=\"([^\"]*drawings/drawing\d+\.xml)\"", rels)
+    if not m:
+        return ""
+    tgt = m.group(1).replace("../", "")
+    return tgt if tgt.startswith("xl/") else "xl/" + tgt
+
+
+def _abs_xy(cedge, redge, col, coloff, row, rowoff):
+    cx = cedge[min(col, len(cedge) - 1)] + coloff / _EMU_PT
+    ry = redge[min(row, len(redge) - 1)] + rowoff / _EMU_PT
+    return cx, ry
+
+
+def _parse_objs(zf, part, cedge, redge):
+    """把 drawing xml 解析成 _Obj 列表（坐标单位：磅）。"""
+    objs = []
+    if not part:
+        return objs
+    try:
+        xml = zf.read(part).decode("utf-8", "ignore")
+    except KeyError:
+        return objs
+    for m in _RE_ANCHOR.finditer(xml):
+        body = m.group(2)
+        mf = _RE_FROM.search(body)
+        if not mf:
+            continue
+        col, coloff, row, rowoff = (int(g) for g in mf.groups())
+        x, y = _abs_xy(cedge, redge, col, coloff, row, rowoff)
+        me = _RE_EXT.search(body)
+        if me:
+            w, h = int(me.group(1)) / _EMU_PT, int(me.group(2)) / _EMU_PT
+        else:
+            mt = _RE_TO.search(body)
+            if not mt:
+                continue
+            tc, tco, tr, tro = (int(g) for g in mt.groups())
+            x2, y2 = _abs_xy(cedge, redge, tc, tco, tr, tro)
+            w, h = x2 - x, y2 - y
+        paras = []
+        for p in _RE_PARA.findall(body):
+            paras.append(_unesc("".join(_RE_T.findall(p))))
+        if paras and any(t.strip() for t in paras):
+            kind = "txt"
+        elif "<xdr:pic" in body:
+            kind = "pic"
+        else:
+            kind = "shape"
+        objs.append(_Obj(kind, x, y, w, h, paras, col, row))
+    return objs
+class _Region(object):
+    """一个填写区域（合并单元格）：把单元格文字和叠放在它上面的浮动文本框
+    统一还原成若干条“视觉行”，这样两种交付形态可以走同一套文本判定。"""
+
+    __slots__ = ("name", "ref", "x0", "y0", "x1", "y1", "cell", "cell_lines", "objs", "lines")
+
+    def __init__(self, name, ref, ws, objs, cedge, redge):
+        self.name = name
+        self.ref = ref
+        c0, r0, c1, r1 = range_boundaries(ref)
+        self.x0, self.x1 = cedge[c0 - 1], cedge[c1]
+        self.y0, self.y1 = redge[r0 - 1], redge[r1]
+        self.cell = ws.cell(row=r0, column=c0)
+        val = self.cell.value
+        self.cell_lines = [l for l in _norm(val).split("\n")] if val is not None else []
+        self.objs = [o for o in objs
+                     if self.x0 - 1.0 <= o.x + 2.0 < self.x1 and self.y0 - 1.0 <= o.y + 2.0 < self.y1]
+        self.lines = self._build_lines()
+
+    def _build_lines(self):
+        frags = []
+        lh = (self.cell.font.size or 11.0) * 1.45
+        for i, ln in enumerate(self.cell_lines):
+            if ln.strip():
+                frags.append((0.0, self.y0 + _INSET_PT + (i + 0.5) * lh, ln))
+        for o in self.objs:
+            if o.kind != "txt":
+                continue
+            n = max(1, len(o.paras))
+            bh = (o.h - 2 * _INSET_PT) / n
+            # 文本框内行高：正常 11 号字约 16 磅；段落很多时按框高均摊，
+            # 段落很少时不能把行摊开，否则纵向顺序会失真。
+            bh = _LINE_H_DEF if bh <= 0 else min(_LINE_H_DEF, max(11.0, bh))
+            for i, p in enumerate(o.paras):
+                if p.strip():
+                    frags.append(((o.x - self.x0) / _HALF_PT,
+                                  o.y + _INSET_PT + (i + 0.5) * bh, _norm(p)))
+        frags.sort(key=lambda f: (f[1], f[0]))
+        lines, cur = [], None
+        for x, y, t in frags:
+            if cur is None or y - cur.y > 9.0:
+                cur = _Line(y)
+                lines.append(cur)
+            cur.frags.append((x, t))
+        for ln in lines:
+            ln.sort()
+        return lines
+
+    @property
+    def width(self):
+        return self.x1 - self.x0
+
+    @property
+    def text(self):
+        return "\n".join(l.text for l in self.lines)
+    @property
+    def raw_paras(self):
+        """区域内所有“原始段落序列”：单元格自身一组，每个文本框各一组。
+        空段落也保留，用于判定“留出可书写的空行”。"""
+        out = []
+        if self.cell_lines:
+            out.append(list(self.cell_lines))
+        for o in sorted(self.objs, key=lambda z: (z.y, z.x)):
+            if o.kind == "txt":
+                out.append([_norm(p) for p in o.paras])
+        return out
+
+    @property
+    def compact(self):
+        return _compact(self.text)
+
+    @property
+    def loose(self):
+        return _loose(self.text)
+
+    def idx_of(self, *tokens):
+        """含全部 tokens 的第一条视觉行的行号，找不到返回 -1。"""
+        for i, ln in enumerate(self.lines):
+            t = _compact(ln.text)
+            if all(_compact(tk) in t for tk in tokens):
+                return i
+        return -1
+
+    def line_of(self, *tokens):
+        i = self.idx_of(*tokens)
+        return self.lines[i] if i >= 0 else None
+
+    def num_lines(self):
+        """题号行：返回 [(行号, 序号)]，只认行首的“N.”“N、”。"""
+        out = []
+        for i, ln in enumerate(self.lines):
+            m = re.match(r"^\s*([1-9])\s*[.、．]", ln.text.lstrip())
+            if m:
+                out.append((i, int(m.group(1))))
+        return out
+
+    @property
+    def pics(self):
+        return [o for o in self.objs if o.kind != "txt"]
+
+    @property
+    def tians(self):
+        return [o for o in self.objs if o.is_tian]
+
+    @property
+    def illus(self):
+        """插图：非文本框且宽度明显大于田字格的图片。"""
+        return [o for o in self.pics if o.w >= 80.0 and o.h >= 40.0]
+
+    def contains(self, o, tol=3.0):
+        return (o.x >= self.x0 - tol and o.y >= self.y0 - tol
+                and o.x + o.w <= self.x1 + tol and o.y + o.h <= self.y1 + tol)
+
+
+def _tian_rows(objs, tol=12.0):
+    """把田字格按纵向位置聚成“行组”，只保留 2 个以上、合计 3 个字格以上的行组。"""
+    rows, cur = [], []
+    for o in sorted(objs, key=lambda z: z.y):
+        if cur and o.y - cur[0].y > tol:
+            rows.append(cur)
+            cur = []
+        cur.append(o)
+    if cur:
+        rows.append(cur)
+    return [sorted(r, key=lambda z: z.x) for r in rows
+            if len(r) >= 2 and sum(z.cells for z in r) >= 3]
+_SONG = ("宋体", "SimSun", "NSimSun", "宋体-简", "STSong")
+
+
+def _cell(ws, ref):
+    return ws[ref]
+
+
+def _ctext(ws, ref):
+    v = ws[ref].value
+    return _norm(v) if v is not None else ""
+
+
+def _clines(ws, ref):
+    t = _ctext(ws, ref)
+    return [x for x in t.split("\n")]
+
+
+def _font_ok(cell, name=None, size=None, bold=None):
+    f = cell.font
+    if name is not None:
+        fn = (f.name or "")
+        if not any(fn.startswith(n) for n in (_SONG if name == "宋体" else (name,))):
+            return False
+    if size is not None:
+        try:
+            if abs(float(f.sz or 0) - size) > 0.6:
+                return False
+        except Exception:
+            return False
+    if bold is not None and bool(f.bold) != bold:
+        return False
+    return True
+
+
+def _align_ok(cell, horiz=None, vert=None, none_ok=()):
+    a = cell.alignment
+    if horiz is not None:
+        h = a.horizontal
+        if h != horiz and not (h is None and horiz in none_ok):
+            return False
+    if vert is not None:
+        v = a.vertical
+        if v != vert and not (v is None and vert in none_ok):
+            return False
+    return True
+
+
+def _font_colored(cell):
+    """字体是否被改成了黑/白以外的彩色。"""
+    c = cell.font.color
+    if c is None:
+        return False
+    rgb = None
+    try:
+        rgb = c.rgb
+    except Exception:
+        rgb = None
+    if isinstance(rgb, str) and re.match(r"^[0-9A-Fa-f]{8}$", rgb):
+        if rgb[2:].upper() not in ("000000", "FFFFFF"):
+            return True
+    try:
+        if c.theme is not None and int(c.theme) not in (0, 1):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _bflags(cell):
+    b = cell.border
+    out = ""
+    for side in (b.left, b.right, b.top, b.bottom):
+        out += "1" if (side is not None and side.style) else "0"
+    return out
+
+
+def _has_fill(cell):
+    f = cell.fill
+    try:
+        if f is None or f.fill_type in (None, "none"):
+            return False
+    except Exception:
+        return False
+    return True
+def _token_xs(line, tokens):
+    """依次取出 tokens 的左边缘位置（缺失记 None）。"""
+    xs, cursor = [], 0.0
+    for tk in tokens:
+        x = line.x_of(tk, cursor)
+        xs.append(x)
+        if x is not None:
+            cursor = x + _vis_w(tk)
+    return xs
+
+
+def _find_all_x(line, pattern):
+    """该行中匹配 pattern 的全部 (左边缘, 匹配文本)，按位置排序。"""
+    out = []
+    for x, t in line.frags:
+        for m in re.finditer(pattern, t):
+            out.append((x + _vis_w(t[:m.start()]), m.group(0)))
+    out.sort(key=lambda z: z[0])
+    return out
+
+
+def _paren_xs(line, tokens):
+    """沿着一条视觉行依次找“读音 + 紧跟的括号”，返回每个括号左边缘的位置。
+    找不到的项记 None。半角、全角括号都接受。"""
+    xs = []
+    cursor = 0.0
+    for tk in tokens:
+        x = line.x_of(tk, cursor)
+        if x is None:
+            xs.append(None)
+            continue
+        cursor = x + _vis_w(tk)
+        best = None
+        for p in ("（", "("):
+            px = line.x_of(p, cursor)
+            if px is not None and (best is None or px < best):
+                best = px
+        if best is None or best - cursor > 6.0:
+            xs.append(None)
+        else:
+            xs.append(best)
+            cursor = best + 1.0
+    return xs
+
+
+def _blank_slots(text, min_half=6):
+    """行内“前后都有字、长度足够”的空白段数量，用作可书写空缺的计数。"""
+    n = len(re.findall(r"(?<=\S)[ ]{%d,}(?=\S)" % min_half, text))
+    n += len(re.findall(r"(?<=\S)　{%d,}(?=\S)" % max(2, min_half // 2), text))
+    n += len(re.findall(r"(?<=\S)[_﹏﹍…]{4,}(?=\S)", text))
+    return n
+
+
+def _pick_file(dir_path):
+    """在目录内定位被评估的工作簿：优先文件名含“分层作业设计”的。
+    返回 (工作簿路径, 格式不被接受的候选文件名列表)。"""
+    files = [f for f in sorted(os.listdir(dir_path)) if not f.startswith("~$")]
+    cands = [f for f in files if f.lower().endswith(_EXT_OK)]
+    rejects = [f for f in files if f.lower().endswith(_EXT_REJECT)]
+    if not cands:
+        return "", rejects
+    pref = [f for f in cands if "分层作业设计" in f]
+    return os.path.join(dir_path, (pref or cands)[0]), rejects
+def _left_aligned(region):
+    """区域内容是否左对齐：单元格文字看对齐属性，浮动文本框看题号行的左边缘。"""
+    if any(l.strip() for l in region.cell_lines):
+        h = region.cell.alignment.horizontal
+        if h not in (None, "left", "justify", "general"):
+            return False
+    nums = region.num_lines()
+    if not nums:
+        return True
+    xs_all = [min(x for x, _ in ln.frags) for ln in region.lines if ln.frags]
+    base = min(xs_all) if xs_all else 0.0
+    for i, _ in nums:
+        ln = region.lines[i]
+        if min(x for x, _ in ln.frags) - base > 4.0:
+            return False
+    return True
+
+
+# add() 登记的字符串尾部常带一段“（实测值…）”，那是本地排查用的实测摘要，不写入
+# 返回信息：返回的 rule 只保留规则原文，命中与未命中完全一致，不随判定结果变化。
+# 只剥离结尾处、内部不再嵌套括号的一段全角括号，规则原文中部的括号不受影响。
+_RULE_ONLY = re.compile(r"（[^（）]*）$")
+
+
+def evaluate(dir_path):
+    """入口：dir_path 为脚本所在目录，函数自行在其中定位被评估的工作簿。
+
+    返回信息约定：
+      status="error"（目录不存在、目录中没有交付文件、脚本自身异常）表示这份作业
+      根本没评上，此时 dim1_pass 为空串（未判定）、dim1_reason 为空串、
+      dim2_items 为 []、total_score 与 max_score 均为 0；
+      维度一未通过时 status 仍为 "ok"，dim1_pass 为 False、dim1_reason 写错误摘要、
+      dim2_items 为 []（未真正逐条评过）、total_score 为 0、max_score 为满分；
+      维度一通过时 dim1_pass 为 True、dim1_reason 保持空串。
+      dim2_items 每条只含 rule / max_delta / delta / hit 四个键。"""
+    result = {
         "id": SCRIPT_ID,
-        "file_name": file_name,
-        "status": "error",
-        "error": error_msg,
-        "dim1_pass": False,
-        "dim1_reason": error_msg,
+        "file_name": "",
+        "status": "ok",
+        "error": None,
+        "dim1_pass": "",
+        "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
         "max_score": 0,
     }
-
-
-def evaluate(dir_path: str) -> dict:
-    """批量运行器统一入口。
-
-    入参 dir_path 为“脚本所在目录的路径”；脚本自行在该目录内定位被评估文档，
-    执行维度一/维度二检查，返回结构化字典（见模块顶部约定）。
-    """
     try:
-        base_dir = Path(dir_path)
-        target = _locate_target_file(base_dir)
-        if target is None:
-            return _build_error_report(TARGET_FILE, f"在目录 {base_dir} 下未找到待评估的 xlsx 文件")
+        if not dir_path or not os.path.isdir(dir_path):
+            result["status"] = "error"
+            result["error"] = "目录不存在：%s" % dir_path
+            return result
+        file_path, rejects = _pick_file(dir_path)
+        if not file_path:
+            if rejects:
+                # 目录里只有 .xls 之类不被接受的格式：维度一直接判不通过。
+                result["file_name"] = rejects[0]
+                return _dim1_fail(result, "交付物格式为 %s，维度一仅接受 .xlsx、.xlsm"
+                                          % os.path.splitext(rejects[0])[1].lower())
+            result["status"] = "error"
+            result["error"] = "目录中未找到 .xlsx/.xlsm 文件：%s" % dir_path
+            return result
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except Exception as exc:
+        # 脚本异常同样视为“没评上”：维度一未判定，两项分数归零。
+        result["status"] = "error"
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
 
-        file_name = target.name
 
+def _dim1_fail(result, reason):
+    """维度一未通过：完成度总分记 0，不再逐条罗列（未真正逐条评过）。"""
+    result["dim1_pass"] = False
+    result["dim1_reason"] = reason or "维度一未通过（未给出具体原因）"
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def _evaluate_impl(file_path, result):
+    try:
+        wb = load_workbook(file_path, data_only=True)
+    except Exception as exc:
+        return _dim1_fail(result, "工作簿无法打开：%s: %s" % (type(exc).__name__, exc))
+    if not wb.worksheets:
+        return _dim1_fail(result, "工作簿内没有工作表")
+    result["dim1_pass"] = True
+    # 约定：维度一通过时 dim1_reason 保持空串，只有未通过才写错误摘要。
+    result["dim1_reason"] = ""
+
+    ws = wb.worksheets[_MAIN_SHEET_IDX]
+    mdw = _mdw(wb)
+    cedge = _col_edges(ws, mdw)
+    redge = _row_edges(ws)
+    with zipfile.ZipFile(file_path) as zf:
+        names = zf.namelist()
+        parts = _sheet_parts(zf)
+        main_part = parts[_MAIN_SHEET_IDX] if len(parts) > _MAIN_SHEET_IDX else ""
+        objs = _parse_objs(zf, _drawing_part(zf, main_part), cedge, redge)
+        has_comment = any(n.startswith("xl/comments") or n.startswith("xl/threadedComments")
+                          for n in names)
+        other_draw = any(_drawing_part(zf, p)
+                         for i, p in enumerate(parts) if i != _MAIN_SHEET_IDX and p)
+    RT = _Region("A1", "A1:F1", ws, objs, cedge, redge)
+    R3 = _Region("B3", "B3:F3", ws, objs, cedge, redge)
+    R4 = _Region("C4", "C4:F4", ws, objs, cedge, redge)
+    R5 = _Region("C5", "C5:F5", ws, objs, cedge, redge)
+    R6 = _Region("C6", "C6:F6", ws, objs, cedge, redge)
+    R7 = _Region("B7", "B7:F9", ws, objs, cedge, redge)
+    flat4 = R4.text.replace("\n", " ")
+    all_text = "\n".join([_ctext(ws, "A1"), R3.text, R4.text, R5.text, R6.text, R7.text])
+
+    results = []
+
+    def add(hit, delta, rule):
+        # rule 尾部允许带“（实测值…）”，汇总时会剥掉，只把规则原文写进返回信息。
+        results.append("%+d：%s" % ((delta if hit else 0), rule))
+
+    # ---- 01 作业主题 ----
+    hit = _compact(_THEME) in (_compact(RT.text) + R3.compact)
+    add(hit, 3, "标题行或“作业设计简介”栏出现作业主题“%s”" % _THEME)
+
+    # ---- 02 分层要求 ----
+    b3 = R3.compact
+    hit = ("基础" in b3 and ("提升" in b3 or "提高" in b3) and "必做" in b3
+           and "拓展" in b3 and "选做" in b3)
+    add(hit, 3, "B3:F3 说明分层要求：基础层/提高层必做、拓展层选做")
+
+    # ---- 03 第 1 题题干 + 五个正确读音 ----
+    i_stem1 = R4.idx_of("给词语选择正确的读音")
+    i_read_ok = R4.idx_of("chén lù")
+    got_ok = [r for r in _READ_OK5 if re.search(re.escape(r) + r"\s*[（(]", flat4)]
+    hit = (i_stem1 >= 0 and "√" in R4.compact and len(got_ok) == 5
+           and i_read_ok > i_stem1)
+    add(hit, 3, "C4:F4 有“1.给词语选择正确的读音画“√”。”并另起一行给出五个正确读音"
+                "（命中 %d/5）" % len(got_ok))
+
+    # ---- 04 干扰读音行且括号与上行对齐 ----
+    l_ok = R4.line_of("chén lù")
+    l_ng = R4.line_of("chēn lù")
+    n_ng = 0
+    off = -1.0
+    hit = False
+    if l_ok is not None and l_ng is not None:
+        xa = _paren_xs(l_ok, _READ_OK5)
+        xb = _paren_xs(l_ng, _READ_NG5)
+        n_ng = sum(1 for v in xb if v is not None)
+        pairs = [(a, b) for a, b in zip(xa, xb) if a is not None and b is not None]
+        if pairs:
+            off = max(abs(a - b) for a, b in pairs)
+        bad_pair = sum(1 for a, b in pairs if abs(a - b) > 2.5)
+        hit = (n_ng == 5 and len(pairs) >= 4 and bad_pair <= 1)
+    add(hit, 3, "C4:F4 有五个干扰读音且与上行括号横向基本对齐"
+                "（干扰读音 %d/5，最大偏差 %.1f 字符）" % (n_ng, off))
+    # ---- 05 五段词语位于读音上方 + “游”处叶子图 ----
+    i_word = R4.idx_of(*_WORDS5[:4])
+    hit = False
+    dmax = -1.0
+    if i_word >= 0 and l_ok is not None and i_word < i_read_ok:
+        lw = R4.lines[i_word]
+        sp = _spans(lw, _WORDS5[:4])
+        xr = _token_xs(l_ok, _READ_OK5)
+        if sp and _gaps_ok(sp) and all(v is not None for v in xr[:4]):
+            dmax = max(abs(sp[k][0] - xr[k]) for k in range(4))
+            x_you = lw.x_of("游")
+            leaf = None
+            if x_you is not None:
+                for o in R4.pics:
+                    if o.w < 15 or o.h < 15:
+                        continue
+                    if o.y - 8.0 <= lw.y <= o.y + o.h + 8.0 and \
+                            abs((o.x - R4.x0) / _HALF_PT - x_you) <= 9.0:
+                        leaf = o
+                        break
+            hit = (dmax <= 6.0 and x_you is not None and leaf is not None)
+    add(hit, 3, "C4:F4 读音上方有“晨露/清风/细雨/晚霞/游”五段文本、间距分明且各自对位，"
+                "“游”处有叶子图片（对位最大偏差 %.1f 字符）" % dmax)
+
+    # ---- 06 第 2 题题干 ----
+    hit = "2.看拼音，写词语" in R4.compact
+    add(hit, 1, "C4:F4 有文本“2.看拼音，写词语。”")
+
+    # ---- 07 第一组拼音 + 三个 2:1 田字格 ----
+    rows4 = _tian_rows(R4.tians)
+    g1 = [p for p in _PINYIN_G1 if p in flat4]
+    n_g1 = sum(o.cells for o in rows4[0]) if rows4 else 0
+    hit = (len(g1) == 3 and n_g1 >= 5)
+    add(hit, 3, "C4:F4 有“qīng chén/xiǎo yǔ/hé fēng”且下一行有三个 2:1 田字格"
+                "（拼音 %d/3，田字格合计 %d 字格）" % (len(g1), n_g1))
+
+    # ---- 08 第二组拼音 + 2:1、2:1、1:1 田字格 ----
+    g2 = [p for p in _PINYIN_G2 if p in flat4]
+    n_g2 = sum(o.cells for o in rows4[1]) if len(rows4) >= 2 else 0
+    hit = (len(g2) == 3 and 4 <= n_g2 <= 7)
+    add(hit, 3, "C4:F4 有“huā duǒ/niǎo ér/fēi”且下一行有 2:1、2:1、1:1 田字格"
+                "（拼音 %d/3，田字格合计 %d 字格）" % (len(g2), n_g2))
+
+    # ---- 09 两个例句 + 5 处留白 ----
+    miss_sent = _missing_ordered(R4.loose, _SENT_SEGS)
+    slots = 0
+    for ln in R4.lines:
+        tc = _compact(ln.text)
+        if any(_compact(p) in tc for p in _SENT_SEGS):
+            slots += _blank_slots(ln.text, 6)
+    hit = (not miss_sent and slots >= 5)
+    add(hit, 5, "C4:F4 两个例句文字完整且共 5 处不少于 6 空格的留白"
+                "（缺失片段 %d 个，留白 %d 处）" % (len(miss_sent), slots))
+    # ---- 10 第 3 题题干 + 三个词语 ----
+    i_stem3 = R4.idx_of("3.你能圈出这几个词中表示自然景物的字吗")
+    hit = False
+    if i_stem3 >= 0:
+        for ln in R4.lines[i_stem3 + 1:i_stem3 + 3]:
+            sp = _spans(ln, ["晨露", "细雨", "晚霞"])
+            if sp and _gaps_ok(sp):
+                hit = True
+                break
+    add(hit, 3, "C4:F4 有“3.你能圈出这几个词中表示自然景物的字吗？”"
+                "且下一行为间距分明的“晨露/细雨/晚霞”")
+
+    # ---- 11 第 4 题题干 ----
+    i_stem4 = R4.idx_of("4.连一连")
+    add(i_stem4 >= 0, 1, "C4:F4 有文本“4.连一连。”")
+
+    # ---- 12 连一连上下两行同序项对应 ----
+    hit = False
+    dmax = -1.0
+    if i_stem4 >= 0:
+        cand = R4.lines[i_stem4 + 1:i_stem4 + 6]
+        l1 = i1 = None
+        for k, ln in enumerate(cand):
+            if _spans(ln, _LINK_ROW1):
+                l1, i1 = ln, k
+                break
+        if l1 is not None:
+            for ln in cand[i1 + 1:]:
+                s1 = _spans(l1, _LINK_ROW1)
+                s2 = _spans(ln, _LINK_ROW2)
+                if not s2:
+                    continue
+                dmax = max(abs(s1[k][0] - s2[k][0]) for k in range(4))
+                hit = (_gaps_ok(s1) and _gaps_ok(s2) and dmax <= 6.0)
+                break
+    add(hit, 3, "C4:F4 连一连有“晨露 午阳 晚霞 夜风”与“亮 暖 红 轻”上下两行、"
+                "项间有间距且同序项上下对应（最大错位 %.1f 字符）" % dmax)
+
+    # ---- 13 基础层题号 1234 ----
+    seq4 = [n for _, n in R4.num_lines() if n <= 4]
+    hit = (seq4 == [1, 2, 3, 4])
+    add(hit, 1, "C4:F4 内 1、2、3、4 四道题依次自上而下排列（实测序号 %s）"
+                % ("".join(str(n) for n in seq4) or "无"))
+    # ---- 14 词语接龙 ----
+    i14 = R5.idx_of("1.词语接龙")
+    hit = False
+    gmin = -1.0
+    if i14 >= 0 and "清晨" not in _compact(R5.lines[i14].text):
+        for ln in R5.lines[i14 + 1:i14 + 3]:
+            if "清晨" not in ln.text or "←" in ln.text:
+                continue
+            grp = _find_all_x(ln, r"[（(][\s　]*[）)]")
+            if len(grp) >= 3 and ln.text.count("→") >= 2:
+                gaps = [grp[k][0] - (grp[k - 1][0] + _vis_w(grp[k - 1][1]))
+                        for k in range(1, len(grp))]
+                gmin = min(gaps)
+                hit = gmin > 2.0
+            break
+    add(hit, 3, "C5:F5 第一行“1.词语接龙。”、第二行“清晨→(  )→(  )→(  )”，箭头统一向右、"
+                "括号间隔大于 2 字符（最小间隔 %.1f 字符）" % gmin)
+
+    # ---- 15 第 2 题题干 ----
+    i15 = R5.idx_of("2.照样子，看图说一说")
+    add(i15 >= 0, 3, "C5:F5 有文本“2.照样子，看图说一说。”")
+
+    # ---- 16 山水插图（长宽比≈2）----
+    y15 = R5.lines[i15].y if i15 >= 0 else -1.0e9
+    illu1 = None
+    for o in sorted(R5.illus, key=lambda z: z.y):
+        if 1.60 <= o.ratio <= 2.45 and o.y >= y15 - 4.0:
+            illu1 = o
+            break
+    hit = (illu1 is not None
+           and (illu1.x - R5.x0) <= 0.25 * R5.width and R5.contains(illu1))
+    add(hit, 3, "C5:F5 “2.照样子”下方有长宽比≈2 的山水插图，靠左且完整在格内"
+                "（%s）" % ("长宽比 %.2f，左偏移 %.0f 磅" % (illu1.ratio, illu1.x - R5.x0)
+                           if illu1 is not None else "未找到插图"))
+
+    # ---- 17 插图右侧第一列 ----
+    i_ex = R5.idx_of("例", "微风轻")
+    rows1 = []
+    if i_ex >= 0:
+        cur = i_ex
+        for tk in _COL1_ITEMS:
+            found = -1
+            for j in range(cur + 1, min(len(R5.lines), i_ex + 9)):
+                if (R5.lines[j].x_of(tk) is not None
+                        and re.search(re.escape(tk) + r"[\s　]*[（(]", R5.lines[j].text)):
+                    found = j
+                    break
+            if found < 0:
+                rows1 = []
+                break
+            rows1.append((found, R5.lines[found].x_of(tk)))
+            cur = found
+    hit = False
+    if rows1:
+        xs1 = [x for _, x in rows1]
+        right_ok = (illu1 is None
+                    or min(xs1) * _HALF_PT >= (illu1.x - R5.x0) + illu1.w * 0.6)
+        hit = (max(xs1) - min(xs1) <= 3.0 and right_ok)
+    add(hit, 3, "C5:F5 插图右侧第一列依次为“例：微风轻/小鸟(  )/柳叶(  )/溪水(  )”")
+
+    # ---- 18 插图右侧第二列 ----
+    hit = False
+    if rows1:
+        ok2 = 0
+        for tk in _COL2_ITEMS:
+            for j in range(i_ex, min(len(R5.lines), i_ex + 9)):
+                x = R5.lines[j].x_of(tk)
+                if x is None or not re.search(re.escape(tk) + r"[\s　]*[（(]", R5.lines[j].text):
+                    continue
+                if x > min(x2 for _, x2 in rows1) + 2.0 or j > rows1[-1][0]:
+                    ok2 += 1
+                    break
+        hit = (ok2 == 2)
+    add(hit, 3, "C5:F5 第二列（或紧随第一列之后）为“纸鸢(  )”“云朵(  )”")
+    # ---- 19 第 3 题题干 ----
+    i19 = R5.idx_of("3.仔细观察图片，填一填")
+    add(i19 >= 0, 1, "C5:F5 有文本“3.仔细观察图片，填一填。”")
+
+    # ---- 20 山水插图（长宽比≈1.5）----
+    y19 = R5.lines[i19].y if i19 >= 0 else -1.0e9
+    illu2 = None
+    for o in sorted(R5.illus, key=lambda z: z.y):
+        if o is illu1:
+            continue
+        if 1.20 <= o.ratio <= 1.80 and o.y >= y19 - 4.0:
+            illu2 = o
+            break
+    hit = (illu2 is not None
+           and (illu2.x - R5.x0) <= 0.25 * R5.width and R5.contains(illu2))
+    add(hit, 3, "C5:F5 “3.仔细观察图片”下方有长宽比≈1.5 的山水插图，靠左且完整在格内"
+                "（%s）" % ("长宽比 %.2f，左偏移 %.0f 磅" % (illu2.ratio, illu2.x - R5.x0)
+                           if illu2 is not None else "未找到插图"))
+
+    # ---- 21 观察填空文段完整 ----
+    miss_para = _missing_ordered(R5.loose, _PARA_SEGS)
+    hit = not miss_para
+    add(hit, 5, "C5:F5 第二张插图下方文段完整、无缺字错字漏句（缺失片段 %d 个%s）"
+                % (len(miss_para), ("：" + "/".join(miss_para[:3])) if miss_para else ""))
+
+    # ---- 22 文段 8 处空缺各有田字格 ----
+    i_para = R5.idx_of("清风吹过")
+    y_ref = illu2.y if illu2 is not None else (
+        R5.lines[i_para].y - 24.0 if i_para >= 0 else -1.0e9)
+    tian5 = [o for o in R5.tians if o.y >= y_ref - 4.0]
+    inside = all(R5.contains(o) for o in tian5)
+    hit = (8 <= len(tian5) <= 18 and sum(o.cells for o in tian5) >= 8 and inside)
+    add(hit, 5, "C5:F5 文段 8 处空缺各有田字格图片、与前后文字同行且未压住文字"
+                "（实测田字格 %d 个 / %d 字格）" % (len(tian5), sum(o.cells for o in tian5)))
+
+    # ---- 23 提高层题号 123 ----
+    seq5 = [n for _, n in R5.num_lines() if n <= 3]
+    hit = (seq5 == [1, 2, 3])
+    add(hit, 1, "C5:F5 内 1、2、3 三道题依次自上而下排列（实测序号 %s）"
+                % ("".join(str(n) for n in seq5) or "无"))
+    # ---- 24 拓展层两题 ----
+    t6 = R6.compact
+    have6 = [all(k in t6 for k in grp) for grp in _EXT_TASKS]
+    i6a, i6b = R6.idx_of("和家人"), R6.idx_of("搜集两个描写季节的词语")
+    seq6 = [n for _, n in R6.num_lines() if n <= 2]
+    hit = (all(have6) and 0 <= i6a < i6b and seq6 == [1, 2] and _left_aligned(R6))
+    add(hit, 3, "C6:F6 两道拓展题文字完整、序号 1/2 各自独立成段且左侧对齐")
+
+    # ---- 25 星星评价三段文字 ----
+    miss_star = _missing_ordered(R7.loose, _STAR_SEGS)
+    hit = not miss_star
+    add(hit, 3, "B7:F9 有“今天我完成了”“颗星，我已经累计了”“颗星，请继续保持！”三段文字"
+                "（缺失 %d 段）" % len(miss_star))
+
+    # ---- 26 三段之间 2-8 字符留白 ----
+    l_star = R7.line_of("今天我完成了")
+    hit = False
+    if l_star is not None:
+        t = l_star.text
+        m1 = re.search(r"今天我完成了([ 　_﹏﹍…\-]{2,8})颗星", t)
+        m2 = re.search(r"累计了?([ 　_﹏﹍…\-]{2,8})颗星", t)
+        hit = bool(m1 and m2)
+    add(hit, 1, "B7:F9 三段文字之间各有一处 2-8 字符的下划线或空白留白")
+
+    # ---- 27 自我评价/教师评价标签 + 可书写空行 ----
+    t7 = R7.compact
+    blank_after = False
+    for paras in R7.raw_paras:
+        for k, p in enumerate(paras):
+            if "教师评价" not in p:
+                continue
+            if re.search(r"[ 　_﹏﹍…\-]{6,}\s*$", p):
+                blank_after = True
+            if k + 1 < len(paras) and not paras[k + 1].strip():
+                blank_after = True
+            if k + 1 == len(paras) and R7.lines:
+                blank_after = blank_after or (R7.y1 - R7.lines[-1].y) >= 24.0
+    hit = ("自我评价" in t7 and "教师评价" in t7 and blank_after)
+    add(hit, 1, "B7:F9 含“自我评价”“教师评价”两项标签，并为教师评价留出可书写空行")
+    # ================= 减分项 =================
+    # ---- 28 使用区域与 8 处合并单元格 ----
+    merges = set(str(r) for r in ws.merged_cells.ranges)
+    dims_ok = (ws.max_row <= _EXPECTED_DIMS[3] and ws.max_column <= _EXPECTED_DIMS[2])
+    hit = not (dims_ok and merges == _EXPECTED_MERGES)
+    add(hit, -3, "工作表使用区域或 8 处合并单元格被改动（实测区域 %s，合并 %d 处）"
+                 % (ws.dimensions, len(merges)))
+
+    # ---- 29 第二行标签与空格 ----
+    bad29 = [k for k, v in _LBL_ROW2.items() if _compact(_ctext(ws, k)) != v]
+    filled = [k for k in ("B2", "D2", "F2") if _ctext(ws, k).strip()]
+    hit = bool(bad29 or filled)
+    add(hit, -3, "第二行标签被改动或 B2/D2/F2 被填入文字（异常标签 %s，被填 %s）"
+                 % ("/".join(bad29) or "无", "/".join(filled) or "无"))
+
+    # ---- 30 A3 说明文字 ----
+    a3 = [x for x in _clines(ws, "A3") if x.strip()]
+    hit = not (len(a3) == 2 and _compact(a3[0]) == _LBL_A3[0]
+               and _loose(a3[1]) == _loose(_LBL_A3[1]))
+    add(hit, -3, "A3 不是“作业设计简介”与“（学习目标、题型说明等）”两行")
+
+    # ---- 31 A4:A6 三行文字与字体 ----
+    a4raw = _clines(ws, "A4")
+    a4 = [x for x in a4raw if x.strip()]
+    c_a4 = ws["A4"]
+    hit = not (a4 == _LBL_A4 and len(a4raw) >= 5
+               and _font_ok(c_a4, "宋体", 14, True)
+               and _align_ok(c_a4, "center", "center"))
+    add(hit, -3, "A4:A6 不是“作业/设计/内容”三行（行间留空）或不是宋体 14 号加粗居中")
+
+    # ---- 32 分层标题与反馈标题 ----
+    bad32 = [k for k, v in _LBL_B456.items() if _compact(_ctext(ws, k)) != v]
+    if _compact(_ctext(ws, "A7")) != _LBL_A7:
+        bad32.append("A7")
+    hit = bool(bad32)
+    add(hit, -3, "B4/B5/B6 分层标题或 A7“作业情况反馈”被改动（异常 %s）"
+                 % ("/".join(bad32) or "无"))
+
+    # ---- 33 标题与标签字体字号 ----
+    c_a1 = ws["A1"]
+    bad33 = []
+    if not (_font_ok(c_a1, "宋体", 18, True) and _align_ok(c_a1, "center", "center")):
+        bad33.append("A1")
+    for k in _BOLD11_CELLS:
+        if not _font_ok(ws[k], "宋体", 11, True):
+            bad33.append(k)
+    hit = bool(bad33)
+    add(hit, -3, "标题或标签字体字号不符（异常 %s）" % ("/".join(bad33) or "无"))
+    # ---- 34 列宽 ----
+    bad34 = []
+    for col, want in _EXPECTED_COL_W.items():
+        dim = ws.column_dimensions.get(col)
+        got = float(dim.width) if (dim is not None and dim.width) else 0.0
+        if abs(got - want) > _COL_W_TOL:
+            bad34.append("%s=%.2f" % (col, got))
+    hit = bool(bad34)
+    add(hit, -3, "A 至 F 列列宽超出 ±1.5 字符（异常 %s）" % ("/".join(bad34) or "无"))
+
+    # ---- 35 行高 ----
+    bad35 = []
+
+    def _rh(r):
+        dim = ws.row_dimensions.get(r)
+        return float(dim.height) if (dim is not None and dim.height) else 0.0
+
+    for r, want in _EXPECTED_ROW_H.items():
+        if abs(_rh(r) - want) > _ROW_H_TOL:
+            bad35.append("%d=%.0f" % (r, _rh(r)))
+    if _rh(4) < _ROW4_MIN_H:
+        bad35.append("4=%.0f" % _rh(4))
+    if _rh(5) < _ROW5_MIN_H:
+        bad35.append("5=%.0f" % _rh(5))
+    hit = bool(bad35)
+    add(hit, -3, "行高不符（异常 %s）" % ("/".join(bad35) or "无"))
+
+    # ---- 36 五处填写区自动换行 ----
+    bad36 = []
+    for R in (R3, R4, R5, R6, R7):
+        if not any(l.strip() for l in R.cell_lines):
+            continue                      # 内容放在浮动文本框里，不涉及单元格换行
+        if bool(R.cell.alignment.wrap_text):
+            continue
+        if len(R.cell_lines) > 1:
+            bad36.append(R.name)
+        elif max(_vis_w(l) for l in R.cell_lines) * _HALF_PT > R.width * 1.15:
+            bad36.append(R.name)
+    hit = bool(bad36)
+    add(hit, -3, "填写区未自动换行、文字挤在一行或超出右边界（异常 %s）"
+                 % ("/".join(bad36) or "无"))
+
+    # ---- 37 题目被概括/改写 ----
+    ct_all = _compact(all_text)
+    hit_words = [w for w in _REWRITE_WORDS if w in ct_all]
+    miss_stem = [s for s in _ORIG_STEMS if _compact(s) not in ct_all]
+    hit = bool(hit_words) or len(miss_stem) >= 3
+    add(hit, -3, "题目被概括/改写/自创表述（可疑表述 %s；缺失原题干 %d 条）"
+                 % ("/".join(hit_words) or "无", len(miss_stem)))
+
+    # ---- 38 内容左对齐 ----
+    bad38 = [R.name for R in (R4, R5, R6) if not _left_aligned(R)]
+    hit = bool(bad38)
+    add(hit, -1, "C4/C5/C6 内容未左对齐、题号未沿左边界对齐（异常 %s）"
+                 % ("/".join(bad38) or "无"))
+    # ---- 39 边框与装饰 ----
+    lost_border, deco = [], []
+    for r in range(1, _EXPECTED_DIMS[3] + 1):
+        want_row = _TEMPLATE_BORDERS.get(r)
+        for c in range(1, _EXPECTED_DIMS[2] + 1):
+            cell = ws.cell(row=r, column=c)
+            if want_row is not None:
+                want, got = want_row[c - 1], _bflags(cell)
+                if any(want[k] == "1" and got[k] == "0" for k in range(4)):
+                    lost_border.append(cell.coordinate)
+            if _has_fill(cell) or _font_colored(cell):
+                deco.append(cell.coordinate)
+    hit = bool(lost_border or deco)
+    add(hit, -1, "实线边框缺失或新增底纹/填充/彩色字体（缺框 %s；装饰 %s）"
+                 % ("/".join(lost_border[:4]) or "无", "/".join(deco[:4]) or "无"))
+
+    # ---- 40 纸张与方向 ----
+    ps = ws.page_setup
+    try:
+        paper = int(ps.paperSize) if ps.paperSize else 0
+    except Exception:
+        paper = 0
+    orient = ps.orientation
+    hit = not (paper == 9 and orient in (None, "portrait", "default"))
+    add(hit, -1, "页面设置被破坏（纸张代码 %s，方向 %s）" % (paper or "缺失", orient or "缺失"))
+
+    # ---- 41 工作表数量与 Sheet2/Sheet3 ----
+    dirty_sheets = []
+    for i, wsx in enumerate(wb.worksheets):
+        if i == _MAIN_SHEET_IDX:
+            continue
+        if wsx.max_row > 1 or wsx.max_column > 1 or wsx["A1"].value is not None:
+            dirty_sheets.append(wsx.title)
+    hit = (len(wb.sheetnames) < 3) or bool(dirty_sheets) or other_draw
+    add(hit, -1, "工作表少于 3 个或 Sheet2/Sheet3 被写入内容（工作表 %d 个，被写入 %s）"
+                 % (len(wb.sheetnames), "/".join(dirty_sheets) or "无"))
+
+    # ---- 42 批注、水印、交付说明文字 ----
+    n_cmt = 0
+    for row in ws.iter_rows(min_row=1, max_row=9, min_col=1, max_col=6):
+        for cell in row:
+            if getattr(cell, "comment", None) is not None:
+                n_cmt += 1
+    hdr = ""
+    try:
+        for part in (ws.oddHeader, ws.oddFooter):
+            for pos in (part.left, part.center, part.right):
+                hdr += (pos.text or "")
+    except Exception:
+        hdr = ""
+    dw = [w for w in _DELIVERY_WORDS if w in ct_all or w in _compact(hdr)]
+    hit = bool(has_comment or n_cmt or dw)
+    add(hit, -1, "出现批注、水印或交付说明文字（批注 %d 处；可疑文字 %s）"
+                 % (n_cmt, "/".join(dw) or "无"))
+
+    # ---- 43 图片变形、移出单元格 ----
+    regions_all = (RT, R3, R4, R5, R6, R7)
+    bad43 = []
+    for o in objs:
+        host = None
+        for R in regions_all:
+            if R.x0 - 1.0 <= o.x + 2.0 < R.x1 and R.y0 - 1.0 <= o.y + 2.0 < R.y1:
+                host = R
+                break
+        if host is None or not host.contains(o):
+            bad43.append("越界%.0fx%.0f" % (o.w, o.h))
+        elif o.kind != "txt":
+            if not (0.30 <= o.ratio <= 6.0):
+                bad43.append("变形%.0fx%.0f" % (o.w, o.h))
+            elif max(o.w, o.h) <= _TIAN_MAX_PT and o.cells == 0:
+                bad43.append("方格变形%.0fx%.0f" % (o.w, o.h))
+    hit = bool(bad43)
+    add(hit, -1, "图片被拉伸变形或移出所属单元格（异常 %d 处 %s）"
+                 % (len(bad43), "/".join(bad43[:3])))
+    # ---- 汇总：把 results 字符串反解为结构化 dim2_items ----
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(f"dim2 项数不一致：results={len(results)} vs order={len(_MAX_DELTAS_ORDER)}")
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
         try:
-            wb = load_workbook_editable(target)
-        except Exception as exc:
-            return {
-                "id": SCRIPT_ID,
-                "file_name": file_name,
-                "status": "ok",
-                "error": None,
-                "dim1_pass": False,
-                "dim1_reason": f"无法打开工作簿：{exc}",
-                "dim2_items": [],
-                "total_score": 0,
-                "max_score": 0,
-            }
-
-        d1 = dimension1_checks(target, wb)
-        if not all(ok for ok, _ in d1):
-            failed = [detail for ok, detail in d1 if not ok]
-            return {
-                "id": SCRIPT_ID,
-                "file_name": file_name,
-                "status": "ok",
-                "error": None,
-                "dim1_pass": False,
-                "dim1_reason": "；".join(failed),
-                "dim2_items": [],
-                "total_score": 0,
-                "max_score": 0,
-            }
-
-        results = evaluate_dimension2(wb, target)
-        dim2_items = []
-        max_score = 0
-        total_score = 0
-        for r in results:
-            max_delta = r.score
-            hit = bool(r.passed)
-            delta = max_delta if hit else 0
-            dim2_items.append({
-                "rule": r.name,
-                "max_delta": max_delta,
-                "delta": delta,
-                "hit": hit,
-                "detail": "",
-            })
-            # 满分只累加正向项；扣分项（score<0）不计入 max_score，命中时从 total 中扣。
-            if max_delta > 0:
-                max_score += max_delta
-            if hit:
-                total_score += delta
-
-        return {
-            "id": SCRIPT_ID,
-            "file_name": file_name,
-            "status": "ok",
-            "error": None,
-            "dim1_pass": True,
-            "dim1_reason": "",
-            "dim2_items": dim2_items,
-            "total_score": total_score,
-            "max_score": max_score,
-        }
-    except Exception as exc:  # 兜底：脚本自身异常一律标记 error，避免与“0 分”混淆
-        return _build_error_report(TARGET_FILE, f"脚本执行异常：{exc}")
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        # 加分项：delta>0 表示拿到分；减分项：delta<0 表示扣分成立。
+        # 两者统一用 hit 表示“该评分项判定成立”。
+        hit = (delta != 0)
+        dim2_items.append({"rule": _RULE_ONLY.sub("", rule), "max_delta": max_delta,
+                           "delta": max_delta if hit else 0, "hit": hit})
+        total_score += (max_delta if hit else 0)
+    result["dim2_items"] = dim2_items
+    # 扣分不倒扣：完成度总分下限为 0
+    result["total_score"] = max(0, total_score)
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 仅用于本地调试：默认使用脚本自身所在目录，允许命令行覆盖为其它目录。
-    _dir = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent)
-    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

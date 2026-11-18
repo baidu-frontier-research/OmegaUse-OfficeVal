@@ -41,6 +41,7 @@ dependencies = [
     "Pillow>=10.0",
     "numpy>=1.26",
     "opencv-python>=4.9",
+    "pyopenvba>=3.4.0",
 ]
 
 [project.optional-dependencies]

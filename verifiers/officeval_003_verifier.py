@@ -1,1108 +1,810 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-部门协调会记录_会议内容横线表格版.docx 自动评估代码
-"""
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-import docx
-from docx.shared import Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-import json
 import os
 import re
 import sys
+import json
+from docx import Document
+from docx.oxml.ns import qn
 
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .docx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 评测对象：把"部门协调会记录"里"会议内容"下方每一行文字放入表格并加横线、删空行的改写结果。
+# 细则见同目录 细则.txt（维度1 门禁 + 维度2 加分/减分项）。
 
-# 本脚本对应的编号（用于 evaluate() 返回值中的 "id" 字段）
 SCRIPT_ID = "003"
-# 期望的被评估文档名；若目录中不存在同名文件，则回退到目录内首个 .docx
-EXPECTED_DOC_NAME = "部门协调会记录_会议内容横线表格版.docx"
 
-
-class DocumentEvaluator:
-    """文档评估器"""
-
-    def __init__(self, docx_path: str):
-        self.docx_path = docx_path
-        self.doc = None
-        self.dimension1_passed = True
-        self.dimension1_details = []
-        self.dimension2_score = 0
-        self.dimension2_details = []
-
-    def load_document(self):
-        """加载文档"""
-        try:
-            self.doc = docx.Document(self.docx_path)
-            self.dimension1_details.append("✓ 文档可正常打开")
-            return True
-        except Exception as e:
-            self.dimension1_passed = False
-            self.dimension1_details.append(f"✗ 文档无法正常打开: {e}")
-            return False
-
-    def evaluate_dimension1(self):
-        """评估维度1：可用与可修改性"""
-        # 1. 检查文件扩展名
-        if not self.docx_path.endswith('.docx'):
-            self.dimension1_passed = False
-            self.dimension1_details.append("✗ 交付文件扩展名不是.docx")
-        else:
-            self.dimension1_details.append("✓ 交付文件扩展名符合要求")
-
-        # 2. 文档可正常打开（已在load_document中检查）
-        # 如果无法打开，直接返回
-        if not self.doc:
-            return False
-
-        return self.dimension1_passed
-
-    def evaluate_dimension2(self):
-        """评估维度2：完成度评分细则"""
-        if not self.doc:
-            return
-
-        all_text = ""
-        for para in self.doc.paragraphs:
-            all_text += para.text + "\n"
-        for table in self.doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    all_text += cell.text + " "
-
-        # +5：文档表格中没有空白行
-        self._check_no_empty_rows()
-
-        # +5：文档表格中所有文本：下方都出现横线；横线长度与表格上边框长度一致；颜色为黑色，类型为细实线
-        self._check_underline_format()
-
-        # +5：文档表格中所有横线：相邻两条横线之间的距离几乎相等，只允许有0.15cm的误差
-        self._check_row_height()
-
-        # -5：文中出现图片或者不可编辑的部分
-        self._check_images_and_non_editable()
-
-        # -5：文档第一页顶部不满足其中任意一项
-        self._check_first_page_header()
-
-        # -1："会议内容："下方第一行出现缩进
-        self._check_meeting_content_indent()
-
-        # -1：文中没有出现"侯景澜：上月两项重点现场事项整改推进如下："文本内容
-        self._check_hou_jinglan_text()
-
-        # -1："二月份作业偏差共发生若干件，具体情况如下："与"四、研究后续事项"之间的文本出现缩进
-        self._check_indentation_between_sections()
-
-    def _check_no_empty_rows(self):
-        """+5：文档表格中没有空白行
-
-        每条横线对应一个表格行（<w:tr>），要求每个表格行的文字内容不能
-        为空。python-docx 的 doc.tables 只覆盖顶层表格，单元格内嵌套的
-        子表格（cell.tables）不会被收进去，必须递归遍历才能覆盖表中表
-        的所有行。此外，若文档中完全没有表格，该评分点无法成立（rubric
-        针对"表格中"的行提出要求），不应默认通过并加分。
-        """
-        if self.doc is None:
-            return
-
-        invisible_chars = ' \t\r\n　\xa0​'
-        empty_locations = []
-        table_count = [0]
-
-        def walk_table(tbl, prefix):
-            table_count[0] += 1
-            ti = table_count[0]
-            label_prefix = f"{prefix}表{ti}" if prefix else f"表{ti}"
-            for ri, row in enumerate(tbl.rows, 1):
-                row_text = "".join(cell.text for cell in row.cells)
-                if not row_text.strip(invisible_chars):
-                    empty_locations.append(f"{label_prefix}第{ri}行")
-                for cell in row.cells:
-                    for sub in cell.tables:
-                        walk_table(sub, f"{label_prefix}内嵌套")
-
-        for table in self.doc.tables:
-            walk_table(table, "")
-
-        if table_count[0] == 0:
-            self.dimension2_details.append("+5：文档表格中没有空白行 ✗（文档中不存在表格，无法验证该评分点）")
-            return
-
-        if not empty_locations:
-            self.dimension2_score += 5
-            self.dimension2_details.append("+5：文档表格中没有空白行 ✓")
-        else:
-            preview = ", ".join(empty_locations[:3])
-            more = f"等{len(empty_locations)}处" if len(empty_locations) > 3 else ""
-            self.dimension2_details.append(
-                f"+5：文档表格中没有空白行 ✗（{preview}{more}）"
-            )
-
-    def _check_underline_format(self):
-        """+5：文档表格中所有文本：下方都出现横线；横线长度与表格上边框长度一致；颜色为黑色，类型为细实线
-
-        单元格底部边框只能保证"该单元格最后一行文字"下方有横线。
-        若单元格内文字过长发生自动换行，换行后的前几行文字下方就没有横线。
-        判断换行采用"字号 × 字符视觉宽度 ∑ 与 单元格净宽 比较"的估算方式，
-        比按"字符数阈值"精准得多。
-
-        "横线长度与表格上边框长度一致"：以行内各单元格 w:tcW 之和作为该
-        横线实际覆盖的宽度，与表格整体宽度（各列 w:tcW 之和；缺失则用
-        w:tblW）比较，要求近似相等（允许 dxa 舍入误差）——这样才能识别
-        "横线只覆盖部分列宽"（例如某行被拆分成多个单元格，只有其中一个
-        单元格有底部边框）的不合规情况。
-        "颜色为黑色"：要求 w:color 严格等于 auto 或 000000，不再把深灰
-        等非黑色（此前 <=80 的宽松阈值会误判为黑色）当作合格。
-        """
-        if self.doc is None:
-            return
-
-        all_ok = True
-        fail_reason = ""
-
-        # 文档默认字号（Normal 样式）作为兜底
-        default_pt = 10.5
-        try:
-            normal_size = self.doc.styles['Normal'].font.size
-            if normal_size is not None:
-                default_pt = normal_size.pt
-        except Exception:
-            pass
-
-        def char_visual_units(ch):
-            """返回该字符相对于当前字号的宽度倍率（1 表示占一个全角字宽）。"""
-            code = ord(ch)
-            # 中日韩统一表意文字 / 全角标点 / 全角字符
-            if (0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF
-                    or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF):
-                return 1.0
-            if code < 128:
-                # ASCII 平均按 0.55 全角宽估算（数字/字母/半角标点）
-                return 0.55
-            return 1.0  # 其它非 ASCII 字符按全角处理
-
-        def paragraph_text_width_pt(para):
-            """估算段落文字的视觉宽度（pt）。字号取 run 显式 → Normal 兜底。
-
-            仅计算段落"可见内容"的宽度：先剥离段末尾随空白（Word 中尾随空白不参与换行），
-            再逐 run 累加。
-            """
-            # 计算需要保留的字符总数（去掉尾随空白）
-            full_text = "".join(run.text for run in para.runs)
-            trimmed = full_text.rstrip(" \t　\xa0\r\n")
-            remaining = len(trimmed)
-            if remaining == 0:
-                return 0.0
-
-            width = 0.0
-            for run in para.runs:
-                run_pt = default_pt
-                if run.font.size is not None:
-                    run_pt = run.font.size.pt
-                for ch in run.text:
-                    if remaining <= 0:
-                        break
-                    remaining -= 1
-                    if ch in ('\r', '\n'):
-                        continue
-                    width += char_visual_units(ch) * run_pt
-                if remaining <= 0:
-                    break
-            return width
-
-        def cell_dxa_width(cell):
-            """读取单元格 w:tcW 原始宽度（dxa）。失败返回 0.0。"""
-            tcPr = cell._tc.tcPr
-            if tcPr is None:
-                return 0.0
-            tcW = tcPr.find(qn('w:tcW'))
-            if tcW is None:
-                return 0.0
-            try:
-                w_dxa = float(tcW.get(qn('w:w'), '0'))
-            except (TypeError, ValueError):
-                return 0.0
-            return max(0.0, w_dxa)
-
-        def table_total_width_dxa(table):
-            """表格整体宽度（dxa）：优先取首行各单元格 tcW 之和；
-            取不到（单元格未显式设宽）则回退到 tblPr/w:tblW。返回 0.0
-            表示无法确定（此时跳过"横线长度一致"比较，不误判失败）。
-            """
-            if table.rows:
-                first_row_sum = sum(
-                    cell_dxa_width(c) for c in table.rows[0].cells
-                )
-                if first_row_sum > 0:
-                    return first_row_sum
-            tblPr = table._tbl.find(qn('w:tblPr'))
-            tblW = tblPr.find(qn('w:tblW')) if tblPr is not None else None
-            if tblW is not None:
-                try:
-                    return max(0.0, float(tblW.get(qn('w:w'), '0')))
-                except (TypeError, ValueError):
-                    return 0.0
-            return 0.0
-
-        def cell_inner_width_pt(cell):
-            """读取单元格净宽（pt）：tcW 减去左右单元格边距。失败返回 None。"""
-            tcPr = cell._tc.tcPr
-            if tcPr is None:
-                return None
-            tcW = tcPr.find(qn('w:tcW'))
-            if tcW is None:
-                return None
-            try:
-                w_dxa = float(tcW.get(qn('w:w'), '0'))
-            except (TypeError, ValueError):
-                return None
-            if w_dxa <= 0:
-                return None
-            # 表级默认边距
-            left_dxa = right_dxa = 108.0  # Word 默认 0.19cm ≈ 108 dxa（保守值）
-            try:
-                tbl = cell._tc.getparent().getparent()  # tr -> tbl
-                tblCellMar = tbl.find('.//' + qn('w:tblCellMar'))
-                if tblCellMar is not None:
-                    l = tblCellMar.find(qn('w:left'))
-                    r = tblCellMar.find(qn('w:right'))
-                    if l is not None and l.get(qn('w:w')) is not None:
-                        left_dxa = float(l.get(qn('w:w')))
-                    if r is not None and r.get(qn('w:w')) is not None:
-                        right_dxa = float(r.get(qn('w:w')))
-            except Exception:
-                pass
-            # dxa = 1/20 pt
-            return max(0.0, (w_dxa - left_dxa - right_dxa) / 20.0)
-
-        for table_index, table in enumerate(self.doc.tables, 1):
-            # 表级 tblBorders/bottom：作为最后一行"底部横线"的兜底
-            tblPr = table._tbl.find(qn('w:tblPr'))
-            tbl_borders = tblPr.find(qn('w:tblBorders')) if tblPr is not None else None
-            tbl_bottom = tbl_borders.find(qn('w:bottom')) if tbl_borders is not None else None
-            last_row_index = len(table.rows)
-            table_width_dxa = table_total_width_dxa(table)
-
-            for row_index, row in enumerate(table.rows, 1):
-                is_last_row = (row_index == last_row_index)
-
-                # 该行横线实际覆盖的宽度：仅累加"有可见底部边框"的单元格
-                # 宽度——只要其中一个单元格缺失/不可见边框，上面的检查会
-                # 立即 all_ok=False 并 break，不会走到下面的宽度比较。
-                row_line_dxa = 0.0
-
-                for cell_index, cell in enumerate(row.cells, 1):
-                    non_empty_paras = [p for p in cell.paragraphs if p.text.strip()]
-                    if not non_empty_paras:
-                        continue  # 跳过空单元格
-
-                    tcPr = cell._tc.tcPr
-                    tcBorders = tcPr.find(qn('w:tcBorders')) if tcPr is not None else None
-                    bottom = tcBorders.find(qn('w:bottom')) if tcBorders is not None else None
-
-                    # 最后一行：单元格自身无底部边框时，回退到表级底部边框
-                    if bottom is None and is_last_row and tbl_bottom is not None:
-                        bottom = tbl_bottom
-
-                    if bottom is None:
-                        all_ok = False
-                        fail_reason = f"第{table_index}个表格第{row_index}行第{cell_index}列无底部边框"
-                        break
-
-                    val = bottom.get(qn('w:val'), '')
-                    color = bottom.get(qn('w:color'), '').upper().lstrip('#')
-                    sz = int(bottom.get(qn('w:sz'), '0'))
-                    # 类型须为细实线（single），sz<=6即细线，颜色须为黑色
-                    if val != 'single':
-                        all_ok = False
-                        fail_reason = f"第{table_index}个表格第{row_index}行底部边框类型不是细实线(val={val})"
-                        break
-                    if sz > 6:
-                        all_ok = False
-                        fail_reason = f"第{table_index}个表格第{row_index}行底部边框线宽过粗(sz={sz})"
-                        break
-                    # 颜色须严格为黑色：auto 或 000000。此前 RGB 各通道
-                    # <=80 的宽松阈值会把深灰等非黑色误判为合格，收紧为
-                    # 精确匹配。
-                    if color not in ('AUTO', '000000', ''):
-                        all_ok = False
-                        fail_reason = f"第{table_index}个表格第{row_index}行底部边框颜色不为黑色(#{color})"
-                        break
-
-                    row_line_dxa += cell_dxa_width(cell)
-
-                    # 若单元格内含多个非空段落：段落硬回车即视为强制换行，
-                    # 除最后一个段落外，其它段落下方一定没有横线。
-                    if len(non_empty_paras) > 1:
-                        all_ok = False
-                        fail_reason = (f"第{table_index}个表格第{row_index}行含{len(non_empty_paras)}个段落，"
-                                       f"非末段下方无横线")
-                        break
-
-                    # 单段落：按视觉宽度判断是否会自动换行
-                    # 不加"安全余量"——文字视觉宽度严格大于单元格净宽即判换行。
-                    # （测试数据：46 字全中文 ≈ 483pt 会溢出 481.85pt 净宽而换行；
-                    # 而 44 中 + 2 半 ≈ 473pt 则不会换行。）
-                    inner_w = cell_inner_width_pt(cell)
-                    if inner_w and inner_w > 0:
-                        text_w = paragraph_text_width_pt(non_empty_paras[0])
-                        if text_w > inner_w:
-                            all_ok = False
-                            fail_reason = (f"第{table_index}个表格第{row_index}行文字过长发生换行"
-                                           f"(文字≈{text_w:.0f}pt, 单元格净宽≈{inner_w:.0f}pt)，"
-                                           f"换行后的前几行文字下方无横线")
-                            break
-                if not all_ok:
-                    break
-
-                # "横线长度与表格上边框长度一致"：整行都有可见底部边框时，
-                # 该横线覆盖宽度应与表格整体宽度一致（允许 20dxa≈1pt 舍入
-                # 误差）；宽度信息缺失（table_width_dxa<=0）时无法比较，
-                # 跳过该项而不误判失败。
-                if table_width_dxa > 0 and row_line_dxa > 0:
-                    if abs(row_line_dxa - table_width_dxa) > 20:
-                        all_ok = False
-                        fail_reason = (
-                            f"第{table_index}个表格第{row_index}行横线宽度"
-                            f"≈{row_line_dxa/20:.1f}pt，与表格上边框宽度"
-                            f"≈{table_width_dxa/20:.1f}pt不一致"
-                        )
-                        break
-            if not all_ok:
-                break
-
-        if all_ok:
-            self.dimension2_score += 5
-            self.dimension2_details.append("+5：文档表格中所有文本：下方都出现横线；横线长度与表格上边框长度一致；颜色为黑色，类型为细实线 ✓")
-        else:
-            self.dimension2_details.append(f"+5：文档表格中所有文本：下方都出现横线；横线长度与表格上边框长度一致；颜色为黑色，类型为细实线 ✗（{fail_reason}）")
-
-    def _check_row_height(self):
-        """+5：文档表格中所有横线：相邻两条横线之间的距离几乎相等，只允许有0.15cm的误差
-
-        评分口径：把所有"相邻两条横线的距离"收集起来，最大值 - 最小值 ≤ 0.15cm。
-        - 短行（无字符下划线）：距离 = 表格行的实际渲染高度
-        - 长段落（含 <w:u> 字符下划线）：每一视觉行下方都有横线，
-          距离 = 段落 line spacing（对每个视觉行都计入一次）
-        - 递归遍历嵌套子表；含子表的表格行本身跳过、直接测子表。
-        """
-        if self.doc is None:
-            return
-
-        tolerance = 0.15
-        gaps = []  # (label, cm)
-
-        def paragraph_has_underline(para):
-            pPr = para._p.find(qn('w:pPr'))
-            if pPr is not None:
-                rPr_p = pPr.find(qn('w:rPr'))
-                if rPr_p is not None:
-                    u = rPr_p.find(qn('w:u'))
-                    if u is not None and u.get(qn('w:val')) not in (None, 'none'):
-                        return True
-            for r in para.runs:
-                rPr_r = r._r.find(qn('w:rPr'))
-                if rPr_r is None:
-                    continue
-                u = rPr_r.find(qn('w:u'))
-                if u is not None and u.get(qn('w:val')) not in (None, 'none'):
-                    return True
-            return False
-
-        def collect_underlined_gaps(row, label):
-            """对带下划线段落：视觉每一行都记一次 line spacing。"""
-            found_any = False
-            for cell in row.cells:
-                inner_w = self._cell_inner_width_pt(cell)
-                for para in cell.paragraphs:
-                    if not para.text.strip() or not paragraph_has_underline(para):
-                        continue
-                    found_any = True
-                    cm = self._paragraph_line_spacing_cm(para)
-                    if cm is None:
-                        continue
-                    # 估算视觉行数
-                    lines = self._visual_line_count(para, inner_w)
-                    for _ in range(lines):
-                        gaps.append((label, cm))
-            return found_any
-
-        def walk(tables, prefix):
-            for ti, table in enumerate(tables, 1):
-                for ri, row in enumerate(table.rows, 1):
-                    label = f"{prefix}表{ti}第{ri}行"
-                    has_nested = any(cell.tables for cell in row.cells)
-                    if not has_nested:
-                        # 优先按下划线段落记录（每一视觉行一条横线间距）
-                        if not collect_underlined_gaps(row, label):
-                            # 无下划线：整行只贡献一条底边框——距离 = 该行实际高度
-                            h_cm = self._get_effective_row_height_cm(row)
-                            if h_cm is not None:
-                                gaps.append((label, h_cm))
-                    for cell in row.cells:
-                        if cell.tables:
-                            walk(cell.tables, prefix=f"{label}>")
-
-        walk(self.doc.tables, prefix="")
-
-        rule_text = "文档表格中所有横线：相邻两条横线之间的距离几乎相等，只允许有0.15cm的误差"
-        if not gaps:
-            self.dimension2_details.append(f"+5：{rule_text} ✗（未采集到任何横线间距）")
-            return
-
-        max_gap = max(cm for _, cm in gaps)
-        min_gap = min(cm for _, cm in gaps)
-        diff = max_gap - min_gap
-        if diff <= tolerance:
-            self.dimension2_score += 5
-            self.dimension2_details.append(f"+5：{rule_text} ✓")
-        else:
-            # 挑出偏离最远的两处，便于定位
-            max_label = next(l for l, cm in gaps if cm == max_gap)
-            min_label = next(l for l, cm in gaps if cm == min_gap)
-            self.dimension2_details.append(
-                f"+5：{rule_text} ✗（"
-                f"最大间距{max_gap:.2f}cm@{max_label}，"
-                f"最小间距{min_gap:.2f}cm@{min_label}，"
-                f"极差{diff:.2f}cm > 0.15cm）"
-            )
-
-    def _cell_inner_width_pt(self, cell):
-        """单元格净宽（pt）。失败返回 None。"""
-        tcPr = cell._tc.tcPr
-        if tcPr is None:
-            return None
-        tcW = tcPr.find(qn('w:tcW'))
-        if tcW is None:
-            return None
-        try:
-            w_dxa = float(tcW.get(qn('w:w'), '0'))
-        except (TypeError, ValueError):
-            return None
-        if w_dxa <= 0:
-            return None
-        left_dxa = right_dxa = 108.0
-        try:
-            tbl = cell._tc.getparent().getparent()
-            tblCellMar = tbl.find('.//' + qn('w:tblCellMar'))
-            if tblCellMar is not None:
-                l = tblCellMar.find(qn('w:left'))
-                r = tblCellMar.find(qn('w:right'))
-                if l is not None and l.get(qn('w:w')) is not None:
-                    left_dxa = float(l.get(qn('w:w')))
-                if r is not None and r.get(qn('w:w')) is not None:
-                    right_dxa = float(r.get(qn('w:w')))
-        except Exception:
-            pass
-        return max(0.0, (w_dxa - left_dxa - right_dxa) / 20.0)
-
-    def _visual_line_count(self, para, inner_w_pt):
-        """估算段落自动换行后的视觉行数（≥1）。"""
-        import math
-        default_pt = 10.5
-        try:
-            normal_size = self.doc.styles['Normal'].font.size
-            if normal_size is not None:
-                default_pt = normal_size.pt
-        except Exception:
-            pass
-        para_pt = default_pt
-        for r in para.runs:
-            if r.font.size is not None:
-                para_pt = max(para_pt, r.font.size.pt)
-
-        def char_units(ch):
-            code = ord(ch)
-            if (0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF
-                    or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF):
-                return 1.0
-            if code < 128:
-                return 0.55
-            return 1.0
-
-        trimmed = "".join(run.text for run in para.runs).rstrip(" \t　\xa0\r\n")
-        if not trimmed:
-            return 1
-        if not inner_w_pt or inner_w_pt <= 0:
-            return 1
-        text_w = sum(char_units(ch) * para_pt for ch in trimmed)
-        return max(1, math.ceil(text_w / inner_w_pt))
-
-    def _paragraph_line_spacing_cm(self, para):
-        """段落 line spacing（cm）：exact 取值；atLeast 取 max(设置值, 字号自然行高)；
-        auto/未设置按倍数换算，缺省 1.0 倍。"""
-        PT_PER_CM = 28.3464567
-        DXA_PER_CM = 567.0
-
-        default_pt = 10.5
-        try:
-            normal_size = self.doc.styles['Normal'].font.size
-            if normal_size is not None:
-                default_pt = normal_size.pt
-        except Exception:
-            pass
-        para_pt = default_pt
-        for r in para.runs:
-            if r.font.size is not None:
-                para_pt = max(para_pt, r.font.size.pt)
-        natural_cm = para_pt * 1.2 / PT_PER_CM
-
+# 维度二"结果追加顺序"的 (max_delta, kind) 列表；末端把 results 里的 "+N：..."/"-N：..."
+# 反解为结构化 dim2_items 时用。顺序须与 _evaluate_impl 中 results.append(...) 严格一致。
+#   kind='bonus'  ：加分项，命中得 +mag，否则 0；输出 max_delta = +mag
+#   kind='penalty'：减分项，触发扣 mag，否则 0；输出 max_delta = -mag（与其他脚本一致，
+#                   减分项 max_delta 取负值表示该项能造成的最大变动；不计入维度二满分）
+_ITEM_SPECS = [
+    (5, 'bonus'),    # 01 各行均已添加横线
+    (3, 'bonus'),    # 02 横线样式统一（上下单实线 231F20 sz2，无竖线）
+    (5, 'bonus'),    # 03 一行一格（单列、未合并/未拆分）——指令"每一行文字都放到表里"的核心动作
+    (3, 'bonus'),    # 04 已删除空行
+    (3, 'bonus'),    # 05 单元格正文字体字号对齐与原件一致、垂直居中
+    (1, 'bonus'),    # 06 会议内容标签行保留且位于表格上方
+    (1, 'bonus'),    # 07 标题"部门协调会"微软雅黑20.5磅居中
+    (1, 'bonus'),    # 08 表头三行微软雅黑9.5磅
+    (1, 'bonus'),    # 09 表格宽度=版心、单列、纸张页边距未变
+    (5, 'penalty'),  # 10 正文有遗漏/被截断（原为 +5 加分项，见下方说明改为减分项）
+    (3, 'penalty'),  # 11 改动了正文文字内容
+    (3, 'penalty'),  # 12 新增多余表格/文本框
+    (1, 'penalty'),  # 13 添加多余底纹/颜色/高亮/下划线
+    (1, 'penalty'),  # 14 新增页眉/页脚/水印/批注/多余标题说明
+]
+# 维度二满分 = 所有加分项 max_delta 之和（减分项只减不增，不计入满分）
+MAX_SCORE_TOTAL = sum(m for m, k in _ITEM_SPECS if k == 'bonus')
+
+# ===== 参照原"部门协调会记录"版式的期望常量（细则中"未被改动"以此为基准）=====
+STRICT_SONGTI = ('宋体', 'SimSun', 'NSimSun')
+BORDER_COLOR = '231F20'          # 横线颜色（深灰黑）
+BORDER_SZ = 2                    # 横线线宽（1/8 磅，=0.25磅）
+TITLE_TEXT = '部门协调会'
+YAHEI = '微软雅黑'
+# "会议内容"正文的格式基线（细则中"字体字号与对齐方式未被改动"以此为准）。
+# 原件正文本就不是统一格式：主体为宋体 10.5 磅（21 半磅），但"许承柏：请各位成员发表意见？"
+# 若干行为微软雅黑 10.5 磅，议题 5/6/7 的标题行为微软雅黑 10 磅（20 半磅）。这些差异属指令
+# "其他格式保持不变"应原样保留的内容，不得按"统一为宋体 10.5 磅"判罚。
+# 原件中出现过的 (东亚字体关键字集, 半磅) 组合白名单：正文任一 run 必须落在其中。
+BODY_ALLOWED_FONTS = (
+    (STRICT_SONGTI, 21),        # 宋体 10.5 磅（正文主体）
+    ((YAHEI,), 21),             # 微软雅黑 10.5 磅（"请各位成员发表意见？"等行）
+    ((YAHEI,), 20),             # 微软雅黑 10 磅（议题 5/6/7 标题行）
+)
+# 原件中文本唯一、可精确定位的行：字体字号须与原件完全一致（被统一改成宋体 10.5 即不通过）。
+# "请各位成员发表意见？"一行在原件中重复出现且本身宋体/微软雅黑混用，无法逐行定位，
+# 故不列入此表，只受上面白名单约束。
+BODY_PINNED_FONTS = {
+    '5、北苑营业点生产用水及排水设施维护事项': (YAHEI, 20),
+    '6、北苑货区检测设备维修': (YAHEI, 20),
+    '7、北苑货区车辆雨棚整修': (YAHEI, 20),
+}
+# 原件正文绝大多数行并未设置 w:jc（走默认对齐），仅少数行为两端对齐，个别行为左对齐；
+# 故"对齐方式未被改动"只判定是否被改成了明显可见的居中/右对齐/分散对齐，
+# 默认对齐、左对齐、两端对齐三者均视为未被改动。
+ALIGN_CHANGED = ('center', 'right', 'end', 'distribute')
+# 期望页面（原文件 sectPr）：pgSz 11850x16783 twips，pgMar 上下400/左846/右847
+EXPECT_PGW, EXPECT_PGH = 11850, 16783
+EXPECT_MAR = {'top': 400, 'bottom': 400, 'left': 846, 'right': 847}
+# 完整"会议内容"的分节锚点（用于判定是否完整置入、无遗漏）
+CONTENT_ANCHORS = [
+    '一、专题学习', '二、回顾2月份工作情况', '三、作业偏差情况分析', '四、研究后续事项',
+    '1、研究东港作业点值班室照明', '2、研究南苑作业点茶水间排风', '3、研究北苑货区仓库安装高处作业防护挂点',
+    '4、南苑营业点现场办公设施维护', '5、北苑营业点生产用水及排水设施维护', '6、北苑货区检测设备维修',
+    '7、北苑货区车辆雨棚整修', '8、语禾集运服务有限公司申请2026年协同装卸', '最终意见', '散会',
+]
+# 关键事实锚点（会议记录不可被篡改的人名/日期/地点），用于"改动正文"减分项的粗判
+FACT_ANCHORS = ['许承柏', '陈予宁', '侯景澜', '魏预', '周言朔', '林若棠',
+                '2026年3月18日', '综合楼二层会议室']
+
+def _default_para_style_id(styles_el):
+    """styles.xml 中默认段落样式（w:type="paragraph" w:default="1"，通常即 Normal）的 styleId。
+       段落未写 w:pStyle 时，Word 按该样式取值，故继承链须从这里起算。"""
+    for st in styles_el.findall(qn('w:style')):
+        if st.get(qn('w:type')) == 'paragraph' and st.get(qn('w:default')) == '1':
+            return st.get(qn('w:styleId'))
+    return None
+
+
+def _resolve_effective_eastasia(doc, run):
+    """按 Word 字体继承链解析 run 中文字符实际生效的东亚字体：
+       run 直接设定(w:eastAsia) → 段落样式(含 basedOn 链) → docDefaults。都没有则 None。"""
+    rPr = run._element.rPr
+    if rPr is not None:
+        rFonts = rPr.find(qn('w:rFonts'))
+        if rFonts is not None:
+            ea = rFonts.get(qn('w:eastAsia'))
+            if ea:
+                return ea
+    styles_el = doc.styles.element
+    para = run._parent
+    style_id = None
+    try:
         pPr = para._p.find(qn('w:pPr'))
-        spacing = pPr.find(qn('w:spacing')) if pPr is not None else None
-        if spacing is None:
-            return natural_cm
-        line = spacing.get(qn('w:line'))
-        line_rule = spacing.get(qn('w:lineRule'))
-        if line is None:
-            return natural_cm
-        try:
-            lv = float(line)
-        except ValueError:
-            return natural_cm
-        if line_rule == 'exact':
-            return lv / DXA_PER_CM
-        if line_rule == 'atLeast':
-            return max(lv / DXA_PER_CM, natural_cm)
-        # auto / 未指定
-        multiplier = lv / 240.0 if lv > 0 else 1.0
-        return natural_cm * multiplier
+        if pPr is not None:
+            pStyle = pPr.find(qn('w:pStyle'))
+            if pStyle is not None:
+                style_id = pStyle.get(qn('w:val'))
+    except Exception:
+        style_id = None
+    if not style_id:            # 段落未设 w:pStyle → 从默认段落样式(Normal)起算继承链
+        style_id = _default_para_style_id(styles_el)
 
-    def _get_effective_row_height_cm(self, row):
-        """按 Word 实际渲染语义计算行高 (cm)：
-        - exact：取 trHeight 设置值
-        - atLeast/auto/未设置：max(设置值, 内容需要高度)
-        """
-        set_cm = None
-        rule = None
-        try:
-            trPr = row._tr.find(qn('w:trPr'))
-            trHeight = trPr.find(qn('w:trHeight')) if trPr is not None else None
-            if trHeight is not None:
-                h_val = trHeight.get(qn('w:val'))
-                rule = trHeight.get(qn('w:hRule'))
-                if h_val is not None:
-                    try:
-                        set_cm = float(h_val) / 567.0  # 1 cm = 567 dxa
-                    except (TypeError, ValueError):
-                        set_cm = None
-        except Exception:
-            pass
+    def _style_by_id(sid):
+        for st in styles_el.findall(qn('w:style')):
+            if st.get(qn('w:styleId')) == sid:
+                return st
+        return None
 
-        if rule == 'exact' and set_cm is not None:
-            return set_cm
+    seen = set()
+    while style_id and style_id not in seen:
+        seen.add(style_id)
+        st = _style_by_id(style_id)
+        if st is None:
+            break
+        rpr = st.find(qn('w:rPr'))
+        if rpr is not None:
+            rf = rpr.find(qn('w:rFonts'))
+            if rf is not None:
+                ea = rf.get(qn('w:eastAsia'))
+                if ea:
+                    return ea
+        base = st.find(qn('w:basedOn'))
+        style_id = base.get(qn('w:val')) if base is not None else None
 
-        content_cm = self._estimate_content_height_cm(row)
-        if set_cm is None and content_cm is None:
+    dd = styles_el.find(qn('w:docDefaults'))
+    if dd is not None:
+        rpd = dd.find(qn('w:rPrDefault'))
+        if rpd is not None:
+            rpr = rpd.find(qn('w:rPr'))
+            if rpr is not None:
+                rf = rpr.find(qn('w:rFonts'))
+                if rf is not None:
+                    ea = rf.get(qn('w:eastAsia'))
+                    if ea:
+                        return ea
+    return None
+
+
+def _resolve_effective_size_halfpt(doc, run):
+    """按 Word 继承链解析 run 实际生效字号（半磅）：run → 段落样式(basedOn 链) → docDefaults。"""
+    def _sz_of(rpr):
+        if rpr is None:
             return None
-        if set_cm is None:
-            return content_cm
-        if content_cm is None:
-            return set_cm
-        return max(set_cm, content_cm)
-
-    def _estimate_content_height_cm(self, row):
-        """估算行内容需要的高度（cm）——跨单元格取最大值。
-
-        单元格高度 = Σ 每段（视觉行数 × 单行高度）
-        - 视觉行数 = ceil(段落文字视觉宽度 / 单元格净宽)，至少 1
-        - 单行高度 pt = 段落最大字号 × 1.2 × max(行距倍数, 1.0)
-        """
-        import math
-        PT_PER_CM = 28.3464567
-        DXA_PER_CM = 567.0
-
-        default_pt = 10.5
-        try:
-            normal_size = self.doc.styles['Normal'].font.size
-            if normal_size is not None:
-                default_pt = normal_size.pt
-        except Exception:
-            pass
-
-        def char_units(ch):
-            code = ord(ch)
-            if (0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF
-                    or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF):
-                return 1.0
-            if code < 128:
-                return 0.55
-            return 1.0
-
-        def cell_inner_width_pt(cell):
-            tcPr = cell._tc.tcPr
-            if tcPr is None:
-                return None
-            tcW = tcPr.find(qn('w:tcW'))
-            if tcW is None:
-                return None
-            try:
-                w_dxa = float(tcW.get(qn('w:w'), '0'))
-            except (TypeError, ValueError):
-                return None
-            if w_dxa <= 0:
-                return None
-            left_dxa = right_dxa = 108.0
-            try:
-                tbl = cell._tc.getparent().getparent()
-                tblCellMar = tbl.find('.//' + qn('w:tblCellMar'))
-                if tblCellMar is not None:
-                    l = tblCellMar.find(qn('w:left'))
-                    r = tblCellMar.find(qn('w:right'))
-                    if l is not None and l.get(qn('w:w')) is not None:
-                        left_dxa = float(l.get(qn('w:w')))
-                    if r is not None and r.get(qn('w:w')) is not None:
-                        right_dxa = float(r.get(qn('w:w')))
-            except Exception:
-                pass
-            return max(0.0, (w_dxa - left_dxa - right_dxa) / 20.0)
-
-        max_cell_cm = 0.0
-        try:
-            for cell in row.cells:
-                inner_w = cell_inner_width_pt(cell)
-                cell_total_pt = 0.0
-                for para in cell.paragraphs:
-                    para_pt = default_pt
-                    for run in para.runs:
-                        if run.font.size is not None:
-                            para_pt = max(para_pt, run.font.size.pt)
-                    # 行距倍数
-                    line_mul = 1.0
-                    pPr = para._p.find(qn('w:pPr'))
-                    spacing = pPr.find(qn('w:spacing')) if pPr is not None else None
-                    if spacing is not None:
-                        line = spacing.get(qn('w:line'))
-                        line_rule = spacing.get(qn('w:lineRule'))
-                        if line is not None:
-                            try:
-                                lv = float(line)
-                            except ValueError:
-                                lv = None
-                            if lv is not None:
-                                if line_rule == 'exact':
-                                    # 精确行距（dxa）：等价行距倍数 = 精确 pt / (字号 × 1.2)
-                                    exact_pt = lv / 20.0
-                                    denom = para_pt * 1.2
-                                    line_mul = exact_pt / denom if denom > 0 else 1.0
-                                elif line_rule == 'atLeast':
-                                    exact_pt = lv / 20.0
-                                    denom = para_pt * 1.2
-                                    line_mul = max(1.0, exact_pt / denom if denom > 0 else 1.0)
-                                else:  # auto 或未指定
-                                    line_mul = lv / 240.0 if lv > 0 else 1.0
-
-                    trimmed = "".join(run.text for run in para.runs).rstrip(" \t　\xa0\r\n")
-                    if not trimmed:
-                        lines = 1
-                    else:
-                        text_w = sum(char_units(ch) * para_pt for ch in trimmed)
-                        if inner_w and inner_w > 0:
-                            lines = max(1, math.ceil(text_w / inner_w))
-                        else:
-                            lines = 1
-                    line_pt = para_pt * 1.2 * line_mul
-                    cell_total_pt += lines * line_pt
-                cm = cell_total_pt / PT_PER_CM
-                if cm > max_cell_cm:
-                    max_cell_cm = cm
-        except Exception:
+        sz = rpr.find(qn('w:sz'))
+        if sz is None:
             return None
+        v = sz.get(qn('w:val'))
+        return int(v) if v and v.lstrip('-').isdigit() else None
 
-        return max_cell_cm if max_cell_cm > 0 else None
+    v = _sz_of(run._element.rPr)
+    if v is not None:
+        return v
+    styles_el = doc.styles.element
+    para = run._parent
+    style_id = None
+    try:
+        pPr = para._p.find(qn('w:pPr'))
+        if pPr is not None:
+            pStyle = pPr.find(qn('w:pStyle'))
+            if pStyle is not None:
+                style_id = pStyle.get(qn('w:val'))
+    except Exception:
+        style_id = None
+    if not style_id:            # 段落未设 w:pStyle → 从默认段落样式(Normal)起算继承链
+        style_id = _default_para_style_id(styles_el)
 
-    def _check_images_and_non_editable(self):
-        """-5：文中出现图片或者不可编辑的部分"""
-        has_images = False
+    def _style_by_id(sid):
+        for st in styles_el.findall(qn('w:style')):
+            if st.get(qn('w:styleId')) == sid:
+                return st
+        return None
 
-        # 检查段落中的图片
-        for para in self.doc.paragraphs:
-            for run in para.runs:
-                # 检查是否有图片
-                if hasattr(run, '_element'):
-                    for pic in run._element.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing'):
-                        has_images = True
-                        break
-                if has_images:
-                    break
-            if has_images:
-                break
-
-        # 检查表格中的图片
-        if not has_images:
-            for table in self.doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        for para in cell.paragraphs:
-                            for run in para.runs:
-                                if hasattr(run, '_element'):
-                                    for pic in run._element.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing'):
-                                        has_images = True
-                                        break
-                                if has_images:
-                                    break
-                            if has_images:
-                                break
-                        if has_images:
-                            break
-                    if has_images:
-                        break
-                if has_images:
-                    break
-
-        if has_images:
-            self.dimension2_score -= 5
-            self.dimension2_details.append("-5：文中出现图片或者不可编辑的部分 ✗")
-        else:
-            self.dimension2_details.append("-5：文中出现图片或者不可编辑的部分 ✓")
-
-    def _check_first_page_header(self):
-        """-5：文档第一页顶部不满足其中任意一项：文档标题为"部门协调会"；
-        主持人为许承柏；地点为综合楼二层会议室
-
-        标准文档版式中标题独占一段（B2），随后是"时间/主持人/记录人"一行
-        （B4），再是"地点/应出席数/实出席数"一行（B6），均在文档最前面
-        （表格/会议内容之前）。此前的实现只对前10个段落做整体拼接后的
-        子串包含匹配：既不能确认标题是否精确为"部门协调会"（可能只是
-        某个较长句子里包含这四个字），也不能确认"主持人"字段本身存在
-        （"许承柏"可能出现在正文其它位置而不是主持人字段）。
-        改为：只在文档最前面若干段落（表格/会议内容开始之前）中，用
-        "字段标签 + 分隔符 + 值"的正则做字段级精确匹配；标题段落要求
-        strip 后原文本严格等于"部门协调会"。
-        """
-        # 字段标签内的字符之间可能插入全角/半角空格（如 "主  持  人"），
-        # 用 [\s]* 把标签逐字符间的空白容忍掉。
-        def label_pattern(label):
-            return r'[\s]*'.join(re.escape(ch) for ch in label)
-
-        # 顶部区域：取表格/会议内容之前的普通段落（顶部字段不可能出现在
-        # 表格里），并限定在文档开头一个较小的窗口内，避免匹配到正文中
-        # 出现的同名字符串。
-        top_paragraphs = []
-        for para in self.doc.paragraphs:
-            if len(top_paragraphs) >= 15:
-                break
-            top_paragraphs.append(para.text)
-
-        has_title = any(p.strip() == "部门协调会" for p in top_paragraphs)
-
-        host_re = re.compile(label_pattern("主持人") + r'[\s:：]+许承柏')
-        has_host = any(host_re.search(p) for p in top_paragraphs)
-
-        location_re = re.compile(label_pattern("地点") + r'[\s:：]+综合楼二层会议室')
-        has_location = any(location_re.search(p) for p in top_paragraphs)
-
-        if has_title and has_host and has_location:
-            self.dimension2_details.append("-5：文档第一页顶部不满足其中任意一项 ✓")
-        else:
-            self.dimension2_score -= 5
-            missing = []
-            if not has_title:
-                missing.append("文档标题为'部门协调会'")
-            if not has_host:
-                missing.append("主持人为许承柏")
-            if not has_location:
-                missing.append("地点为综合楼二层会议室")
-            missing_str = ", ".join(missing)
-            self.dimension2_details.append(f"-5：文档第一页顶部不满足其中任意一项 ✗（缺少: {missing_str}）")
-
-    def _check_meeting_content_indent(self):
-        """-1："会议内容："下方第一行出现缩进
-
-        - 冒号兼容全角"："(U+FF1A) 与半角":"(U+003A)，允许"会议内容"与冒号之间有空白；
-        - "下方第一行"按 body 元素的版面顺序取：紧挨着的下一段；若紧跟的是表格，则
-          取该表格第 1 行第 1 列的第一个非空段落。
-        """
-        if self.doc is None:
-            return
-
-        from docx.oxml.ns import qn
-        from docx.text.paragraph import Paragraph
-        from docx.table import Table
-
-        marker_re = re.compile(r'会议内容\s*[:：]')
-
-        body = self.doc.element.body
-        children = list(body)
-        # Paragraph/Table 需要一个 parent 来定位 story part，正文段落的 parent 就是文档 body
-        parent = self.doc.paragraphs[0]._parent if self.doc.paragraphs else self.doc.element.body
-
-        found_marker = False
-        next_line_indent = False
-        marker_idx = -1
-
-        for idx, child in enumerate(children):
-            if child.tag == qn('w:p'):
-                text = ''.join((t.text or '') for t in child.iter(qn('w:t')))
-                if marker_re.search(text):
-                    found_marker = True
-                    marker_idx = idx
-                    break
-
-        def _has_indent(para):
-            fli = para.paragraph_format.first_line_indent
-            li = para.paragraph_format.left_indent
-            return (fli is not None and fli.pt > 0) or (li is not None and li.pt > 0)
-
-        if found_marker:
-            for j in range(marker_idx + 1, len(children)):
-                nxt = children[j]
-                if nxt.tag == qn('w:p'):
-                    next_para = Paragraph(nxt, parent)  # type: ignore[arg-type]
-                    # 空段落不算"下一行"，继续向后找
-                    if not next_para.text.strip():
-                        continue
-                    if _has_indent(next_para):
-                        next_line_indent = True
-                    break
-                elif nxt.tag == qn('w:tbl'):
-                    tbl = Table(nxt, parent)  # type: ignore[arg-type]
-                    first_para = None
-                    if tbl.rows and tbl.rows[0].cells:
-                        for p in tbl.rows[0].cells[0].paragraphs:
-                            if p.text.strip():
-                                first_para = p
-                                break
-                        if first_para is None and tbl.rows[0].cells[0].paragraphs:
-                            # 单元格全空，退而取第一个段落
-                            first_para = tbl.rows[0].cells[0].paragraphs[0]
-                    if first_para is not None and _has_indent(first_para):
-                        next_line_indent = True
-                    break
-
-        if found_marker and next_line_indent:
-            self.dimension2_score -= 1
-            self.dimension2_details.append('-1："会议内容："下方第一行出现缩进 ✗')
-        elif not found_marker:
-            self.dimension2_details.append("-1：未找到会议内容标记，跳过检查")
-        else:
-            self.dimension2_details.append('-1："会议内容："下方第一行出现缩进 ✓')
-
-    def _iter_all_text(self):
-        """收集文档全部文字（含嵌套表格）。python-docx 的 doc.tables 与 cell.text
-        仅覆盖顶层表格与非嵌套内容，直接拼接会漏掉表中表内的文字。"""
-        if self.doc is None:
-            return ""
-        buf = []
-        for para in self.doc.paragraphs:
-            buf.append(para.text)
-
-        def walk_table(tbl):
-            for row in tbl.rows:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        buf.append(para.text)
-                    for sub in cell.tables:
-                        walk_table(sub)
-
-        for tbl in self.doc.tables:
-            walk_table(tbl)
-        return "\n".join(buf)
-
-    def _check_hou_jinglan_text(self):
-        """-1：侯景澜文本内容检查"""
-        all_text = self._iter_all_text()
-
-        target_text = "侯景澜：上月两项重点现场事项整改推进如下："
-        if target_text in all_text:
-            self.dimension2_details.append('-1：文中没有出现"侯景澜：上月两项重点现场事项整改推进如下："文本内容 ✓')
-        else:
-            self.dimension2_score -= 1
-            self.dimension2_details.append('-1：文中没有出现"侯景澜：上月两项重点现场事项整改推进如下："文本内容 ✗')
-
-    def _check_indentation_between_sections(self):
-        """-1：区间缩进检查"""
-        # 获取所有文本内容
-        all_content = []
-        for para in self.doc.paragraphs:
-            all_content.append(('paragraph', para.text, para))
-        for table in self.doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        all_content.append(('cell', para.text, para))
-
-        # 查找两个标记之间的内容
-        start_text = "二月份作业偏差共发生若干件，具体情况如下："
-        end_text = "四、研究后续事项"
-
-        found_start = False
-        found_end = False
-        has_indentation = False
-
-        for content_type, text, para in all_content:
-            if not found_start:
-                if start_text in text:
-                    found_start = True
-                continue
-
-            if found_start and not found_end:
-                if end_text in text or "四、研究后续事项" in text:
-                    found_end = True
-                    break
-
-                # 检查此段落是否有缩进
-                if text.strip():  # 只检查非空段落
-                    first_line_indent = para.paragraph_format.first_line_indent
-                    left_indent = para.paragraph_format.left_indent
-
-                    if (first_line_indent is not None and first_line_indent.pt > 0) or \
-                       (left_indent is not None and left_indent.pt > 0):
-                        has_indentation = True
-
-        if found_start and found_end and has_indentation:
-            self.dimension2_score -= 1
-            self.dimension2_details.append('-1："二月份作业偏差共发生若干件，具体情况如下："与"四、研究后续事项"之间的文本出现缩进 ✗')
-        elif not found_start or not found_end:
-            self.dimension2_details.append("-1：未找到指定的章节标记，跳过检查")
-        else:
-            self.dimension2_details.append('-1："二月份作业偏差共发生若干件，具体情况如下："与"四、研究后续事项"之间的文本出现缩进 ✓')
-
-    def _check_xu_chengbai_text_format(self):
-        """已废弃：该评分细则已删除，保留空实现以避免外部误调用。"""
-        return
-
-    def evaluate(self):
-        """执行完整评估"""
-        # 维度1评估
-        if self.load_document():
-            self.evaluate_dimension1()
-
-        # 维度1未通过：仅输出维度1详情
-        if not self.dimension1_passed:
-            print("维度一：未通过")
-            for detail in self.dimension1_details:
-                print(detail)
-            return self.dimension1_passed, self.dimension2_score, self.dimension1_details, self.dimension2_details
-
-        # 维度1通过
-        print("维度一：通过")
-
-        # 维度2评估：仅打印命中项（+项达标 或 -项违反）
-        self.evaluate_dimension2()
-        print("维度二：评分结果")
-
-        hit_pattern = re.compile(r'^([+-]\d+)：([^✓✗]+?)\s*[✓✗]')
-        for detail in self.dimension2_details:
-            is_plus_hit = detail.startswith('+') and '✓' in detail
-            is_minus_hit = detail.startswith('-') and '✗' in detail
-            if not (is_plus_hit or is_minus_hit):
-                continue
-            m = hit_pattern.match(detail)
-            if m:
-                score, rule = m.group(1), m.group(2).strip()
-                print(f"{score}：{rule}")
-            else:
-                # 兜底：原样输出（去掉末尾说明）
-                print(detail)
-
-        print(f"总分：{self.dimension2_score}")
-
-        return self.dimension1_passed, self.dimension2_score, self.dimension1_details, self.dimension2_details
+    seen = set()
+    while style_id and style_id not in seen:
+        seen.add(style_id)
+        st = _style_by_id(style_id)
+        if st is None:
+            break
+        v = _sz_of(st.find(qn('w:rPr')))
+        if v is not None:
+            return v
+        base = st.find(qn('w:basedOn'))
+        style_id = base.get(qn('w:val')) if base is not None else None
+    dd = styles_el.find(qn('w:docDefaults'))
+    if dd is not None:
+        rpd = dd.find(qn('w:rPrDefault'))
+        if rpd is not None:
+            v = _sz_of(rpd.find(qn('w:rPr')))
+            if v is not None:
+                return v
+    return None
 
 
-def _build_dim2_items(details):
-    """把 dimension2_details 里的可读文本解析为结构化条目。
-
-    保留原有 `_check_*` 生成文本的逻辑不动，此处只做二次解析：
-    - `+N`：✓ 计为命中（得分 +N）；✗ 计为未命中（0）
-    - `-N`：✗ 计为命中（得分 -N，即触发扣分）；✓ 计为未命中（0）
-    - "未找到..跳过检查" 等无标记行，视为未命中且带上"跳过检查"说明
-    """
-    hit_pattern = re.compile(r'^([+-])(\d+)：(.+?)\s*(✓|✗)\s*(?:（(.*?)）)?\s*$')
-    skip_pattern = re.compile(r'^([+-])(\d+)：(.+)$')
-    items = []
-    for line in details:
-        m = hit_pattern.match(line)
-        if m:
-            sign, num, rule, mark, extra = m.groups()
-            max_delta = int(num) if sign == '+' else -int(num)
-            hit = (mark == '✓') if max_delta >= 0 else (mark == '✗')
-            items.append({
-                "rule": rule.strip(),
-                "max_delta": max_delta,
-                "delta": max_delta if hit else 0,
-                "hit": hit,
-                "detail": "",
-            })
-            continue
-        m2 = skip_pattern.match(line)
-        if m2:
-            sign, num, rest = m2.groups()
-            max_delta = int(num) if sign == '+' else -int(num)
-            items.append({
-                "rule": rest.strip(),
-                "max_delta": max_delta,
-                "delta": 0,
-                "hit": False,
-                "detail": "",
-            })
-    return items
+def _norm(s):
+    """去除所有空白（含全角空格/NBSP）后的文本，用于稳健的子串/相等比较。"""
+    return re.sub(r'\s+', '', (s or '')).replace('　', '').replace('\xa0', '')
 
 
-def evaluate(dir_path: str):
-    """统一评估入口。
+def _elem_text(elem):
+    """OOXML 元素内所有 w:t 文本拼接。"""
+    return ''.join(t.text or '' for t in elem.iter(qn('w:t')))
 
-    参数:
-        dir_path: 脚本所在目录的路径。脚本自行在该目录中定位并打开被评估文档。
 
-    返回:
-        结构化评估结果字典，字段规范见"脚本接口差异与统一建议.md §2.2"。
-    """
+def _cell_own_text(tc):
+    """单元格自身文字：只取其直属 w:p，不含嵌套表格内的文字。"""
+    if tc is None:
+        return ''
+    return ''.join(_elem_text(p) for p in tc.findall(qn('w:p')))
+
+
+def _flatten_content_rows(tbl_elem):
+    """按文档顺序展平表格的"内容行"，返回 [(tr, 首单元格 tc), ...]。
+       单元格内若嵌有表格（原文件"一、专题学习"格内即嵌了一张 56 行的表），
+       其各行也是"会议内容"的显示行，须一并纳入逐行判定，否则会被整块漏掉。"""
+    out = []
+    for tr in tbl_elem.findall(qn('w:tr')):
+        cells = tr.findall(qn('w:tc'))
+        out.append((tr, cells[0] if cells else None))
+        for tc in cells:
+            for nested in tc.findall(qn('w:tbl')):
+                out.extend(_flatten_content_rows(nested))
+    return out
+
+
+def _find_content_table_elem(doc):
+    """定位"会议内容"标签段之后的第一个表格元素(w:tbl)；找不到则回退为行数最多的表格。"""
+    body = doc.element.body
+    label_seen = False
+    for child in body.iterchildren():
+        tag = child.tag.split('}')[-1]
+        if tag == 'p':
+            if '会议内容' in _norm(_elem_text(child)):
+                label_seen = True
+        elif tag == 'tbl':
+            if label_seen:
+                return child
+    # 回退：行数最多的表格
+    best, best_rows = None, -1
+    for tbl in body.findall(qn('w:tbl')):
+        n = len(tbl.findall(qn('w:tr')))
+        if n > best_rows:
+            best, best_rows = tbl, n
+    return best
+
+
+def _border_edge(tcPr, name):
+    """返回单元格某条边框的 (val, color, sz)；无则 (None,None,None)。"""
+    if tcPr is None:
+        return (None, None, None)
+    tb = tcPr.find(qn('w:tcBorders'))
+    if tb is None:
+        return (None, None, None)
+    e = tb.find(qn('w:' + name))
+    if e is None:
+        return (None, None, None)
+    return (e.get(qn('w:val')), e.get(qn('w:color')), e.get(qn('w:sz')))
+
+
+def _has_line(val):
+    return val is not None and val not in ('none', 'nil')
+
+
+def _char_em(ch):
+    """单个字符的显示宽度（相对字号 em）：CJK 及全角标点/全角字符按 1 em，
+    其余（ASCII 字母数字、半角标点、空格）按 0.5 em。"""
+    o = ord(ch)
+    if (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0xF900 <= o <= 0xFAFF
+            or 0x3000 <= o <= 0x303F         # CJK 标点（，。、；：「」等）
+            or 0xFF00 <= o <= 0xFFEF          # 全角 ASCII / 全角标点
+            or 0x2018 <= o <= 0x201F          # 中文引号
+            or 0x2E80 <= o <= 0x2EFF):        # CJK 部首补充
+        return 1.0
+    return 0.5
+
+
+def _row_is_merged(text, usable_twips, half_pt, tol=1.15):
+    """静态估算某行单元格文字是否明显超过"一个显示行"的宽度——用于识别把多行
+    正文合并进同一格（导致中间缺横线）的情况。.docx 不存储换行位置，故据字号与
+    字宽近似求文本总宽，超过版心可用宽的 tol 倍则判为"合并了多行"。"""
+    if not text or usable_twips <= 0:
+        return False
+    em = (half_pt / 2.0) * 20.0              # 1 em 宽度（twips）≈ 字号磅数 × 20
+    if em <= 0:
+        return False
+    width = sum(_char_em(c) for c in text) * em
+    return width > usable_twips * tol
+
+
+class _ParaLite:
+    """给 _resolve_effective_* 用的极简段落包装：只暴露 _p（段落底层元素）。"""
+    def __init__(self, doc, p_elem):
+        self._p = p_elem
+
+
+class _RunLite:
+    """给 _resolve_effective_* 用的极简 run 包装：_element 为 w:r（CT_R，含 .rPr），
+    _parent 为 _ParaLite。python-docx 解析出的元素均为注册的自定义类，故 .rPr 可用。"""
+    def __init__(self, r_elem, para):
+        self._element = r_elem
+        self._parent = para
+
+
+
+def _locate_error(result, message):
+    """未能在目录中定位到被评估文档（目录不存在 / 目录中没有 .docx）：维度一根本没有进入判定，
+    故 dim1_pass 置为空字符串表示"未判定"，dim1_reason 留空，失败摘要只写在 error；
+    维度二一项未评，max_score 同时归 0。"""
+    result["status"] = "error"
+    result["error"] = message
+    result["dim1_pass"] = ""
+    result["dim1_reason"] = ""
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = 0
+    return result
+
+
+def evaluate(dir_path):
+    """按统一约定返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为目录路径，脚本自己在其中定位并打开被评估的 .docx（忽略 ~$ 临时锁文件）。
+    脚本自身崩溃（目录不存在 / 未发现文档 / 文件损坏无法打开等）由本函数捕获并返回 status='error'。
+
+    输出约定：
+      ① 定位不到被评估文档（目录不存在 / 无 .docx）→ status='error'，error 写失败摘要，
+         dim1_pass=""（未判定）、dim1_reason=""、dim2_items=[]、total_score=0、max_score=0；
+      ② 文档存在但打不开等导致维度一不通过 → status='error'，dim1_pass=False，
+         此时 dim1_reason 须写出错误摘要（与 error 同文）。"""
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
     }
     try:
-        if not os.path.isdir(dir_path):
-            raise FileNotFoundError(f"目录不存在: {dir_path}")
-
-        # 在目录中定位被评估文档：优先精确文件名，否则回退到目录内首个 .docx
-        target = os.path.join(dir_path, EXPECTED_DOC_NAME)
-        if not os.path.isfile(target):
-            candidates = sorted(
-                f for f in os.listdir(dir_path)
-                if f.lower().endswith(".docx") and not f.startswith("~$")
-            )
-            if not candidates:
-                raise FileNotFoundError(f"目录中未找到 .docx 文件: {dir_path}")
-            target = os.path.join(dir_path, candidates[0])
-
-        result["file_name"] = os.path.basename(target)
-
-        evaluator = DocumentEvaluator(target)
-        if evaluator.load_document():
-            evaluator.evaluate_dimension1()
-
-        result["dim1_pass"] = evaluator.dimension1_passed
-        if not evaluator.dimension1_passed:
-            fail_msgs = [d for d in evaluator.dimension1_details if d.startswith("✗")]
-            result["dim1_reason"] = "; ".join(fail_msgs) if fail_msgs else "维度一未通过"
-            return result
-
-        # 维度一通过：评估维度二
-        evaluator.evaluate_dimension2()
-        items = _build_dim2_items(evaluator.dimension2_details)
-        result["dim2_items"] = items
-        # 满分 = 所有 +N 项之和；扣分项不计入满分
-        result["max_score"] = sum(it["max_delta"] for it in items if it["max_delta"] > 0)
-        result["total_score"] = evaluator.dimension2_score
-        return result
-    except Exception as e:
+        if not dir_path or not os.path.isdir(dir_path):
+            return _locate_error(result, f"目录不存在：{dir_path}")
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith('.docx') and not f.startswith('~$')
+        )
+        if not cands:
+            return _locate_error(result, f"目录中未找到 .docx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except Exception as exc:
+        # 文件损坏/无法打开等 → 维度一不通过，完成度记 0；错误摘要同时写入 error 与 dim1_reason。
+        summary = f"{type(exc).__name__}: {exc}"
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = summary
+        result["dim1_pass"] = False
+        result["dim1_reason"] = summary
+        result["dim2_items"] = []
+        result["total_score"] = 0
         return result
 
 
-if __name__ == "__main__":
-    # 本地自测：默认使用脚本所在目录；也可通过命令行显式传入目录
-    _dir = sys.argv[1] if len(sys.argv) >= 2 else os.path.dirname(os.path.abspath(__file__))
+def _finalize(result, results):
+    """把 results 里的 "+N：..."/"-N：..." 按 _ITEM_SPECS 顺序反解为结构化 dim2_items。"""
+    if len(results) != len(_ITEM_SPECS):
+        raise RuntimeError(
+            f"dim2 项数不一致：results={len(results)} vs specs={len(_ITEM_SPECS)}"
+        )
+    dim2_items = []
+    total = 0
+    for raw, (mag, kind) in zip(results, _ITEM_SPECS):
+        head, _, rule = raw.partition("：")
+        num = int(re.sub(r'[^0-9]', '', head) or 0)
+        if kind == 'bonus':
+            hit = num > 0
+            delta = mag if hit else 0
+            max_delta = mag
+        else:  # penalty
+            hit = num > 0                      # 触发扣分即视为"命中该减分项"
+            delta = -mag if hit else 0
+            max_delta = -mag                   # 该减分项能造成的最大变动（负值）
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": hit,
+        })
+        total += delta
+    result["dim2_items"] = dim2_items
+    result["total_score"] = max(0, total)      # 完成度不低于 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def _evaluate_impl(file_path, result):
+    doc = Document(file_path)
+    results = []
+
+    # ========== 维度1：可用与可修改性（门禁） ==========
+    # 细则维度1 仅要求"交付文件应为1个可正常打开的Word文档（.docx）"：
+    # 能被 Document() 成功打开即通过；打不开的情形已在 evaluate() 中捕获为不通过。
+    result["dim1_pass"] = True
+    result["dim1_reason"] = ""          # 通过时不填理由；不通过的情形只发生在 evaluate 的
+                                        # 异常分支（status='error'），那里错误摘要同时写入
+                                        # error 与 dim1_reason
+
+    tbl_elem = _find_content_table_elem(doc)
+    if tbl_elem is None:
+        # 找不到可评的"会议内容"表格不再作为门禁项，维度2 各加分项均不得分。
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+    rows = tbl_elem.findall(qn('w:tr'))
+    table_text = _elem_text(tbl_elem)
+
+    # 预取每行首单元格（本任务表格为单列一行一格）。嵌套表格的行一并展平纳入，
+    # 否则嵌在单元格里的整块内容会绕过下面所有逐行判定。
+    row_pairs = _flatten_content_rows(tbl_elem)
+    rows = [tr for tr, _ in row_pairs]
+    row_cells = [tr.findall(qn('w:tc')) for tr in rows]
+    row_first_tc = [tc for _, tc in row_pairs]
+    # 行文字只取单元格自身段落：宿主行不应把嵌套表格的文字算作自己的一行
+    row_texts = [_norm(_cell_own_text(tc)) for tc in row_first_tc]
+    full_table_text = _norm(table_text)
+    full_doc_text = _norm('\n'.join(p.text for p in doc.paragraphs) + table_text)
+
+    # 单元格可用文字宽（twips）：优先取实际表宽，否则用版心宽；再扣默认单元格左右内边距。
+    content_w_twips = EXPECT_PGW - EXPECT_MAR['left'] - EXPECT_MAR['right']
+    _tblPr0 = tbl_elem.find(qn('w:tblPr'))
+    if _tblPr0 is not None:
+        _wEl0 = _tblPr0.find(qn('w:tblW'))
+        if _wEl0 is not None and (_wEl0.get(qn('w:w')) or '').isdigit():
+            content_w_twips = int(_wEl0.get(qn('w:w')))
+    usable_twips = max(1, content_w_twips - 216)   # 默认单元格左右内边距各约 108 twips
+
+    def _cell_rep_halfpt(tc):
+        """取单元格首个有文字 run 的生效字号（半磅）；取不到默认 21（=10.5磅）。"""
+        if tc is None:
+            return 21
+        for p in tc.findall(qn('w:p')):
+            para = _ParaLite(doc, p)
+            for r_el in p.findall(qn('w:r')):
+                run = _RunLite(r_el, para)
+                t = ''.join(x.text or '' for x in r_el.iter(qn('w:t')))
+                if t.strip():
+                    h = _resolve_effective_size_halfpt(doc, run)
+                    return h if h else 21
+        return 21
+
+    # 逐行判定是否"把多行合并进了同一格"（其内部换行处必然缺横线）
+    row_merged = [_row_is_merged(t, usable_twips, _cell_rep_halfpt(tc))
+                  for tc, t in zip(row_first_tc, row_texts)]
+
+    # ========== 维度2：完成度评分 ==========
+
+    # +5：表格各行均已添加横线，全表逐行覆盖，无遗漏或缺线行
+    #     注：把多行正文合并进同一格的行，其内部换行处并无横线 → 视为"缺线行"，不计入。
+    lined_rows = 0
+    for tc, merged in zip(row_first_tc, row_merged):
+        tcPr = tc.find(qn('w:tcPr')) if tc is not None else None
+        tv, _, _ = _border_edge(tcPr, 'top')
+        bv, _, _ = _border_edge(tcPr, 'bottom')
+        if (_has_line(tv) or _has_line(bv)) and not merged:
+            lined_rows += 1
+    if rows and lined_rows == len(rows):
+        results.append("+5：表格各行均已添加横线，全表逐行覆盖，无遗漏或缺线行")
+    else:
+        results.append("+0：表格各行均已添加横线，全表逐行覆盖，无遗漏或缺线行")
+
+    # +3：横线样式为上、下两条水平细实线（single、#231F20、sz=2），全表统一，且不含左右竖线
+    style_ok = bool(rows)
+    for tc in row_first_tc:
+        tcPr = tc.find(qn('w:tcPr')) if tc is not None else None
+        tv, tc_, tsz = _border_edge(tcPr, 'top')
+        bv, bc, bsz = _border_edge(tcPr, 'bottom')
+        lv, _, _ = _border_edge(tcPr, 'left')
+        rv, _, _ = _border_edge(tcPr, 'right')
+
+        def _ok(v, c, s):
+            return (v == 'single' and (c or '').upper() == BORDER_COLOR
+                    and s is not None and s.isdigit() and int(s) == BORDER_SZ)
+        if not (_ok(tv, tc_, tsz) and _ok(bv, bc, bsz)):
+            style_ok = False
+            break
+        if _has_line(lv) or _has_line(rv):
+            style_ok = False
+            break
+    if style_ok:
+        results.append("+3：横线样式为上下两条水平细实线（单线、#231F20、sz=2），全表统一且不含左右竖线")
+    else:
+        results.append("+0：横线样式为上下两条水平细实线（单线、#231F20、sz=2），全表统一且不含左右竖线")
+
+    # +5：每一显示行的文字对应表格中的一行，一行一格（单列；未合并多行、未拆分一行）
+    #     权重与"逐行加横线"并列为 5 分：这是指令"每一行文字都放到表里面"的核心动作，
+    #     也是最易做错的一项（把整段塞进一格、或把一行切到多格）。
+    one_line_ok = bool(rows)
+    for cs, tc, merged in zip(row_cells, row_first_tc, row_merged):
+        if len(cs) != 1:                       # 单元格>1 → 一行被拆到多格
+            one_line_ok = False
+            break
+        # 单个单元格内若含多个非空段落 → 多行被合并进同一格
+        nonempty_ps = [p for p in tc.findall(qn('w:p')) if _norm(_elem_text(p))]
+        if len(nonempty_ps) > 1:
+            one_line_ok = False
+            break
+        if merged:                             # 单段落但文字超一显示行 → 多行被合并进同一格
+            one_line_ok = False
+            break
+    if one_line_ok:
+        results.append("+5：会议内容每一显示行对应表格一行，一行一格，未合并多行亦未拆分一行")
+    else:
+        results.append("+0：会议内容每一显示行对应表格一行，一行一格，未合并多行亦未拆分一行")
+
+    # +3：已删除"会议内容"区域内所有无文字的空行（此处判定表格内无空行）
+    empty_rows = sum(1 for t in row_texts if t == '')
+    if empty_rows == 0:
+        results.append("+3：已删除会议内容区域内所有无文字的空行，删除后无残留空白行")
+    else:
+        results.append("+0：已删除会议内容区域内所有无文字的空行，删除后无残留空白行")
+
+    # +3：单元格正文各行的字体、字号与对齐方式与原文件一致（未被改动），且垂直居中
+    #     原件正文本非统一格式（见 BODY_ALLOWED_FONTS / BODY_PINNED_FONTS 注释），故判定为：
+    #     ① 每个 run 的 (字体, 字号) 必须是原件出现过的组合；② 原件中文本唯一的议题 5/6/7
+    #     标题行须仍为微软雅黑 10 磅；③ 对齐未被改成居中/右对齐/分散对齐；④ 单元格垂直居中。
+    font_ok = bool(rows)
+    for tc in row_first_tc:
+        if tc is None:
+            font_ok = False
+            break
+        tcPr = tc.find(qn('w:tcPr'))
+        vAlign = tcPr.find(qn('w:vAlign')) if tcPr is not None else None
+        if vAlign is None or vAlign.get(qn('w:val')) != 'center':   # 垂直居中
+            font_ok = False
+            break
+        cell_ok = True
+        for p in tc.findall(qn('w:p')):
+            line = _norm(_elem_text(p))
+            if not line:
+                continue
+            pPr = p.find(qn('w:pPr'))
+            jc = pPr.find(qn('w:jc')) if pPr is not None else None
+            jc_val = jc.get(qn('w:val')) if jc is not None else None
+            if jc_val in ALIGN_CHANGED:          # 对齐被改成居中/右对齐/分散对齐
+                cell_ok = False
+                break
+            pinned = BODY_PINNED_FONTS.get(line)
+            para = _ParaLite(doc, p)
+            for r_el in p.findall(qn('w:r')):
+                run = _RunLite(r_el, para)
+                txt = ''.join(t.text or '' for t in r_el.iter(qn('w:t')))
+                if not txt.strip():
+                    continue
+                half = _resolve_effective_size_halfpt(doc, run)
+                ea = _resolve_effective_eastasia(doc, run) or ''
+                is_cjk = bool(re.search(r'[一-鿿]', txt))
+                if pinned is not None:                  # 唯一可定位行 → 与原件精确比对
+                    if half != pinned[1] or (is_cjk and pinned[0] not in ea):
+                        cell_ok = False
+                        break
+                    continue
+                if half is None:
+                    cell_ok = False
+                    break
+                if is_cjk:
+                    if not any(half == h and any(k in ea for k in ks)
+                               for ks, h in BODY_ALLOWED_FONTS):
+                        cell_ok = False
+                        break
+                elif not any(half == h for _, h in BODY_ALLOWED_FONTS):
+                    cell_ok = False
+                    break
+            if not cell_ok:
+                break
+        if not cell_ok:
+            font_ok = False
+            break
+    if font_ok:
+        results.append("+3：单元格正文各行字体、字号与对齐方式与原文件一致未被改动，且垂直居中")
+    else:
+        results.append("+0：单元格正文各行字体、字号与对齐方式与原文件一致未被改动，且垂直居中")
+
+    # --- 表格之前的 body 顶层段落（标题/表头/标签所在处）---
+    lead_paras = []
+    for child in doc.element.body.iterchildren():
+        if child is tbl_elem:
+            break
+        if child.tag.split('}')[-1] == 'p':
+            lead_paras.append(child)
+
+    def _para_runs(p_elem):
+        para = _ParaLite(doc, p_elem)
+        return [(_RunLite(r, para), ''.join(t.text or '' for t in r.iter(qn('w:t'))))
+                for r in p_elem.findall(qn('w:r'))]
+
+    def _jc_of(p_elem):
+        pPr = p_elem.find(qn('w:pPr'))
+        jc = pPr.find(qn('w:jc')) if pPr is not None else None
+        return jc.get(qn('w:val')) if jc is not None else None
+
+    # +1："会议内容 :"标签行予以保留，且位于表格上方
+    label_ok = any('会议内容' in _norm(_elem_text(p)) for p in lead_paras)
+    if label_ok:
+        results.append("+1：\"会议内容 :\"标签行予以保留，且位于表格上方")
+    else:
+        results.append("+0：\"会议内容 :\"标签行予以保留，且位于表格上方")
+
+    # +1：标题"部门协调会"为微软雅黑、20.5磅、居中，文字与格式均未被改动
+    title_ok = False
+    for p in lead_paras:
+        if _norm(_elem_text(p)) != TITLE_TEXT:
+            continue
+        if _jc_of(p) != 'center':
+            break
+        ok = True
+        for run, txt in _para_runs(p):
+            if not txt.strip():
+                continue
+            ea = _resolve_effective_eastasia(doc, run)
+            half = _resolve_effective_size_halfpt(doc, run)
+            if not (ea and YAHEI in ea):
+                ok = False
+                break
+            if half is None or not (40 <= half <= 42):   # 20.5磅=41半磅（容差40-42）
+                ok = False
+                break
+        title_ok = ok
+        break
+    if title_ok:
+        results.append("+1：标题\"部门协调会\"为微软雅黑、20.5磅、居中，文字与格式均未被改动")
+    else:
+        results.append("+0：标题\"部门协调会\"为微软雅黑、20.5磅、居中，文字与格式均未被改动")
+
+    # +1：表头三行（时间/主持人/记录人、地点/应出席数/实出席数、列席人员）为微软雅黑、9.5磅
+    header_keys = ('主持人', '应出席数', '列席人员')
+    header_paras = [p for p in lead_paras
+                    if any(k in _norm(_elem_text(p)) for k in header_keys)]
+    header_ok = len(header_paras) >= 3
+    for p in header_paras:
+        for run, txt in _para_runs(p):
+            if not txt.strip():
+                continue
+            ea = _resolve_effective_eastasia(doc, run)
+            half = _resolve_effective_size_halfpt(doc, run)
+            if not (ea and YAHEI in ea):
+                header_ok = False
+                break
+            if half is None or not (18 <= half <= 20):   # 9.5磅=19半磅（容差18-20）
+                header_ok = False
+                break
+        if not header_ok:
+            break
+    if header_ok:
+        results.append("+1：表头三行（时间/主持人/记录人、地点/应出席数/实出席数、列席人员）为微软雅黑、9.5磅")
+    else:
+        results.append("+0：表头三行（时间/主持人/记录人、地点/应出席数/实出席数、列席人员）为微软雅黑、9.5磅")
+
+    # +1：表格宽度与正文版心一致并保持单列，纸张大小与页边距未发生改变
+    sect = doc.element.body.find(qn('w:sectPr'))
+    page_ok = sect is not None
+    if page_ok:
+        pgSz = sect.find(qn('w:pgSz'))
+        pgMar = sect.find(qn('w:pgMar'))
+        cols = sect.find(qn('w:cols'))
+        w = int(pgSz.get(qn('w:w'))) if pgSz is not None and pgSz.get(qn('w:w')) else 0
+        h = int(pgSz.get(qn('w:h'))) if pgSz is not None and pgSz.get(qn('w:h')) else 0
+        if abs(w - EXPECT_PGW) > 40 or abs(h - EXPECT_PGH) > 40:
+            page_ok = False
+        if pgMar is not None:
+            for k, exp in EXPECT_MAR.items():
+                v = pgMar.get(qn('w:' + k))
+                if v is None or abs(int(v) - exp) > 30:
+                    page_ok = False
+                    break
+        else:
+            page_ok = False
+        num = cols.get(qn('w:num')) if cols is not None else None
+        if num is not None and num != '1':          # 多栏 → 不合规
+            page_ok = False
+    # 单列：所有行仅 1 格
+    single_col = all(len(cs) == 1 for cs in row_cells) and bool(row_cells)
+    # 表格宽度 ≈ 版心宽（页宽-左右边距）
+    tblW = None
+    tblPr = tbl_elem.find(qn('w:tblPr'))
+    if tblPr is not None:
+        wEl = tblPr.find(qn('w:tblW'))
+        if wEl is not None and wEl.get(qn('w:w')) and wEl.get(qn('w:w')).isdigit():
+            tblW = int(wEl.get(qn('w:w')))
+    content_w = EXPECT_PGW - EXPECT_MAR['left'] - EXPECT_MAR['right']
+    width_ok = tblW is not None and (0.85 * content_w) <= tblW <= (1.03 * content_w)
+    if page_ok and single_col and width_ok:
+        results.append("+1：表格宽度与正文版心一致并保持单列，纸张大小与页边距未发生改变")
+    else:
+        results.append("+0：表格宽度与正文版心一致并保持单列，纸张大小与页边距未发生改变")
+
+    # ========== 减分项 ==========
+    # 说明：减分项在仅有输出文件、无原始文件可比对时，采用可静态检出的保守代理判定，
+    #       宁可漏报（默认不扣分）也不误伤；命中确凿的多余修改信号才触发扣分。
+
+    # -5：未把"会议内容"下方的全部正文完整置入表格，存在文字遗漏或整段截断
+    #     本项原为 +5 加分项，现改为减分项：原件正文本就已在表格内（部分嵌在单元格内的
+    #     嵌套表格里），"完整置入"对未处理的原件同样成立，作为加分项对所有交付无差别送分、
+    #     无区分度且抬高分数基线；改为减分项后只在真的丢内容时触发（如把表格逐行重建到
+    #     一半就截断，丢掉议题6/7/8 与"散会"）。注意 -3"改动正文文字内容"抓不到这种情况：
+    #     它的代理判据 FACT_ANCHORS 是人名/日期/地点，截断后这些锚点往往仍然齐全。
+    hit_anchors = [a for a in CONTENT_ANCHORS if _norm(a) in full_table_text]
+    if len(hit_anchors) != len(CONTENT_ANCHORS):
+        results.append("-5：未将\"会议内容\"下方的全部正文完整置入表格，存在文字遗漏或整段截断")
+    else:
+        results.append("-0：未将\"会议内容\"下方的全部正文完整置入表格，存在文字遗漏或整段截断")
+
+    # -3：改动了"会议内容"正文的文字内容（篡改数字/日期/人名/议题编号等）
+    #     代理判定：正文已实际写入（维度一通过）却缺失应恒在的关键事实锚点 → 视为被篡改/破坏。
+    missing_facts = [a for a in FACT_ANCHORS if _norm(a) not in full_doc_text]
+    if missing_facts:
+        results.append("-3：改动了会议内容正文的文字内容（关键人名/日期/地点等事实缺失或不符）")
+    else:
+        results.append("-0：改动了会议内容正文的文字内容（关键人名/日期/地点等事实缺失或不符）")
+
+    # -3：新增指令未要求的表格、文本框等多余结构
+    extra_tbl = len(doc.element.body.findall(qn('w:tbl'))) > 1
+    has_txbx = doc.element.body.find('.//' + qn('w:txbxContent')) is not None
+    if extra_tbl or has_txbx:
+        results.append("-3：新增指令未要求的表格、文本框等多余结构，扰乱版面")
+    else:
+        results.append("-0：新增指令未要求的表格、文本框等多余结构，扰乱版面")
+
+    # -1：为文字添加指令未要求的底纹、颜色、高亮或下划线等多余修饰（限"会议内容"单元格内）
+    #     只看承载可见文字的 run：段落标记(¶)自带的 w:pPr/w:rPr 与空 run 不影响文字外观，
+    #     而原文件最末段的段落标记本就带 w:u，若一并计入会对未作任何修饰的交付误扣分。
+    deco = False
+    for tc in row_first_tc:
+        if tc is None:
+            continue
+        for p in tc.findall(qn('w:p')):
+            for r_el in p.findall(qn('w:r')):
+                if not ''.join(t.text or '' for t in r_el.iter(qn('w:t'))).strip():
+                    continue
+                rPr = r_el.find(qn('w:rPr'))
+                if rPr is None:
+                    continue
+                if rPr.find(qn('w:highlight')) is not None:
+                    deco = True
+                    break
+                u = rPr.find(qn('w:u'))
+                if u is not None and (u.get(qn('w:val')) or 'single') not in ('none',):
+                    deco = True
+                    break
+                shd = rPr.find(qn('w:shd'))
+                if shd is not None:
+                    fill = (shd.get(qn('w:fill')) or '').upper()
+                    if fill not in ('', 'AUTO', 'FFFFFF') and \
+                            (shd.get(qn('w:val')) or 'clear') != 'nil':
+                        deco = True
+                        break
+            if deco:
+                break
+        if deco:
+            break
+    if deco:
+        results.append("-1：为会议内容文字添加了指令未要求的底纹、颜色、高亮或下划线等多余修饰")
+    else:
+        results.append("-0：为会议内容文字添加了指令未要求的底纹、颜色、高亮或下划线等多余修饰")
+
+    # -1：新增指令未要求的页眉、页脚、水印、批注或多余标题、说明文字
+    #     代理判定：出现批注引用，或表格之后新增了含文字的多余段落。
+    doc_xml = doc.element.body.xml if hasattr(doc.element.body, 'xml') else ''
+    has_comment = 'commentReference' in doc_xml
+    trailing_text = False
+    seen_tbl = False
+    for child in doc.element.body.iterchildren():
+        if child is tbl_elem:
+            seen_tbl = True
+            continue
+        if seen_tbl and child.tag.split('}')[-1] == 'p' and _norm(_elem_text(child)):
+            trailing_text = True
+            break
+    if has_comment or trailing_text:
+        results.append("-1：新增指令未要求的批注或表格之后的多余说明文字")
+    else:
+        results.append("-0：新增指令未要求的批注或表格之后的多余说明文字")
+
+
+    return _finalize(result, results)
+
+
+if __name__ == '__main__':
+    # 本地调试入口：默认取脚本所在目录，或用命令行传入的目录路径。
+    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
     print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+
+
+

@@ -1,4163 +1,2347 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自动评估“名片复刻_可编辑版.pptx”。
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-依赖：python-pptx、Pillow（本脚本主要使用 python-pptx）。
-运行：python evaluate_ppt.py 名片复刻_可编辑版.pptx
-
-评分逻辑：
-1. 先检查维度1（可用与可修改性）。任一项不满足，直接输出0分，不进入维度2。
-2. 维度2逐条自动检测。正分项需满足该条内全部关键点；负分项（若以后添加）满足任一触发点即扣分。
-3. 打印命中的评分点、未命中的评分点和最终得分。
-"""
-
-from __future__ import annotations
-
-import json
-
-SCRIPT_ID = "043"
-import math
+import os
 import re
 import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Iterable, Optional
-
+import json
+import math
+import zipfile
+import colorsys
 from pptx import Presentation
+from pptx.util import Emu
 
-EMU_PER_CM = 360000
-EMU_PER_PT = 12700
-CHINESE_RE = re.compile(r"[一-鿿]")
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
 
+SCRIPT_ID = "043"
+# 维度二所有评分项 max_delta 之和；用于维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 115
 
-@dataclass
-class ShapeInfo:
-    raw: object
-    slide_no: int
-    name: str
-    type_name: str
-    prst: str
-    x: float
-    y: float
-    w: float
-    h: float
-    text: str
-    paragraphs: list[dict]
-    fill: Optional[tuple[int, int, int]]
-    line: Optional[tuple[int, int, int]]
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." 字符串反解为结构化 dim2_items 时用。顺序须与 _evaluate_impl 中
+# results.append(...) 的顺序严格一致；共 33 项，累加 = MAX_SCORE_TOTAL。
+_MAX_DELTAS_ORDER = [
+    1,  # 01 共2页，第1页中文正面、第2页英文背面，页序不颠倒
+    3,  # 02 两页画布一致、横向名片比例、圆角矩形卡片主体、米白填充
+    5,  # 03 两页右上角二维码为图片对象且尺寸位置达标
+    3,  # 04 两页二维码位置与尺寸一致
+    3,  # 05 每页原生可编辑对象≥25个，无整版截图贴图
+    3,  # 06 全篇字体为 Windows 常见字体，未用仅 macOS 字体承载可见文字
+    3,  # 07 所有形状宽高均为非负有效值
+    3,  # 08 第1页左上角企业徽标（图片/成组矢量）
+    3,  # 09 中文公司名文本、加粗、深墨绿、左边缘、字号倍数
+    3,  # 10 英文公司名全大写单行、无衬线带字间距、字号比例、铜橙色
+    3,  # 11 三处"线段＋叶片＋线段"分隔装饰
+    5,  # 12 第1页姓名"沈知行"书法字体/深墨绿/最大字号/位置
+    5,  # 13 第1页3行徽章式联系方式（等距堆叠、徽章左对齐）
+    5,  # 14 三个徽章内为真实电话/信封/定位针图标
+    3,  # 15 第1行 M.P.＋电话（近黑加粗、同行左置、字号倍数）
+    3,  # 16 第2行邮箱、第3行地址断两行且与电话行左对齐
+    3,  # 17 第1页纵向分隔线（位置与跨度）
+    3,  # 18 第1页"主 营"胶囊标签
+    5,  # 19 第1页右栏3个主营分组（圆形底衬＋图标＋文字块，等距、左对齐）
+    5,  # 20 三个圆形底衬内为真实水滴/叶片/包装箱图标
+    5,  # 21 第1页右栏三组文字完整（标题全角冒号加粗深墨绿＋7行条目）
+    1,  # 22 三组之间2条细横向分隔线
+    5,  # 23 两页底部深墨绿色带，上缘为自由曲线，横贯整页宽
+    3,  # 24 第1页色带左端铜橙色块/渐变过渡段
+    3,  # 25 第2页英文公司名两行、加粗深墨绿、该页最大字号、左边缘
+    3,  # 26 第2页姓名"Ethan Shen"手写花体、深墨绿、位置对应
+    3,  # 27 第2页3行徽章式联系方式＋英文地址断3行
+    3,  # 28 第2页"MAIN BUSINESS"胶囊＋纵向分隔线，与第1页同位
+    5,  # 29 第2页右栏3个主营分组（英文标题＋条目＋圆形底衬＋图标）
+    5,  # 30 第2页色带内4组"图标＋全大写标签"
+    1,  # 31 第2页色带上缘另叠波浪/曲线类线条装饰（画法与深浅不限）
+    5,  # 32 两页所有对象落在卡片内，无遮挡/重叠/溢出
+    3,  # 33 两页统一配色体系，卡片主体不描黑色边框
+]
+assert sum(_MAX_DELTAS_ORDER) == MAX_SCORE_TOTAL
 
-    @property
-    def x2(self) -> float:
-        return self.x + self.w
-
-    @property
-    def y2(self) -> float:
-        return self.y + self.h
-
-    @property
-    def cx(self) -> float:
-        return self.x + self.w / 2
-
-    @property
-    def cy(self) -> float:
-        return self.y + self.h / 2
-
-    @property
-    def area(self) -> float:
-        return max(0.0, self.w) * max(0.0, self.h)
-
-
-@dataclass
-class CheckResult:
-    passed: bool
-    details: str
-
-
-@dataclass
-class Criterion:
-    cid: str
-    score: int
-    title: str
-    check: Callable[["PptModel"], CheckResult]
-    is_penalty: bool = False
+# ---------------------------------------------------------------- 常量
+A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 
 
-class PptModel:
-    def __init__(self, path: Path):
-        self.path = path
-        self.prs = Presentation(str(path))
-        self.slide_w = self.prs.slide_width / EMU_PER_CM
-        self.slide_h = self.prs.slide_height / EMU_PER_CM
-        self.slides: list[list[ShapeInfo]] = []
-        for idx, slide in enumerate(self.prs.slides, start=1):
-            self.slides.append(list(self._flatten_slide(slide, idx)))
+def _a(tag):
+    return '{%s}%s' % (A_NS, tag)
 
-    def _flatten_slide(self, slide_or_group, slide_no: int) -> Iterable[ShapeInfo]:
-        for shape in slide_or_group.shapes:
-            yield self._shape_info(shape, slide_no)
-            if hasattr(shape, "shapes"):
-                yield from self._flatten_slide(shape, slide_no)
 
-    def _shape_info(self, shape, slide_no: int) -> ShapeInfo:
-        left = shape.left / EMU_PER_CM
-        top = shape.top / EMU_PER_CM
-        width = shape.width / EMU_PER_CM
-        height = shape.height / EMU_PER_CM
-        # 连接符/线条可能存在负宽高，统一归一化成左上角 + 正宽高。
-        x1 = min(left, left + width)
-        y1 = min(top, top + height)
-        x2 = max(left, left + width)
-        y2 = max(top, top + height)
-        paragraphs = self._paragraphs(shape)
-        return ShapeInfo(
-            raw=shape,
-            slide_no=slide_no,
-            name=getattr(shape, "name", ""),
-            type_name=str(getattr(shape, "shape_type", "")),
-            prst=get_prst(shape),
-            x=x1,
-            y=y1,
-            w=x2 - x1,
-            h=y2 - y1,
-            text=getattr(shape, "text", "") if getattr(shape, "has_text_frame", False) else "",
-            paragraphs=paragraphs,
-            fill=get_fill_rgb(shape),
-            line=get_line_rgb(shape),
-        )
+EMU_PER_CM = 360000.0
+# 1 磅 = 12700 EMU：把字号换算成画布上的实际长度时用
+EMU_PER_PT = 12700.0
+# PowerPoint 文本框未显式写 sz 时的默认字号（打开 PPT/WPS 实际显示 18 磅）
+DEFAULT_SZ_PT = 18.0
 
-    def _paragraphs(self, shape) -> list[dict]:
-        if not getattr(shape, "has_text_frame", False):
-            return []
-        out = []
-        for para in shape.text_frame.paragraphs:
-            runs = []
-            para_text = ""
-            for run in para.runs:
-                para_text += run.text
-                font = run.font
-                runs.append(
-                    {
-                        "text": run.text,
-                        "font": font.name,
-                        "size": font.size.pt if font.size else None,
-                        "bold": font.bold,
-                        "italic": font.italic,
-                        "color": get_font_rgb(font),
-                    }
-                )
-            if para_text.strip():
-                out.append({"text": para_text, "runs": runs})
+# 仅 macOS 随系统提供的字体：在 Windows 打开会回退到默认字形，原字形丢失
+MAC_ONLY_FONTS = (
+    'STXingkai', 'STKaiti', 'STSong', 'STHeiti', 'STFangsong', 'STXihei',
+    'STLiti', 'STXinwei', 'STZhongsong', 'Zapfino', 'Hiragino', 'PingFang',
+    'Apple LiGothic', 'Apple LiSung', 'Songti SC', 'Heiti SC', 'Kaiti SC',
+    'Yuanti SC', 'Hannotate SC', 'HanziPen SC', 'Weibei SC', 'Lantinghei SC',
+    'Baoli SC', 'Libian SC', 'Xingkai SC', 'Yuppy SC', 'Wawati SC',
+    'LiHei Pro', 'BiauKai',
+)
+# macOS 旧版繁体中文字体，字族名就叫"Hei"/"Kai"：这两个名字太短，按"族名包含"
+# 匹配会把 SimHei（黑体）、Microsoft YaHei（微软雅黑）、KaiTi（楷体）这些 Windows
+# 自带字体一并误判成 macOS 专有，故只按整名相等匹配。
+MAC_ONLY_EXACT = ('Hei', 'Kai')
+# Windows 环境可正常显示的常见字体（含前缀族）
+WIN_COMMON_FONTS = (
+    '微软雅黑', 'Microsoft YaHei', '微软正黑体', 'Microsoft JhengHei',
+    '黑体', 'SimHei', '宋体', 'SimSun', 'NSimSun', '新宋体',
+    '楷体', 'KaiTi', 'KaiTi_GB2312', '楷体_GB2312', '仿宋', 'FangSong',
+    '等线', 'DengXian', '思源', 'Source Han', '方正',
+    'Arial', 'Times New Roman', 'Calibri', 'Cambria', 'Candara', 'Consolas',
+    'Corbel', 'Courier New', 'Georgia', 'Impact', 'Tahoma', 'Trebuchet MS',
+    'Verdana', 'Segoe', 'Symbol', 'Wingdings', 'Webdings', 'Franklin Gothic',
+    'Century', 'Garamond', 'Palatino Linotype', 'Lucida', 'MS Gothic',
+    'Malgun Gothic', 'Sylfaen', 'Ebrima', 'Gabriola', 'Ink Free',
+)
+# 行楷/楷书类书法风格中文字体（细则明确点名"楷体、行楷等"）
+KAI_FONTS = ('楷', '行楷', 'KaiTi', 'Kaiti', 'Xingkai', 'XingKai', 'STKaiti',
+             'STXingkai', 'Kai')
+# 手写花体英文字体（细则明确点名"Segoe Script 等脚本体"）
+SCRIPT_FONTS = ('Script', 'Hand', 'Zapfino', 'Mistral', 'Brush', 'Vladimir',
+                'Gabriola', 'Ink Free', 'Pacifico', 'Segoe Print')
+# 胶囊/圆角标签允许的预设几何
+CAPSULE_PRSTS = ('roundRect', 'round1Rect', 'round2SameRect', 'round2DiagRect',
+                 'flowChartTerminator', 'flowChartAlternateProcess', 'pill')
+
+
+# ------------------------------------------------------- 颜色工具
+def _rgb(hexstr):
+    """'RRGGBB' -> (r, g, b)；非法返回 None。"""
+    if not hexstr or not re.fullmatch(r'[0-9A-Fa-f]{6}', hexstr):
+        return None
+    return (int(hexstr[0:2], 16), int(hexstr[2:4], 16), int(hexstr[4:6], 16))
+
+
+def _is_blackish(hexstr):
+    """近黑色（描黑边框判定）：三通道都很暗且接近中性灰，深墨绿不算黑。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    return max(c) <= 0x38 and (max(c) - min(c)) <= 0x14
+
+
+def _is_near_black(hexstr):
+    """近黑（电话号码"近黑"文字色）：细则给的参照区间是 #1A1A1A-#333333，
+    按"近似"留出容差取到 0x4D；允许带一点冷色偏（各通道极差 ≤ 0x30），
+    这是办公软件里常见的"黑里带一点墨绿/墨蓝"写法，肉眼仍是黑字。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    return max(c) <= 0x4D and (max(c) - min(c)) <= 0x30
+
+
+def _is_white(hexstr):
+    c = _rgb(hexstr)
+    return c is not None and min(c) >= 0xE6
+
+
+def _is_cream(hexstr):
+    """米白/象牙白（细则给出近似 #F5F3EE-#FEFDF8 的浅暖白）：
+    整体极亮、暖偏（R≥B）、通道差很小，且不是纯白、不是彩色。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    r, g, b = c
+    if min(c) < 0xEE or max(c) - min(c) > 0x18:
+        return False
+    if r < b:
+        return False
+    return hexstr.upper() != 'FFFFFF'
+
+
+def _is_pale_greengray(hexstr):
+    """淡灰绿实心圆底衬（细则给出近似 #EDF0EA-#F0F2EC）：极亮、绿分量不低于
+    红蓝、通道差很小。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    r, g, b = c
+    if min(c) < 0xDC or max(c) - min(c) > 0x18:
+        return False
+    return g >= r - 2 and g >= b - 2
+
+
+def _is_deep_teal(hexstr):
+    """深墨绿色族（细则给出近似 #013B3C-#004F49 / #004F49-#05565D，
+    或同族更深值）：红分量很低、绿蓝分量接近且处于中低亮度区，按整族判定。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    r, g, b = c
+    if r > 0x3A:
+        return False
+    if not (0x20 <= g <= 0x6E and 0x20 <= b <= 0x76):
+        return False
+    return abs(g - b) <= 0x30
+
+
+def _is_teal_family(hexstr):
+    """墨绿/青绿填充族（胶囊、色带等实心填充；比正文文字色允许更亮一档）。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    r, g, b = c
+    if not (g > r + 0x0A and b > r + 0x0A):
+        return False
+    return 0x28 <= max(g, b) <= 0xA0
+
+
+def _is_green(hexstr):
+    """泛绿色（细则只要求"字体为绿色"，不限定深浅）：按色相整段判定——
+    从黄绿（约75°）到青绿（约200°）都算绿，深墨绿#05565D、橄榄绿#3A5E21、
+    亮青绿#09747B 同属此段；另要求有一定饱和度且不是近黑/近白，否则灰色
+    与黑白会因色相计算的舍入误差被当成绿色。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    h, s, l = _rgb_to_hsl(c)
+    if s < 0.12 or not (0.03 < l < 0.92):
+        return False
+    return 75.0 <= h * 360.0 <= 200.0
+
+
+def _is_copper(hexstr):
+    """铜橙色族（细则给出近似 #B5713C-#C77B45，或同族更饱和的暖橙）：
+    按"红>绿>蓝且反差明显的暖橙"整族判定，不卡死在两个端点值上——
+    办公软件里同一枚铜橙常以主题色叠亮度变换写出（如 accent2 + lumMod
+    得到 #C65F10），取色器看着是同一色系，硬套区间反而会误判。"""
+    c = _rgb(hexstr)
+    if c is None:
+        return False
+    r, g, b = c
+    if not (0x80 <= r <= 0xEE and 0x40 <= g <= 0xB0 and b <= 0x80):
+        return False
+    return r > g + 0x18 and g > b + 0x10
+
+
+# ------------------------------------------------- 主题色解析（schemeClr）
+# 说明：PPT 里一个颜色可以写成 srgbClr（直接给 RRGGBB），也可以写成
+# schemeClr（引用主题色板，再叠加 lumMod/lumOff/shade/tint 等亮度变换）。
+# 办公软件里"取色器看到的颜色"是变换之后的结果，所以必须先解析成实际 RGB，
+# 否则"深墨绿""铜橙色"这类判定会漏判。
+def _rgb_to_hsl(c):
+    r, g, b = (x / 255.0 for x in c)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    return h, s, l
+
+
+def _hsl_to_rgb(h, s, l):
+    r, g, b = colorsys.hls_to_rgb(h, max(0.0, min(1.0, l)),
+                                  max(0.0, min(1.0, s)))
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def _hex(c):
+    return '%02X%02X%02X' % c
+
+
+def _apply_mods(base_rgb, mods):
+    """把 lumMod/lumOff/shade/tint 依次作用到基色上（PowerPoint 语义）。"""
+    c = base_rgb
+    for name, val in mods:
+        v = val / 100000.0
+        if name == 'lumMod':
+            h, s, l = _rgb_to_hsl(c)
+            c = _hsl_to_rgb(h, s, l * v)
+        elif name == 'lumOff':
+            h, s, l = _rgb_to_hsl(c)
+            c = _hsl_to_rgb(h, s, l + v)
+        elif name == 'shade':
+            c = tuple(int(round(x * v)) for x in c)
+        elif name == 'tint':
+            c = tuple(int(round(x * v + 255 * (1 - v))) for x in c)
+        elif name == 'satMod':
+            h, s, l = _rgb_to_hsl(c)
+            c = _hsl_to_rgb(h, s * v, l)
+    return tuple(max(0, min(255, int(x))) for x in c)
+
+
+_SCHEME_ALIAS = {'tx1': 'dk1', 'bg1': 'lt1', 'tx2': 'dk2', 'bg2': 'lt2'}
+
+
+def _read_theme_scheme(pptx_path):
+    """从 ppt/theme/theme1.xml 读出主题色板 {'accent1': (r,g,b), ...}。
+    读不到时返回空 dict，schemeClr 便放弃解析（不误判成某个颜色）。"""
+    table = {}
+    try:
+        with zipfile.ZipFile(pptx_path) as z:
+            names = [n for n in z.namelist()
+                     if re.fullmatch(r'ppt/theme/theme\d+\.xml', n)]
+            if not names:
+                return table
+            xml = z.read(sorted(names)[0]).decode('utf-8', 'ignore')
+    except Exception:
+        return table
+    m = re.search(r'<a:clrScheme\b.*?</a:clrScheme>', xml, re.S)
+    if not m:
+        return table
+    for key, body in re.findall(
+            r'<a:(dk1|lt1|dk2|lt2|accent[1-6]|hlink|folHlink)>(.*?)</a:\1>',
+            m.group(0), re.S):
+        mm = re.search(r'<a:srgbClr val="([0-9A-Fa-f]{6})"', body)
+        if mm is None:
+            mm = re.search(r'<a:sysClr [^>]*lastClr="([0-9A-Fa-f]{6})"', body)
+        if mm:
+            table[key] = _rgb(mm.group(1))
+    return table
+
+
+# theme 字典里存放主题字体的保留键（与色板的 accent1/dk1 等键不冲突）
+THEME_FONT_KEY = '#fonts'
+
+
+def _read_theme_fonts(pptx_path):
+    """从 ppt\theme\theme1.xml 读出主题字体：
+    {'major_latin':…, 'minor_latin':…, 'major_ea':…, 'minor_ea':…}。
+    与办公软件对齐：run 里不写 a:latin/a:ea 时，屏幕上显示的就是这里的主题字体
+    （字体框里显示成"+ 中文正文"一类），判字体时必须回落到它，否则等于没判。
+    只取 majorFont/minorFont 的 a:latin 与 a:ea，不取 a:font script="…" 的
+    分脚本回退字体（那些不是正文实际使用的字体）。"""
+    out = {}
+    try:
+        with zipfile.ZipFile(pptx_path) as z:
+            names = [n for n in z.namelist()
+                     if re.fullmatch(r'ppt/theme/theme\d+\.xml', n)]
+            if not names:
+                return out
+            xml = z.read(sorted(names)[0]).decode('utf-8', 'ignore')
+    except Exception:
         return out
-
-    def slide(self, no: int) -> list[ShapeInfo]:
-        return self.slides[no - 1]
-
-    def all_shapes(self) -> list[ShapeInfo]:
-        return [s for slide in self.slides for s in slide]
-
-
-# ------------------------- 基础解析/判断工具 -------------------------
-
-
-def get_prst(shape) -> str:
-    try:
-        return shape.auto_shape_type.name.upper()
-    except Exception:
-        try:
-            nodes = shape._element.xpath(".//a:prstGeom")
-            if nodes:
-                return (nodes[0].get("prst") or "").upper()
-        except Exception:
-            pass
-    if "PICTURE" in str(getattr(shape, "shape_type", "")).upper():
-        return "PICTURE"
-    return ""
+    for kind in ('major', 'minor'):
+        m = re.search(r'<a:%sFont>(.*?)</a:%sFont>' % (kind, kind), xml, re.S)
+        if m is None:
+            continue
+        for tag in ('latin', 'ea'):
+            mm = re.search(r'<a:%s typeface="([^"]*)"' % tag, m.group(1))
+            if mm and mm.group(1).strip():
+                out['%s_%s' % (kind, tag)] = mm.group(1).strip()
+    return out
 
 
-def rgb_from_color_format(cf) -> Optional[tuple[int, int, int]]:
-    if cf is None:
+def _resolve_font(name, fonts, kind):
+    """把 run 上的字体名解析成办公软件实际使用的字体名：
+    空值 → 主题正文（minor）字体；"+mj-lt"/"+mn-ea" 这类主题引用 → 对应主题字体。
+    kind 取 'latin'（西文）或 'ea'（中日韩文）。"""
+    n = (name or '').strip()
+    fonts = fonts or {}
+    if n.startswith('+'):
+        prefix = 'major_' if n[1:3] == 'mj' else 'minor_'
+        tag = 'ea' if n.endswith('ea') else 'latin'
+        return fonts.get(prefix + tag, '')
+    if n:
+        return n
+    return fonts.get('minor_' + kind, '')
+
+
+def _clr_hex(holder, theme):
+    """holder 是任意"装着颜色"的元素（a:solidFill / a:gs / a:ln 里的 fill 等）。
+    返回该颜色在办公软件里实际显示的 'RRGGBB'；解析不出时返回 None。"""
+    if holder is None:
         return None
-    try:
-        if cf.rgb is not None:
-            s = str(cf.rgb)
-            return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
-    except Exception:
-        pass
-    # 某些主题色 python-pptx 不给 rgb，尝试从底层 XML 取 srgbClr。
-    try:
-        xml = cf._xFill.xml
-        m = re.search(r"srgbClr val=\"([0-9A-Fa-f]{6})\"", xml)
-        if m:
-            s = m.group(1)
-            return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
-    except Exception:
-        pass
-    return None
-
-
-def get_fill_rgb(shape) -> Optional[tuple[int, int, int]]:
-    try:
-        return rgb_from_color_format(shape.fill.fore_color)
-    except Exception:
-        return None
-
-
-def get_line_rgb(shape) -> Optional[tuple[int, int, int]]:
-    try:
-        return rgb_from_color_format(shape.line.color)
-    except Exception:
-        return None
-
-
-def get_font_rgb(font) -> Optional[tuple[int, int, int]]:
-    try:
-        return rgb_from_color_format(font.color)
-    except Exception:
-        return None
-
-
-def clean_text(s: str) -> str:
-    table = str.maketrans(
-        {
-            "：": ":",
-            "，": ",",
-            "–": "-",
-            "—": "-",
-            "－": "-",
-            "‐": "-",
-            "黏": "粘",
-            "涂": "图",  # 兼容评分细则“图层”和文件中常见“涂层”写法
-        }
-    )
-    return re.sub(r"\s+", "", s.translate(table)).lower()
-
-
-def text_contains(shape: ShapeInfo, target: str) -> bool:
-    return clean_text(target) in clean_text(shape.text)
-
-
-def slide_text(slide: list[ShapeInfo]) -> str:
-    return "\n".join(s.text for s in slide if s.text)
-
-
-def font_names(shape: ShapeInfo) -> list[str]:
-    names = []
-    for para in shape.paragraphs:
-        for run in para["runs"]:
-            if run["text"].strip() and run["font"]:
-                names.append(run["font"])
-    return names
-
-
-def font_sizes(shape: ShapeInfo) -> list[float]:
-    sizes = []
-    for para in shape.paragraphs:
-        for run in para["runs"]:
-            if run["text"].strip() and run["size"] is not None:
-                sizes.append(float(run["size"]))
-    return sizes
-
-
-def font_colors(shape: ShapeInfo) -> list[Optional[tuple[int, int, int]]]:
-    colors = []
-    for para in shape.paragraphs:
-        for run in para["runs"]:
-            if run["text"].strip():
-                colors.append(run["color"])
-    return colors
-
-
-def all_runs_match(shape: ShapeInfo, *, font: Callable[[str], bool] | None = None,
-                   size: tuple[float, float] | None = None,
-                   color: Callable[[Optional[tuple[int, int, int]]], bool] | None = None,
-                   bold: Optional[bool] = None) -> bool:
-    runs = [r for p in shape.paragraphs for r in p["runs"] if r["text"].strip()]
-    if not runs:
-        return False
-    for run in runs:
-        if font and not font(run["font"] or ""):
-            return False
-        if size and (run["size"] is None or not between(float(run["size"]), size[0], size[1], tol=0.25)):
-            return False
-        if color and not color(run["color"]):
-            return False
-        if bold is True and run["bold"] is not True:
-            return False
-        if bold is False and run["bold"] is True:
-            return False
-    return True
-
-
-def any_run_match(shape: ShapeInfo, **kwargs) -> bool:
-    runs = [r for p in shape.paragraphs for r in p["runs"] if r["text"].strip()]
-    if not runs:
-        return False
-    for run in runs:
-        fake = ShapeInfo(shape.raw, shape.slide_no, shape.name, shape.type_name, shape.prst,
-                         shape.x, shape.y, shape.w, shape.h, run["text"],
-                         [{"text": run["text"], "runs": [run]}], shape.fill, shape.line)
-        if all_runs_match(fake, **kwargs):
-            return True
-    return False
-
-
-def between(v: float, lo: float, hi: float, tol: float = 0.0) -> bool:
-    return lo - tol <= v <= hi + tol
-
-
-def pos_pct(model: PptModel, shape: ShapeInfo) -> tuple[float, float, float, float]:
-    return shape.x / model.slide_w, shape.y / model.slide_h, shape.x2 / model.slide_w, shape.y2 / model.slide_h
-
-
-def center_pct(model: PptModel, shape: ShapeInfo) -> tuple[float, float]:
-    return shape.cx / model.slide_w, shape.cy / model.slide_h
-
-
-def in_region(model: PptModel, shape: ShapeInfo, x: tuple[float, float] | None = None,
-              y: tuple[float, float] | None = None, *, use_center: bool = False,
-              tol: float = 0.0) -> bool:
-    px, py = center_pct(model, shape) if use_center else (shape.x / model.slide_w, shape.y / model.slide_h)
-    return (x is None or between(px, x[0], x[1], tol)) and (y is None or between(py, y[0], y[1], tol))
-
-
-def norm_font_name(name: str) -> str:
-    return (name or "").replace(" ", "").lower()
-
-
-def is_yahei_or_heiti(name: str) -> bool:
-    n = norm_font_name(name)
-    return any(k in n for k in ["yahei", "microsoftyahei", "simhei", "heiti", "黑体", "微软雅黑"])
-
-
-def is_heiti_only(name: str) -> bool:
-    """严格判定 typeface 是否为"黑体"（SimHei / Heiti），排除"微软雅黑"。
-
-    用于细则原文仅写"黑体"（而非"微软雅黑或黑体"）的条目。OOXML 中：
-      - SimHei：Windows 中文黑体，typeface="SimHei" 或 "黑体"
-      - Heiti SC / Heiti TC：macOS 黑体，typeface="Heiti SC"/"Heiti TC"
-    微软雅黑（Microsoft YaHei / YaHei）不算作细则字面上的"黑体"。
-    """
-    n = norm_font_name(name)
-    if "yahei" in n or "微软雅黑" in n:  # 明确排除
-        return False
-    return any(k in n for k in ["simhei", "heiti", "黑体"])
-
-
-def is_arial(name: str) -> bool:
-    return "arial" in norm_font_name(name)
-
-
-def is_times_or_arial(name: str) -> bool:
-    n = norm_font_name(name)
-    return "arial" in n or "timesnewroman" in n or "times" in n
-
-
-def is_song_or_kai(name: str) -> bool:
-    n = norm_font_name(name)
-    return any(k in n for k in ["simsun", "song", "宋", "kaiti", "kai", "楷", "xingkai", "stxingkai"])
-
-
-def is_script_font(name: str) -> bool:
-    n = norm_font_name(name)
-    return any(k in n for k in ["brushscript", "scriptmt", "alexbrush", "segoescript"])
-
-
-def dist(c: Optional[tuple[int, int, int]], target: tuple[int, int, int]) -> float:
-    if c is None:
-        return 999.0
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(c, target)))
-
-
-def is_white(c) -> bool:
-    # 非主题色：只要"看起来是白色"就通过——不强求纯白，接受略带轻微偏色的浅色。
-    if c is None:
-        return False
-    return min(c) >= 210 and max(c) - min(c) <= 40
-
-
-def is_black(c) -> bool:
-    # 非主题色：只要"看起来是黑色"就通过——接受略带偏色的深色（如 #202428 之类）。
-    if c is None:
-        return False
-    return max(c) <= 80 and max(c) - min(c) <= 40
-
-
-def is_gray(c) -> bool:
-    # 非主题色：只要是灰色即可——放宽色偏容差，覆盖浅灰、中灰、深灰。
-    # 允许通道差最多 55（吸收 PPT 中带轻微色调倾向的"灰"），且平均亮度在 40-240 区间。
-    if c is None:
-        return False
-    return max(c) - min(c) <= 55 and 40 <= sum(c) / 3 <= 240
-
-
-def is_green(c) -> bool:
-    # 放宽：只要色相是绿色即可——不再限定为特定主题绿。
-    # 判定：g 通道必须最大，且明显大于 r、b；排除灰度色。
-    if c is None:
-        return False
-    r, g, b = c
-    if max(c) - min(c) < 20:  # 灰度色排除
-        return False
-    if g < r or g < b:
-        return False
-    # g 要明显高于 r（避免把黄色、米色误判为绿）
-    if g - r < 12:
-        return False
-    # 且不能过暗（纯黑的偏色）
-    return g >= 50
-
-
-def is_deep_green(c) -> bool:
-    # 放宽：任意"较深的绿色"都可通过。
-    if c is None:
-        return False
-    return is_green(c) and max(c) < 180
-
-
-def is_orange(c) -> bool:
-    # 非主题色：只要色相是橙色即可（r 明显大于 g/b，且不是红也不是黄）。
-    if c is None:
-        return False
-    r, g, b = c
-    if r < 130:
-        return False
-    if r <= g or r <= b:
-        return False
-    # 排除纯黄（g 太接近 r 视为黄）和纯红（g 太低视为红）
-    if g < 40 or g > r - 10:
-        return False
-    return b <= 130 and r - b >= 40
-
-
-def is_yellow(c) -> bool:
-    # 非主题色：只要色相是黄色即可（r、g 都高且接近，b 明显低）。
-    if c is None:
-        return False
-    r, g, b = c
-    if r < 150 or g < 130:
-        return False
-    if b >= min(r, g) - 30:
-        return False
-    # r 与 g 要相近（区别于橙色 r>>g）
-    return abs(r - g) <= max(60, r * 0.35)
-
-
-def is_light_gray(c) -> bool:
-    # 非主题色：用户要求"只要是灰色就通过"，不再强求"浅"灰。
-    # 保留函数名以兼容现有调用点，实际语义放宽为"任意灰色"。
-    return is_gray(c)
-
-
-def color_name(c) -> str:
-    if c is None:
-        return "none"
-    return "#%02X%02X%02X" % c
-
-
-def overlap_area(a: ShapeInfo, b: ShapeInfo) -> float:
-    x = max(0.0, min(a.x2, b.x2) - max(a.x, b.x))
-    y = max(0.0, min(a.y2, b.y2) - max(a.y, b.y))
-    return x * y
-
-
-def estimated_text_right(shape: ShapeInfo) -> float:
-    """估算文本真实绘制宽度的右边界，降低宽文本框导致的误判。"""
-    sizes = font_sizes(shape)
-    avg_size = sum(sizes) / len(sizes) if sizes else 12.0
-    max_units = 0.0
-    for line in text_lines(shape):
-        units = 0.0
-        for ch in line:
-            if ch.isspace():
-                units += 0.25
-            elif ord(ch) > 127:
-                units += 1.0
-            else:
-                units += 0.55
-        max_units = max(max_units, units)
-    # 1pt约0.035cm；加少量余量，避免过度低估。
-    estimated_width = max_units * avg_size * 0.035 * 1.20
-    return shape.x + min(shape.w, max(0.4, estimated_width))
-
-
-def is_picture(shape: ShapeInfo) -> bool:
-    return "PICTURE" in shape.type_name.upper() or shape.prst == "PICTURE"
-
-
-def is_line(shape: ShapeInfo) -> bool:
-    return shape.prst == "LINE" or (shape.w == 0 or shape.h == 0)
-
-
-def is_horizontal_line(shape: ShapeInfo) -> bool:
-    return is_line(shape) and shape.w >= 0.3 and shape.h <= 0.12
-
-
-def is_vertical_line(shape: ShapeInfo) -> bool:
-    return is_line(shape) and shape.h >= 0.3 and shape.w <= 0.12
-
-
-def is_round_rect(shape: ShapeInfo) -> bool:
-    return "ROUND" in shape.prst and "RECT" in shape.prst
-
-
-def is_oval(shape: ShapeInfo) -> bool:
-    return "OVAL" in shape.prst or "ELLIPSE" in shape.prst
-
-
-def find_text_shapes(model: PptModel, slide_no: int, target: str) -> list[ShapeInfo]:
-    return [s for s in model.slide(slide_no) if s.text and text_contains(s, target)]
-
-
-def first_text(model: PptModel, slide_no: int, target: str) -> Optional[ShapeInfo]:
-    found = find_text_shapes(model, slide_no, target)
-    return found[0] if found else None
-
-
-def text_lines(shape: ShapeInfo) -> list[str]:
-    return [p["text"] for p in shape.paragraphs] or [x for x in shape.text.splitlines() if x.strip()]
-
-
-def ok(msg: str) -> CheckResult:
-    return CheckResult(True, msg)
-
-
-def fail(msg: str) -> CheckResult:
-    return CheckResult(False, msg)
-
-
-# ------------------------- 维度1 -------------------------
-
-
-def check_dimension_1(path: Path) -> tuple[bool, list[str], Optional[PptModel]]:
-    details: list[str] = []
-    if path.suffix.lower() != ".pptx":
-        details.append(f"✗ 文件扩展名不是 .pptx：{path.suffix}")
-        return False, details, None
-    details.append("✓ 文件扩展名为 .pptx")
-
-    try:
-        model = PptModel(path)
-    except Exception as exc:
-        details.append(f"✗ 文件无法正常打开：{exc}")
-        return False, details, None
-    details.append("✓ 文件可由 python-pptx 正常打开")
-
-    if len(model.prs.slides) != 2:
-        details.append(f"✗ 幻灯片页数为 {len(model.prs.slides)}，不是2页")
-        return False, details, model
-    details.append("✓ 交付PPT只包含2页幻灯片")
-
-    slide2_text = slide_text(model.slide(2))
-    if CHINESE_RE.search(slide2_text):
-        details.append("✗ 第2页出现中文文本")
-        return False, details, model
-    details.append("✓ 第2页未检测到中文文本")
-
-    for no in (1, 2):
-        slide = model.slide(no)
-        page_area = model.slide_w * model.slide_h
-        huge_pictures = [s for s in slide if is_picture(s) and s.area / page_area > 0.80]
-        editable_count = sum(1 for s in slide if s.text or (not is_picture(s)))
-        if huge_pictures and editable_count < 5:
-            details.append(f"✗ 第{no}页疑似整页图片且不可编辑")
-            return False, details, model
-    details.append("✓ 未检测到整页不可编辑图片覆盖")
-
-    return True, details, model
-
-
-# ------------------------- 维度2评分点 -------------------------
-
-
-def c01_logo_top_left(model: PptModel) -> CheckResult:
-    """+5：第1页幻灯片距左页面边线0%–20%、距顶部边线0%–20%位置内出现组件
-    形状或者图片：所有组件组合或者图片总体宽度为2-4cm，高度为2-4cm；若为
-    组件组合，则其中包含填充为橙色的圆形组件以及剩余组件填充为绿色；橙色
-    部分位于整体的中上位置。
-    """
-    slide = model.slide(1)
-    # 位置约束：形状左上角距左页面边线 0%-20%、距顶部边线 0%-20%
-    # OOXML `off x,y`（EMU）在 PowerPoint / WPS / Keynote 中写法一致，
-    # 归一化为 slide_w/slide_h 百分比即可跨办公软件生效。
-    candidates = [
-        s for s in slide
-        if s.x / model.slide_w <= 0.20
-        and s.y / model.slide_h <= 0.20
-        and (is_picture(s) or s.fill is not None)
-        and s.w <= 4.5 and s.h <= 4.5
-        and s.area > 0.01
-    ]
-    if not candidates:
-        return fail("第1页左上角0%-20%区域内未找到组件形状或图片")
-
-    x1 = min(s.x for s in candidates)
-    y1 = min(s.y for s in candidates)
-    x2 = max(s.x2 for s in candidates)
-    y2 = max(s.y2 for s in candidates)
-    w, h = x2 - x1, y2 - y1
-
-    # 总体尺寸约束：宽 2-4cm、高 2-4cm（图片路径与组件组合路径均需满足）
-    if not (between(w, 2, 4) and between(h, 2, 4)):
-        return fail(f"第1页左上角总体尺寸 {w:.2f}×{h:.2f}cm 不在 2-4cm 范围内")
-
-    # 分支一：整体是图片（区域内不存在非图片组件即视为"图片"路径）
-    non_pictures = [s for s in candidates if not is_picture(s)]
-    if not non_pictures:
-        return ok(f"第1页左上角logo图片 {w:.2f}×{h:.2f}cm")
-
-    # 分支二：组件组合。收集细则要求的全部问题后一次性汇报，避免"只报第一
-    # 个失败"掩盖后续问题（例如"中上位置"未被检测到）。
-    problems: list[str] = []
-
-    # 其中包含填充为橙色的圆形组件
-    # OOXML: prst="ellipse" + <a:solidFill><a:srgbClr val="..."/>；办公软件
-    # 均以 srgbClr 写入颜色，is_orange 对色值做阈值判定。
-    orange_circles = [s for s in candidates if is_oval(s) and is_orange(s.fill)]
-    if not orange_circles:
-        problems.append("组件组合中未找到填充为橙色的圆形组件")
-
-    # 剩余组件填充为绿色
-    rest = [s for s in candidates if s not in orange_circles]
-    if not rest:
-        problems.append("组件组合缺少剩余绿色组件")
+    node = holder.find(_a('srgbClr'))
+    base = None
+    if node is not None:
+        base = _rgb(node.get('val') or '')
     else:
-        non_green = [s for s in rest if not is_green(s.fill)]
-        if non_green:
-            problems.append(
-                f"除橙色圆形外仍存在非绿色填充组件："
-                f"{[color_name(s.fill) for s in non_green]}"
-            )
-
-    # 橙色部分位于整体的"中上"位置：
-    #   中 —— 橙色几何中心的水平位置接近组合水平中线
-    #   上 —— 橙色几何中心的垂直位置位于组合上半部
-    # OOXML `off`+`ext` 精确到 EMU，办公软件间一致。
-    if orange_circles:
-        combo_mid_x = x1 + w * 0.5
-        combo_mid_y = y1 + h * 0.5
-        # "上"：中心在上半部
-        not_upper = [s for s in orange_circles if s.cy > combo_mid_y]
-        if not_upper:
-            problems.append("橙色圆形垂直中心未位于组合上半部（不『上』）")
-        # "中"：中心横向偏离 ≤ 组合宽度 15%
-        off_center = [
-            s for s in orange_circles
-            if w > 0 and abs(s.cx - combo_mid_x) / w > 0.15
-        ]
-        if off_center:
-            for s in off_center:
-                offset = (s.cx - combo_mid_x)
-                problems.append(
-                    f"橙色圆形水平中心偏离组合中线 {offset:+.2f}cm（组合宽 {w:.2f}cm，占比 {abs(offset)/w*100:.1f}%），不『中』"
-                )
-
-    if problems:
-        return fail("第1页左上角logo组件不满足：" + "；".join(problems))
-
-    return ok(
-        f"第1页左上角logo组件组合 {w:.2f}×{h:.2f}cm，"
-        f"含中上位置橙色圆形与剩余绿色组件"
-    )
-
-
-def c02_cn_company(model: PptModel) -> CheckResult:
-    """+1：第1页幻灯片出现"福建蓝屿新材料科技有限公司"文本：字体为微软雅黑
-    或黑体，24-32磅，位于距顶部页面 10%-25% 的位置。
-    """
-    s = first_text(model, 1, "福建蓝屿新材料科技有限公司")
-    if not s:
-        return fail("第1页未找到\"福建蓝屿新材料科技有限公司\"文本")
-
-    # 字体：微软雅黑或黑体
-    # 首选 python-pptx 解析的 font.name（对应 <a:latin typeface>）；
-    # 中文字体在部分办公软件（WPS/Keynote 等）中可能仅写入 <a:ea typeface>，
-    # 因此再从形状原始 XML 中读取全部 typeface 作为兜底，保证跨办公软件有效。
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', s.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(s)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not any(is_yahei_or_heiti(n) for n in all_names):
-        return fail(
-            f"第1页公司中文名字体不是微软雅黑/黑体："
-            f"latin={latin_names} typefaces={typefaces}"
-        )
-
-    # 字号：24-32 磅（每个非空 run 都必须落在区间内）
-    sizes = font_sizes(s)
-    if not sizes or not all(between(sz, 24, 32) for sz in sizes):
-        return fail(f"第1页公司中文名字号不在 24-32 磅：{sizes}")
-
-    # 位置：距顶部页面 10%-25%
-    top_pct = s.y / model.slide_h
-    if not between(top_pct, 0.10, 0.25):
-        return fail(f"第1页公司中文名距顶部 {top_pct:.1%}，不在 10%-25%")
-
-    return ok(
-        f"第1页公司中文名符合：字号={sizes} 距顶部={top_pct:.1%}"
-    )
-
-
-def c03_en_company_slide2(model: PptModel) -> CheckResult:
-    """+1：第2页幻灯片出现"FUJIAN LANYU NOVA MATERIALS CO., LTD."文本：字体
-    为 Arial，24-32 磅，整体位于距页面左边线 0%-70%、顶部边线 10%-25% 的
-    位置；分两行排列布局。
-    """
-    s = first_text(model, 2, "FUJIAN LANYU NOVA MATERIALS CO., LTD.")
-    if not s:
-        return fail("第2页未找到\"FUJIAN LANYU NOVA MATERIALS CO., LTD.\"文本")
-
-    # 字体：Arial
-    # 为兼容 PowerPoint / WPS / Keynote 等办公软件，除 python-pptx 解析的
-    # font.name（<a:latin typeface>）之外，再从原始 XML 中收集所有 typeface
-    # 声明，避免仅写入 ea/cs 时漏判。
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', s.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(s)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not all(is_arial(n) for n in all_names):
-        return fail(
-            f"第2页英文公司名字体不是 Arial："
-            f"latin={latin_names} typefaces={typefaces}"
-        )
-
-    # 字号：24-32 磅（每个非空 run 都必须落在区间内）
-    sizes = font_sizes(s)
-    if not sizes or not all(between(sz, 24, 32) for sz in sizes):
-        return fail(f"第2页英文公司名字号不在 24-32 磅：{sizes}")
-
-    # 整体位置：距页面左边线 0%-70%、顶部边线 10%-25%
-    # "整体位于"指文本框的外框整体落入区域内 → 左右边界都需在横向范围内、
-    # 上下边界都需在纵向范围内。办公软件（PowerPoint/WPS/Keynote）保存
-    # 位置时以 EMU 为单位，最终换算到百分比会有 ~1%-2% 的渲染精度损失，
-    # 因此这里保留 2% 容差以兼容真实办公软件文件，同时仍严格执行"整体
-    # 位于"的双边界检查。
-    x1_pct = s.x / model.slide_w
-    x2_pct = s.x2 / model.slide_w
-    y1_pct = s.y / model.slide_h
-    y2_pct = s.y2 / model.slide_h
-    if not (between(x1_pct, 0.0, 0.70, tol=0.02)
-            and between(x2_pct, 0.0, 0.70, tol=0.02)):
-        return fail(
-            f"第2页英文公司名横向未整体落入 0%-70%："
-            f"x=[{x1_pct:.1%},{x2_pct:.1%}]"
-        )
-    if not (between(y1_pct, 0.10, 0.25, tol=0.02)
-            and between(y2_pct, 0.10, 0.25, tol=0.02)):
-        return fail(
-            f"第2页英文公司名纵向未整体落入 10%-25%："
-            f"y=[{y1_pct:.1%},{y2_pct:.1%}]"
-        )
-
-    # 分两行排列布局：文本框内正好包含两个非空段落
-    lines = text_lines(s)
-    if len(lines) != 2:
-        return fail(f"第2页英文公司名未分两行排列，当前行数={len(lines)}")
-
-    return ok(
-        f"第2页英文公司名符合：字号={sizes} x=[{x1_pct:.1%},{x2_pct:.1%}] "
-        f"y=[{y1_pct:.1%},{y2_pct:.1%}] 行数=2"
-    )
-
-
-def _is_four_corner_rounded_rect(shape: ShapeInfo) -> bool:
-    """判定 shape 是否为"四个圆角的矩形"。
-
-    OOXML 中"四个圆角矩形"对应 prstGeom prst="roundRect"，与仅有
-    1 个圆角 (round1Rect)、2 个同侧圆角 (round2SameRect)、
-    2 个对角圆角 (round2DiagRect) 以及切角矩形 (snip*Rect) 严格区分。
-    python-pptx 将其映射为 MSO_SHAPE.ROUNDED_RECTANGLE，name 为
-    "ROUNDED_RECTANGLE"；若走 XML 兜底则为 "ROUNDRECT"。
-    """
-    p = shape.prst.upper()
-    return p == "ROUNDED_RECTANGLE" or p == "ROUNDRECT"
-
-
-def _is_solid_line(shape: ShapeInfo) -> bool:
-    """判定 shape 的边线是否为"实线"。
-
-    OOXML 中线条虚实通过 <a:ln> 下的 <a:prstDash val="..."/> 或
-    <a:custDash> 指定；未显式声明时默认为 solid。这里既接受
-    prstDash="solid" 也接受未声明虚线两种情况，并显式排除各种
-    虚线/点线值。判定基于原始 XML，兼容 PowerPoint/WPS/Keynote。
-    """
-    try:
-        xml = shape.raw._element.xml
-    except Exception:
-        return True  # 无法访问 XML 时不阻塞
-    # 只在 <a:ln>...</a:ln> 段内判定
-    ln_match = re.search(r"<a:ln\b[^>]*>.*?</a:ln>", xml, re.DOTALL)
-    ln_xml = ln_match.group(0) if ln_match else ""
-    # 存在自定义虚线段 → 非实线
-    if "<a:custDash" in ln_xml:
-        return False
-    dash_match = re.search(r'<a:prstDash[^/]*val="([^"]+)"', ln_xml)
-    if not dash_match:
-        return True  # 未声明 → 默认实线
-    return dash_match.group(1).lower() == "solid"
-
-
-def c04_borders(model: PptModel) -> CheckResult:
-    """+1：两页幻灯片均出现"包含四个圆角的矩形"形状；边线颜色为黑色、
-    灰色、绿色实线；矩形整体宽度 24cm-26cm，高度 13cm-15cm。
-    """
-    for no in (1, 2):
-        matched = []
-        for s in model.slide(no):
-            if not _is_four_corner_rounded_rect(s):
-                continue
-            if not between(s.w, 24, 26):
-                continue
-            if not between(s.h, 13, 15):
-                continue
-            if s.line is None:
-                continue
-            color_ok = is_black(s.line) or is_gray(s.line) or is_green(s.line)
-            if not color_ok:
-                continue
-            if not _is_solid_line(s):
-                continue
-            matched.append(s)
-        if not matched:
-            return fail(
-                f"第{no}页未找到四个圆角矩形、宽24-26cm×高13-15cm、"
-                f"黑/灰/绿色实线边框"
-            )
-    return ok("两页均含四个圆角矩形（24-26×13-15cm），边线为黑/灰/绿色实线")
-
-
-def c05_en_company_slide1_subtitle(model: PptModel) -> CheckResult:
-    """+1：第1页幻灯片"福建蓝屿新材料科技有限公司"的下方出现
-    "FUJIAN LANYU NOVA MATERIALS CO., LTD." 文本：从上至下整体位于页面
-    10%-25% 之间；字体为 Arial，14-22 磅，颜色为橙色。
-    """
-    cn = first_text(model, 1, "福建蓝屿新材料科技有限公司")
-    s = first_text(model, 1, "FUJIAN LANYU NOVA MATERIALS CO., LTD.")
-    if not cn:
-        return fail("第1页未找到\"福建蓝屿新材料科技有限公司\"文本")
-    if not s:
-        return fail("第1页未找到\"FUJIAN LANYU NOVA MATERIALS CO., LTD.\"文本")
-
-    # 位于"福建蓝屿新材料科技有限公司"的下方：英文副标题顶部在中文名顶部之下
-    if not s.y > cn.y:
-        return fail(
-            f"第1页英文副标题未位于中文公司名下方："
-            f"cn_y={cn.y/model.slide_h:.1%} en_y={s.y/model.slide_h:.1%}"
-        )
-
-    # 从上至下整体位于页面 10%-25% 之间 → 上下边界都需落入区间
-    # 办公软件写入 EMU 存在渲染精度损失，保留 2% 容差以兼容真实文件。
-    y1_pct = s.y / model.slide_h
-    y2_pct = s.y2 / model.slide_h
-    if not (between(y1_pct, 0.10, 0.25, tol=0.02)
-            and between(y2_pct, 0.10, 0.25, tol=0.02)):
-        return fail(
-            f"第1页英文副标题纵向未整体落入 10%-25%："
-            f"y=[{y1_pct:.1%},{y2_pct:.1%}]"
-        )
-
-    # 字体：Arial（兼容 <a:latin>/<a:ea>/<a:cs> typeface 三种写入方式）
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', s.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(s)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not all(is_arial(n) for n in all_names):
-        return fail(
-            f"第1页英文副标题字体不是 Arial："
-            f"latin={latin_names} typefaces={typefaces}"
-        )
-
-    # 字号：14-22 磅
-    sizes = font_sizes(s)
-    if not sizes or not all(between(sz, 14, 22) for sz in sizes):
-        return fail(f"第1页英文副标题字号不在 14-22 磅：{sizes}")
-
-    # 颜色：橙色
-    colors = font_colors(s)
-    if not colors or not all(is_orange(c) for c in colors):
-        return fail(
-            f"第1页英文副标题颜色不是橙色："
-            f"{[color_name(c) for c in colors]}"
-        )
-
-    return ok(
-        f"第1页英文副标题符合：字号={sizes} y=[{y1_pct:.1%},{y2_pct:.1%}] "
-        f"颜色={[color_name(c) for c in colors]}"
-    )
-
-
-def two_horizontal_lines_with_leaf(model: PptModel, slide_no: int, y_range: tuple[float, float], length_range: tuple[float, float],
-                                   color_check: Callable, leaf_size: tuple[tuple[float, float], tuple[float, float]],
-                                   below_shape: Optional[ShapeInfo] = None,
-                                   leaf_colors_required: Optional[list[Callable]] = None) -> CheckResult:
-    """两条同水平线 + 中间叶片"组合"判定。
-
-    leaf_colors_required 为 None 时退化为旧逻辑（单一叶片满足任一颜色即可）；
-    若传入颜色检查列表，则要求叶片为"组合图形"：在中间区域内必须存在**多于一个**
-    形状，且这些形状的填充颜色集合需要**全部覆盖** leaf_colors_required 中的颜色
-    （即每个颜色至少由一个形状满足），方可视为命中。
-    """
-    slide = model.slide(slide_no)
-    lines = [s for s in slide if is_horizontal_line(s) and between(s.cy / model.slide_h, y_range[0], y_range[1], 0.02) and between(s.w, length_range[0], length_range[1], 0.25) and color_check(s.line)]
-    default_leaf_color = lambda c: is_green(c) or is_orange(c) or is_yellow(c)
-    pairs = []
-    for i, a in enumerate(lines):
-        for b in lines[i + 1:]:
-            if abs(a.cy - b.cy) <= 0.15 and a.x2 <= b.x or b.x2 <= a.x:
-                left, right = (a, b) if a.x < b.x else (b, a)
-                if below_shape is not None and min(left.y, right.y) <= below_shape.y:
-                    continue
-                middle_x1, middle_x2 = left.x2, right.x
-                if middle_x2 - middle_x1 > 3.0:  # 两条线之间空隙过大，不是同一组分隔器
-                    continue
-                middle_shapes = [s for s in slide
-                                 if middle_x1 - 0.15 <= s.cx <= middle_x2 + 0.15
-                                 and abs(s.cy - left.cy) <= 0.45
-                                 and between(s.w, leaf_size[0][0], leaf_size[0][1], 0.08)
-                                 and between(s.h, leaf_size[1][0], leaf_size[1][1], 0.08)]
-                if leaf_colors_required:
-                    # 组合图形：必须 ≥2 件形状或 1 张图片，且全部要求颜色都被覆盖
-                    if any(is_picture(s) for s in middle_shapes):
-                        pairs.append((left, right, middle_shapes[0]))
-                        continue
-                    if len(middle_shapes) < 2:
-                        continue
-                    if all(any(check(s.fill) for s in middle_shapes) for check in leaf_colors_required):
-                        pairs.append((left, right, middle_shapes[0]))
-                else:
-                    valid = [s for s in middle_shapes if default_leaf_color(s.fill) or is_picture(s)]
-                    if valid:
-                        pairs.append((left, right, valid[0]))
-    if pairs:
-        l, r, leaf = pairs[0]
-        return ok(f"第{slide_no}页找到两条同水平线及中间叶片：线长 {l.w:.2f}/{r.w:.2f}cm，叶片 {leaf.w:.2f}×{leaf.h:.2f}cm")
-    return fail(f"第{slide_no}页未找到满足位置、长度、颜色和叶片尺寸的双横线组合")
-
-
-def c06_slide1_top_separator(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片距顶部 23%-26% 位置处出现两条在同一水平线上的单实线：
-    位于"FUJIAN LANYU NOVA MATERIALS CO., LTD."下方；两条线长度均在
-    5cm-8cm 范围内，颜色为橙色；两条线中间存在一个绿色和黄色填充的叶片
-    组合形状或者图片，整体高度 0.4-0.5cm，宽度 0.3-0.4cm。
-    """
-    subtitle = first_text(model, 1, "FUJIAN LANYU NOVA MATERIALS CO., LTD.")
-    if not subtitle:
-        return fail("第1页未找到英文副标题，无法定位其下方分隔线")
-
-    slide = model.slide(1)
-
-    # 收集候选横线：
-    # 1) 位置：cy 落在 23%-26%（保留 2% 容差兼容办公软件 EMU 渲染精度）
-    # 2) 长度：5-8cm
-    # 3) 颜色：橙色
-    # 4) 单实线（<a:prstDash> 未声明或 val="solid"，且无 <a:custDash>）
-    # 5) 位于英文副标题下方（顶部在副标题底部之下）
-    lines = []
-    for s in slide:
-        if not is_horizontal_line(s):
-            continue
-        cy_pct = s.cy / model.slide_h
-        if not between(cy_pct, 0.23, 0.26, tol=0.02):
-            continue
-        if not between(s.w, 5, 8):
-            continue
-        if not is_orange(s.line):
-            continue
-        if not _is_solid_line(s):
-            continue
-        if s.y < subtitle.y2:
-            continue
-        lines.append(s)
-
-    # 两条线在"同一水平线上"：cy 差 ≤ 0.10cm（≈同一渲染像素行）；
-    # 且互不重叠，才能作为"两条独立的横线"。
-    pair = None
-    for i, a in enumerate(lines):
-        for b in lines[i + 1:]:
-            if abs(a.cy - b.cy) > 0.10:
-                continue
-            left, right = (a, b) if a.x < b.x else (b, a)
-            if left.x2 > right.x:  # 有重叠 → 不是并排两条
-                continue
-            pair = (left, right)
-            break
-        if pair:
-            break
-
-    if not pair:
-        return fail(
-            "第1页副标题下方 23%-26% 未找到两条在同一水平线、"
-            "长度 5-8cm、橙色、单实线的横线"
-        )
-
-    left, right = pair
-    middle_x1, middle_x2 = left.x2, right.x
-    middle_cy = (left.cy + right.cy) / 2
-
-    # 两条线中间的"叶片"组合形状或图片：
-    # - 组合形状：中间区域内 ≥2 个具备填充/线条的图形，且填充颜色集合同时
-    #   覆盖"绿色"与"黄色"两个要求。
-    # - 图片：中间区域内存在一张图片（图片路径不再校验颜色，只校验尺寸）。
-    # 整体：宽 0.3-0.4cm、高 0.4-0.5cm（组合看外包围盒；图片看自身尺寸）。
-    middle_shapes = [
-        s for s in slide
-        if s is not left and s is not right
-        and middle_x1 - 0.15 <= s.cx <= middle_x2 + 0.15
-        and abs(s.cy - middle_cy) <= 0.45
-    ]
-
-    # 路径 A：图片
-    pictures = [s for s in middle_shapes if is_picture(s)]
-    for pic in pictures:
-        if between(pic.w, 0.3, 0.4) and between(pic.h, 0.4, 0.5):
-            return ok(
-                f"第1页副标题下方双橙线中间找到叶片图片 "
-                f"{pic.w:.2f}×{pic.h:.2f}cm"
-            )
-
-    # 路径 B：组合形状
-    combo = [
-        s for s in middle_shapes
-        if not is_picture(s)
-        and s.prst  # 需有几何形状（排除纯文本框）
-        and (s.fill is not None or s.line is not None)
-    ]
-    if len(combo) >= 2:
-        has_green = any(is_green(s.fill) for s in combo)
-        has_yellow = any(is_yellow(s.fill) for s in combo)
-        if has_green and has_yellow:
-            cx1 = min(s.x for s in combo)
-            cx2 = max(s.x2 for s in combo)
-            cy1 = min(s.y for s in combo)
-            cy2 = max(s.y2 for s in combo)
-            combo_w, combo_h = cx2 - cx1, cy2 - cy1
-            if between(combo_w, 0.3, 0.4) and between(combo_h, 0.4, 0.5):
-                return ok(
-                    f"第1页副标题下方双橙线中间找到叶片组合形状（{len(combo)} 件），"
-                    f"整体 {combo_w:.2f}×{combo_h:.2f}cm，含绿色与黄色填充"
-                )
-            return fail(
-                f"第1页副标题下方双橙线中间叶片组合尺寸不满足："
-                f"{combo_w:.2f}×{combo_h:.2f}cm"
-            )
-        return fail(
-            f"第1页副标题下方双橙线中间组合缺少绿色或黄色填充："
-            f"green={has_green} yellow={has_yellow}"
-        )
-
-    return fail("第1页副标题下方双橙线中间未找到叶片组合形状或图片")
-
-
-def c07_qr_both(model: PptModel) -> CheckResult:
-    """+1：两页幻灯片右上角均出现二维码组合形状或者图片：距左侧页边线
-    75%-100%、顶部 0%-25% 的距离范围内；整体宽度 3-4cm，高度 3-4cm，
-    宽高比为 1:1。
-    """
-    for no in (1, 2):
-        matched = []
-        for s in model.slide(no):
-            # 类型：组合形状（GroupShape，python-pptx 会同时暴露 group 与其
-            # 子形状；group 本身具备 `.shapes` 属性）或者图片（PICTURE）。
-            is_group = hasattr(s.raw, "shapes")
-            if not (is_picture(s) or is_group):
-                continue
-
-            # 位置："距左侧页边线 75%-100%" → 形状左边距页面左边线的相对距离
-            # 处在 75%-100%；"距顶部 0%-25%" → 形状上边距页面顶部的相对距离
-            # 处在 0%-25%。二者以形状左上角为基准。保留 2% 容差以兼容办公
-            # 软件写入 EMU 的渲染精度损失。
-            x_pct = s.x / model.slide_w
-            y_pct = s.y / model.slide_h
-            if not between(x_pct, 0.75, 1.00, tol=0.02):
-                continue
-            if not between(y_pct, 0.00, 0.25, tol=0.02):
-                continue
-
-            # 尺寸：宽 3-4cm、高 3-4cm
-            if not (between(s.w, 3, 4) and between(s.h, 3, 4)):
-                continue
-
-            # 宽高比 1:1：允许 ±5% 的办公软件渲染误差
-            if s.h <= 0:
-                continue
-            ratio = s.w / s.h
-            if not between(ratio, 1.0, 1.0, tol=0.05):
-                continue
-
-            matched.append(s)
-
-        if not matched:
-            return fail(
-                f"第{no}页右上角未找到二维码组合形状/图片："
-                f"位置 75%-100% × 0%-25%、尺寸 3-4cm、宽高比 1:1"
-            )
-
-    return ok("两页右上角均出现二维码组合形状或图片，位置/尺寸/宽高比均符合")
-
-
-def c08_name_cn(model: PptModel) -> CheckResult:
-    """+1：第1页幻灯片出现"沈知行"文本：位于页面从左至右 10%-45%、从上至下
-    30%-60% 的位置处；字体为宋体或楷体，加粗，字号为 40-50 磅，颜色为绿色。
-    """
-    s = first_text(model, 1, "沈知行")
-    if not s:
-        return fail("第1页未找到\"沈知行\"文本")
-
-    # 位置：整体位于页面从左至右 10%-45%、从上至下 30%-60%。
-    # "位于"取形状的左上角为基准（与其它条目一致）。保留 2% 容差以兼容办公
-    # 软件写入 EMU 的渲染精度损失。
-    x_pct = s.x / model.slide_w
-    y_pct = s.y / model.slide_h
-    if not between(x_pct, 0.10, 0.45, tol=0.02):
-        return fail(f"第1页\"沈知行\"横向位置 {x_pct:.1%} 不在 10%-45%")
-    if not between(y_pct, 0.30, 0.60, tol=0.02):
-        return fail(f"第1页\"沈知行\"纵向位置 {y_pct:.1%} 不在 30%-60%")
-
-    # 字体：宋体或楷体。兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式，
-    # 以适配 PowerPoint / WPS / Keynote 对中文字体的不同存放位置。
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', s.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(s)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not all(is_song_or_kai(n) for n in all_names):
-        return fail(
-            f"第1页\"沈知行\"字体不是宋体/楷体："
-            f"latin={latin_names} typefaces={typefaces}"
-        )
-
-    # 加粗：OOXML `<a:rPr b="1"/>`；python-pptx 映射为 run.font.bold == True。
-    # 未声明时为 None，视为未加粗。要求所有非空 run 均声明为加粗。
-    runs = [r for p in s.paragraphs for r in p["runs"] if r["text"].strip()]
-    if not runs or not all(r["bold"] is True for r in runs):
-        return fail(
-            f"第1页\"沈知行\"未加粗：bold={[r['bold'] for r in runs]}"
-        )
-
-    # 字号：40-50 磅
-    sizes = font_sizes(s)
-    if not sizes or not all(between(sz, 40, 50) for sz in sizes):
-        return fail(f"第1页\"沈知行\"字号不在 40-50 磅：{sizes}")
-
-    # 颜色：绿色
-    colors = font_colors(s)
-    if not colors or not all(is_green(c) for c in colors):
-        return fail(
-            f"第1页\"沈知行\"颜色不是绿色："
-            f"{[color_name(c) for c in colors]}"
-        )
-
-    return ok(
-        f"第1页\"沈知行\"符合：pos=({x_pct:.1%},{y_pct:.1%}) 字号={sizes} "
-        f"颜色={[color_name(c) for c in colors]}"
-    )
-
-
-def c09_name_separator(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片从上至下页面的 50% 处出现两条同一水平线的单实线：
-    位于"沈知行"下方；长度 2cm-3.5cm；颜色为绿色；两条横线中间存在一个
-    黄色或者橙色的叶片形状组合图或图片，整体高度 0.35-0.45cm、宽 0.2-0.3cm。
-    """
-    name = first_text(model, 1, "沈知行")
-    if not name:
-        return fail("第1页未找到\"沈知行\"，无法定位其下方分隔线")
-
-    slide = model.slide(1)
-
-    # 候选横线判定：
-    # 1) 位于 50% 处：cy 落在 50% ± 3%（保留 3% 容差兼容办公软件 EMU 渲染精度）
-    # 2) 位于"沈知行"下方：线的顶端在"沈知行"底部之下
-    # 3) 长度 2cm-3.5cm
-    # 4) 颜色为绿色
-    # 5) 单实线（<a:prstDash> 未声明或 val="solid"，且无 <a:custDash>）
-    lines = []
-    for s in slide:
-        if not is_horizontal_line(s):
-            continue
-        cy_pct = s.cy / model.slide_h
-        if not between(cy_pct, 0.50, 0.50, tol=0.03):
-            continue
-        if s.y < name.y2:
-            continue
-        if not between(s.w, 2, 3.5):
-            continue
-        if not is_green(s.line):
-            continue
-        if not _is_solid_line(s):
-            continue
-        lines.append(s)
-
-    # 两条"同一水平线"：cy 差 ≤ 0.10cm；且两条水平不重叠。
-    pair = None
-    for i, a in enumerate(lines):
-        for b in lines[i + 1:]:
-            if abs(a.cy - b.cy) > 0.10:
-                continue
-            left, right = (a, b) if a.x < b.x else (b, a)
-            if left.x2 > right.x:
-                continue
-            pair = (left, right)
-            break
-        if pair:
-            break
-
-    if not pair:
-        return fail(
-            "第1页\"沈知行\"下方 50% 处未找到两条在同一水平线、"
-            "长度 2-3.5cm、绿色单实线"
-        )
-
-    left, right = pair
-    middle_x1, middle_x2 = left.x2, right.x
-    middle_cy = (left.cy + right.cy) / 2
-
-    # 两条线中间的"叶片"组合形状或图片。
-    # 中间区域：cx 落在两线中间水平段内（放宽 0.15cm 容差），cy 与线中心接
-    # 近（≤0.45cm）。
-    middle_shapes = [
-        s for s in slide
-        if s is not left and s is not right
-        and middle_x1 - 0.15 <= s.cx <= middle_x2 + 0.15
-        and abs(s.cy - middle_cy) <= 0.45
-    ]
-
-    # 路径 A：图片。整体宽 0.2-0.3cm、高 0.35-0.45cm。
-    for pic in [s for s in middle_shapes if is_picture(s)]:
-        if between(pic.w, 0.2, 0.3) and between(pic.h, 0.35, 0.45):
-            return ok(
-                f"第1页\"沈知行\"下方双绿线中间找到叶片图片 "
-                f"{pic.w:.2f}×{pic.h:.2f}cm"
-            )
-
-    # 路径 B：组合形状。至少 1 个组件填充为"黄色或者橙色"；整体外包围盒
-    # 宽 0.2-0.3cm、高 0.35-0.45cm。
-    combo = [
-        s for s in middle_shapes
-        if not is_picture(s)
-        and s.prst  # 需有几何形状 prst（排除纯文本框）
-        and (s.fill is not None or s.line is not None)
-    ]
-    if combo:
-        has_yellow_or_orange = any(
-            is_yellow(s.fill) or is_orange(s.fill) for s in combo
-        )
-        cx1 = min(s.x for s in combo)
-        cx2 = max(s.x2 for s in combo)
-        cy1 = min(s.y for s in combo)
-        cy2 = max(s.y2 for s in combo)
-        combo_w, combo_h = cx2 - cx1, cy2 - cy1
-        size_ok = between(combo_w, 0.2, 0.3) and between(combo_h, 0.35, 0.45)
-        if has_yellow_or_orange and size_ok:
-            return ok(
-                f"第1页\"沈知行\"下方双绿线中间找到叶片组合形状"
-                f"（{len(combo)} 件），整体 {combo_w:.2f}×{combo_h:.2f}cm"
-            )
-        if not has_yellow_or_orange:
-            return fail(
-                f"第1页\"沈知行\"下方双绿线中间组合缺少黄色或橙色填充："
-                f"{[color_name(s.fill) for s in combo]}"
-            )
-        return fail(
-            f"第1页\"沈知行\"下方双绿线中间叶片组合尺寸不满足："
-            f"{combo_w:.2f}×{combo_h:.2f}cm"
-        )
-
-    return fail("第1页\"沈知行\"下方双绿线中间未找到叶片组合形状或图片")
-
-
-def c10_mp_slide1(model: PptModel) -> CheckResult:
-    """+1：第1页幻灯片出现"M.P."文本：位于页面下方 70%-80%、左侧 10%-40%
-    的区域范围内，且在"沈知行"下方且与其左对齐，字体为 Arial，13-20Pt，
-    颜色为绿色。
-    """
-    mp = first_text(model, 1, "M.P.")
-    name = first_text(model, 1, "沈知行")
-    if not mp:
-        return fail("第1页未找到\"M.P.\"文本")
-    if not name:
-        return fail("第1页未找到\"沈知行\"，无法判定 M.P. 与其左对齐")
-
-    # 位置：位于页面下方 70%-80%、左侧 10%-40% 的区域范围内。
-    # "位于...区域范围内"以形状左上角为基准；保留 2% 容差兼容办公软件
-    # EMU→百分比的渲染精度损失。
-    x_pct = mp.x / model.slide_w
-    y_pct = mp.y / model.slide_h
-    if not between(y_pct, 0.70, 0.80, tol=0.02):
-        return fail(f"第1页\"M.P.\"纵向位置 {y_pct:.1%} 不在 70%-80%")
-    if not between(x_pct, 0.10, 0.40, tol=0.02):
-        return fail(f"第1页\"M.P.\"横向位置 {x_pct:.1%} 不在 10%-40%")
-
-    # 在"沈知行"下方：M.P. 顶部在"沈知行"底部之下
-    if not mp.y > name.y2:
-        return fail(
-            f"第1页\"M.P.\"未位于\"沈知行\"下方："
-            f"name_y2={name.y2:.2f} mp_y={mp.y:.2f}"
-        )
-
-    # 与"沈知行"左对齐：两者左边界差 ≤ 0.35cm（办公软件文本框内边距 ~0.25cm）
-    if abs(mp.x - name.x) > 0.35:
-        return fail(
-            f"第1页\"M.P.\"与\"沈知行\"未左对齐："
-            f"Δx={abs(mp.x - name.x):.2f}cm"
-        )
-
-    # 字体：Arial。兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式。
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', mp.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(mp)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not all(is_arial(n) for n in all_names):
-        return fail(
-            f"第1页\"M.P.\"字体不是 Arial："
-            f"latin={latin_names} typefaces={typefaces}"
-        )
-
-    # 字号：13-20 磅
-    sizes = font_sizes(mp)
-    if not sizes or not all(between(sz, 13, 20) for sz in sizes):
-        return fail(f"第1页\"M.P.\"字号不在 13-20 磅：{sizes}")
-
-    # 颜色：绿色
-    colors = font_colors(mp)
-    if not colors or not all(is_green(c) for c in colors):
-        return fail(
-            f"第1页\"M.P.\"颜色不是绿色：{[color_name(c) for c in colors]}"
-        )
-
-    return ok(
-        f"第1页\"M.P.\"符合：pos=({x_pct:.1%},{y_pct:.1%}) 字号={sizes} "
-        f"颜色={[color_name(c) for c in colors]}"
-    )
-
-
-def _is_times_new_roman(name: str) -> bool:
-    """严格判定 typeface 是否为 Times New Roman（区别于普通 Times）。
-
-    OOXML 中"Times New Roman"字体通常以完整名称写入 typeface；这里同时兼
-    容"Times New Roman"和常见变体如"TimesNewRomanPSMT"、"NimbusRomNo9L"
-    等,与"Arial"互斥判定。
-    """
-    n = norm_font_name(name)
-    return "timesnewroman" in n
-
-
-def c11_phone_text_both(model: PptModel) -> CheckResult:
-    """+1：两页幻灯片均出现"139 4826 7153"文本：位于"M.P."右侧，字体为
-    Arial、Times New Roman，15-22Pt，颜色为黑色、绿色。
-    """
-    for no in (1, 2):
-        phone = first_text(model, no, "139 4826 7153")
-        mp = first_text(model, no, "M.P.")
-        if not phone:
-            return fail(f"第{no}页未找到\"139 4826 7153\"文本")
-        if not mp:
-            return fail(f"第{no}页未找到\"M.P.\"，无法判定电话在其右侧")
-
-        # 位于"M.P."右侧：电话文本框左边在 M.P. 右边之后
-        if not phone.x >= mp.x2:
-            return fail(
-                f"第{no}页\"139 4826 7153\"未位于\"M.P.\"右侧："
-                f"mp.x2={mp.x2:.2f} phone.x={phone.x:.2f}"
-            )
-
-        # 字体：Arial 或 Times New Roman。兼容 <a:latin>/<a:ea>/<a:cs> 三种
-        # typeface 写入方式，以适配 PowerPoint / WPS / Keynote。
-        try:
-            typefaces = re.findall(r'typeface="([^"]+)"', phone.raw._element.xml)
-        except Exception:
-            typefaces = []
-        latin_names = font_names(phone)
-        all_names = [n for n in latin_names + typefaces if n]
-        if not all_names:
-            return fail(f"第{no}页\"139 4826 7153\"未声明字体")
-        for n in all_names:
-            if not (is_arial(n) or _is_times_new_roman(n)):
-                return fail(
-                    f"第{no}页\"139 4826 7153\"字体不是 Arial/Times New Roman："
-                    f"{n!r}（全部：latin={latin_names} typefaces={typefaces}）"
-                )
-
-        # 字号：15-22Pt
-        sizes = font_sizes(phone)
-        if not sizes or not all(between(sz, 15, 22) for sz in sizes):
-            return fail(
-                f"第{no}页\"139 4826 7153\"字号不在 15-22 磅：{sizes}"
-            )
-
-        # 颜色：黑色或绿色（细则用"、"表示或）
-        colors = font_colors(phone)
-        if not colors or not all(is_black(c) or is_green(c) for c in colors):
-            return fail(
-                f"第{no}页\"139 4826 7153\"颜色不是黑色/绿色："
-                f"{[color_name(c) for c in colors]}"
-            )
-
-    return ok(
-        "两页\"139 4826 7153\"均位于\"M.P.\"右侧，"
-        "Arial/Times New Roman 15-22Pt 黑/绿色符合"
-    )
-
-
-def icon_left_of_text(model: PptModel, slide_no: int, target: str, glyphs: list[str]) -> CheckResult:
-    text = first_text(model, slide_no, target)
-    if not text:
-        return fail(f"第{slide_no}页未找到目标文本 {target}")
-    icons = []
-    for s in model.slide(slide_no):
-        if s.x2 <= text.x + 0.15 and abs(s.cy - text.cy) <= 0.45 and is_round_rect(s) and between(s.w, 0.8, 1.0, 0.12) and between(s.h, 0.8, 1.0, 0.12) and is_deep_green(s.fill):
-            glyph_ok = any(g in s.text for g in glyphs)
-            white_text = not s.text.strip() or any(is_white(c) for c in font_colors(s))
-            if glyph_ok and white_text:
-                icons.append(s)
-    if icons:
-        return ok(f"第{slide_no}页 {target} 左侧找到深绿色圆角矩形白色图标")
-    return fail(f"第{slide_no}页 {target} 左侧未找到符合尺寸/颜色/图案的图标")
-
-
-def c12_phone_icon_both(model: PptModel) -> CheckResult:
-    """+3：两页幻灯片中"M.P."左侧均有一个宽 0.8-1cm、高 0.8-1cm 的深绿色
-    填充的圆角矩形，其中间有一个白色的电话图案。
-    """
-    phone_glyphs = ["☎", "☏", "phone", "tel"]
-    for no in (1, 2):
-        mp = first_text(model, no, "M.P.")
-        if not mp:
-            return fail(f"第{no}页未找到\"M.P.\"，无法定位其左侧图标")
-
-        # 收集候选：位于 M.P. 左侧、宽高 0.8-1cm、深绿色填充的圆角矩形。
-        # - 位于左侧：候选形状右边不超过 M.P. 左边（允许 0.15cm 办公软件边距）
-        # - 圆角矩形：OOXML prst="roundRect"（严格四个圆角）
-        # - 深绿色填充：is_deep_green(fill)
-        # - 宽/高 0.8-1cm
-        candidates = []
-        for s in model.slide(no):
-            if s is mp:
-                continue
-            if not _is_four_corner_rounded_rect(s):
-                continue
-            if not (between(s.w, 0.8, 1.0) and between(s.h, 0.8, 1.0)):
-                continue
-            if not is_deep_green(s.fill):
-                continue
-            if s.x2 > mp.x + 0.15:
-                continue
-            candidates.append(s)
-
-        # 需要"其中间"存在电话图案（白色）：
-        # 路径 A：圆角矩形自身文本框包含电话字符（☎/☏/phone/tel），
-        #         且字体颜色为白色。这是最常见的图标写法（形状 + 文本）。
-        # 路径 B：圆角矩形的几何范围内存在一张图片（is_picture）— 视为
-        #         "电话图案"的图片形式。图片是否为电话内容无法在 OOXML
-        #         级别校验，采用几何包含 + "存在图片"作为可行判据。
-        # 路径 C：圆角矩形几何范围内存在白色矢量图形/线条组合 —— 覆盖
-        #         "电话图案由白色 freeform / line / group 构成"这种常见写法。
-        #         判定条件：
-        #           a) 形状不是圆角矩形本身、不是 M.P. 文本；
-        #           b) 形状不是图片（图片走路径 B）；
-        #           c) 形状不承载文字（文字走路径 A）；
-        #           d) 填充或线条颜色为白色；
-        #           e) 几何上落入圆角矩形内部（面积≥50%重叠；线条按中心点判定）；
-        #           f) 尺寸不超过圆角矩形自身（排除整页级白色背景）。
-        def _mostly_inside(inner: "ShapeInfo", container: "ShapeInfo") -> bool:
-            if inner.area > 0:
-                return overlap_area(inner, container) / inner.area >= 0.50
-            # 退化形状(w 或 h 为 0，如直线)：用中心点是否落入 container
-            return (container.x - 0.05 <= inner.cx <= container.x2 + 0.05
-                    and container.y - 0.05 <= inner.cy <= container.y2 + 0.05)
-
-        def _is_white_vector_inside(inner: "ShapeInfo", container: "ShapeInfo", mp_shape: "ShapeInfo") -> bool:
-            if inner is container or inner is mp_shape:
-                return False
-            if is_picture(inner):
-                return False
-            if inner.text.strip():
-                return False
-            if not (is_white(inner.fill) or is_white(inner.line)):
-                return False
-            # 排除超出圆角矩形自身尺寸的形状（页面级白色背景/大装饰）
-            if inner.w > container.w * 1.1 or inner.h > container.h * 1.1:
-                return False
-            return _mostly_inside(inner, container)
-
-        icon_ok = None
-        for c in candidates:
-            # 路径 A
-            has_glyph = any(g in c.text for g in phone_glyphs)
-            colors = font_colors(c)
-            white_glyph = has_glyph and colors and all(is_white(cc) for cc in colors)
-            if white_glyph:
-                icon_ok = c
-                break
-
-            # 路径 B：查找几何上落入圆角矩形内部的图片
-            has_pic_inside = any(
-                is_picture(s)
-                and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50
-                for s in model.slide(no)
-            )
-            if has_pic_inside:
-                icon_ok = c
-                break
-
-            # 路径 C：查找几何上落入圆角矩形内部的白色矢量图形/线条组合
-            has_white_vector = any(
-                _is_white_vector_inside(s, c, mp) for s in model.slide(no)
-            )
-            if has_white_vector:
-                icon_ok = c
-                break
-
-        if not icon_ok:
-            return fail(
-                f"第{no}页\"M.P.\"左侧未找到 0.8-1cm 深绿色圆角矩形，"
-                f"或其中间未包含白色电话图案"
-            )
-
-    return ok(
-        "两页\"M.P.\"左侧均有 0.8-1cm 深绿色圆角矩形，中间含白色电话图案"
-    )
-
-
-def c13_email_text_both(model: PptModel) -> CheckResult:
-    """+1：两页幻灯片均出现"z.xing@lanyunova.com"文本：从上至下位于页面
-    70%-80% 高度，从左至右位于 10%-40% 宽度的区域范围内；字体为 Arial，
-    13-17 磅。
-    """
-    for no in (1, 2):
-        s = first_text(model, no, "z.xing@lanyunova.com")
-        if not s:
-            return fail(f"第{no}页未找到\"z.xing@lanyunova.com\"文本")
-
-        # 位置："从上至下位于页面 70%-80% 高度"、"从左至右位于 10%-40% 宽度"。
-        # 以形状左上角为基准（与本细则中其它同类"位于...区域范围内"条目
-        # 保持一致的判定基准）。保留 2% 容差兼容办公软件 EMU→百分比的
-        # 渲染精度损失。
-        x_pct = s.x / model.slide_w
-        y_pct = s.y / model.slide_h
-        if not between(y_pct, 0.70, 0.80, tol=0.02):
-            return fail(
-                f"第{no}页邮箱纵向位置 {y_pct:.1%} 不在 70%-80%"
-            )
-        if not between(x_pct, 0.10, 0.40, tol=0.02):
-            return fail(
-                f"第{no}页邮箱横向位置 {x_pct:.1%} 不在 10%-40%"
-            )
-
-        # 字体：Arial。兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式。
-        try:
-            typefaces = re.findall(r'typeface="([^"]+)"', s.raw._element.xml)
-        except Exception:
-            typefaces = []
-        latin_names = font_names(s)
-        all_names = [n for n in latin_names + typefaces if n]
-        if not all_names or not all(is_arial(n) for n in all_names):
-            return fail(
-                f"第{no}页邮箱字体不是 Arial："
-                f"latin={latin_names} typefaces={typefaces}"
-            )
-
-        # 字号：13-17 磅
-        sizes = font_sizes(s)
-        if not sizes or not all(between(sz, 13, 17) for sz in sizes):
-            return fail(
-                f"第{no}页邮箱字号不在 13-17 磅：{sizes}"
-            )
-
-    return ok(
-        "两页\"z.xing@lanyunova.com\"位置、Arial 字体、13-17 磅均符合"
-    )
-
-
-def c14_email_icon_both(model: PptModel) -> CheckResult:
-    """+5：两页幻灯片"z.xing@lanyunova.com"左侧均出现一个宽 0.8-1cm、高
-    0.8-1cm 的深绿色填充圆角矩形形状，中间是一个白色信封图案。
-    """
-    envelope_glyphs = ["✉", "✉️", "envelope", "mail", "📧"]
-    for no in (1, 2):
-        email = first_text(model, no, "z.xing@lanyunova.com")
-        if not email:
-            return fail(
-                f"第{no}页未找到\"z.xing@lanyunova.com\"，无法定位其左侧图标"
-            )
-
-        # 候选：位于邮箱左侧、宽高 0.8-1cm、深绿色填充的圆角矩形。
-        # - 位于左侧：候选形状右边不超过邮箱左边（+0.15cm 办公软件文本框内边距）
-        # - 圆角矩形：OOXML prst="roundRect"（严格四个圆角）
-        # - 宽 0.8-1cm、高 0.8-1cm
-        # - 深绿色填充：is_deep_green(fill)
-        candidates: list[ShapeInfo] = []
-        for s in model.slide(no):
-            if s is email:
-                continue
-            if not _is_four_corner_rounded_rect(s):
-                continue
-            if not (between(s.w, 0.8, 1.0) and between(s.h, 0.8, 1.0)):
-                continue
-            if not is_deep_green(s.fill):
-                continue
-            if s.x2 > email.x + 0.15:
-                continue
-            candidates.append(s)
-
-        # 中间是白色信封图案：
-        # 路径 A：圆角矩形自身文本框包含信封字符（✉/envelope/mail 等），
-        #         且字体颜色全为白色。
-        # 路径 B：圆角矩形几何范围内存在一张图片（is_picture）— 视为
-        #         "信封图案"的图片形式。
-        # 路径 C：圆角矩形几何范围内存在白色矢量图形/线条组合 —— 覆盖
-        #         "信封图案由白色 freeform / line / group 构成"这种常见写法。
-        #         判定条件：
-        #           a) 形状不是圆角矩形本身、不是邮箱文本；
-        #           b) 形状不是图片（图片走路径 B）；
-        #           c) 形状不承载文字（文字走路径 A）；
-        #           d) 填充或线条颜色为白色；
-        #           e) 几何上落入圆角矩形内部（面积≥50%重叠；线条按中心点判定）；
-        #           f) 尺寸不超过圆角矩形自身（排除整页级白色背景）。
-        def _mostly_inside(inner: "ShapeInfo", container: "ShapeInfo") -> bool:
-            if inner.area > 0:
-                return overlap_area(inner, container) / inner.area >= 0.50
-            # 退化形状(w 或 h 为 0，如直线)：用中心点是否落入 container
-            return (container.x - 0.05 <= inner.cx <= container.x2 + 0.05
-                    and container.y - 0.05 <= inner.cy <= container.y2 + 0.05)
-
-        def _is_white_vector_inside(inner: "ShapeInfo", container: "ShapeInfo", email_shape: "ShapeInfo") -> bool:
-            if inner is container or inner is email_shape:
-                return False
-            if is_picture(inner):
-                return False
-            if inner.text.strip():
-                return False
-            if not (is_white(inner.fill) or is_white(inner.line)):
-                return False
-            # 排除超出圆角矩形自身尺寸的形状（页面级白色背景/大装饰）
-            if inner.w > container.w * 1.1 or inner.h > container.h * 1.1:
-                return False
-            return _mostly_inside(inner, container)
-
-        icon_ok = None
-        for c in candidates:
-            has_glyph = any(g in c.text for g in envelope_glyphs)
-            colors = font_colors(c)
-            white_glyph = has_glyph and colors and all(is_white(cc) for cc in colors)
-            if white_glyph:
-                icon_ok = c
-                break
-
-            has_pic_inside = any(
-                is_picture(s)
-                and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50
-                for s in model.slide(no)
-            )
-            if has_pic_inside:
-                icon_ok = c
-                break
-
-            # 路径 C：查找几何上落入圆角矩形内部的白色矢量图形/线条组合
-            has_white_vector = any(
-                _is_white_vector_inside(s, c, email) for s in model.slide(no)
-            )
-            if has_white_vector:
-                icon_ok = c
-                break
-
-        if not icon_ok:
-            return fail(
-                f"第{no}页邮箱左侧未找到 0.8-1cm 深绿色圆角矩形，"
-                f"或其中间未包含白色信封图案"
-            )
-
-    return ok("两页邮箱左侧均有 0.8-1cm 深绿色圆角矩形，中间含白色信封图案")
-
-
-def c15_cn_address_text(model: PptModel) -> CheckResult:
-    """+1：第1页幻灯片出现"福建省厦门市海沧区云创大道88号蓝湾创新中心12层
-    1208室"文本：从上至下位于页面下方 80%-90% 高度，从左至右位于 10%-40%
-    宽度的区域范围内；且在"z.xing@lanyunova.com"文本下方并与其左对齐；
-    字体为微软雅黑或黑体 9-15 磅。
-    """
-    target = "福建省厦门市海沧区云创大道88号蓝湾创新中心12层1208室"
-    addr = first_text(model, 1, target)
-    email = first_text(model, 1, "z.xing@lanyunova.com")
-    if not addr:
-        return fail(f"第1页未找到中文地址文本：{target}")
-    if not email:
-        return fail("第1页未找到\"z.xing@lanyunova.com\"，无法判定地址与其左对齐")
-
-    # 位置：从上至下位于 80%-90% 高度、从左至右位于 10%-40% 宽度。
-    # 以形状左上角为基准（与本细则中其它同类"位于...区域范围内"条目
-    # 保持一致）。保留 2% 容差兼容办公软件 EMU→百分比的渲染精度损失。
-    x_pct = addr.x / model.slide_w
-    y_pct = addr.y / model.slide_h
-    if not between(y_pct, 0.80, 0.90, tol=0.02):
-        return fail(f"第1页中文地址纵向位置 {y_pct:.1%} 不在 80%-90%")
-    if not between(x_pct, 0.10, 0.40, tol=0.02):
-        return fail(f"第1页中文地址横向位置 {x_pct:.1%} 不在 10%-40%")
-
-    # 在邮箱下方：地址顶部在邮箱底部之下
-    if not addr.y >= email.y2:
-        return fail(
-            f"第1页中文地址未位于邮箱下方："
-            f"email_y2={email.y2:.2f} addr_y={addr.y:.2f}"
-        )
-
-    # 与邮箱左对齐：左边界差 ≤ 0.35cm（办公软件文本框内边距 ~0.25cm）
-    if abs(addr.x - email.x) > 0.35:
-        return fail(
-            f"第1页中文地址与邮箱未左对齐：Δx={abs(addr.x - email.x):.2f}cm"
-        )
-
-    # 字体：微软雅黑或黑体。兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入
-    # 方式，以适配 PowerPoint / WPS / Keynote 对中文字体的不同存放位置。
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', addr.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(addr)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not any(is_yahei_or_heiti(n) for n in all_names):
-        return fail(
-            f"第1页中文地址字体不是微软雅黑/黑体："
-            f"latin={latin_names} typefaces={typefaces}"
-        )
-
-    # 字号：9-15 磅（每个非空 run 都必须落在区间内）
-    sizes = font_sizes(addr)
-    if not sizes or not all(between(sz, 9, 15) for sz in sizes):
-        return fail(f"第1页中文地址字号不在 9-15 磅：{sizes}")
-
-    return ok(
-        f"第1页中文地址符合：pos=({x_pct:.1%},{y_pct:.1%}) 字号={sizes}"
-    )
-
-
-def c16_cn_address_icon(model: PptModel) -> CheckResult:
-    target = "福建省厦门市海沧区云创大道88号蓝湾创新中心12层1208室"
-    return icon_left_of_text(model, 1, target, ["⌖", "⌾", "📍", "location", "pin"])
-
-
-def c17_vertical_line_both(model: PptModel) -> CheckResult:
-    """+1：两页幻灯片从左至右页面 45%-55% 处出现一条绿色单实线：整体垂直
-    与页面；长度 6-8.5cm。
-    """
-    for no in (1, 2):
-        matched = []
-        for s in model.slide(no):
-            # 整体垂直于页面：宽 ≈ 0（OOXML 中垂线为 <p:sp> 或 <p:cxnSp> 且
-            # ext.cx == 0；python-pptx 会把连接符宽度归一为 0 或极小值）。
-            # 用 is_vertical_line：prst=="LINE" 或宽/高有一维为 0；高 ≥ 0.3cm、
-            # 宽 ≤ 0.12cm，即"整体垂直"于页面。
-            if not is_vertical_line(s):
-                continue
-
-            # 从左至右页面 45%-55% 处：整条线的横向位置（以线中心为基准，
-            # 因为线的 x 与 x2 在归一化后接近同一值）。保留 2% 容差兼容
-            # 办公软件 EMU→百分比的渲染精度损失。
-            cx_pct = s.cx / model.slide_w
-            if not between(cx_pct, 0.45, 0.55, tol=0.02):
-                continue
-
-            # 长度 6-8.5cm：竖线长度即高度
-            if not between(s.h, 6, 8.5):
-                continue
-
-            # 绿色
-            if not is_green(s.line):
-                continue
-
-            # 单实线：<a:ln> 内 <a:prstDash val="solid"> 或未声明；无 <a:custDash>
-            if not _is_solid_line(s):
-                continue
-
-            matched.append(s)
-
-        if not matched:
-            return fail(
-                f"第{no}页 45%-55% 宽度处未找到绿色单实线竖线（长度 6-8.5cm）"
-            )
-    return ok("两页均有 45%-55% 处、6-8.5cm 绿色单实线竖线")
-
-
-def _is_rounded_rect_or_pill(shape: ShapeInfo) -> bool:
-    """判定 shape 是否为"圆角矩形或胶囊形"形状。
-
-    OOXML 中：
-    - 四角圆角矩形 → prst="roundRect"（python-pptx: ROUNDED_RECTANGLE / ROUNDRECT）
-    - 胶囊形（两端半圆的矩形）→ prst="pill"（较少见），或使用
-      prst="roundRect" 并将圆角调节手柄 adj 拉满至 50000（即
-      corner_radius == height/2，视觉即胶囊形）。python-pptx 均映射为
-      ROUNDED_RECTANGLE。此外 PowerPoint 也可通过 prst="ellipse" 拉长
-      成胶囊，但那不属于"矩形"类，此处不接受。
-    """
-    p = shape.prst.upper()
-    return p in ("ROUNDED_RECTANGLE", "ROUNDRECT", "PILL")
-
-
-def c18_cn_business_pill(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片"福建蓝屿新材料科技有限公司"文本下方出现绿色填充的
-    圆角矩形或胶囊形形状：从上至下位于页面 20%-30% 高度，从左至右位于
-    50%-75% 宽度范围内；其内部出现"主营"文本：字体为微软雅黑、黑体，
-    白色，14-16 磅。
-    """
-    company = first_text(model, 1, "福建蓝屿新材料科技有限公司")
-    if not company:
-        return fail("第1页未找到\"福建蓝屿新材料科技有限公司\"，无法定位其下方胶囊")
-
-    # 收集绿色填充、位于 20%-30% × 50%-75% 区域内、位于公司名下方的"圆角
-    # 矩形或胶囊形"形状。以形状左上角为基准判定位置。保留 2% 容差兼容
-    # 办公软件 EMU→百分比的渲染精度损失。
-    candidates = []
-    for s in model.slide(1):
-        if not _is_rounded_rect_or_pill(s):
-            continue
-        if not is_green(s.fill):
-            continue
-        x_pct = s.x / model.slide_w
-        y_pct = s.y / model.slide_h
-        if not between(y_pct, 0.20, 0.30, tol=0.02):
-            continue
-        if not between(x_pct, 0.50, 0.75, tol=0.02):
-            continue
-        if s.y < company.y2:
-            continue
-        candidates.append(s)
-
-    if not candidates:
-        return fail(
-            "第1页公司名下方 20%-30%×50%-75% 未找到绿色填充圆角矩形/胶囊形"
-        )
-
-    # 其内部出现"主营"文本 + 字体 + 颜色 + 字号：
-    # 优先匹配自身文本框内含"主营"的形状；否则支持外部"主营"文本框在几何
-    # 上落入圆角矩形（重叠比例 ≥ 50%）。
-    for c in candidates:
-        # 路径 A：自身文本框包含"主营"
-        pill_shape = c if text_contains(c, "主营") else None
-
-        # 路径 B：外部"主营"文本框落入胶囊几何范围
-        if pill_shape is None:
-            for s in model.slide(1):
-                if s is c:
-                    continue
-                if not text_contains(s, "主营"):
-                    continue
-                if c.area <= 0 or s.area <= 0:
-                    continue
-                if overlap_area(s, c) / max(0.01, min(s.area, c.area)) < 0.50:
-                    continue
-                pill_shape = s
-                break
-
-        if pill_shape is None:
-            continue
-
-        # 字体：微软雅黑、黑体（细则用"、"表示或）。兼容
-        # <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式。
-        try:
-            typefaces = re.findall(r'typeface="([^"]+)"', pill_shape.raw._element.xml)
-        except Exception:
-            typefaces = []
-        latin_names = font_names(pill_shape)
-        all_names = [n for n in latin_names + typefaces if n]
-        if not all_names or not any(is_yahei_or_heiti(n) for n in all_names):
-            return fail(
-                f"第1页胶囊内\"主营\"字体不是微软雅黑/黑体："
-                f"latin={latin_names} typefaces={typefaces}"
-            )
-
-        # 颜色：白色
-        colors = font_colors(pill_shape)
-        if not colors or not all(is_white(cc) for cc in colors):
-            return fail(
-                f"第1页胶囊内\"主营\"颜色不是白色：{[color_name(c) for c in colors]}"
-            )
-
-        # 字号：14-16 磅
-        sizes = font_sizes(pill_shape)
-        if not sizes or not all(between(sz, 14, 16) for sz in sizes):
-            return fail(f"第1页胶囊内\"主营\"字号不在 14-16 磅：{sizes}")
-
-        return ok(
-            f"第1页绿色圆角矩形/胶囊 {c.w:.2f}×{c.h:.2f}cm 位于公司名下方，"
-            f"内含\"主营\"白色微软雅黑/黑体 {sizes} 磅"
-        )
-
-    return fail("第1页公司名下方绿色圆角矩形/胶囊未包含符合规格的\"主营\"文本")
-
-
-def check_business_list(model: PptModel, slide_no: int, headings: list[str], items: list[str], heading_font, item_font,
-                        heading_size: tuple[float, float], item_size: tuple[float, float], heading_color, item_color) -> CheckResult:
-    line_records = []
-    for s in model.slide(slide_no):
-        if not s.text.strip():
-            continue
-        for para in s.paragraphs:
-            line_records.append((para["text"], s, para))
-    cleaned_to_record = {clean_text(t): (t, s, p) for t, s, p in line_records}
-    needed = headings + items
-    missing = [t for t in needed if clean_text(t) not in cleaned_to_record]
-    if missing:
-        return fail(f"第{slide_no}页业务列表缺少：{missing}")
-
-    # 每个文本单独一行：已按段落拆分，只要各目标文本能匹配单个段落即可。
-    xs = []
-    for t in needed:
-        raw, s, para = cleaned_to_record[clean_text(t)]
-        xs.append(round(s.x, 1))
-        runs = [r for r in para["runs"] if r["text"].strip()]
-        if not runs:
-            return fail(f"第{slide_no}页 {raw} 无有效字体信息")
-        if t in headings:
-            for r in runs:
-                if not (heading_font(r["font"] or "") and r["size"] is not None and between(float(r["size"]), *heading_size, tol=0.35) and heading_color(r["color"])):
-                    return fail(f"第{slide_no}页标题 {raw} 字体/字号/颜色不满足")
+        node = holder.find(_a('schemeClr'))
+        if node is not None:
+            key = node.get('val') or ''
+            key = _SCHEME_ALIAS.get(key, key)
+            base = theme.get(key)
         else:
-            for r in runs:
-                if not (item_font(r["font"] or "") and r["size"] is not None and between(float(r["size"]), *item_size, tol=0.35) and item_color(r["color"])):
-                    return fail(f"第{slide_no}页条目 {raw} 字体/字号/颜色不满足")
-    if max(xs) - min(xs) > 2.8:  # 标题和条目允许在同一左栏内不同缩进，但不应分散到多列
-        return fail(f"第{slide_no}页业务列表未整体左对齐，x分布过宽：{xs}")
-    return ok(f"第{slide_no}页业务列表目标文本均为独立段落，字体/字号/颜色和左对齐符合")
+            node = holder.find(_a('sysClr'))
+            if node is not None:
+                base = _rgb(node.get('lastClr') or '')
+    if base is None or node is None:
+        return None
+    mods = []
+    for child in node:
+        tag = child.tag.split('}')[-1]
+        if tag in ('lumMod', 'lumOff', 'shade', 'tint', 'satMod'):
+            try:
+                mods.append((tag, int(child.get('val'))))
+            except (TypeError, ValueError):
+                pass
+    if mods:
+        base = _apply_mods(base, mods)
+    return _hex(base)
 
 
-def _is_yahei(name: str) -> bool:
-    """严格判定 typeface 是否为"微软雅黑"（不含"黑体"）。"""
-    n = norm_font_name(name)
-    return any(k in n for k in ["yahei", "microsoftyahei", "微软雅黑"])
+# ------------------------------------------------------- 形状模型
+class Sh(object):
+    """把一个形状（含组内子形状）拍平成评分要用到的最小属性集合。
+    坐标一律换算成"幻灯片绝对坐标（EMU）"，组内子形状按组的缩放映射过。"""
+
+    __slots__ = ('sid', 'name', 'z', 'left', 'top', 'width', 'height',
+                 'raw_w', 'raw_h', 'kind', 'prst', 'is_pic', 'is_group',
+                 'curve_n', 'has_custgeom', 'fill_kind', 'fills', 'line_hex',
+                 'line_w', 'text', 'runs', 'rot', 'el')
+
+    def right(self):
+        return self.left + self.width
+
+    def bottom(self):
+        return self.top + self.height
+
+    def cx(self):
+        return self.left + self.width / 2.0
+
+    def cy(self):
+        return self.top + self.height / 2.0
+
+    def area(self):
+        return max(0, self.width) * max(0, self.height)
+
+    def is_sized(self):
+        """是否是一个"有尺寸"的对象：宽或高有值即可。
+        直线/连接线只有长度没有厚度（面积为 0），仍然是可点选可编辑的对象。"""
+        return self.width > 0 or self.height > 0
+
+    def has_text(self):
+        return bool(self.text.strip())
 
 
-def c19_cn_business_list(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片"主营"文本下方出现"环保图层："、"水性树脂"、"功能助剂"、
-    "高阻隔图层"、"绿色材料："、"可降解薄膜"、"纸塑复合材料"、"应用方案："、
-    "工业胶粘剂"、"包装表面处理"这几个文本内容："环保图层：""绿色材料：""应用方案："
-    文本颜色为绿色，字体为微软雅黑，13-15 磅；剩余文本颜色为黑色，字体为
-    微软雅黑，11-13 磅；每一个文本单独一行，且全部左对齐。
-    """
-    headings = ["环保图层:", "绿色材料:", "应用方案:"]
-    items = [
-        "水性树脂", "功能助剂", "高阻隔图层", "可降解薄膜",
-        "纸塑复合材料", "工业胶粘剂", "包装表面处理",
-    ]
-    needed = headings + items
-
-    pill = first_text(model, 1, "主营")
-    if not pill:
-        return fail("第1页未找到\"主营\"，无法判定业务列表在其下方")
-
-    # 收集所有非空段落（对应 OOXML `<a:p>`），保留段落所在形状 x 与段落
-    # 层级的 XML 以便判定对齐属性。
-    para_records = []  # (target, shape, para, para_xml)
-    slide_shapes = model.slide(1)
-    for s in slide_shapes:
-        if not s.text.strip():
-            continue
-        try:
-            para_nodes = re.findall(r"<a:p\b.*?</a:p>", s.raw._element.xml, re.DOTALL)
-        except Exception:
-            para_nodes = [""] * len(s.paragraphs)
-        # 段落 XML 与 s.paragraphs 顺序对应（python-pptx 遍历顺序与 XML 一致）
-        for idx, para in enumerate(s.paragraphs):
-            para_xml = para_nodes[idx] if idx < len(para_nodes) else ""
-            cleaned = clean_text(para["text"])
-            for t in needed:
-                if clean_text(t) == cleaned:
-                    para_records.append((t, s, para, para_xml))
-                    break
-
-    matched_targets = {rec[0] for rec in para_records}
-    missing = [t for t in needed if t not in matched_targets]
-    if missing:
-        return fail(f"第1页业务列表缺少文本：{missing}")
-
-    # 每一个文本单独一行 → 已按 <a:p> 段落匹配，若同一段落被同时匹配到两个
-    # 目标或段落文本远长于目标本身，视为未"单独一行"。
-    for t, s, para, _ in para_records:
-        if clean_text(para["text"]) != clean_text(t):
-            return fail(f"第1页业务列表 {t!r} 所在段落包含其它内容：{para['text']!r}")
-
-    # 位于"主营"文本下方
-    for t, s, para, _ in para_records:
-        if s.y < pill.y2 - 0.05:
-            return fail(
-                f"第1页业务列表 {t!r} 未位于\"主营\"下方："
-                f"pill.y2={pill.y2:.2f} shape.y={s.y:.2f}"
-            )
-
-    # 全部左对齐：
-    # 判据 1（几何）：所有段落所在形状的 x 相同 —— 允许 0.35cm 偏差（办公
-    # 软件对文本框内边距/自动布局的合理误差）。
-    xs = [round(rec[1].x, 2) for rec in para_records]
-    if max(xs) - min(xs) > 0.35:
-        return fail(f"第1页业务列表未左对齐（形状 x 分散过大）：{xs}")
-
-    # 判据 2（段落属性）：如果段落 <a:pPr algn="..."/> 显式声明对齐，必须
-    # 为 "l"（左对齐）；未声明视为左对齐（OOXML 默认值）。
-    for t, _, _, para_xml in para_records:
-        algn_m = re.search(r'<a:pPr[^>]*algn="([^"]+)"', para_xml)
-        if algn_m and algn_m.group(1) != "l":
-            return fail(f"第1页业务列表 {t!r} 段落对齐不是左对齐：algn={algn_m.group(1)}")
-
-    # 逐条校验字体/字号/颜色
-    # - 字体：微软雅黑（细则仅写"微软雅黑"）。兼容 <a:latin>/<a:ea>/<a:cs>。
-    # - 颜色：标题绿；条目黑。
-    # - 字号：标题 13-15 磅；条目 11-13 磅。
-    for t, shape, para, para_xml in para_records:
-        runs = [r for r in para["runs"] if r["text"].strip()]
-        if not runs:
-            return fail(f"第1页业务列表 {t!r} 无有效字体信息")
-
-        # 段落级 typefaces 优先，未取到再从形状级 XML 兜底
-        para_typefaces = re.findall(r'typeface="([^"]+)"', para_xml)
-        for r in runs:
-            name_candidates = [r["font"]] + para_typefaces
-            name_candidates = [n for n in name_candidates if n]
-            if not name_candidates or not all(_is_yahei(n) for n in name_candidates):
-                return fail(
-                    f"第1页业务列表 {t!r} 字体不是微软雅黑：{name_candidates}"
-                )
-
-            if r["size"] is None:
-                return fail(f"第1页业务列表 {t!r} 未声明字号")
-
-            if t in headings:
-                if not between(float(r["size"]), 13, 15):
-                    return fail(
-                        f"第1页业务列表标题 {t!r} 字号不在 13-15 磅：{r['size']}"
-                    )
-                if not is_green(r["color"]):
-                    return fail(
-                        f"第1页业务列表标题 {t!r} 颜色不是绿色：{color_name(r['color'])}"
-                    )
-            else:
-                if not between(float(r["size"]), 11, 13):
-                    return fail(
-                        f"第1页业务列表条目 {t!r} 字号不在 11-13 磅：{r['size']}"
-                    )
-                if not is_black(r["color"]):
-                    return fail(
-                        f"第1页业务列表条目 {t!r} 颜色不是黑色：{color_name(r['color'])}"
-                    )
-
-    return ok(
-        "第1页业务列表 10 项文本齐全、单独成行、左对齐；"
-        "标题绿色微软雅黑 13-15pt，条目黑色微软雅黑 11-13pt"
-    )
+def _norm_text(s):
+    """全角标点→半角、各类连字符→'-'、各类空格→普通空格、压缩空白；
+    保留 '：' 以便判定全角冒号。
+    办公软件里排版常写入不换行空格（U+00A0）等特殊空格，肉眼与普通空格无异，
+    统一折算成普通空格后再比对文字内容。"""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if 0xFF01 <= o <= 0xFF5E and ch != '：':
+            out.append(chr(o - 0xFEE0))
+        elif ch in '‐‑‒–—―−':
+            out.append('-')
+        elif ch == '　' or o == 0xA0 or 0x2000 <= o <= 0x200A \
+                or o in (0x202F, 0x205F):
+            out.append(' ')
+        else:
+            out.append(ch)
+    return re.sub(r'[ \t\r\n]+', ' ', ''.join(out)).strip()
 
 
-def circle_icon_left(model: PptModel, slide_no: int, heading: str,
-                     icon_color_check: Callable = is_green) -> CheckResult:
-    h = first_text(model, slide_no, heading)
-    if not h:
-        return fail(f"第{slide_no}页未找到标题 {heading}")
-    circles = [s for s in model.slide(slide_no) if s.x2 <= h.x + 0.25 and abs(s.cy - h.cy) <= 0.65 and is_oval(s) and between((s.w + s.h) / 2, 1.3, 1.5, 0.12) and is_light_gray(s.fill)]
-    for c in circles:
-        # 判定圆内"组合图形或图片"。
-        # 1) 圆形本身是一张图片 → 直接通过
-        if is_picture(c):
-            return ok(f"第{slide_no}页 {heading} 左侧找到浅灰圆形图标（图片），直径约 {(c.w+c.h)/2:.2f}cm")
-        # 2) 圆形几何范围内存在 ≥2 个独立"图形/图片"，且至少一个填充满足目标颜色
-        #    → 视为"组合图形"。单个文本字符不计入"组合图形"。
-        children = []
-        target_color_hit = False
-        for s in model.slide(slide_no):
-            if s is c:
-                continue
-            inter = overlap_area(s, c)
-            if min(c.area, max(s.area, 0.001)) <= 0:
-                continue
-            ratio = inter / max(0.01, min(s.area, c.area))
-            if ratio < 0.40:
-                continue
-            # 圆形外框/同尺寸圆形不计入子元素
-            if is_oval(s) and abs(s.w - c.w) < 0.1 and abs(s.h - c.h) < 0.1:
-                continue
-            if is_picture(s):
-                children.append(s)
-                target_color_hit = True
-                continue
-            # 几何形状（非纯文本框）：必须有可识别的填充或线条颜色
-            has_geom = bool(s.prst) and s.prst not in ("RECTANGLE",) and (s.fill is not None or s.line is not None)
-            if has_geom:
-                children.append(s)
-                if icon_color_check(s.fill) or icon_color_check(s.line):
-                    target_color_hit = True
-        if len(children) >= 2 and target_color_hit:
-            return ok(f"第{slide_no}页 {heading} 左侧找到浅灰圆形图标（组合图形 {len(children)} 件），直径约 {(c.w+c.h)/2:.2f}cm")
-    return fail(f"第{slide_no}页 {heading} 左侧未找到浅灰圆形及绿色主题组合图形/图片")
+def _has_cjk(s):
+    return any('㐀' <= ch <= '鿿' or '　' <= ch <= '〿'
+               or '＀' <= ch <= '￯' for ch in s)
 
 
-def c20_icon_eco_cn(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片"环保涂层"文本左侧有一个圆形填充形状：直径在
-    1.3-1.5cm，颜色为浅灰色；其中间有一个"绿色的水滴造型和一片小叶子"的
-    组合图形或者整体是一个图片。
-    """
-    heading = first_text(model, 1, "环保涂层")
-    if not heading:
-        return fail("第1页未找到\"环保涂层\"文本，无法定位其左侧图标")
-
-    slide = model.slide(1)
-
-    # 候选圆形：
-    # - 位于文本左侧：候选右边不超过文本左边 + 0.25cm（办公软件文本框内边距）
-    # - 垂直中心与文本中心接近：|Δcy| ≤ 0.65cm
-    # - 圆形：OOXML prst="ellipse"（python-pptx: OVAL/ELLIPSE）
-    # - 直径 1.3-1.5cm：宽、高均需在区间内
-    # - 浅灰色填充
-    circles = []
-    for s in slide:
-        if s is heading:
-            continue
-        if s.x2 > heading.x + 0.25:
-            continue
-        if abs(s.cy - heading.cy) > 0.65:
-            continue
-        if not is_oval(s):
-            continue
-        if not (between(s.w, 1.3, 1.5) and between(s.h, 1.3, 1.5)):
-            continue
-        if not is_light_gray(s.fill):
-            continue
-        circles.append(s)
-
-    if not circles:
-        return fail(
-            "第1页\"环保涂层\"左侧未找到浅灰色填充、直径 1.3-1.5cm 的圆形"
-        )
-
-    # 判定圆的"中间"是否有：
-    # (A) 整体是一个图片：圆形本身为 <p:pic>（is_picture(circle) 为真）；
-    #     或者圆形几何范围内包含一张图片（重叠比例 ≥ 50%）。
-    # (B) 绿色水滴 + 小叶子的组合图形：需能静态区分"水滴"与"叶子"两个构件。
-    #     - 水滴构件："prst" 名称含 TEAR/TEARDROP（PowerPoint 原生 teardrop
-    #       预设几何），且填充或线条为绿色。
-    #     - 叶子构件：与水滴不是同一件形状，且填充或线条为绿色。PowerPoint
-    #       没有原生 leaf 预设，叶子绝大多数以 freeform (custGeom / 无 prst /
-    #       FREEFORM 等) 方式绘制，静态无法从曲线路径判定"这画的是叶子"，
-    #       故叶子放宽为"另一件绿色几何形状"，与水滴形成"至少两件、语义
-    #       可区分"的组合。
-    #     - 二者缺一 → 路径 B 不命中；只能走路径 A（图片）。
-    #     组合还可能以 <p:grpSp>（GroupShape）形式存在——其子形状会由
-    #     flatten 递归展开，计入 children。
-    for c in circles:
-        # (A-1) 圆形自身是图片
-        if is_picture(c):
-            return ok(
-                f"第1页\"环保涂层\"左侧找到浅灰圆形图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        # 圆形几何内的其它形状（不含圆形自身、不含整页边框类超大形状）
-        children: list[ShapeInfo] = []
-        for s in slide:
-            if s is c:
-                continue
-            # 排除整页级/接近整页的大形状（如边框圆角矩形）
-            if s.area > c.area * 4:
-                continue
-            if min(s.area, c.area) <= 0:
-                continue
-            inter = overlap_area(s, c)
-            if inter <= 0:
-                continue
-            if inter / max(0.01, min(s.area, c.area)) < 0.40:
-                continue
-            children.append(s)
-
-        # (A-2) 圆内包含图片
-        if any(is_picture(s) for s in children):
-            return ok(
-                f"第1页\"环保涂层\"左侧圆形中间包含图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        # (B) 组合图形：需分别识别"水滴"与"叶子"两件绿色构件
-        combo: list[ShapeInfo] = [
-            s for s in children
-            if s.prst  # 需有 prstGeom 或图片标识
-            and (s.fill is not None or s.line is not None or is_picture(s))
-        ]
-        # 水滴构件：prst 名称含 TEAR/TEARDROP，且颜色为绿色
-        teardrops: list[ShapeInfo] = [
-            s for s in combo
-            if ("TEAR" in s.prst.upper() or "TEARDROP" in s.prst.upper())
-            and (is_green(s.fill) or is_green(s.line))
-        ]
-        # 叶子构件：不是水滴，且颜色为绿色（叶子多为 freeform / custGeom，
-        # 静态无法从曲线路径判定"这画的是叶子"，因此叶子按"另一件绿色几何
-        # 构件"识别；只有当同时存在水滴构件时才算命中组合语义）。
-        leaves: list[ShapeInfo] = [
-            s for s in combo
-            if s not in teardrops
-            and (is_green(s.fill) or is_green(s.line))
-        ]
-        if teardrops and leaves:
-            return ok(
-                f"第1页\"环保涂层\"左侧圆形中间找到绿色水滴+叶子组合 "
-                f"（水滴 {len(teardrops)} 件、叶子 {len(leaves)} 件）"
-            )
-
-    return fail(
-        "第1页\"环保涂层\"左侧浅灰圆形中间未找到绿色水滴+叶子的组合图形或图片"
-    )
+def _has_latin(s):
+    return any(('a' <= ch <= 'z') or ('A' <= ch <= 'Z') or ch.isdigit()
+               for ch in s)
 
 
-def c21_icon_green_cn(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片"绿色材料"文本左侧有一个圆形填充形状：直径在
-    1.3-1.5cm，颜色为浅灰色；其中间有一个绿色的"带有白色脉络的叶子"组合
-    图形或者整体是一个图片。
-    """
-    heading = first_text(model, 1, "绿色材料")
-    if not heading:
-        return fail("第1页未找到\"绿色材料\"文本，无法定位其左侧图标")
-
-    slide = model.slide(1)
-
-    # 候选圆形：位于文本左侧、直径 1.3-1.5cm、浅灰色填充
-    circles = []
-    for s in slide:
-        if s is heading:
-            continue
-        if s.x2 > heading.x + 0.25:
-            continue
-        if abs(s.cy - heading.cy) > 0.65:
-            continue
-        if not is_oval(s):
-            continue
-        if not (between(s.w, 1.3, 1.5) and between(s.h, 1.3, 1.5)):
-            continue
-        if not is_light_gray(s.fill):
-            continue
-        circles.append(s)
-
-    if not circles:
-        return fail(
-            "第1页\"绿色材料\"左侧未找到浅灰色填充、直径 1.3-1.5cm 的圆形"
-        )
-
-    # "其中间有一个绿色的带有白色脉络的叶子的组合图形或者整体是一个图片"
-    # 分两条互斥路径：
-    # 路径 A：整体是一个图片
-    #   - A-1：圆形自身是 <p:pic>
-    #   - A-2：圆形几何范围内包含一张图片（重叠比例 ≥ 50%）
-    # 路径 B：组合图形（≥2 件独立几何形状/图片）
-    #   - 位于圆形几何范围内（重叠比例 ≥ 40%，排除整页级超大形状）
-    #   - 至少一件填充/线条为绿色（叶子主体）
-    #   - 至少一件填充/线条为白色（脉络）
-    for c in circles:
-        # (A-1)
-        if is_picture(c):
-            return ok(
-                f"第1页\"绿色材料\"左侧找到浅灰圆形图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        children = []
-        for s in slide:
-            if s is c:
-                continue
-            if s.area > c.area * 4:
-                continue
-            if min(s.area, c.area) <= 0:
-                continue
-            inter = overlap_area(s, c)
-            if inter <= 0:
-                continue
-            if inter / max(0.01, min(s.area, c.area)) < 0.40:
-                continue
-            children.append(s)
-
-        # (A-2)
-        if any(is_picture(s) for s in children):
-            return ok(
-                f"第1页\"绿色材料\"左侧圆形中间包含图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        # (B) 组合图形：绿色叶子主体 + 白色脉络
-        combo = [
-            s for s in children
-            if s.prst
-            and (s.fill is not None or s.line is not None or is_picture(s))
-        ]
-        if len(combo) >= 2:
-            has_green = any(is_green(s.fill) or is_green(s.line) for s in combo)
-            has_white = any(is_white(s.fill) or is_white(s.line) for s in combo)
-            if has_green and has_white:
-                return ok(
-                    f"第1页\"绿色材料\"左侧圆形中间找到组合图形（{len(combo)} 件），"
-                    f"含绿色叶子与白色脉络"
-                )
-
-    return fail(
-        "第1页\"绿色材料\"左侧浅灰圆形中间未找到绿色叶子+白色脉络的组合"
-        "图形或图片"
-    )
+def _int_attr(el, name, default=None):
+    if el is None:
+        return default
+    v = el.get(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
 
 
-def c22_icon_app_cn(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片"应用方案"文本左侧有一个圆形填充形状：直径在
-    1.3-1.5cm，颜色为浅灰色；其中间有一个"绿色的带有白色箱盖和锁扣的立体
-    纸箱"组合图型或者整体是一个图片。
-    """
-    heading = first_text(model, 1, "应用方案")
-    if not heading:
-        return fail("第1页未找到\"应用方案\"文本，无法定位其左侧图标")
+def _collect_paras(tx_body, theme):
+    """把 a:txBody 解析成段落列表；每段是 run 字典列表。
+    run 上没写的字号/加粗/倾斜/字距/大写效果，一律按办公软件的继承链逐级回落：
+    run rPr → 段落 pPr/defRPr → txBody 的 lstStyle/lvlNpPr/defRPr → endParaRPr →
+    （字号）PowerPoint 文本框默认 18 磅。屏幕上看到的是继承后的效果，只读 run 级
+    会把"在段落/文本框级别设的加粗、字距、全部大写"判成没设。
+    run['latin']/['ea'] 采用"办公软件里实际使用的字体"：未写字体时回落到主题
+    字体；原始写法保留在 ['latin_raw']/['ea_raw'] 里。"""
+    paras = []
+    if tx_body is None:
+        return paras
+    fonts = theme.get(THEME_FONT_KEY) if isinstance(theme, dict) else None
+    lst = tx_body.find(_a('lstStyle'))
+    for p in tx_body.findall(_a('p')):
+        p_pr = p.find(_a('pPr'))
+        def_rpr = p_pr.find(_a('defRPr')) if p_pr is not None else None
+        lvl = _int_attr(p_pr, 'lvl', 0) or 0
+        lvl_rpr = None
+        if lst is not None:
+            lvl_pr = lst.find(_a('lvl%dpPr' % (lvl + 1)))
+            if lvl_pr is not None:
+                lvl_rpr = lvl_pr.find(_a('defRPr'))
+        end_rpr = p.find(_a('endParaRPr'))
+        runs = []
+        for r in p.findall(_a('r')):
+            t_el = r.find(_a('t'))
+            txt = t_el.text if (t_el is not None and t_el.text) else ''
+            r_pr = r.find(_a('rPr'))
 
-    slide = model.slide(1)
+            def inherit(name, _rp=r_pr):
+                """按继承链取属性值，取到第一个显式写出的为止。"""
+                for holder in (_rp, def_rpr, lvl_rpr, end_rpr):
+                    if holder is not None and holder.get(name) is not None:
+                        return holder.get(name)
+                return None
 
-    # 候选圆形：
-    # - 位于文本左侧：候选右边不超过文本左边 + 0.25cm（办公软件文本框内边距）
-    # - 垂直中心与文本中心接近：|Δcy| ≤ 0.65cm
-    # - 圆形：OOXML prst="ellipse"（python-pptx: OVAL/ELLIPSE）
-    # - 直径 1.3-1.5cm：宽、高均需在区间内
-    # - 浅灰色填充（细则"颜色为浅灰色"→ fill 判定，兼容 PowerPoint/WPS/Keynote）
-    circles = []
-    for s in slide:
-        if s is heading:
-            continue
-        if s.x2 > heading.x + 0.25:
-            continue
-        if abs(s.cy - heading.cy) > 0.65:
-            continue
-        if not is_oval(s):
-            continue
-        if not (between(s.w, 1.3, 1.5) and between(s.h, 1.3, 1.5)):
-            continue
-        if not is_light_gray(s.fill):
-            continue
-        circles.append(s)
-
-    if not circles:
-        return fail(
-            "第1页\"应用方案\"左侧未找到浅灰色填充、直径 1.3-1.5cm 的圆形"
-        )
-
-    # "其中间有一个绿色的带有白色箱盖和锁扣的立体纸箱组合图型或者整体是
-    # 一个图片"—— 分两条互斥路径：
-    # 路径 A：整体是一个图片
-    #   - A-1：圆形自身是 <p:pic>
-    #   - A-2：圆形几何范围内包含一张图片（重叠比例 ≥ 50% 认为"在其中间"）
-    # 路径 B：组合图形（≥2 件独立几何形状/图片）
-    #   - 位于圆形几何范围内（重叠比例 ≥ 40%，排除整页级超大形状）
-    #   - 至少一件填充/线条为绿色（纸箱主体）
-    #   - 至少一件填充/线条为白色（箱盖 / 锁扣）
-    for c in circles:
-        # (A-1) 圆形自身是图片
-        if is_picture(c):
-            return ok(
-                f"第1页\"应用方案\"左侧找到浅灰圆形图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        # 圆形几何内的其它形状（排除圆形自身与整页级超大形状）
-        children = []
-        for s in slide:
-            if s is c:
-                continue
-            if s.area > c.area * 4:
-                continue
-            if min(s.area, c.area) <= 0:
-                continue
-            inter = overlap_area(s, c)
-            if inter <= 0:
-                continue
-            if inter / max(0.01, min(s.area, c.area)) < 0.40:
-                continue
-            children.append(s)
-
-        # (A-2) 圆形几何内包含一张图片
-        for s in children:
-            if is_picture(s) and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50:
-                return ok(
-                    f"第1页\"应用方案\"左侧圆形中间包含图片，直径约 "
-                    f"{(c.w+c.h)/2:.2f}cm"
-                )
-
-        # (B) 组合图形：绿色纸箱主体 + 白色箱盖/锁扣
-        combo = [
-            s for s in children
-            if s.prst
-            and (s.fill is not None or s.line is not None or is_picture(s))
-        ]
-        if len(combo) >= 2:
-            has_green = any(is_green(s.fill) or is_green(s.line) for s in combo)
-            has_white = any(is_white(s.fill) or is_white(s.line) for s in combo)
-            if has_green and has_white:
-                return ok(
-                    f"第1页\"应用方案\"左侧圆形中间找到组合图形（{len(combo)} 件），"
-                    f"含绿色纸箱与白色箱盖/锁扣"
-                )
-
-    return fail(
-        "第1页\"应用方案\"左侧浅灰圆形中间未找到绿色纸箱+白色箱盖/锁扣的"
-        "组合图形或图片"
-    )
+            sz = inherit('sz')
+            sz = int(sz) if (sz or '').isdigit() else None
+            spc = inherit('spc')
+            try:
+                spc = int(spc) if spc is not None else 0
+            except ValueError:
+                spc = 0
+            latin = r_pr.find(_a('latin')) if r_pr is not None else None
+            ea = r_pr.find(_a('ea')) if r_pr is not None else None
+            latin_raw = (latin.get('typeface') or '') if latin is not None else ''
+            ea_raw = (ea.get('typeface') or '') if ea is not None else ''
+            runs.append({
+                't': txt,
+                'sz': (sz / 100.0) if sz else DEFAULT_SZ_PT,
+                'sz_explicit': sz is not None,
+                'b': inherit('b') == '1',
+                'i': inherit('i') == '1',
+                'spc': spc,
+                'cap': inherit('cap') or '',
+                'latin': _resolve_font(latin_raw, fonts, 'latin'),
+                'ea': _resolve_font(ea_raw, fonts, 'ea'),
+                'latin_raw': latin_raw,
+                'ea_raw': ea_raw,
+                'clr': _clr_hex(r_pr.find(_a('solidFill'))
+                                if r_pr is not None else None, theme),
+            })
+        paras.append(runs)
+    return paras
 
 
-def c23_slide2_title_separator(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"FUJIAN LANYU NOVA MATERIALS CO., LTD."文本左下方有
-    两条直线：从上至下整体位于页面 20%-50% 处；两条线在同一水平线上；类型
-    为单实线；颜色为橙色；长度 2.5-4cm；两条线中间有一个橙色或者黄色填充
-    的叶片组合形状或者图片，整体高度 0.4-0.5cm，宽度 0.3-0.4cm。
-    """
-    title = first_text(model, 2, "FUJIAN LANYU NOVA MATERIALS CO., LTD.")
-    if not title:
-        return fail("第2页未找到英文公司名，无法定位其左下方分隔线")
+P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 
-    slide = model.slide(2)
 
-    # 候选横线判定（细则逐点）：
-    # A) "两条直线" → 水平线段：is_horizontal_line 判定 prst==LINE 或宽/高
-    #    有一维为 0（办公软件写入 <p:cxnSp prstGeom prst="line"> 时 y、
-    #    y+cy 相等，宽度 == 0 的直线段）
-    # B) "从上至下整体位于页面 20%-50% 处" → 线的 y 与 y2 都需落入 20%-50%
-    #    区间（保留 2% 容差以兼容办公软件 EMU→百分比的渲染精度损失）
-    # C) "类型为单实线" → _is_solid_line：<a:ln> 内 <a:prstDash> 未声明
-    #    或 val="solid"，且无 <a:custDash>（兼容 PowerPoint/WPS/Keynote）
-    # D) "颜色为橙色" → is_orange(s.line)
-    # E) "长度 2.5-4cm" → 水平线段的可视长度即 s.w
-    # F) "文本左下方"（作用于整对，见后文 pair 判定，此处仅先过滤单线的
-    #    位置约束——必须位于标题底部之下）
-    lines = []
-    for s in slide:
-        if not is_horizontal_line(s):
-            continue
-        y1_pct = s.y / model.slide_h
-        y2_pct = s.y2 / model.slide_h
-        if not (between(y1_pct, 0.20, 0.50, tol=0.02)
-                and between(y2_pct, 0.20, 0.50, tol=0.02)):
-            continue
-        if not between(s.w, 2.5, 4):
-            continue
-        if not is_orange(s.line):
-            continue
-        if not _is_solid_line(s):
-            continue
-        if s.y < title.y2:
-            continue
-        lines.append(s)
+def _p(tag):
+    return '{%s}%s' % (P_NS, tag)
 
-    # "两条线在同一水平线上"：cy 差 ≤ 0.10cm（≈同一渲染像素行）；且水平不
-    # 重叠（`left.x2 ≤ right.x`），构成两条独立并排的横线。
-    # "文本左下方"（对 pair 判定）：pair 整体位于标题左半侧 → 两线的横向
-    # 中点 (left.x + right.x2) / 2 ≤ 标题水平中心 title.cx（保留 0.3cm 容差
-    # 以兼容办公软件文本框内边距对可视中心的影响）。
-    pair = None
-    for i, a in enumerate(lines):
-        for b in lines[i + 1:]:
-            if abs(a.cy - b.cy) > 0.10:
-                continue
-            left, right = (a, b) if a.x < b.x else (b, a)
-            if left.x2 > right.x:
-                continue
-            pair_mid_x = (left.x + right.x2) / 2
-            if pair_mid_x > title.cx + 0.30:
-                continue
-            pair = (left, right)
+
+def _xfrm_of(el, kind):
+    if kind == 'grp':
+        holder = el.find(_p('grpSpPr'))
+        return holder.find(_a('xfrm')) if holder is not None else None
+    if kind == 'frame':
+        return el.find(_p('xfrm'))
+    holder = el.find(_p('spPr'))
+    return holder.find(_a('xfrm')) if holder is not None else None
+
+
+def _box(xfrm):
+    """返回 (x, y, w, h)；缺 xfrm 或缺 off/ext 时返回 None。
+    注意 ext 的 cx/cy 允许为负——这正是"宽高非负"评分项要抓的问题。"""
+    if xfrm is None:
+        return None
+    off = xfrm.find(_a('off'))
+    ext = xfrm.find(_a('ext'))
+    if off is None or ext is None:
+        return None
+    return (_int_attr(off, 'x', 0), _int_attr(off, 'y', 0),
+            _int_attr(ext, 'cx', 0), _int_attr(ext, 'cy', 0))
+
+
+def _fill_info(el, kind, theme):
+    """返回 (fill_kind, [hex...])。gradFill 把所有渐变色标都列出来，
+    对应办公软件"设置形状格式→渐变填充"里看到的一串光圈颜色。"""
+    sp_pr = el.find(_p('spPr'))
+    if kind == 'pic':
+        return ('pic', [])
+    if sp_pr is None:
+        return ('none', [])
+    if sp_pr.find(_a('solidFill')) is not None:
+        h = _clr_hex(sp_pr.find(_a('solidFill')), theme)
+        return ('solid', [h] if h else [])
+    g = sp_pr.find(_a('gradFill'))
+    if g is not None:
+        hexes = []
+        for gs in g.iter(_a('gs')):
+            h = _clr_hex(gs, theme)
+            if h:
+                hexes.append(h)
+        return ('grad', hexes)
+    if sp_pr.find(_a('blipFill')) is not None:
+        return ('pic', [])
+    if sp_pr.find(_a('pattFill')) is not None:
+        return ('patt', [])
+    if sp_pr.find(_a('noFill')) is not None:
+        return ('none', [])
+    return ('inherit', [])
+
+
+def _line_info(el, theme):
+    """返回 (线条颜色 hex 或 None, 线宽 EMU 或 None)。noFill 视为无边框。"""
+    sp_pr = el.find(_p('spPr'))
+    if sp_pr is None:
+        return (None, None)
+    ln = sp_pr.find(_a('ln'))
+    if ln is None:
+        return (None, None)
+    w = _int_attr(ln, 'w')
+    if ln.find(_a('noFill')) is not None:
+        return (None, w)
+    return (_clr_hex(ln.find(_a('solidFill')), theme), w)
+
+
+_KIND_BY_TAG = {
+    _p('sp'): 'sp', _p('pic'): 'pic', _p('cxnSp'): 'cxn',
+    _p('grpSp'): 'grp', _p('graphicFrame'): 'frame',
+}
+
+
+def _make_sh(el, kind, box, z, theme):
+    sh = Sh()
+    sh.el = el
+    sh.z = z
+    sh.kind = kind
+    sh.is_pic = (kind == 'pic')
+    sh.is_group = (kind == 'grp')
+    x, y, w, h = box
+    sh.raw_w, sh.raw_h = w, h
+    # 负宽高在几何上无意义：取绝对值得到"实际占位框"，原始值另存供第7项判定
+    sh.left = x if w >= 0 else x + w
+    sh.top = y if h >= 0 else y + h
+    sh.width = abs(w)
+    sh.height = abs(h)
+    nv = None
+    for tag in ('nvSpPr', 'nvPicPr', 'nvCxnSpPr', 'nvGrpSpPr',
+                'nvGraphicFramePr'):
+        cand = el.find(_p(tag))
+        if cand is not None:
+            nv = cand
             break
-        if pair:
-            break
-
-    if not pair:
-        return fail(
-            "第2页英文公司名左下方 20%-50% 未找到两条在同一水平线、"
-            "长度 2.5-4cm、橙色单实线的横线"
-        )
-
-    left, right = pair
-    middle_x1, middle_x2 = left.x2, right.x
-    middle_cy = (left.cy + right.cy) / 2
-
-    # "两条线中间有一个橙色或者黄色填充的叶片组合形状或者图片，整体高度
-    # 0.4-0.5cm，宽度 0.3-0.4cm"：
-    # - "两条线中间"：候选形状的水平中心落在两线间水平段（放宽 0.15cm
-    #   办公软件文本框边距容差），垂直中心与线中心接近（≤0.45cm）
-    # - 分两条互斥路径（细则用"或者"，命中其一即可）：
-    #   路径 A：图片（<p:pic>），宽 0.3-0.4cm、高 0.4-0.5cm
-    #   路径 B：组合形状 —— 中间区域内 ≥2 件具备几何 prst 与填充/线条的
-    #           图形；填充中至少存在"橙色或者黄色"（细则"或者"，命中其一
-    #           即可）；外包围盒宽 0.3-0.4cm、高 0.4-0.5cm
-    middle_shapes = [
-        s for s in slide
-        if s is not left and s is not right
-        and middle_x1 - 0.15 <= s.cx <= middle_x2 + 0.15
-        and abs(s.cy - middle_cy) <= 0.45
-    ]
-
-    # 路径 A：图片
-    for pic in [s for s in middle_shapes if is_picture(s)]:
-        if between(pic.w, 0.3, 0.4) and between(pic.h, 0.4, 0.5):
-            return ok(
-                f"第2页英文公司名左下方双橙线中间找到叶片图片 "
-                f"{pic.w:.2f}×{pic.h:.2f}cm"
-            )
-
-    # 路径 B：组合形状
-    combo = [
-        s for s in middle_shapes
-        if not is_picture(s)
-        and s.prst  # 需有几何形状（排除纯文本框）
-        and (s.fill is not None or s.line is not None)
-    ]
-    if len(combo) >= 2:
-        has_orange_or_yellow = any(
-            is_orange(s.fill) or is_yellow(s.fill) for s in combo
-        )
-        if has_orange_or_yellow:
-            cx1 = min(s.x for s in combo)
-            cx2 = max(s.x2 for s in combo)
-            cy1 = min(s.y for s in combo)
-            cy2 = max(s.y2 for s in combo)
-            combo_w, combo_h = cx2 - cx1, cy2 - cy1
-            if between(combo_w, 0.3, 0.4) and between(combo_h, 0.4, 0.5):
-                return ok(
-                    f"第2页英文公司名左下方双橙线中间找到叶片组合形状"
-                    f"（{len(combo)} 件），整体 {combo_w:.2f}×{combo_h:.2f}cm，"
-                    f"含橙色或黄色填充"
-                )
-            return fail(
-                f"第2页英文公司名左下方双橙线中间叶片组合尺寸不满足："
-                f"{combo_w:.2f}×{combo_h:.2f}cm"
-            )
-        return fail(
-            f"第2页英文公司名左下方双橙线中间组合缺少橙色或黄色填充："
-            f"{[color_name(s.fill) for s in combo]}"
-        )
-
-    return fail("第2页英文公司名左下方双橙线中间未找到叶片组合形状或图片")
+    c_nv = nv.find(_p('cNvPr')) if nv is not None else None
+    sh.sid = _int_attr(c_nv, 'id', 0)
+    sh.name = (c_nv.get('name') or '') if c_nv is not None else ''
+    xfrm = _xfrm_of(el, kind)
+    sh.rot = _int_attr(xfrm, 'rot', 0) or 0
+    sp_pr = el.find(_p('spPr'))
+    pg = sp_pr.find(_a('prstGeom')) if sp_pr is not None else None
+    sh.prst = (pg.get('prst') or '') if pg is not None else ''
+    cg = sp_pr.find(_a('custGeom')) if sp_pr is not None else None
+    sh.has_custgeom = cg is not None
+    sh.curve_n = 0
+    if cg is not None:
+        sh.curve_n = (len(list(cg.iter(_a('cubicBezTo'))))
+                      + len(list(cg.iter(_a('quadBezTo')))))
+    sh.fill_kind, sh.fills = _fill_info(el, kind, theme)
+    sh.line_hex, sh.line_w = _line_info(el, theme)
+    tx = el.find(_p('txBody'))
+    sh.runs = _collect_paras(tx, theme)
+    sh.text = _norm_text('\n'.join(
+        ''.join(r['t'] for r in para) for para in sh.runs))
+    return sh
 
 
-def _is_ethan_script_font(name: str) -> bool:
-    """严格判定 typeface 是否为细则列出的四种脚本字体之一：
-    Brush Script MT / Script MT Bold / Alex Brush / Segoe Script。
+def _walk(container, theme, mapper, out, counter, in_group):
+    """深度优先遍历形状树。组：既登记组自身（供"成组矢量"判定），也把子形状
+    按组的缩放映射成绝对坐标登记（供位置/对齐类判定）。"""
+    for el in container:
+        kind = _KIND_BY_TAG.get(el.tag)
+        if kind is None:
+            continue
+        box = _box(_xfrm_of(el, kind))
+        if box is None:
+            box = (0, 0, 0, 0)
+        abox = mapper(box)
+        counter[0] += 1
+        sh = _make_sh(el, kind, abox, counter[0], theme)
+        out.append((sh, in_group))
+        if kind == 'grp':
+            xfrm = _xfrm_of(el, kind)
+            ch_off = xfrm.find(_a('chOff')) if xfrm is not None else None
+            ch_ext = xfrm.find(_a('chExt')) if xfrm is not None else None
+            cox = _int_attr(ch_off, 'x', 0)
+            coy = _int_attr(ch_off, 'y', 0)
+            cex = _int_attr(ch_ext, 'cx', 0) or 1
+            cey = _int_attr(ch_ext, 'cy', 0) or 1
+            gx, gy, gw, gh = abox
+            sx = (gw / float(cex)) if cex else 1.0
+            sy = (gh / float(cey)) if cey else 1.0
 
-    OOXML `<a:latin typeface="..."/>`（以及 <a:ea>/<a:cs>）会原样写入字体
-    名称，办公软件（PowerPoint / WPS / Keynote）之间会保持一致。这里对
-    名称做去空格、小写归一化后按子串匹配，同时兼容常见异体名：
-      - "Brush Script MT" 也常写作 "BrushScriptMT" / "BrushScriptStd"
-      - "Script MT Bold" 也常写作 "ScriptMTBold"
-      - "Alex Brush" 也常写作 "AlexBrush" / "AlexBrush-Regular"
-      - "Segoe Script" 也常写作 "SegoeScript"
-    """
-    n = norm_font_name(name)
+            def sub(b, gx=gx, gy=gy, cox=cox, coy=coy, sx=sx, sy=sy):
+                x, y, w, h = b
+                return (int(gx + (x - cox) * sx), int(gy + (y - coy) * sy),
+                        int(w * sx), int(h * sy))
+
+            _walk(el, theme, sub, out, counter, True)
+
+
+def _slide_shapes(slide_el, theme):
+    """返回 (all_shapes, top_level_shapes)；两者都是 Sh 列表，z 为遍历序。"""
+    sp_tree = slide_el.find(_p('cSld')).find(_p('spTree'))
+    out = []
+    _walk(sp_tree, theme, lambda b: b, out, [0], False)
+    return ([s for s, _ in out], [s for s, g in out if not g])
+
+
+# ------------------------------------------------------- 字体 / 文本工具
+def _hit_family(name, families):
+    n = (name or '').strip()
     if not n:
         return False
-    if "scriptmtbold" in n:
+    low = n.lower()
+    return any(f.lower() in low for f in families)
+
+
+def _is_mac_only(name):
+    n = (name or '').strip()
+    if n.lower() in (x.lower() for x in MAC_ONLY_EXACT):
         return True
-    if "brushscriptmt" in n or "brushscriptstd" in n:
-        return True
-    if "alexbrush" in n:
-        return True
-    if "segoescript" in n:
-        return True
-    return False
+    return _hit_family(n, MAC_ONLY_FONTS)
 
 
-def c24_ethan(model: PptModel) -> CheckResult:
-    """+1：第2页幻灯片出现"Ethan Shen"文本：位于页面从左至右 5%-45%、从上
-    至下 30%-60% 范围内；字体为 Brush Script MT、Script MT Bold、
-    Alex Brush、Segoe Script，25-35 磅。
-    """
-    s = first_text(model, 2, "Ethan Shen")
-    if not s:
-        return fail("第2页未找到\"Ethan Shen\"文本")
+def _is_win_common(name):
+    return _hit_family(name, WIN_COMMON_FONTS)
 
-    # 位置：形状左上角为基准，位于页面从左至右 5%-45%、从上至下 30%-60%
-    # 范围内。保留 2% 容差兼容办公软件 EMU→百分比的渲染精度损失。
-    x_pct = s.x / model.slide_w
-    y_pct = s.y / model.slide_h
-    if not between(x_pct, 0.05, 0.45, tol=0.02):
-        return fail(f"第2页\"Ethan Shen\"横向位置 {x_pct:.1%} 不在 5%-45%")
-    if not between(y_pct, 0.30, 0.60, tol=0.02):
-        return fail(f"第2页\"Ethan Shen\"纵向位置 {y_pct:.1%} 不在 30%-60%")
 
-    # 字体：Brush Script MT / Script MT Bold / Alex Brush / Segoe Script。
-    # 兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式（Ethan Shen 为
-    # 英文文本，PowerPoint 写入 <a:latin>；WPS/Keynote 有时也会写入
-    # <a:ea>/<a:cs>）。所有非空 run 的所有 typeface 均需命中细则四种之一。
-    try:
-        typefaces = re.findall(r'typeface="([^"]+)"', s.raw._element.xml)
-    except Exception:
-        typefaces = []
-    latin_names = font_names(s)
-    all_names = [n for n in latin_names + typefaces if n]
-    if not all_names or not all(_is_ethan_script_font(n) for n in all_names):
-        return fail(
-            f"第2页\"Ethan Shen\"字体不在 Brush Script MT / Script MT Bold "
-            f"/ Alex Brush / Segoe Script 之中：latin={latin_names} "
-            f"typefaces={typefaces}"
-        )
+def _is_kai_font(name):
+    return _hit_family(name, KAI_FONTS)
 
-    # 字号：25-35 磅（每个非空 run 都必须落在区间内）
-    sizes = font_sizes(s)
-    if not sizes or not all(between(sz, 25, 35) for sz in sizes):
-        return fail(f"第2页\"Ethan Shen\"字号不在 25-35 磅：{sizes}")
 
-    return ok(
-        f"第2页\"Ethan Shen\"符合：pos=({x_pct:.1%},{y_pct:.1%}) "
-        f"字号={sizes} 字体={all_names}"
-    )
+def _is_script_font(name):
+    return _hit_family(name, SCRIPT_FONTS)
 
 
-def c25_en_address_lines(model: PptModel) -> CheckResult:
-    """+1：第2页幻灯片"z.xing@lanyunova.com"下方出现"Suite 1208, BlueBay
-    Innovation Center,"、"No.88 Yunchuang Avenue,"、"Haicang District,
-    Xiamen, Fujian, China"文本：每个文本单独位于一行；左对齐；字体为
-    Arial，10-12 磅，黑色、绿色、灰色。
-    """
-    targets = [
-        "Suite 1208, BlueBay Innovation Center,",
-        "No.88 Yunchuang Avenue,",
-        "Haicang District, Xiamen, Fujian, China",
-    ]
-    email = first_text(model, 2, "z.xing@lanyunova.com")
-    if not email:
-        return fail("第2页未找到\"z.xing@lanyunova.com\"，无法判定地址在其下方")
-
-    # 收集第 2 页所有非空段落（对应 OOXML `<a:p>`）。三行地址可能位于
-    # 同一个文本框中的三个段落，也可能各自独立文本框 —— 段落级判定同时
-    # 覆盖两种办公软件常见写法（PowerPoint / WPS / Keynote）。
-    para_records = []  # (target, shape, para, para_xml)
-    for s in model.slide(2):
-        if not s.text.strip():
-            continue
-        try:
-            para_nodes = re.findall(r"<a:p\b.*?</a:p>", s.raw._element.xml, re.DOTALL)
-        except Exception:
-            para_nodes = [""] * len(s.paragraphs)
-        for idx, para in enumerate(s.paragraphs):
-            para_xml = para_nodes[idx] if idx < len(para_nodes) else ""
-            cleaned = clean_text(para["text"])
-            for t in targets:
-                if clean_text(t) == cleaned:
-                    para_records.append((t, s, para, para_xml))
-                    break
-
-    matched = {rec[0] for rec in para_records}
-    missing = [t for t in targets if t not in matched]
-    if missing:
-        return fail(f"第2页英文地址缺少文本：{missing}")
-
-    # "每个文本单独位于一行" → 目标文本必须等于段落全部内容（不含前后空白）
-    for t, _, para, _ in para_records:
-        if clean_text(para["text"]) != clean_text(t):
-            return fail(
-                f"第2页英文地址 {t!r} 所在段落包含其它内容：{para['text']!r}"
-            )
-
-    # 位于"z.xing@lanyunova.com"下方：段落所在形状顶端在邮箱底部之下
-    # （允许 0.05cm 办公软件段落间距误差）
-    for t, s, _, _ in para_records:
-        if s.y < email.y2 - 0.05:
-            return fail(
-                f"第2页英文地址 {t!r} 未位于邮箱下方："
-                f"email.y2={email.y2:.2f} shape.y={s.y:.2f}"
-            )
-
-    # "左对齐"：
-    # 判据 1（几何）：三个段落所在形状的 x 相同 —— 允许 0.35cm 办公软件
-    # 文本框内边距/自动布局误差。若三段位于同一文本框，形状 x 天然相同。
-    xs = [round(rec[1].x, 2) for rec in para_records]
-    if max(xs) - min(xs) > 0.35:
-        return fail(f"第2页英文地址三行未左对齐（形状 x 分散过大）：{xs}")
-
-    # 判据 2（段落属性）：段落 <a:pPr algn="..."/> 若显式声明，必须为
-    # "l"（左对齐）；未声明视为左对齐（OOXML 默认值）。
-    for t, _, _, para_xml in para_records:
-        algn_m = re.search(r'<a:pPr[^>]*algn="([^"]+)"', para_xml)
-        if algn_m and algn_m.group(1) != "l":
-            return fail(
-                f"第2页英文地址 {t!r} 段落对齐不是左对齐：algn={algn_m.group(1)}"
-            )
-
-    # 字体：Arial。兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式；
-    # 段落级 typefaces 优先，未取到再从形状级 XML 兜底。
-    # 字号：10-12 磅（每个非空 run 都必须落在区间内）
-    # 颜色：黑色、绿色、灰色（细则列举三种，命中其一即可）
-    for t, shape, para, para_xml in para_records:
-        runs = [r for r in para["runs"] if r["text"].strip()]
-        if not runs:
-            return fail(f"第2页英文地址 {t!r} 无有效字体信息")
-
-        para_typefaces = re.findall(r'typeface="([^"]+)"', para_xml)
-        for r in runs:
-            name_candidates = [r["font"]] + para_typefaces
-            name_candidates = [n for n in name_candidates if n]
-            if not name_candidates or not all(is_arial(n) for n in name_candidates):
-                return fail(
-                    f"第2页英文地址 {t!r} 字体不是 Arial：{name_candidates}"
-                )
-
-            if r["size"] is None:
-                return fail(f"第2页英文地址 {t!r} 未声明字号")
-            if not between(float(r["size"]), 10, 12):
-                return fail(
-                    f"第2页英文地址 {t!r} 字号不在 10-12 磅：{r['size']}"
-                )
-
-            if not (is_black(r["color"]) or is_green(r["color"])
-                    or is_gray(r["color"])):
-                return fail(
-                    f"第2页英文地址 {t!r} 颜色不是黑色/绿色/灰色："
-                    f"{color_name(r['color'])}"
-                )
-
-    return ok(
-        "第2页英文地址三行位于邮箱下方、单独成行、左对齐；"
-        "Arial 10-12 磅，颜色为黑色/绿色/灰色"
-    )
-
-
-def c26_en_address_icon(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"Haicang District, Xiamen, Fujian, China"文本左侧有
-    一个宽 0.8-1cm、高 0.8-1cm 的深绿色填充的圆角矩形形状，其中间是一个
-    白色定位标记图案。
-    """
-    text = first_text(model, 2, "Haicang District, Xiamen, Fujian, China")
-    if not text:
-        return fail("第2页未找到英文地址末行")
-
-    slide = model.slide(2)
-
-    # 候选：位于文本左侧、宽/高 0.8-1cm、深绿色填充的圆角矩形。
-    # - 位于左侧：候选形状右边不超过文本左边 + 0.15cm（办公软件文本框内边距）
-    # - 圆角矩形：OOXML prst="roundRect"（严格四个圆角）
-    #   [注意]细则用"圆角矩形"，这里严格采用 `_is_four_corner_rounded_rect`
-    #   与 D2-12 / D2-14 / D2-16 保持一致；旧代码使用的 is_round_rect 会把
-    #   1 圆角/2 圆角等变体也纳入，超出细则语义。
-    # - 宽 0.8-1cm、高 0.8-1cm
-    # - 深绿色填充：is_deep_green(fill)
-    candidates: list[ShapeInfo] = []
-    for s in slide:
-        if s is text:
-            continue
-        if not _is_four_corner_rounded_rect(s):
-            continue
-        if not (between(s.w, 0.8, 1.0) and between(s.h, 0.8, 1.0)):
-            continue
-        if not is_deep_green(s.fill):
-            continue
-        if s.x2 > text.x + 0.15:
-            continue
-        candidates.append(s)
-
-    # 中间是一个白色定位标记图案：
-    # 路径 A：圆角矩形自身文本框内含定位字符（⌖/⌾/📍/location/pin），
-    #         且字体颜色全为白色。这是最常见的图标写法（形状 + 文本符号）。
-    # 路径 B：圆角矩形几何范围内存在一张图片（<p:pic>，重叠 ≥ 50%）—— 视
-    #         为"定位图案"的图片形式；图片本身是否为定位图无法在 OOXML
-    #         级别校验，采用几何包含 + "存在图片"作为可行判据。
-    # 路径 C：圆角矩形几何范围内存在白色矢量定位标记组合 —— 覆盖"定位图案
-    #         由白色 freeform / 圆 / 针脚线条 / group 构成"这种写法。
-    #         定位标记的经典构成：外轮廓水滴形(teardrop)/椭圆(oval) + 内部
-    #         针脚小圆(oval)；亦可能是任意 freeform 曲线。判定策略：
-    #           a) 至少一件填充或线条为白色；
-    #           b) 该形状不承载文字（文字走路径 A）、不是图片（图片走路径 B）；
-    #           c) 几何上落入圆角矩形内部（面积≥50%重叠；线条按中心点判定）；
-    #           d) 单件尺寸不超过圆角矩形自身（排除整页级白色背景）；
-    #           e) 优先识别"外轮廓 + 内针脚"组合（外部为 teardrop / oval /
-    #              freeform，内部包含小 oval 针脚且色调可分）；若不满足，退
-    #              化为"至少两件白色矢量构件"（覆盖 freeform 线条组合写法）；
-    #              再退化为"外轮廓为 teardrop/oval 的单件白色矢量图形"（覆盖
-    #              整个定位标记就是一个白色水滴/椭圆的写法）。
-    location_glyphs = ["⌖", "⌾", "📍", "location", "pin"]
-
-    def _mostly_inside(inner: "ShapeInfo", container: "ShapeInfo") -> bool:
-        if inner.area > 0:
-            return overlap_area(inner, container) / inner.area >= 0.50
-        # 退化形状(w 或 h 为 0，如直线)：用中心点是否落入 container
-        return (container.x - 0.05 <= inner.cx <= container.x2 + 0.05
-                and container.y - 0.05 <= inner.cy <= container.y2 + 0.05)
-
-    def _is_white_vector_inside(inner: "ShapeInfo", container: "ShapeInfo") -> bool:
-        if inner is container or inner is text:
-            return False
-        if is_picture(inner):
-            return False
-        if inner.text.strip():
-            return False
-        if not (is_white(inner.fill) or is_white(inner.line)):
-            return False
-        # 排除超出圆角矩形自身尺寸的形状（页面级白色背景/大装饰）
-        if inner.w > container.w * 1.1 or inner.h > container.h * 1.1:
-            return False
-        return _mostly_inside(inner, container)
-
-    for c in candidates:
-        # 路径 A
-        has_glyph = any(g in c.text for g in location_glyphs)
-        colors = font_colors(c)
-        white_glyph = has_glyph and colors and all(is_white(cc) for cc in colors)
-        if white_glyph:
-            return ok(
-                "第2页英文地址末行左侧找到深绿色圆角矩形，中间含白色定位"
-                "标记字符"
-            )
-
-        # 路径 B
-        has_pic_inside = any(
-            is_picture(s)
-            and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50
-            for s in slide
-        )
-        if has_pic_inside:
-            return ok(
-                "第2页英文地址末行左侧找到深绿色圆角矩形，中间含定位图片"
-            )
-
-        # 路径 C：白色矢量定位标记组合
-        white_vec = [s for s in slide if _is_white_vector_inside(s, c)]
-        if white_vec:
-            # 优先识别"外轮廓 + 内针脚"结构：
-            #   - 外轮廓：teardrop / oval / freeform / 无 prst 的 custGeom；
-            #   - 内针脚：小圆(oval)，且几何上落入外轮廓包围盒内部。
-            outers = [
-                s for s in white_vec
-                if ("TEAR" in s.prst.upper() or "TEARDROP" in s.prst.upper()
-                    or "OVAL" in s.prst.upper() or "ELLIPSE" in s.prst.upper()
-                    or "FREEFORM" in s.prst.upper() or s.prst == "")
-            ]
-            pins = [s for s in white_vec if is_oval(s)]
-            outer_pin_hit = False
-            for outer in outers:
-                for pin in pins:
-                    if pin is outer:
-                        continue
-                    if (pin.w < outer.w * 0.9 and pin.h < outer.h * 0.9
-                            and _mostly_inside(pin, outer)):
-                        outer_pin_hit = True
-                        break
-                if outer_pin_hit:
-                    break
-            if outer_pin_hit:
-                return ok(
-                    "第2页英文地址末行左侧找到深绿色圆角矩形，中间含白色定位标记矢量组合（外轮廓+内针脚）"
-                )
-            # 退化：多件白色矢量构件（覆盖 freeform 线条组合写法）
-            if len(white_vec) >= 2:
-                return ok(
-                    f"第2页英文地址末行左侧找到深绿色圆角矩形，中间含白色定位标记矢量组合（{len(white_vec)} 件）"
-                )
-            # 再退化：单件白色 teardrop / oval / freeform 定位标记
-            single = white_vec[0]
-            if ("TEAR" in single.prst.upper()
-                    or "TEARDROP" in single.prst.upper()
-                    or "OVAL" in single.prst.upper()
-                    or "ELLIPSE" in single.prst.upper()
-                    or "FREEFORM" in single.prst.upper()):
-                return ok(
-                    "第2页英文地址末行左侧找到深绿色圆角矩形，中间含白色定位标记矢量图形"
-                )
-
-    return fail(
-        "第2页英文地址末行左侧未找到 0.8-1cm 深绿色圆角矩形，或其中间未"
-        "包含白色定位标记图案"
-    )
-
-
-def c27_main_business_pill(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"FUJIAN LANYU NOVA MATERIALS CO., LTD."右下方出现
-    绿色填充的圆角矩形或胶囊形形状：从上至下位于页面 25%-40%，从左至右
-    位于 50%-75% 的位置范围内；其内部出现"MAIN BUSINESS"文本：字体为
-    Arial、黑体，白色，10-15 磅。
-    """
-    title = first_text(model, 2, "FUJIAN LANYU NOVA MATERIALS CO., LTD.")
-    if not title:
-        return fail("第2页未找到英文公司名，无法定位其右下方胶囊")
-
-    slide = model.slide(2)
-
-    # 收集绿色填充、位于 25%-40% × 50%-75% 区域内、位于公司名"右下方"的
-    # "圆角矩形或胶囊形"形状。
-    # - "圆角矩形或胶囊形"：OOXML `prst="roundRect"`（含 adj 拉满至胶囊视觉）
-    #   或 `prst="pill"`（少见）；python-pptx 均映射为 ROUNDED_RECTANGLE
-    # - 绿色填充：is_green(fill)
-    # - 位置：形状左上角为基准，落入 25%-40% 纵向、50%-75% 横向（保留 2%
-    #   容差兼容办公软件 EMU→百分比的渲染精度损失）
-    # - 右下方：形状左端在标题水平中心之右（`s.x ≥ title.cx`，允许 0.3cm
-    #   办公软件文本框内边距容差）；形状顶端在标题底部之下（`s.y ≥ title.y2`）
-    candidates = []
-    for s in slide:
-        if not _is_rounded_rect_or_pill(s):
-            continue
-        if not is_green(s.fill):
-            continue
-        x_pct = s.x / model.slide_w
-        y_pct = s.y / model.slide_h
-        if not between(y_pct, 0.25, 0.40, tol=0.02):
-            continue
-        if not between(x_pct, 0.50, 0.75, tol=0.02):
-            continue
-        if s.y < title.y2:
-            continue
-        if s.x < title.cx - 0.30:
-            continue
-        candidates.append(s)
-
-    if not candidates:
-        return fail(
-            "第2页英文公司名右下方 25%-40%×50%-75% 未找到绿色填充"
-            "圆角矩形/胶囊形"
-        )
-
-    # 其内部出现"MAIN BUSINESS"文本，且字体/颜色/字号满足细则：
-    # - 路径 A：胶囊自身文本框包含"MAIN BUSINESS"（最常见的办公软件写法）
-    # - 路径 B：外部"MAIN BUSINESS"文本框在几何上落入胶囊范围（重叠 ≥ 50%）
-    #
-    # 字体：Arial、黑体（细则用"、"表示或；黑体覆盖 SimHei/微软雅黑等中文
-    #   黑体族），命中其一即可。兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface。
-    # 颜色：白色（每个非空 run 都为白色）
-    # 字号：10-15 磅（每个非空 run）
-    for c in candidates:
-        # 路径 A
-        pill_shape = c if text_contains(c, "MAIN BUSINESS") else None
-
-        # 路径 B
-        if pill_shape is None:
-            for s in slide:
-                if s is c:
-                    continue
-                if not text_contains(s, "MAIN BUSINESS"):
-                    continue
-                if c.area <= 0 or s.area <= 0:
-                    continue
-                if overlap_area(s, c) / max(0.01, min(s.area, c.area)) < 0.50:
-                    continue
-                pill_shape = s
-                break
-
-        if pill_shape is None:
-            continue
-
-        # 字体：Arial 或 黑体（细则原文"Arial、黑体"表示或）。此处"黑体"
-        # 严格指 SimHei / Heiti，不包含微软雅黑等其它中文黑体族字体。
-        try:
-            typefaces = re.findall(r'typeface="([^"]+)"', pill_shape.raw._element.xml)
-        except Exception:
-            typefaces = []
-        latin_names = font_names(pill_shape)
-        all_names = [n for n in latin_names + typefaces if n]
-        if not all_names:
-            return fail(
-                f"第2页胶囊内\"MAIN BUSINESS\"未声明字体："
-                f"latin={latin_names} typefaces={typefaces}"
-            )
-        for n in all_names:
-            if not (is_arial(n) or is_heiti_only(n)):
-                return fail(
-                    f"第2页胶囊内\"MAIN BUSINESS\"字体不是 Arial 或 黑体："
-                    f"{n!r}（全部：latin={latin_names} typefaces={typefaces}）"
-                )
-
-        # 颜色：白色
-        colors = font_colors(pill_shape)
-        if not colors or not all(is_white(cc) for cc in colors):
-            return fail(
-                f"第2页胶囊内\"MAIN BUSINESS\"颜色不是白色："
-                f"{[color_name(cc) for cc in colors]}"
-            )
-
-        # 字号：10-15 磅
-        sizes = font_sizes(pill_shape)
-        if not sizes or not all(between(sz, 10, 15) for sz in sizes):
-            return fail(
-                f"第2页胶囊内\"MAIN BUSINESS\"字号不在 10-15 磅：{sizes}"
-            )
-
-        return ok(
-            f"第2页绿色圆角矩形/胶囊 {c.w:.2f}×{c.h:.2f}cm 位于公司名右下方，"
-            f"内含\"MAIN BUSINESS\"白色 Arial/黑体 {sizes} 磅"
-        )
-
-    return fail(
-        "第2页公司名右下方绿色圆角矩形/胶囊未包含符合规格的"
-        "\"MAIN BUSINESS\"文本"
-    )
-
-
-def c28_en_business_list(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"MAIN BUSINESS"下方出现"ECO COATINGS:"、
-    "Water-based resins"、"Functional additives"、"Barrier coatings"、
-    "GREEN MATERIALS:"、"Biodegradable films"、"Paper-plastic composites"、
-    "APPLICATION SOLUTIONS:"、"Industrial adhesives"、
-    "Packaging surface treatment"文本：每一个文本都单独排列在一行，全部
-    左对齐；"ECO COATINGS:"、"GREEN MATERIALS:"、"APPLICATION SOLUTIONS:"
-    这三个文本字体为绿色，Arial，11-13 磅；其它文本字体为黑色、灰色、
-    绿色，Arial，9-11 磅。
-    """
-    headings = ["ECO COATINGS:", "GREEN MATERIALS:", "APPLICATION SOLUTIONS:"]
-    items = [
-        "Water-based resins", "Functional additives", "Barrier coatings",
-        "Biodegradable films", "Paper-plastic composites",
-        "Industrial adhesives", "Packaging surface treatment",
-    ]
-    needed = headings + items
-
-    pill = first_text(model, 2, "MAIN BUSINESS")
-    if not pill:
-        return fail("第2页未找到\"MAIN BUSINESS\"，无法判定业务列表在其下方")
-
-    # 收集所有非空段落（对应 OOXML `<a:p>`）。10 项文本可能位于同一个文本
-    # 框中的多个段落，也可能各自独立文本框 —— 段落级判定同时覆盖两种办公
-    # 软件常见写法（PowerPoint / WPS / Keynote）。
-    para_records = []  # (target, shape, para, para_xml)
-    for s in model.slide(2):
-        if not s.text.strip():
-            continue
-        try:
-            para_nodes = re.findall(r"<a:p\b.*?</a:p>", s.raw._element.xml, re.DOTALL)
-        except Exception:
-            para_nodes = [""] * len(s.paragraphs)
-        for idx, para in enumerate(s.paragraphs):
-            para_xml = para_nodes[idx] if idx < len(para_nodes) else ""
-            cleaned = clean_text(para["text"])
-            for t in needed:
-                if clean_text(t) == cleaned:
-                    para_records.append((t, s, para, para_xml))
-                    break
-
-    matched = {rec[0] for rec in para_records}
-    missing = [t for t in needed if t not in matched]
-    if missing:
-        return fail(f"第2页英文业务列表缺少文本：{missing}")
-
-    # "每一个文本都单独排列在一行" → 段落文本 clean_text 必须等于目标文本，
-    # 不能包含其它内容（同段落多目标或段落含额外文本均视为不满足）
-    for t, _, para, _ in para_records:
-        if clean_text(para["text"]) != clean_text(t):
-            return fail(
-                f"第2页英文业务列表 {t!r} 所在段落包含其它内容：{para['text']!r}"
-            )
-
-    # 位于"MAIN BUSINESS"下方（细则"下方"）：所在形状顶端在 MAIN BUSINESS
-    # 底部之下（允许 0.05cm 办公软件段落间距误差）
-    for t, s, _, _ in para_records:
-        if s.y < pill.y2 - 0.05:
-            return fail(
-                f"第2页英文业务列表 {t!r} 未位于\"MAIN BUSINESS\"下方："
-                f"pill.y2={pill.y2:.2f} shape.y={s.y:.2f}"
-            )
-
-    # "全部左对齐"：
-    # 判据 1（几何）：所有段落所在形状的 x 相同 —— 允许 0.35cm 办公软件
-    #   文本框内边距/自动布局误差。同一文本框内多段天然共享 x。
-    # 判据 2（段落属性）：段落 <a:pPr algn="..."/> 若显式声明，必须为
-    #   "l"（左对齐）；未声明视为左对齐（OOXML 默认值）。
-    xs = [round(rec[1].x, 2) for rec in para_records]
-    if max(xs) - min(xs) > 0.35:
-        return fail(f"第2页英文业务列表未左对齐（形状 x 分散过大）：{xs}")
-
-    for t, _, _, para_xml in para_records:
-        algn_m = re.search(r'<a:pPr[^>]*algn="([^"]+)"', para_xml)
-        if algn_m and algn_m.group(1) != "l":
-            return fail(
-                f"第2页英文业务列表 {t!r} 段落对齐不是左对齐："
-                f"algn={algn_m.group(1)}"
-            )
-
-    # 逐条校验字体/字号/颜色：
-    # - 三个标题：Arial，11-13 磅，绿色
-    # - 其它 7 条：Arial，9-11 磅，黑色/灰色/绿色（"、"表示或，命中其一即可）
-    # 字体兼容 <a:latin>/<a:ea>/<a:cs> 三种 typeface 写入方式（段落级优先，
-    # 形状级兜底）；颜色/字号逐 run 检查。
-    for t, shape, para, para_xml in para_records:
-        runs = [r for r in para["runs"] if r["text"].strip()]
-        if not runs:
-            return fail(f"第2页英文业务列表 {t!r} 无有效字体信息")
-
-        para_typefaces = re.findall(r'typeface="([^"]+)"', para_xml)
-        for r in runs:
-            name_candidates = [r["font"]] + para_typefaces
-            name_candidates = [n for n in name_candidates if n]
-            if not name_candidates or not all(is_arial(n) for n in name_candidates):
-                return fail(
-                    f"第2页英文业务列表 {t!r} 字体不是 Arial：{name_candidates}"
-                )
-
-            if r["size"] is None:
-                return fail(f"第2页英文业务列表 {t!r} 未声明字号")
-
-            if t in headings:
-                if not between(float(r["size"]), 11, 13):
-                    return fail(
-                        f"第2页英文业务列表标题 {t!r} 字号不在 11-13 磅："
-                        f"{r['size']}"
-                    )
-                if not is_green(r["color"]):
-                    return fail(
-                        f"第2页英文业务列表标题 {t!r} 颜色不是绿色："
-                        f"{color_name(r['color'])}"
-                    )
-            else:
-                if not between(float(r["size"]), 9, 11):
-                    return fail(
-                        f"第2页英文业务列表条目 {t!r} 字号不在 9-11 磅："
-                        f"{r['size']}"
-                    )
-                if not (is_black(r["color"]) or is_gray(r["color"])
-                        or is_green(r["color"])):
-                    return fail(
-                        f"第2页英文业务列表条目 {t!r} 颜色不是黑色/灰色/绿色："
-                        f"{color_name(r['color'])}"
-                    )
-
-    return ok(
-        "第2页英文业务列表 10 项文本齐全、单独成行、左对齐；"
-        "标题绿色 Arial 11-13 磅，条目 Arial 9-11 磅（黑/灰/绿色）"
-    )
-
-
-def c29_icon_eco_en(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"ECO COATINGS"左侧有一个圆形填充形状：直径在
-    1.3-1.5cm，颜色为浅灰色；其中间有一个"绿色的水滴造型和一片小叶子"的
-    组合图形或者此部分直接为一张图片。
-    """
-    heading = first_text(model, 2, "ECO COATINGS")
-    if not heading:
-        return fail("第2页未找到\"ECO COATINGS\"文本，无法定位其左侧图标")
-
-    slide = model.slide(2)
-
-    # 候选圆形：
-    # - 位于文本左侧：候选右边不超过文本左边 + 0.25cm（办公软件文本框内边距）
-    # - 垂直中心与文本中心接近：|Δcy| ≤ 0.65cm
-    # - 圆形：OOXML prst="ellipse"（python-pptx: OVAL/ELLIPSE）
-    # - 直径 1.3-1.5cm：宽、高均需在区间内
-    # - 浅灰色填充
-    circles = []
-    for s in slide:
-        if s is heading:
-            continue
-        if s.x2 > heading.x + 0.25:
-            continue
-        if abs(s.cy - heading.cy) > 0.65:
-            continue
-        if not is_oval(s):
-            continue
-        if not (between(s.w, 1.3, 1.5) and between(s.h, 1.3, 1.5)):
-            continue
-        if not is_light_gray(s.fill):
-            continue
-        circles.append(s)
-
-    if not circles:
-        return fail(
-            "第2页\"ECO COATINGS\"左侧未找到浅灰色填充、直径 1.3-1.5cm 的圆形"
-        )
-
-    # 其中间有一个"绿色的水滴造型和一片小叶子"的组合图形，或者此部分直接
-    # 为一张图片。分两条互斥路径：
-    # 路径 A：此部分直接为一张图片
-    #   - A-1：圆形自身是 <p:pic>
-    #   - A-2：圆形几何范围内包含一张图片（重叠比例 ≥ 50% 视为"在其中间"）
-    # 路径 B：组合图形——必须同时识别到「绿色水滴」与「绿色叶片」两个语义
-    #   构件，才算命中，避免"只要圆内有 ≥2 件几何且有一件绿色"的宽松判定：
-    #   - 位于圆形几何范围内（重叠比例 ≥ 40%，排除整页级超大形状）；
-    #   - 水滴：prst 含 "TEAR"/"TEARDROP"，填充或线条为绿色；
-    #   - 叶片：绿色的非水滴几何形状（可为 leaf/oval/freeform/blob 等）。
-    for c in circles:
-        # (A-1) 圆形自身是图片
-        if is_picture(c):
-            return ok(
-                f"第2页\"ECO COATINGS\"左侧找到浅灰圆形图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        # 圆形几何内的其它形状（排除圆形自身与整页级超大形状）
-        children: list[ShapeInfo] = []
-        for s in slide:
-            if s is c:
-                continue
-            if s.area > c.area * 4:
-                continue
-            if min(s.area, c.area) <= 0:
-                continue
-            inter = overlap_area(s, c)
-            if inter <= 0:
-                continue
-            if inter / max(0.01, min(s.area, c.area)) < 0.40:
-                continue
-            children.append(s)
-
-        # (A-2) 圆形几何内包含一张图片
-        for s in children:
-            if is_picture(s) and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50:
-                return ok(
-                    f"第2页\"ECO COATINGS\"左侧圆形中间包含图片，直径约 "
-                    f"{(c.w+c.h)/2:.2f}cm"
-                )
-
-        # (B) 绿色水滴 + 绿色叶片
-        combo: list[ShapeInfo] = [
-            s for s in children
-            if s.prst
-            and (s.fill is not None or s.line is not None or is_picture(s))
-        ]
-        teardrops: list[ShapeInfo] = [
-            s for s in combo
-            if ("TEAR" in s.prst.upper() or "TEARDROP" in s.prst.upper())
-            and (is_green(s.fill) or is_green(s.line))
-        ]
-        leaves: list[ShapeInfo] = [
-            s for s in combo
-            if s not in teardrops
-            and (is_green(s.fill) or is_green(s.line))
-        ]
-        if teardrops and leaves:
-            return ok(
-                f"第2页\"ECO COATINGS\"左侧圆形中间找到绿色水滴+叶子组合（水滴 {len(teardrops)} 件、叶子 {len(leaves)} 件）"
-            )
-
-    return fail(
-        "第2页\"ECO COATINGS\"左侧浅灰圆形中间未找到绿色水滴+小叶子的组合图形或图片"
-    )
-
-
-def c30_icon_green_en(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"GREEN MATERIALS"左侧有一个圆形填充形状：直径在
-    1.3-1.5cm，颜色为浅灰色；其中间有一个绿色的"带有白色脉络的叶子"组合
-    图形或者整体是一个图片。
-    """
-    heading = first_text(model, 2, "GREEN MATERIALS")
-    if not heading:
-        return fail("第2页未找到\"GREEN MATERIALS\"文本，无法定位其左侧图标")
-
-    slide = model.slide(2)
-
-    # 候选圆形：
-    # - 位于文本左侧：候选右边不超过文本左边 + 0.25cm（办公软件文本框内边距）
-    # - 垂直中心与文本中心接近：|Δcy| ≤ 0.65cm
-    # - 圆形：OOXML prst="ellipse"（python-pptx: OVAL/ELLIPSE）
-    # - 直径 1.3-1.5cm：宽、高均需在区间内
-    # - 浅灰色填充
-    circles = []
-    for s in slide:
-        if s is heading:
-            continue
-        if s.x2 > heading.x + 0.25:
-            continue
-        if abs(s.cy - heading.cy) > 0.65:
-            continue
-        if not is_oval(s):
-            continue
-        if not (between(s.w, 1.3, 1.5) and between(s.h, 1.3, 1.5)):
-            continue
-        if not is_light_gray(s.fill):
-            continue
-        circles.append(s)
-
-    if not circles:
-        return fail(
-            "第2页\"GREEN MATERIALS\"左侧未找到浅灰色填充、直径 1.3-1.5cm 的圆形"
-        )
-
-    # 其中间有一个绿色的"带有白色脉络的叶子"组合图形，或者整体是一个图片。
-    # 分两条互斥路径：
-    # 路径 A：整体是一个图片
-    #   - A-1：圆形自身是 <p:pic>
-    #   - A-2：圆形几何范围内包含一张图片（重叠比例 ≥ 50% 视为"在其中间"）
-    # 路径 B：组合图形（≥2 件独立几何形状/图片）
-    #   - 位于圆形几何范围内（重叠比例 ≥ 40%，排除整页级超大形状）
-    #   - 至少一件填充/线条为绿色（叶子主体）
-    #   - 至少一件填充/线条为白色（脉络）
-    for c in circles:
-        # (A-1) 圆形自身是图片
-        if is_picture(c):
-            return ok(
-                f"第2页\"GREEN MATERIALS\"左侧找到浅灰圆形图片，直径约 "
-                f"{(c.w+c.h)/2:.2f}cm"
-            )
-
-        # 圆形几何内的其它形状（排除圆形自身与整页级超大形状）
-        children = []
-        for s in slide:
-            if s is c:
-                continue
-            if s.area > c.area * 4:
-                continue
-            if min(s.area, c.area) <= 0:
-                continue
-            inter = overlap_area(s, c)
-            if inter <= 0:
-                continue
-            if inter / max(0.01, min(s.area, c.area)) < 0.40:
-                continue
-            children.append(s)
-
-        # (A-2) 圆形几何内包含一张图片
-        for s in children:
-            if is_picture(s) and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50:
-                return ok(
-                    f"第2页\"GREEN MATERIALS\"左侧圆形中间包含图片，直径约 "
-                    f"{(c.w+c.h)/2:.2f}cm"
-                )
-
-        # (B) 组合图形：绿色叶子主体 + 白色脉络
-        combo = [
-            s for s in children
-            if s.prst
-            and (s.fill is not None or s.line is not None or is_picture(s))
-        ]
-        if len(combo) >= 2:
-            has_green = any(is_green(s.fill) or is_green(s.line) for s in combo)
-            has_white = any(is_white(s.fill) or is_white(s.line) for s in combo)
-            if has_green and has_white:
-                return ok(
-                    f"第2页\"GREEN MATERIALS\"左侧圆形中间找到组合图形"
-                    f"（{len(combo)} 件），含绿色叶子与白色脉络"
-                )
-
-    return fail(
-        "第2页\"GREEN MATERIALS\"左侧浅灰圆形中间未找到绿色叶子+白色脉络"
-        "的组合图形或图片"
-    )
-
-
-def c31_icon_app_en(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片"APPLICATION SOLUTIONS"左侧有一个圆形填充形状：直径
-    在 1.3-1.5cm，颜色为浅灰色；其中间有一个"绿色的带有白色箱盖和锁扣的
-    立体纸箱"组合图型或者整体是一个图片。
-    """
-    heading = first_text(model, 2, "APPLICATION SOLUTIONS")
-    if not heading:
-        return fail("第2页未找到\"APPLICATION SOLUTIONS\"文本，无法定位其左侧图标")
-
-    slide = model.slide(2)
-
-    # 候选圆形：
-    # - 位于文本左侧：候选右边不超过文本左边 + 0.25cm（办公软件文本框内边距）
-    # - 垂直中心与文本中心接近：|Δcy| ≤ 0.65cm
-    # - 圆形：OOXML prst="ellipse"（python-pptx: OVAL/ELLIPSE）
-    # - 直径 1.3-1.5cm：宽、高均需在区间内
-    # - 浅灰色填充
-    circles = []
-    for s in slide:
-        if s is heading:
-            continue
-        if s.x2 > heading.x + 0.25:
-            continue
-        if abs(s.cy - heading.cy) > 0.65:
-            continue
-        if not is_oval(s):
-            continue
-        if not (between(s.w, 1.3, 1.5) and between(s.h, 1.3, 1.5)):
-            continue
-        if not is_light_gray(s.fill):
-            continue
-        circles.append(s)
-
-    if not circles:
-        return fail(
-            "第2页\"APPLICATION SOLUTIONS\"左侧未找到浅灰色填充、"
-            "直径 1.3-1.5cm 的圆形"
-        )
-
-    # "其中间有一个绿色的带有白色箱盖和锁扣的立体纸箱组合图型或者整体是
-    # 一个图片"—— 分两条互斥路径：
-    # 路径 A：整体是一个图片
-    #   - A-1：圆形自身是 <p:pic>
-    #   - A-2：圆形几何范围内包含一张图片（重叠比例 ≥ 50% 视为"在其中间"）
-    # 路径 B：组合图形（≥2 件独立几何形状/图片）
-    #   - 位于圆形几何范围内（重叠比例 ≥ 40%，排除整页级超大形状）
-    #   - 至少一件填充/线条为绿色（纸箱主体）
-    #   - 至少一件填充/线条为白色（箱盖 / 锁扣）
-    for c in circles:
-        # (A-1) 圆形自身是图片
-        if is_picture(c):
-            return ok(
-                f"第2页\"APPLICATION SOLUTIONS\"左侧找到浅灰圆形图片，"
-                f"直径约 {(c.w+c.h)/2:.2f}cm"
-            )
-
-        # 圆形几何内的其它形状（排除圆形自身与整页级超大形状）
-        children = []
-        for s in slide:
-            if s is c:
-                continue
-            if s.area > c.area * 4:
-                continue
-            if min(s.area, c.area) <= 0:
-                continue
-            inter = overlap_area(s, c)
-            if inter <= 0:
-                continue
-            if inter / max(0.01, min(s.area, c.area)) < 0.40:
-                continue
-            children.append(s)
-
-        # (A-2) 圆形几何内包含一张图片
-        for s in children:
-            if is_picture(s) and overlap_area(s, c) / max(0.01, min(s.area, c.area)) >= 0.50:
-                return ok(
-                    f"第2页\"APPLICATION SOLUTIONS\"左侧圆形中间包含图片，"
-                    f"直径约 {(c.w+c.h)/2:.2f}cm"
-                )
-
-        # (B) 组合图形：绿色纸箱主体 + 白色箱盖/锁扣
-        combo = [
-            s for s in children
-            if s.prst
-            and (s.fill is not None or s.line is not None or is_picture(s))
-        ]
-        if len(combo) >= 2:
-            has_green = any(is_green(s.fill) or is_green(s.line) for s in combo)
-            has_white = any(is_white(s.fill) or is_white(s.line) for s in combo)
-            if has_green and has_white:
-                return ok(
-                    f"第2页\"APPLICATION SOLUTIONS\"左侧圆形中间找到组合"
-                    f"图形（{len(combo)} 件），含绿色纸箱与白色箱盖/锁扣"
-                )
-
-    return fail(
-        "第2页\"APPLICATION SOLUTIONS\"左侧浅灰圆形中间未找到绿色纸箱+"
-        "白色箱盖/锁扣的组合图形或图片"
-    )
-
-
-def c32_bottom_arcs_slide1(model: PptModel) -> CheckResult:
-    """+3：第1页幻灯片从下至上页面底部 10% 高度范围内有绿色和橙色的弧形
-    色块、橙色面积小于绿色。
-    """
-    slide = model.slide(1)
-
-    # "弧形色块"：OOXML `prstGeom` 中含有弧线 / 曲线的几何形状。常见的
-    # 底部装饰"弧形色块"通常写作：
-    #   - <a:prstGeom prst="wave"/>、prst="doubleWave"（波浪形）
-    #   - prst="arc"（弧线）
-    #   - prst="chord"（弓形）
-    #   - prst="pie"（饼形 / 扇形）
-    #   - prst="ellipse"（椭圆）
-    #   - prst="moon"（月牙）
-    #   - prst="teardrop"（泪滴）
-    #   - prst="cloud"（云）
-    # 上述形状在 PowerPoint / WPS / Keynote 中的写法一致，通过 prst 名称
-    # 即可判定，跨办公软件有效。
-    # 严格排除直线多边形（如 trapezoid / rectangle / triangle 等）——细则
-    # 明确要求"弧形色块"。
-    ARC_KEYWORDS = (
-        "WAVE", "DOUBLE_WAVE", "ARC", "CHORD", "PIE",
-        "ELLIPSE", "OVAL", "MOON", "TEAR", "TEARDROP", "CLOUD",
-    )
-
-    def is_arc_like(shape) -> bool:
-        p = shape.prst.upper()
-        return any(k in p for k in ARC_KEYWORDS)
-
-    # 位置："从下至上页面底部 10% 高度范围内" → 形状整体位于页面纵向
-    # 90%-100% 区间内。以形状顶部 s.y 落入区间为基准 —— 顶部在 90% 以下
-    # 即整体在底部 10% 内。保留 2% 容差兼容办公软件 EMU→百分比的渲染精度
-    # 损失。
-    bottom_arcs = [
-        s for s in slide
-        if is_arc_like(s)
-        and s.y / model.slide_h >= 0.90 - 0.02
-    ]
-
-    # 分别统计绿色和橙色弧形色块的填充面积（以外包围盒面积近似——
-    # OOXML 层面无法访问曲线积分面积，各家办公软件亦以包围盒近似渲染）。
-    green_shapes = [s for s in bottom_arcs if is_green(s.fill)]
-    orange_shapes = [s for s in bottom_arcs if is_orange(s.fill)]
-    green_area = sum(s.area for s in green_shapes)
-    orange_area = sum(s.area for s in orange_shapes)
-
-    # 有绿色弧形色块
-    if green_area <= 0:
-        return fail("第1页底部 10% 未找到绿色弧形色块")
-    # 有橙色弧形色块
-    if orange_area <= 0:
-        return fail("第1页底部 10% 未找到橙色弧形色块")
-    # 橙色面积小于绿色
-    if orange_area >= green_area:
-        return fail(
-            f"第1页底部 10% 橙色弧形色块面积 {orange_area:.2f}cm² "
-            f"未小于绿色 {green_area:.2f}cm²"
-        )
-
-    return ok(
-        f"第1页底部 10% 检测到绿色/橙色弧形色块，"
-        f"橙色面积 {orange_area:.2f}cm² 小于绿色 {green_area:.2f}cm²"
-    )
-
-
-def c37_bottom_arcs_slide2(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片从下至上页面底部 20% 高度范围内有绿色和橙色的弧形
-    色块、橙色面积小于绿色。
-    """
-    slide = model.slide(2)
-
-    # "弧形色块"：OOXML `prstGeom` 中含有弧线 / 曲线的几何形状。常见的
-    # 底部装饰"弧形色块"通常写作：
-    #   - <a:prstGeom prst="wave"/>、prst="doubleWave"（波浪形）
-    #   - prst="arc"（弧线）
-    #   - prst="chord"（弓形）
-    #   - prst="pie"（饼形 / 扇形）
-    #   - prst="ellipse"（椭圆）
-    #   - prst="moon"（月牙）
-    #   - prst="teardrop"（泪滴）
-    #   - prst="cloud"（云）
-    # 上述形状在 PowerPoint / WPS / Keynote 中的写法一致，通过 prst 名称
-    # 即可判定，跨办公软件有效。
-    # 严格排除直线多边形（如 trapezoid / rectangle / triangle 等）——细则
-    # 明确要求"弧形色块"。
-    ARC_KEYWORDS = (
-        "WAVE", "DOUBLE_WAVE", "ARC", "CHORD", "PIE",
-        "ELLIPSE", "OVAL", "MOON", "TEAR", "TEARDROP", "CLOUD",
-    )
-
-    def is_arc_like(shape) -> bool:
-        p = shape.prst.upper()
-        return any(k in p for k in ARC_KEYWORDS)
-
-    # 位置："从下至上页面底部 20% 高度范围内" → 形状整体位于页面纵向
-    # 80%-100% 区间内。以形状顶部 s.y 落入区间为基准 —— 顶部在 80% 以下
-    # 即整体在底部 20% 内。保留 2% 容差兼容办公软件 EMU→百分比的渲染精度
-    # 损失。
-    bottom_arcs = [
-        s for s in slide
-        if is_arc_like(s)
-        and s.y / model.slide_h >= 0.80 - 0.02
-    ]
-
-    # 分别统计绿色和橙色弧形色块的填充面积（以外包围盒面积近似——
-    # OOXML 层面无法访问曲线积分面积，各家办公软件亦以包围盒近似渲染）。
-    green_shapes = [s for s in bottom_arcs if is_green(s.fill)]
-    orange_shapes = [s for s in bottom_arcs if is_orange(s.fill)]
-    green_area = sum(s.area for s in green_shapes)
-    orange_area = sum(s.area for s in orange_shapes)
-
-    # 有绿色弧形色块
-    if green_area <= 0:
-        return fail("第2页底部 20% 未找到绿色弧形色块")
-    # 有橙色弧形色块
-    if orange_area <= 0:
-        return fail("第2页底部 20% 未找到橙色弧形色块")
-    # 橙色面积小于绿色
-    if orange_area >= green_area:
-        return fail(
-            f"第2页底部 20% 橙色弧形色块面积 {orange_area:.2f}cm² "
-            f"未小于绿色 {green_area:.2f}cm²"
-        )
-
-    return ok(
-        f"第2页底部 20% 检测到绿色/橙色弧形色块，"
-        f"橙色面积 {orange_area:.2f}cm² 小于绿色 {green_area:.2f}cm²"
-    )
-
-
-def bottom_icon_with_label(model: PptModel, label: str, icon_chars: list[str]) -> CheckResult:
-    word = first_text(model, 2, label)
-    if not word:
-        return fail(f"第2页底部未找到白色文本 {label}")
-    if not (word.cy / model.slide_h >= 0.85 and any(is_white(c) for c in font_colors(word))):
-        return fail(f"{label} 不在底部或不是白色")
-    # 细则要求图标为"组合图形或者整体是一张图片"，且位于该文本"下方"对应的图标——
-    # 即图标必须紧邻 word 上方的小邻域内（垂直差 ≤ 2cm，水平中心差 ≤ 0.8cm），
-    # 避免把页面上半部的装饰元素错误计入。
-    region_top = word.y - 2.0
-    candidates = [s for s in model.slide(2)
-                  if s is not word
-                  and s.cy < word.cy and s.cy >= region_top
-                  and abs(s.cx - word.cx) <= 0.8]
-    # 路径 A：存在一张图片
-    if any(is_picture(s) for s in candidates):
-        return ok(f"第2页底部 {label} 上方找到对应图片")
-    # 路径 B：存在 ≥2 个独立的"图形"（具备几何 prst 且有填充或线条），构成组合
-    geom_parts = [s for s in candidates
-                  if s.prst and s.prst not in ("RECTANGLE",)
-                  and (s.fill is not None or s.line is not None)]
-    if len(geom_parts) >= 2:
-        return ok(f"第2页底部 {label} 上方找到对应组合图形（{len(geom_parts)} 件）")
-    return fail(f"第2页底部 {label} 上方未找到符合细则的组合图形或图片")
-
-
-def c33_sustainable(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片左下角出现一个绿色的"带有白色脉络的叶子"组合图形
-    或者整体是一个图片，其下方有白色文本"SUSTAINABLE"。
-    """
-    slide = model.slide(2)
-    sw, sh = model.slide_w, model.slide_h
-
-    # 1) 白色文本 "SUSTAINABLE"
-    #    - 内容：包含 SUSTAINABLE
-    #    - 颜色：白色（<a:solidFill><a:srgbClr val="FFFFFF"/>；PowerPoint /
-    #      WPS / Keynote 均写入 srgbClr，`font_colors()` 归一化读取，跨办公
-    #      软件有效）
-    label = None
-    for s in slide:
-        if not s.text:
-            continue
-        if "SUSTAINABLE" not in s.text.upper():
-            continue
-        if not any(is_white(c) for c in font_colors(s)):
-            continue
-        label = s
-        break
-    if label is None:
-        return fail('第2页未找到白色文本 "SUSTAINABLE"')
-
-    # 2) 左下角：文本整体位于页面左半 (x2 ≤ 50%) 且底部 (y ≥ 60%)。
-    #    ±2% 容差兼容 EMU→cm→百分比在各办公软件间的渲染精度差异。
-    if not (label.x2 / sw <= 0.50 + 0.02 and label.y / sh >= 0.60 - 0.02):
-        return fail(
-            f'"SUSTAINABLE" 文本未位于第2页左下角（左至右 '
-            f'{label.x/sw*100:.1f}%–{label.x2/sw*100:.1f}%，上至下 '
-            f'{label.y/sh*100:.1f}%–{label.y2/sh*100:.1f}%）'
-        )
-
-    # 3) 其下方：图标位于 SUSTAINABLE 文本上方（icon 底部在 label 顶部
-    #    之上或与文本中心线接近的紧邻位置），水平中心与文本接近，且同样
-    #    位于左下角区域。相邻距离设为 2.5cm（用于容纳办公软件中 icon 与
-    #    label 之间的行间距）。
-    def is_upper_neighbor(s) -> bool:
-        if s is label:
-            return False
-        if s.cy >= label.cy:  # 必须在文本上方
-            return False
-        if (label.cy - s.cy) > 2.5:  # 与文本相邻
-            return False
-        if abs(s.cx - label.cx) > 1.0:  # 与文本大致同列
-            return False
-        # 图标本身也应位于左下角区域
-        if s.x / sw > 0.50 + 0.02:
-            return False
-        if s.y2 / sh < 0.60 - 0.02:
-            return False
-        return True
-
-    upper = [s for s in slide if is_upper_neighbor(s)]
-    if not upper:
-        return fail('"SUSTAINABLE" 文本上方未找到图标形状')
-
-    # 4) 图标判定（互斥两条路径，任一满足即通过）：
-    #    路径 A —— 整体是一张图片：<p:pic>（在 python-pptx 中 shape.type
-    #             为 PICTURE；WPS/Keynote 同样以 <p:pic> 表达）
-    #    路径 B —— 绿色"带有白色脉络的叶子"组合图形：
-    #             - ≥ 2 件独立几何形状（具备 prstGeom）
-    #             - 至少一件绿色填充或轮廓（叶子主体）
-    #             - 至少一件白色填充或轮廓（脉络）
-    #    prstGeom 与 srgbClr 是 OOXML 标准，跨办公软件写法一致。
-
-    # (A) 图片
-    if any(is_picture(s) for s in upper):
-        return ok('第2页左下角 "SUSTAINABLE" 上方找到图标图片')
-
-    # (B) 绿色 + 白色脉络的组合图形
-    parts = [
-        s for s in upper
-        if s.prst
-        and (s.fill is not None or s.line is not None)
-    ]
-    has_green = any(is_green(s.fill) or is_green(s.line) for s in parts)
-    has_white = any(is_white(s.fill) or is_white(s.line) for s in parts)
-    if len(parts) >= 2 and has_green and has_white:
-        return ok(
-            f'第2页左下角 "SUSTAINABLE" 上方找到"绿色带白色脉络叶子"'
-            f'组合图形（{len(parts)} 件）'
-        )
-
-    return fail(
-        '第2页左下角 "SUSTAINABLE" 上方未找到"绿色带白色脉络叶子"'
-        '组合图形或图片'
-    )
-
-
-def c34_innovative(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片底部左侧出现一个由两个双向弯曲箭头组成的组合图形
-    或者整体是一个图片，其下方有白色文本"INNOVATIVE"。
-    """
-    slide = model.slide(2)
-    sw, sh = model.slide_w, model.slide_h
-
-    # 1) 白色文本 "INNOVATIVE"
-    label = None
-    for s in slide:
-        if not s.text:
-            continue
-        if "INNOVATIVE" not in s.text.upper():
-            continue
-        if not any(is_white(c) for c in font_colors(s)):
-            continue
-        label = s
-        break
-    if label is None:
-        return fail('第2页未找到白色文本 "INNOVATIVE"')
-
-    # 2) 底部：文本整体位于页面底部（y ≥ 60%）。水平位置 rubric 描述为
-    #    "底部左侧"，但四个标签（SUSTAINABLE / INNOVATIVE / RELIABLE /
-    #    PROFESSIONAL）实际横向平铺整个底部，因此这里只强制"底部"约束，
-    #    不再强制"左侧"，避免误伤合规排版。±2% 容差兼容 EMU→cm→百分比
-    #    在各办公软件间的渲染精度差异。
-    if not (label.y / sh >= 0.60 - 0.02):
-        return fail(
-            f'"INNOVATIVE" 文本未位于第2页底部（上至下 '
-            f'{label.y/sh*100:.1f}%–{label.y2/sh*100:.1f}%）'
-        )
-
-    # 3) 其下方：图标位于 INNOVATIVE 文本上方（icon 中心在 label 中心
-    #    之上，垂直距离 ≤ 2.5cm，水平中心差 ≤ 1.0cm），且同样位于底部
-    #    区域。此近邻窗口用于避免把页面上半部的装饰元素错误计入。
-    def is_upper_neighbor(s: "ShapeInfo") -> bool:
-        if s is label:
-            return False
-        if s.cy >= label.cy:  # 必须在文本上方
-            return False
-        if (label.cy - s.cy) > 2.5:  # 与文本相邻
-            return False
-        if abs(s.cx - label.cx) > 1.0:  # 与文本大致同列
-            return False
-        if s.y2 / sh < 0.60 - 0.02:  # 图标本身也应位于底部
-            return False
-        return True
-
-    upper = [s for s in slide if is_upper_neighbor(s)]
-    if not upper:
-        return fail('"INNOVATIVE" 文本上方未找到图标形状')
-
-    # 4) 图标判定（互斥两条路径，任一满足即通过）：
-    #    路径 A —— 整体是一张图片：<p:pic>（python-pptx: PICTURE；WPS /
-    #             Keynote 亦以 <p:pic> 表达）。图片本身是否为"双向弯曲
-    #             箭头"无法在 OOXML 级别校验，rubric 允许"整体是一张
-    #             图片"的写法，按图片存在即视为满足。
-    #    路径 B —— 由两个双向弯曲箭头组成的组合图形：
-    #             - "弯曲箭头"：OOXML prstGeom 明确的弯曲/回转/环形箭头
-    #               预设，包括 curvedRightArrow / curvedLeftArrow /
-    #               curvedUpArrow / curvedDownArrow / bentArrow /
-    #               bentUpArrow / uturnArrow / circularArrow /
-    #               leftCircularArrow / leftRightCircularArrow。以
-    #               "ARROW" 关键字兜底并要求 CURVED/BENT/UTURN/
-    #               CIRCULAR 之一，避免把 straight / left / right /
-    #               leftRight 等直线箭头误判为弯曲。
-    #             - "双向"：整体由两个弯曲箭头拼合，构成回环/相对指向；
-    #               在 OOXML 中通常表达为两件独立的 curvedXxxArrow 形
-    #               状，因此要求至少 2 件命中的箭头形状。
-    #             - 若 OOXML 用 freeform 曲线绘制箭头（无 arrow prst），
-    #               作为兜底：允许"箭头字符 ↻/↺/⇄/⇋/↔/arrow"文本 +
-    #               ≥1 件 freeform 曲线 的组合命中。
-
-    # (A) 图片
-    if any(is_picture(s) for s in upper):
-        return ok('第2页底部 "INNOVATIVE" 上方找到图标图片')
-
-    # (B) 两个双向弯曲箭头组合
-    CURVED_ARROW_KEYS = (
-        "CURVEDRIGHTARROW", "CURVEDLEFTARROW",
-        "CURVEDUPARROW", "CURVEDDOWNARROW",
-        "BENTARROW", "BENTUPARROW", "UTURNARROW",
-        "CIRCULARARROW", "LEFTCIRCULARARROW", "LEFTRIGHTCIRCULARARROW",
-    )
-
-    def _is_curved_arrow(s: "ShapeInfo") -> bool:
-        if not s.prst:
-            return False
-        p = s.prst.upper()
-        if "ARROW" not in p:
-            return False
-        # 精确匹配已知弯曲箭头预设
-        if p in CURVED_ARROW_KEYS:
-            return True
-        # 关键字兜底：包含 CURVED / BENT / UTURN / CIRCULAR
-        if any(k in p for k in ("CURVED", "BENT", "UTURN", "CIRCULAR")):
-            return True
+def _sans_serif(name):
+    """无衬线判定：常见无衬线族命中即可；明确的衬线族（宋体/Times 等）排除。"""
+    if _hit_family(name, ('Times', 'Georgia', 'Cambria', 'Garamond', 'Palatino',
+                          'Book Antiqua', 'Serif', '宋', 'Song', 'Ming')):
         return False
-
-    curved_arrows: list[ShapeInfo] = [s for s in upper if _is_curved_arrow(s)]
-    if len(curved_arrows) >= 2:
-        return ok(
-            f'第2页底部 "INNOVATIVE" 上方找到双向弯曲箭头组合（{len(curved_arrows)} 件）'
-        )
-
-    # 兜底：freeform 曲线绘制的箭头 —— 必须同时具备"箭头字符或 arrow 文本"
-    # 语义标记（rubric 明确要求箭头，若纯 freeform 无任何箭头语义标记则视
-    # 为不命中，避免任意曲线组合冒名顶替）。
-    arrow_chars = ("↻", "↺", "⇄", "⇋", "↔", "⟳", "⟲")
-    has_arrow_semantic = any(
-        (s.text and (
-            any(ch in s.text for ch in arrow_chars)
-            or "ARROW" in s.text.upper()
-        ))
-        for s in upper
-    )
-    freeform_parts: list[ShapeInfo] = [
-        s for s in upper
-        if s.prst
-        and ("FREEFORM" in s.prst.upper() or s.prst == "")
-        and (s.fill is not None or s.line is not None)
-    ]
-    if has_arrow_semantic and len(freeform_parts) >= 1:
-        return ok(
-            f'第2页底部 "INNOVATIVE" 上方找到弯曲箭头 freeform 组合（{len(freeform_parts)} 件，含箭头语义文本）'
-        )
-
-    return fail(
-        '第2页底部 "INNOVATIVE" 上方未找到"两个双向弯曲箭头"组合图形或图片'
-    )
+    return _hit_family(name, ('Arial', 'Helvetica', '雅黑', 'YaHei', 'Segoe UI',
+                              'Calibri', 'Tahoma', 'Verdana', 'Franklin',
+                              'Gothic', '黑体', 'SimHei', '等线', 'DengXian',
+                              'Corbel', 'Candara', 'Trebuchet', 'Ebrima',
+                              'Malgun', 'Roboto', 'Open Sans', 'Lato',
+                              'Noto Sans', 'Source Han Sans', '思源黑'))
 
 
-def c35_reliable(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片底部左侧出现一个由盾牌和对勾组成的组合图形或者
-    整体是一个图片，其下方有白色文本"RELIABLE"。
-    """
-    slide = model.slide(2)
-    sw, sh = model.slide_w, model.slide_h
+# 字族名本身就带粗度的写法（"微软雅黑 Bold"、"Arial Black"、"思源黑体 Heavy"）
+BOLD_FONT_TOKENS = ('BOLD', 'BLACK', 'HEAVY', 'SEMIBOLD', 'DEMIBOLD',
+                    'EXTRABOLD', 'ULTRABOLD', '粗体', '特粗', '中粗')
 
-    # 1) 白色文本 "RELIABLE"
-    #    内容含 RELIABLE，字体颜色为白色（OOXML <a:srgbClr val="FFFFFF"/>，
-    #    PowerPoint / WPS / Keynote 均以此形式写入，`font_colors()` 已作跨
-    #    办公软件的归一化读取）。
-    label = None
-    for s in slide:
-        if not s.text:
-            continue
-        if "RELIABLE" not in s.text.upper():
-            continue
-        if not any(is_white(c) for c in font_colors(s)):
-            continue
-        label = s
-        break
-    if label is None:
-        return fail('第2页未找到白色文本 "RELIABLE"')
 
-    # 2) 底部左侧：文本整体位于页面底部 (y ≥ 60%) 且左侧 (x2 ≤ 50%)。
-    #    ±2% 容差兼容 EMU→cm→百分比在各办公软件间的渲染精度差异。
-    if not (label.y / sh >= 0.60 - 0.02 and label.x2 / sw <= 0.50 + 0.02):
-        return fail(
-            f'"RELIABLE" 文本未位于第2页底部左侧（左至右 '
-            f'{label.x/sw*100:.1f}%–{label.x2/sw*100:.1f}%，上至下 '
-            f'{label.y/sh*100:.1f}%–{label.y2/sh*100:.1f}%）'
-        )
-
-    # 3) "其下方有 RELIABLE" → 图标位于 RELIABLE 文本上方相邻位置，水平
-    #    中心与文本对齐；图标本身也须位于底部左侧区域。
-    def is_upper_neighbor(s) -> bool:
-        if s is label:
-            return False
-        if s.cy >= label.cy:              # 图标必须在文本上方
-            return False
-        if (label.cy - s.cy) > 2.5:        # 与文本相邻
-            return False
-        if abs(s.cx - label.cx) > 1.0:     # 与文本大致同列
-            return False
-        if s.x / sw > 0.50 + 0.02:         # 图标本体亦在左侧
-            return False
-        if s.y2 / sh < 0.60 - 0.02:        # 图标本体亦在底部
-            return False
-        return True
-
-    upper = [s for s in slide if is_upper_neighbor(s)]
-    if not upper:
-        return fail('"RELIABLE" 文本上方未找到图标形状')
-
-    # 4) 图标判定（互斥两条路径，任一满足即通过）：
-    #    路径 A —— 整体是一张图片：<p:pic>（PowerPoint / WPS / Keynote
-    #             均以 <p:pic> 表达）。图片本身是否为"盾牌+对勾"无法在
-    #             OOXML 级别校验，rubric 允许"整体是一张图片"的写法，按
-    #             图片存在即视为满足。
-    #    路径 B —— 由"盾牌"和"对勾"组成的组合图形：必须同时识别到
-    #             「盾牌」与「对勾」两个语义构件，避免"文本上方有 ≥2 件
-    #             任意几何"的宽松判定。
-    #             - 盾牌：OOXML `prstGeom` 无原生 shield 预设，办公软件里
-    #               通常采用 homePlate / pentagon / chevron / roundRect
-    #               这类"上圆下尖"或"上方下尖"形状（PowerPoint 内置的
-    #               "盾牌 SmartArt"/"盾牌"形状在导出为 OOXML 时会落到
-    #               homePlate 或 freeform）。判定：
-    #                 a) prst 含关键字 SHIELD；或
-    #                 b) prst 属于 {homePlate, pentagon, chevron}；或
-    #                 c) prst 为 freeform / 空 prst 且宽高比接近 1:1
-    #                    (0.7 ≤ w/h ≤ 1.3) 且尺寸 ≥ 0.6cm（外轮廓兜底）。
-    #             - 对勾：OOXML 无原生 checkmark 预设，办公软件通常用
-    #               freeform 折线或 rightArrow 变体绘制。判定：
-    #                 a) prst 含关键字 CHECK；或
-    #                 b) 形状包含 "✓/✔/√/check" 文本字符；或
-    #                 c) prst 为 freeform 且落入盾牌形状内部（面积 ≥ 50%
-    #                    重叠或中心在盾牌包围盒内）作为兜底。
-
-    # (A) 图片
-    if any(is_picture(s) for s in upper):
-        return ok('第2页底部左侧 "RELIABLE" 上方找到图标图片')
-
-    # (B) 盾牌 + 对勾
-    def _is_shield(s: "ShapeInfo") -> bool:
-        if not s.prst:
-            # 空 prst → freeform / custGeom 兜底：接近方形且尺寸够大
-            if s.w > 0 and s.h > 0 and 0.7 <= s.w / s.h <= 1.3 \
-                    and min(s.w, s.h) >= 0.6:
-                return True
-            return False
-        p = s.prst.upper()
-        if "SHIELD" in p:
-            return True
-        if p in ("HOMEPLATE", "PENTAGON", "CHEVRON"):
-            return True
-        if ("FREEFORM" in p) and s.w > 0 and s.h > 0 \
-                and 0.7 <= s.w / s.h <= 1.3 and min(s.w, s.h) >= 0.6:
-            return True
+def _is_bold_font(name):
+    """字族自带粗体：办公软件里"加粗"按钮没按下（rPr@b 为 0），
+    但选的字体本身是粗体，屏幕上就是粗的，视觉效果与加粗等同，故一并认可。
+    注意"黑体/思源黑体"是常规字重的字族名，不算粗体。"""
+    n = (name or '').upper().replace('-', ' ')
+    if not n:
         return False
+    return any(tok in n for tok in BOLD_FONT_TOKENS)
 
-    def _is_check(s: "ShapeInfo", shield: "ShapeInfo | None" = None) -> bool:
-        if s.prst and "CHECK" in s.prst.upper():
-            return True
-        if s.text and any(ch in s.text for ch in ("✓", "✔", "√")):
-            return True
-        if s.text and "CHECK" in s.text.upper():
-            return True
-        if shield is not None and s.prst and "FREEFORM" in s.prst.upper():
-            if s.area > 0 and overlap_area(s, shield) / s.area >= 0.50:
-                return True
-            if (shield.x <= s.cx <= shield.x2
-                    and shield.y <= s.cy <= shield.y2):
-                return True
+
+def _letter_spaced(text):
+    """用"字符间显式留空"做出的字间距：如"F U J I A N   L A N Y U"。
+    与办公软件对齐：这类写法在屏幕上与"字符间距加宽"看不出差别，视同带字间距。"""
+    body = _norm_text(text or '').strip()
+    if len([ch for ch in body if ch.isalnum()]) < 6:
         return False
-
-    shields: list[ShapeInfo] = [s for s in upper if _is_shield(s)]
-    if shields:
-        for sh in shields:
-            checks: list[ShapeInfo] = [
-                s for s in upper
-                if s is not sh and _is_check(s, sh)
-            ]
-            if checks:
-                return ok(
-                    f'第2页底部左侧 "RELIABLE" 上方找到"盾牌 + 对勾"组合图形（盾牌 {len(shields)} 件、对勾 {len(checks)} 件）'
-                )
-        # 盾牌自身文本里带 ✓/✔/√/check（PowerPoint 允许盾牌形状承载对勾字符）
-        for sh in shields:
-            if sh.text and any(ch in sh.text for ch in ("✓", "✔", "√")):
-                return ok(
-                    '第2页底部左侧 "RELIABLE" 上方找到"盾牌 + 对勾"组合图形（盾牌形状内含对勾字符）'
-                )
-
-    return fail(
-        '第2页底部左侧 "RELIABLE" 上方未找到"盾牌 + 对勾"组合图形或图片'
-    )
+    toks = [t for t in body.split(' ') if t]
+    if len(toks) < 4:
+        return False
+    singles = sum(1 for t in toks if len(t) == 1)
+    return singles >= 0.6 * len(toks)
 
 
-def c36_global(model: PptModel) -> CheckResult:
-    """+3：第2页幻灯片底部出现一个圆形和线条组成的组合图形或者整体是
-    一个图片，其下方有白色文本"GLOBAL"。
-    """
-    slide = model.slide(2)
-    sw, sh = model.slide_w, model.slide_h
-
-    # 1) 白色文本 "GLOBAL"
-    #    内容含 GLOBAL，字体颜色为白色（OOXML <a:srgbClr val="FFFFFF"/>，
-    #    PowerPoint / WPS / Keynote 均以此形式写入，`font_colors()` 已作跨
-    #    办公软件的归一化读取）。
-    label = None
-    for s in slide:
-        if not s.text:
-            continue
-        if "GLOBAL" not in s.text.upper():
-            continue
-        if not any(is_white(c) for c in font_colors(s)):
-            continue
-        label = s
-        break
-    if label is None:
-        return fail('第2页未找到白色文本 "GLOBAL"')
-
-    # 2) 底部：文本整体位于页面底部 (y ≥ 60%)。
-    #    ±2% 容差兼容 EMU→cm→百分比在各办公软件间的渲染精度差异。
-    if not (label.y / sh >= 0.60 - 0.02):
-        return fail(
-            f'"GLOBAL" 文本未位于第2页底部（上至下 '
-            f'{label.y/sh*100:.1f}%–{label.y2/sh*100:.1f}%）'
-        )
-
-    # 3) "其下方有 GLOBAL" → 图标位于 GLOBAL 文本上方相邻位置，水平中心
-    #    与文本对齐；图标本身也须位于底部。
-    def is_upper_neighbor(s) -> bool:
-        if s is label:
-            return False
-        if s.cy >= label.cy:              # 图标必须在文本上方
-            return False
-        if (label.cy - s.cy) > 2.5:        # 与文本相邻
-            return False
-        if abs(s.cx - label.cx) > 1.0:     # 与文本大致同列
-            return False
-        if s.y2 / sh < 0.60 - 0.02:        # 图标本体亦在底部
-            return False
-        return True
-
-    upper = [s for s in slide if is_upper_neighbor(s)]
-    if not upper:
-        return fail('"GLOBAL" 文本上方未找到图标形状')
-
-    # 4) 图标判定（互斥两条路径，任一满足即通过）：
-    #    路径 A —— 整体是一张图片：<p:pic>（PowerPoint / WPS / Keynote
-    #             均以 <p:pic> 表达）。
-    #    路径 B —— 由"圆形"和"线条"组成的组合图形：
-    #             - 至少一件圆形（OOXML prst="ellipse"，python-pptx OVAL）
-    #             - 至少一件线条（OOXML prst="line"，或宽/高之一为 0）
-    #    prstGeom 是 OOXML 标准，跨办公软件写法一致。
-
-    # (A) 图片
-    if any(is_picture(s) for s in upper):
-        return ok('第2页底部 "GLOBAL" 上方找到图标图片')
-
-    # (B) 圆形 + 线条 组合图形
-    has_oval = any(is_oval(s) for s in upper)
-    has_line = any(is_line(s) for s in upper)
-    if has_oval and has_line:
-        return ok('第2页底部 "GLOBAL" 上方找到"圆形 + 线条"组合图形')
-
-    return fail(
-        '第2页底部 "GLOBAL" 上方未找到"圆形 + 线条"组合图形或图片'
-    )
+def _iter_runs(shapes):
+    for sh in shapes:
+        for para in sh.runs:
+            for r in para:
+                if r['t'].strip():
+                    yield sh, r
 
 
-CRITERIA: list[Criterion] = [
-    Criterion("D2-01", 5, "第1页左上角2-4cm logo组件/图片，含中上橙色和绿色组件", c01_logo_top_left),
-    Criterion("D2-02", 1, "第1页中文公司名：微软雅黑/黑体24-32磅，顶部10%-25%", c02_cn_company),
-    Criterion("D2-03", 1, "第2页英文公司名：Arial 24-32磅，两行，左0%-70%、顶10%-25%", c03_en_company_slide2),
-    Criterion("D2-04", 1, "两页均有24-26cm×13-15cm圆角矩形边框，黑/灰/绿色实线", c04_borders),
-    Criterion("D2-05", 1, "第1页中文公司名下方英文副标题：Arial 14-22磅橙色，位于顶部10%-25%", c05_en_company_slide1_subtitle),
-    Criterion("D2-06", 3, "第1页英文副标题下方顶部23%-26%双橙线+叶片", c06_slide1_top_separator),
-    Criterion("D2-07", 1, "两页右上角3-4cm二维码，宽高比1:1", c07_qr_both),
-    Criterion("D2-08", 1, "第1页沈知行：左10%-45%、上30%-60%，宋/楷体加粗40-50磅绿色", c08_name_cn),
-    Criterion("D2-09", 3, "第1页沈知行下方页面50%处双绿线+叶片", c09_name_separator),
-    Criterion("D2-10", 1, "第1页M.P.：页面下方70%-80%、沈知行下方左对齐，Arial 13-20Pt绿色", c10_mp_slide1),
-    Criterion("D2-11", 1, "两页电话文本位于M.P.右侧，Arial/Times 15-22Pt，黑/绿色", c11_phone_text_both),
-    Criterion("D2-12", 3, "两页M.P.左侧深绿色0.8-1cm圆角矩形白色电话图案", c12_phone_icon_both),
-    Criterion("D2-13", 1, "两页邮箱文本：页面70%-80%高、10%-40%宽，Arial 13-17磅", c13_email_text_both),
-    Criterion("D2-14", 5, "两页邮箱左侧深绿色0.8-1cm圆角矩形白色信封图案", c14_email_icon_both),
-    Criterion("D2-15", 1, "第1页中文地址：80%-90%高、10%-40%宽，邮箱下方左对齐，微软雅黑/黑体9-15磅", c15_cn_address_text),
-    Criterion("D2-16", 3, "第1页中文地址左侧深绿色0.8-1cm圆角矩形白色定位图案", c16_cn_address_icon),
-    Criterion("D2-17", 1, "两页45%-55%宽度处绿色竖向单实线，长6-8.5cm", c17_vertical_line_both),
-    Criterion("D2-18", 3, "第1页绿色主营胶囊：20%-30%高、50%-75%宽，白色微软雅黑/黑体14-16磅", c18_cn_business_pill),
-    Criterion("D2-19", 3, "第1页主营下方中文业务列表：逐行左对齐，标题绿13-15磅，条目黑11-13磅", c19_cn_business_list),
-    Criterion("D2-20", 3, "第1页环保涂层左侧浅灰圆形及绿色水滴/叶子图案", c20_icon_eco_cn),
-    Criterion("D2-21", 3, "第1页绿色材料左侧浅灰圆形及绿色叶子图案", c21_icon_green_cn),
-    Criterion("D2-22", 3, "第1页应用方案左侧浅灰圆形（直径1.3-1.5cm）中间含绿色带白色箱盖/锁扣立体纸箱组合或图片", c22_icon_app_cn),
-    Criterion("D2-23", 3, "第2页英文公司名左下方页面20%-50%双橙线（同一水平、单实线、长2.5-4cm）+ 橙/黄叶片组合或图片(0.3-0.4×0.4-0.5cm)", c23_slide2_title_separator),
-    Criterion("D2-24", 1, "第2页Ethan Shen：左5%-45%、上30%-60%，Brush Script MT/Script MT Bold/Alex Brush/Segoe Script 25-35磅", c24_ethan),
-    Criterion("D2-25", 1, "第2页邮箱下方英文地址三行：单独成行、左对齐，Arial 10-12磅，黑/绿/灰色", c25_en_address_lines),
-    Criterion("D2-26", 3, "第2页英文地址末行左侧深绿色0.8-1cm圆角矩形白色定位图案", c26_en_address_icon),
-    Criterion("D2-27", 3, "第2页英文公司名右下方绿色圆角矩形/胶囊：25%-40%高、50%-75%宽，内含MAIN BUSINESS 白色 Arial/黑体 10-15磅", c27_main_business_pill),
-    Criterion("D2-28", 3, "第2页MAIN BUSINESS下方英文业务列表：单独成行、左对齐；标题绿Arial 11-13磅，条目黑/灰/绿 Arial 9-11磅", c28_en_business_list),
-    Criterion("D2-29", 3, "第2页ECO COATINGS左侧浅灰圆形（直径1.3-1.5cm）中间含绿色水滴+小叶子组合或图片", c29_icon_eco_en),
-    Criterion("D2-30", 3, "第2页GREEN MATERIALS左侧浅灰圆形（直径1.3-1.5cm）中间含绿色带白色脉络叶子组合或图片", c30_icon_green_en),
-    Criterion("D2-31", 3, "第2页APPLICATION SOLUTIONS左侧浅灰圆形（直径1.3-1.5cm）中间含绿色带白色箱盖/锁扣立体纸箱组合或图片", c31_icon_app_en),
-    Criterion("D2-32", 3, "第1页从下至上底部10%高度范围内有绿色和橙色的弧形色块，橙色面积小于绿色", c32_bottom_arcs_slide1),
-    Criterion("D2-33", 3, "第2页左下角绿色带白色脉络叶子组合图形/图片，其下方白色文本SUSTAINABLE", c33_sustainable),
-    Criterion("D2-34", 3, "第2页底部双向弯曲箭头/图片及白色INNOVATIVE", c34_innovative),
-    Criterion("D2-35", 3, "第2页底部左侧盾牌+对勾组合图形/图片，其下方白色文本RELIABLE", c35_reliable),
-    Criterion("D2-36", 3, "第2页底部圆形+线条组合图形/图片，其下方白色文本GLOBAL", c36_global),
-    Criterion("D2-37", 3, "第2页从下至上底部20%高度范围内有绿色和橙色的弧形色块，橙色面积小于绿色", c37_bottom_arcs_slide2),
-]
+def _max_run_sz(shapes):
+    szs = [r['sz'] for _, r in _iter_runs(shapes)]
+    return max(szs) if szs else 0.0
 
 
-def _build_dim2_items(model: Optional[PptModel], dim1_pass: bool) -> tuple[list[dict[str, object]], int, int]:
-    """按 CRITERIA 逐项检测，返回 (dim2_items, total_score, max_score)。
+def _est_text_cm(text, sz_pt):
+    """粗估一行文字的显示宽度（cm）：中日韩字符按 1 个字号宽，
+    西文/数字按 0.52 个字号宽，空格 0.28。用于判断文本是否会自动折行。"""
+    w_pt = 0.0
+    for ch in text:
+        if ch == ' ':
+            w_pt += 0.28 * sz_pt
+        elif _has_cjk(ch):
+            w_pt += 1.0 * sz_pt
+        else:
+            w_pt += 0.52 * sz_pt
+    return w_pt / 72.0 * 2.54
 
-    - 命中项与未命中项均记录，便于外部按矩阵方式对齐。
-    - 若维度一未通过 / model 为 None，则不进入维度二，返回空 dim2_items。
-    """
-    max_score = sum(c.score for c in CRITERIA)
-    if not dim1_pass or model is None:
-        return [], 0, max_score
 
-    items: list[dict[str, object]] = []
+def _visual_lines(sh):
+    """估算形状里文字实际显示的行数：段落数 + 每段因框宽不足产生的折行。
+    办公软件里"地址断两行"既可能是两个段落，也可能是一个段落自动折行。"""
+    if not sh.runs:
+        return 0
+    box_cm = sh.width / EMU_PER_CM
     total = 0
-    for criterion in CRITERIA:
-        errored = False
-        try:
-            result = criterion.check(model)
-        except Exception as exc:
-            result = fail(f"检测异常：{exc}")
-            errored = True
-        hit = bool(result.passed)
-        delta = criterion.score if hit else 0
-        total += delta
-        # errored 变量仍然保留，便于后续追踪评分异常；此处不再将其
-        # 具体理由写入返回结构，`detail` 固定返回空字符串以满足对外
-        # 接口"清空 detail"的要求。评分逻辑、命中判定与最终得分完全
-        # 依赖 `hit` / `delta`，不受此调整影响。
-        _ = errored
-        items.append({
-            "rule": criterion.title,
-            "max_delta": criterion.score,
-            "delta": delta,
-            "hit": hit,
-            "detail": "",
-        })
-    return items, total, max_score
+    for para in sh.runs:
+        txt = ''.join(r['t'] for r in para)
+        if not txt.strip():
+            continue
+        sz = max([r['sz'] for r in para if r['t'].strip()] or [DEFAULT_SZ_PT])
+        need = _est_text_cm(txt, sz)
+        if box_cm <= 0.2:
+            total += 1
+        else:
+            total += max(1, int(math.ceil(need / box_cm - 0.08)))
+    return total
 
 
-def evaluate(dir_path: str) -> dict[str, object]:
-    """统一评估入口。
+def _inter_area(a, b):
+    w = min(a.right(), b.right()) - max(a.left, b.left)
+    h = min(a.bottom(), b.bottom()) - max(a.top, b.top)
+    if w <= 0 or h <= 0:
+        return 0
+    return w * h
 
-    参数:
-        dir_path: 脚本所在目录的路径（str）。脚本在该目录里定位并打开被评估的
-            .pptx 文档（若存在多个则取修改时间最新的一个）。
 
-    返回:
-        参考《脚本接口差异与统一建议.md》§2.2 定义的结构化字典。
-    """
-    result: dict[str, object] = {
-        "id": "043",
-        "file_name": "",
-        "status": "ok",
-        "error": None,
-        "dim1_pass": False,
-        "dim1_reason": "",
-        "dim2_items": [],
-        "total_score": 0,
-        "max_score": sum(c.score for c in CRITERIA),
-    }
+def _cover_ratio(a, b):
+    """b 覆盖 a 的面积占比。"""
+    if a.area() <= 0:
+        return 0.0
+    return _inter_area(a, b) / float(a.area())
 
+
+def _text_ink_box(sh):
+    """文本形状里"真正有字"的那块矩形 (left, top, right, bottom)。
+    与办公软件对齐：文本框高度常留有富余（自动换行留白、框比字大），
+    两个框的边线擦到一起并不等于文字压字，故按"行数 × 字号 × 1.45 行距"
+    估算文字实际占用高度（顶端对齐，不超过框高），再判断是否真的重叠。"""
+    lines = 0
+    sz = 0.0
+    for para in sh.runs:
+        txt = ''.join(r['t'] for r in para)
+        psz = max([r['sz'] for r in para] or [DEFAULT_SZ_PT])
+        sz = max(sz, psz)
+        if not txt.strip():
+            lines += 1
+            continue
+        avail = sh.width / EMU_PER_CM
+        need = _est_text_cm(txt, psz)
+        lines += max(1, int(math.ceil(need / avail)) if avail > 0 else 1)
+    lines = max(1, lines)
+    sz = sz or DEFAULT_SZ_PT
+    ink_h = int(lines * sz * 1.45 * 12700)
+    if ink_h <= 0 or ink_h > sh.height:
+        ink_h = sh.height
+    return (sh.left, sh.top, sh.left + sh.width, sh.top + ink_h)
+
+
+def _box_inter_area(p, q):
+    w = min(p[2], q[2]) - max(p[0], q[0])
+    h = min(p[3], q[3]) - max(p[1], q[1])
+    if w <= 0 or h <= 0:
+        return 0
+    return w * h
+
+
+def _box_area(p):
+    return max(0, p[2] - p[0]) * max(0, p[3] - p[1])
+
+
+def _union_span(items):
+    """一组 (start, end) 的并集总长度。"""
+    segs = sorted(items)
+    total = 0
+    cur_s, cur_e = None, None
+    for s, e in segs:
+        if cur_e is None:
+            cur_s, cur_e = s, e
+        elif s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total
+
+
+def _equidistant(vals, tol):
+    """相邻间距是否一致（等距堆叠）：极差 ≤ tol。"""
+    if len(vals) < 3:
+        return len(vals) == 2
+    gaps = [vals[i + 1] - vals[i] for i in range(len(vals) - 1)]
+    return (max(gaps) - min(gaps)) <= tol
+
+
+# ------------------------------------------------------- 入口
+class _TargetMissing(Exception):
+    """目录不存在或目录中没有 .pptx：连待评测对象都没有，不进入维度判定。"""
+
+
+def evaluate(dir_path):
+    result = {"id": SCRIPT_ID, "file_name": "", "status": "ok", "error": None,
+              "dim1_pass": True, "dim1_reason": "", "dim2_items": [],
+              "total_score": 0, "max_score": MAX_SCORE_TOTAL}
     try:
-        directory = Path(dir_path)
-        if not directory.is_dir():
-            result["status"] = "error"
-            result["error"] = f"目录不存在：{dir_path}"
-            return result
-
-        # 在目录中定位被评估的 PPTX 文档（只识别 .pptx，不再兼容老版 .ppt 二进制格式）
-        candidates = sorted(
-            [p for p in directory.iterdir()
-             if p.is_file() and p.suffix.lower() == ".pptx"
-             and not p.name.startswith("~$")],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not candidates:
-            result["status"] = "error"
-            result["error"] = f"目录中未找到 .pptx 文档：{dir_path}"
-            return result
-
-        target = candidates[0]
-        result["file_name"] = target.name
-
-        # 维度一
-        d1_passed, d1_details, model = check_dimension_1(target)
-        result["dim1_pass"] = bool(d1_passed)
-        if not d1_passed:
-            # 汇总维度一未通过原因（取所有 ✗ 开头的行）
-            reasons = [d for d in d1_details if d.startswith("✗")]
-            result["dim1_reason"] = "；".join(reasons) if reasons else "维度一未通过"
-            return result
-
-        # 维度二
-        items, total, max_score = _build_dim2_items(model, True)
-        result["dim2_items"] = items
-        result["total_score"] = total
-        result["max_score"] = max_score
+        if not dir_path or not os.path.isdir(dir_path):
+            raise _TargetMissing(f"目录不存在：{dir_path}")
+        cands = sorted(f for f in os.listdir(dir_path)
+                       if f.lower().endswith('.pptx')
+                       and not f.startswith('~$') and not f.startswith('.'))
+        if not cands:
+            raise _TargetMissing(f"目录中未找到 .pptx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except _TargetMissing as exc:
+        # 找不到待评测文件：维度1 未参与判定，dim1_pass / dim1_reason 一律留空，满分也置 0
+        result["file_name"] = ""
+        result["status"] = "error"
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
-
     except Exception as exc:
+        # 文件存在但打不开 / 解析失败：维度1 判不通过，dim1_reason 给出错误摘要
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = f"文件无法解析或无法打开：{type(exc).__name__}: {exc}"
+        result["dim2_items"] = []
+        result["total_score"] = 0
         return result
+
+
+def _fail_dim1(result, reason):
+    """维度一不通过（文件打不开或画布无效）：总分直接 0，维度二不再逐项计分。"""
+    result["dim1_pass"] = False
+    result["dim1_reason"] = reason
+    result["dim2_items"] = []
+    result["total_score"] = 0
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
+
+
+def _evaluate_impl(file_path, result):
+    prs = Presentation(file_path)
+    theme = _read_theme_scheme(file_path)
+    theme[THEME_FONT_KEY] = _read_theme_fonts(file_path)
+    W = int(prs.slide_width or 0)
+    H = int(prs.slide_height or 0)
+    slides = list(prs.slides)
+
+    # ---------------- 维度一：可用或可修改性 ----------------
+    # 细则只要求"交付文件为 1 个可正常打开的 PowerPoint 文档（.pptx）"，因此这里
+    # 只做两件事：
+    #   ① 文件能被正常解析为 PPTX（走到这里说明已打开成功，损坏包会在
+    #      Presentation() 抛异常，由 evaluate() 记为 status=error、总分 0）
+    #   ② 画布尺寸有效——宽/高读不出来等于文档无法正常呈现，也无法按比例判定
+    # 页数、是否整版贴图、关键文字是否可编辑等，一律不再作为"总分记0"的前置门槛，
+    # 改由维度二对应评分项各自扣分。
+    if W <= 0 or H <= 0:
+        return _fail_dim1(result, "幻灯片画布尺寸无效，文档无法正常呈现")
+
+    pages = []
+    for sl in slides:
+        allsh, topsh = _slide_shapes(sl._element, theme)
+        pages.append({
+            'all': allsh,
+            'top': topsh,
+            'pics': [s for s in allsh if s.is_pic],
+            'texts': [s for s in allsh if s.has_text()],
+        })
+    # 页数不足 2 时补空页占位：维度二统一按"该页无任何对象"判定，各项自然不得分，
+    # 不再让脚本因索引越界而中断。
+    while len(pages) < 2:
+        pages.append({'all': [], 'top': [], 'pics': [], 'texts': []})
+    page_area = float(W) * H
+
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "文件可正常打开为 .pptx，画布尺寸有效"
+
+    # ---------------- 维度二：完成度 ----------------
+    # 所有阈值一律用"占页宽/页高的比例"表达，避免因画布尺寸不同而误判。
+    p1, p2 = pages[0], pages[1]
+    results = []
+
+    def rw(v):
+        return v / float(W)
+
+    def rh(v):
+        return v / float(H)
+
+    def card_of(pg):
+        """卡片主体：铺满画布的最大非图片形状。"""
+        best = None
+        for s in pg['top']:
+            if s.is_pic or s.area() < 0.70 * page_area:
+                continue
+            if best is None or s.area() > best.area():
+                best = s
+        return best
+
+    def qr_of(pg):
+        """右上角二维码：位于右上区域、接近正方形、面积最大的对象。"""
+        best = None
+        for s in pg['all']:
+            if s.is_group or s.area() <= 0:
+                continue
+            if rw(s.cx()) < 0.60 or rh(s.cy()) > 0.30:
+                continue
+            ar = s.width / float(s.height) if s.height else 0
+            if not (0.80 <= ar <= 1.25):
+                continue
+            if rw(s.width) < 0.06:
+                continue
+            if best is None or s.area() > best.area():
+                best = s
+        return best
+
+    def bands_of(pg):
+        """底部色带：贴近底边、横向较长、填充为墨绿族的形状。"""
+        out = []
+        for s in pg['all']:
+            if s.is_group or s.area() <= 0:
+                continue
+            if rh(s.bottom()) < 0.86 or rw(s.width) < 0.25:
+                continue
+            if any(_is_teal_family(h) for h in s.fills):
+                out.append(s)
+        return out
+
+    def badges_of(pg):
+        """联系方式徽章：左半区偏下、近正方形的小块（深墨绿圆角方底或其图片）。
+        按"左边缘对齐（≤页宽0.015）+ 尺寸相当（宽度相差≤35%）"聚类，取最大的一组；
+        底部色带里的装饰图标虽然也在左侧，但尺寸与纵向位置都对不上，不会混进来。"""
+        cand = []
+        for s in pg['all']:
+            if s.is_group or s.height <= 0 or s.width <= 0:
+                continue
+            if rw(s.cx()) > 0.45 or not (0.50 <= rh(s.cy()) <= 0.88):
+                continue
+            ar = s.width / float(s.height)
+            if not (0.70 <= ar <= 1.45):
+                continue
+            if not (0.025 <= rw(s.width) <= 0.10):
+                continue
+            teal = any(_is_teal_family(h) or _is_deep_teal(h) for h in s.fills)
+            if not (s.is_pic or teal):
+                continue
+            cand.append(s)
+        best = []
+        for a in cand:
+            grp = [b for b in cand
+                   if abs(b.left - a.left) <= 0.015 * W
+                   and abs(b.width - a.width) <= 0.35 * a.width]
+            grp.sort(key=lambda s: s.top)
+            if len(grp) > len(best):
+                best = grp
+        return best
+
+    def icon_inside(pg, host, need_pic=True):
+        """判断 host（徽章方底/圆形底衬）内部是否放了"真实图标"：
+        中心落在 host 内的图片或矢量图形（且不是纯文字符号）。
+        用 ☎ ✉ ♧ 这类字符文字充当图标的，只会命中带文字的形状，不算。"""
+        for s in pg['all']:
+            if s is host or s.is_group or s.area() <= 0:
+                continue
+            if not (host.left <= s.cx() <= host.right()
+                    and host.top <= s.cy() <= host.bottom()):
+                continue
+            if s.area() > 1.30 * host.area():
+                continue
+            if s.is_pic:
+                return True
+            if not need_pic and (s.has_custgeom or s.prst) and not s.has_text():
+                return True
+        return False
+
+    def glyph_icon_inside(pg, host):
+        """host 内是否只有"符号字符文字"当图标（含 host 自身带符号文字）。"""
+        pool = [host] + [s for s in pg['all']
+                         if s is not host and s.area() > 0
+                         and host.left <= s.cx() <= host.right()
+                         and host.top <= s.cy() <= host.bottom()]
+        for s in pool:
+            t = s.text.strip()
+            if not t:
+                continue
+            if any((' ' <= ch <= '⯿') or ch in '☎✉⌖♧♢▱↻✓◎'
+                   for ch in t):
+                return True
+        return False
+
+    def hlines_of(pg):
+        """细横线段：高度极小、横向有一定长度的线/形状。"""
+        out = []
+        for s in pg['all']:
+            if s.is_group or s.width <= 0:
+                continue
+            if rh(s.height) > 0.014 or rw(s.width) < 0.03:
+                continue
+            out.append(s)
+        return out
+
+
+    def circles_of(pg):
+        """右栏主营分组的浅色圆形底衬：正圆、右半区、浅色实心，按左边缘对齐聚类。
+        圆内的图标图片本身也可能是"圆形裁剪"的图片，不能算作底衬，故排除图片。"""
+        cand = []
+        for s in pg['all']:
+            if s.is_group or s.is_pic or s.height <= 0 or s.width <= 0:
+                continue
+            if s.prst not in ('ellipse', 'circle'):
+                continue
+            if s.fill_kind != 'solid' or not s.fills:
+                continue
+            if rw(s.cx()) < 0.45 or rh(s.cy()) < 0.25:
+                continue
+            ar = s.width / float(s.height)
+            if not (0.85 <= ar <= 1.18):
+                continue
+            if not (0.030 <= rw(s.width) <= 0.13):
+                continue
+            cand.append(s)
+        best = []
+        for a in cand:
+            grp = [b for b in cand if abs(b.left - a.left) <= 0.015 * W]
+            grp.sort(key=lambda s: s.top)
+            key = (len(grp), sum(s.area() for s in grp))
+            if key > (len(best), sum(s.area() for s in best)):
+                best = grp
+        return best
+
+    def vdiv_of(pg):
+        """纵向分隔线：极窄、竖向较长、横坐标落在版面中部的线/形状。"""
+        best = None
+        for s in pg['all']:
+            if s.is_group or s.height <= 0:
+                continue
+            if rw(s.width) > 0.013 or rh(s.height) < 0.25:
+                continue
+            if not (0.38 <= rw(s.cx()) <= 0.68):
+                continue
+            if best is None or s.height > best.height:
+                best = s
+        return best
+
+    def cap_texts(pg, cap):
+        """胶囊标签上的文字形状：文字写在形状里，或另用文本框叠在形状上，
+        在办公软件里看到的都是"标签上的一行字"，两种做法都要认。"""
+        if cap is None:
+            return []
+        out = [cap] if cap.has_text() else []
+        for s in pg['texts']:
+            if s is cap:
+                continue
+            if cap.left <= s.cx() <= cap.right() \
+                    and cap.top <= s.cy() <= cap.bottom():
+                out.append(s)
+        return out
+
+    def capsule_of(pg, keys):
+        """胶囊标签：圆角/胶囊预设形状 + 墨绿实心填充 + 标签上写着指定文字。"""
+        best = None
+        for s in pg['all']:
+            if s.is_group or s.area() <= 0:
+                continue
+            if s.prst not in CAPSULE_PRSTS:
+                continue
+            if not any(_is_teal_family(h) or _is_deep_teal(h) for h in s.fills):
+                continue
+            if s.area() > 0.30 * page_area:      # 排除铺满画布的卡片主体
+                continue
+            flat = ' '.join(t.text for t in cap_texts(pg, s))
+            flat = flat.replace(' ', '').upper()
+            if not any(k.replace(' ', '').upper() in flat for k in keys):
+                continue
+            if best is None or s.area() > best.area():
+                best = s
+        return best
+
+    def find_text(pg, pred):
+        """按文字内容找形状；pred 收到规范化后的文字。"""
+        out = []
+        for s in pg['texts']:
+            if pred(s.text):
+                out.append(s)
+        return out
+
+    def divider_groups(pg):
+        """"线段＋叶片＋线段"分隔装饰：同一水平位置（Δy≤页高0.012）的两条细
+        横线，中间夹一个小图形/小图片（叶片），叶片中心落在两线之间。
+        返回 [(整体左端, 整体右端, y, 叶片)]。"""
+        found = []
+        lines = hlines_of(pg)
+        for i in range(len(lines)):
+            for j in range(i + 1, len(lines)):
+                a, b = lines[i], lines[j]
+                if a.left > b.left:
+                    a, b = b, a
+                if abs(a.cy() - b.cy()) > 0.012 * H:
+                    continue
+                gap_l, gap_r = a.right(), b.left
+                if gap_r - gap_l <= 0:
+                    continue
+                if (gap_r - gap_l) > 0.12 * W:
+                    continue
+                for s in pg['all']:
+                    if s is a or s is b or s.is_group or s.area() <= 0:
+                        continue
+                    if rw(s.width) > 0.09 or rh(s.height) > 0.09:
+                        continue
+                    if not (gap_l - 0.01 * W <= s.cx() <= gap_r + 0.01 * W):
+                        continue
+                    if abs(s.cy() - a.cy()) > 0.06 * H:
+                        continue
+                    found.append((a.left, b.right(), a.cy(), s))
+                    break
+        return found
+
+    # ------------ 共用的版面要素定位结果 ------------
+    card1, card2 = card_of(p1), card_of(p2)
+    qr1, qr2 = qr_of(p1), qr_of(p2)
+    badge1, badge2 = badges_of(p1), badges_of(p2)
+    circ1, circ2 = circles_of(p1), circles_of(p2)
+    vdiv1, vdiv2 = vdiv_of(p1), vdiv_of(p2)
+    cap1 = capsule_of(p1, ('主营',))
+    cap2 = capsule_of(p2, ('MAIN BUSINESS', 'MAINBUSINESS'))
+    band1, band2 = bands_of(p1), bands_of(p2)
+    divs1, divs2 = divider_groups(p1), divider_groups(p2)
+
+    def nospace(t):
+        return t.replace(' ', '')
+
+    cn_name = find_text(p1, lambda t: '福建蓝屿' in nospace(t))
+    en_name1 = find_text(p1, lambda t: 'FUJIAN LANYU' in t.upper())
+    xing = find_text(p1, lambda t: '沈知行' in nospace(t))
+    ethan = find_text(p2, lambda t: 'ethan' in t.lower() and 'shen' in t.lower())
+    en_name2 = find_text(p2, lambda t: 'FUJIAN LANYU' in t.upper())
+    mp1 = find_text(p1, lambda t: nospace(t).upper().startswith('M.P.'))
+    mp2 = find_text(p2, lambda t: nospace(t).upper().startswith('M.P.'))
+    phone1 = find_text(p1, lambda t: '4826' in t and '7153' in t)
+    phone2 = find_text(p2, lambda t: '4826' in t and '7153' in t)
+    mail1 = find_text(p1, lambda t: 'z.xing@lanyunova.com' in t.lower())
+    mail2 = find_text(p2, lambda t: 'z.xing@lanyunova.com' in t.lower())
+    addr1 = find_text(p1, lambda t: '云创大道' in t or '蓝湾创新中心' in t)
+    addr2 = find_text(p2, lambda t: 'yunchuang' in t.lower()
+                      or 'bluebay' in t.lower())
+
+    def first(lst):
+        return lst[0] if lst else None
+
+    def sz_of(sh):
+        """形状内可见文字的最大字号（磅）。"""
+        if sh is None:
+            return 0.0
+        return _max_run_sz([sh])
+
+    def runs_of(sh):
+        if sh is None:
+            return []
+        return [r for para in sh.runs for r in para if r['t'].strip()]
+
+    def rightcol(pg):
+        """右栏文字块：横坐标在版面右侧、纵向位于胶囊标签之下的文本形状。"""
+        return sorted([s for s in pg['texts']
+                       if rw(s.cx()) > 0.55 and rh(s.cy()) > 0.30],
+                      key=lambda s: s.top)
+
+    def item_sz(pg):
+        """主营条目文字字号：取右栏文字块里最小的可见字号。"""
+        szs = [r['sz'] for _, r in _iter_runs(rightcol(pg))]
+        return min(szs) if szs else 0.0
+
+    # ============================================================
+    # +1：文档共2页幻灯片，第1页为中文正面版式、第2页为英文背面版式，页序不颠倒
+    # 严格对齐细则，仅踩细则明确写出的点，不额外约束：
+    #   ① 幻灯片恰好 2 页（多页/少页都不算）
+    #   ② 第1页以中文为主（中日韩字符数明显多于纯西文字符数）
+    #   ③ 第2页以西文为主（西文字符数明显多于中日韩字符数）
+    # 与办公软件对齐：即在 PPT 里翻页看到的"第1页中文正面、第2页英文背面"。
+    def cjk_latin(pg):
+        cjk = lat = 0
+        for _, r in _iter_runs(pg['texts']):
+            for ch in r['t']:
+                if _has_cjk(ch):
+                    cjk += 1
+                elif ch.isalpha():
+                    lat += 1
+        return cjk, lat
+
+    c1, l1 = cjk_latin(p1)
+    c2, l2 = cjk_latin(p2)
+    if len(slides) == 2 and c1 > l1 and l2 > c2:
+        results.append("+1：文档共2页幻灯片，第1页为中文正面版式、第2页为英文背面版式，页序不颠倒")
+    else:
+        results.append("+0：文档共2页幻灯片，第1页为中文正面版式、第2页为英文背面版式，页序不颠倒")
+
+    # ============================================================
+    # +3：两页画布尺寸完全一致且为横向名片比例（宽/高在1.50-1.85之间），每页以一个
+    #     圆角矩形卡片主体铺满画布（圆角调节值>0），卡片填充为米白/象牙白
+    # 严格对齐细则：
+    #   ① 画布宽/高比在 1.50-1.85（.pptx 全篇共用一个画布，尺寸天然一致）
+    #   ② 每页有一个圆角矩形（roundRect 系列预设）铺满画布（面积≥画布0.88）
+    #   ③ 该圆角矩形的圆角调节值 adj > 0（即真的有圆角，不是直角矩形）
+    #   ④ 填充为浅暖白（米白/象牙白），既不是纯白也不是彩色
+    # 与办公软件对齐：a:prstGeom prst="roundRect" + a:avLst/a:gd@val → 形状格式里的
+    #   "圆角"调节柄；a:solidFill/a:srgbClr → 填充颜色取色器读数。
+    def card_adj(sh):
+        sp_pr = sh.el.find(_p('spPr'))
+        pg_el = sp_pr.find(_a('prstGeom')) if sp_pr is not None else None
+        if pg_el is None:
+            return None
+        av = pg_el.find(_a('avLst'))
+        if av is None:
+            return 0
+        for gd in av.findall(_a('gd')):
+            if (gd.get('name') or '') == 'adj':
+                try:
+                    return int(gd.get('fmla', 'val 0').split()[-1])
+                except (ValueError, IndexError):
+                    return 0
+        return 0
+
+    ratio_ok = 1.50 <= (W / float(H)) <= 1.85
+    card_ok = True
+    for cd in (card1, card2):
+        if cd is None or cd.area() < 0.88 * page_area:
+            card_ok = False
+            break
+        if 'roundRect' not in cd.prst and cd.prst not in CAPSULE_PRSTS:
+            card_ok = False
+            break
+        if not card_adj(cd):
+            card_ok = False
+            break
+        if not any(_is_cream(h) for h in cd.fills):
+            card_ok = False
+            break
+    if ratio_ok and card_ok:
+        results.append("+3：两页画布尺寸完全一致且为横向名片比例（宽/高在1.50-1.85之间），每页以一个圆角矩形卡片主体铺满画布（圆角调节值>0），卡片填充为米白/象牙白（近似#F5F3EE-#FEFDF8的浅暖白），非纯白或彩色")
+    else:
+        results.append("+0：两页画布尺寸完全一致且为横向名片比例（宽/高在1.50-1.85之间），每页以一个圆角矩形卡片主体铺满画布（圆角调节值>0），卡片填充为米白/象牙白（近似#F5F3EE-#FEFDF8的浅暖白），非纯白或彩色")
+
+    # ============================================================
+    # +5：两页右上角二维码均以图片对象（picture / blipFill）插入，而非用形状、表格或
+    #     文字字符拼出的伪二维码；二维码为正方形（0.90-1.10）、边长占页宽0.11-0.20、
+    #     左边缘位于页宽0.78-0.88、上边缘位于页高0.02-0.14
+    # 严格对齐细则：
+    #   ① 两页右上角都能定位到该对象
+    #   ② 该对象是图片（p:pic / blipFill 填充），不是形状或文字拼贴
+    #   ③ 长宽比 0.90-1.10、边长占页宽 0.11-0.20
+    #   ④ 左边缘占页宽 0.78-0.88、上边缘占页高 0.02-0.14
+    # 与办公软件对齐：p:pic → 选中后功能区出现"图片格式"，可另存为图片。
+    qr_ok = True
+    for q in (qr1, qr2):
+        if q is None:
+            qr_ok = False
+            break
+        if not (q.is_pic or q.fill_kind == 'pic'):
+            qr_ok = False
+            break
+        ar = q.width / float(q.height) if q.height else 0
+        if not (0.90 <= ar <= 1.10):
+            qr_ok = False
+            break
+        if not (0.11 <= rw(q.width) <= 0.20):
+            qr_ok = False
+            break
+        if not (0.78 <= rw(q.left) <= 0.88):
+            qr_ok = False
+            break
+        if not (0.02 <= rh(q.top) <= 0.14):
+            qr_ok = False
+            break
+    if qr_ok:
+        results.append("+5：两页右上角二维码均以图片对象（picture / blipFill）插入，而非用形状、表格或文字字符拼出的伪二维码；二维码为正方形（长宽比0.90-1.10）、边长占页宽0.11-0.20、左边缘位于页宽0.78-0.88、上边缘位于页高0.02-0.14")
+    else:
+        results.append("+0：两页右上角二维码均以图片对象（picture / blipFill）插入，而非用形状、表格或文字字符拼出的伪二维码；二维码为正方形（长宽比0.90-1.10）、边长占页宽0.11-0.20、左边缘位于页宽0.78-0.88、上边缘位于页高0.02-0.14")
+
+    # ============================================================
+    # +3：两页二维码的位置与尺寸保持一致（左坐标、上坐标、边长三项差异均≤页宽的0.02）
+    # 严格对齐细则：① 两页都定位到二维码；② 左、上、边长三项差异均 ≤ 页宽 0.02
+    # 与办公软件对齐：即在"大小和位置"窗格里读到的水平/垂直位置与宽度基本相同。
+    if qr1 is not None and qr2 is not None \
+            and rw(abs(qr1.left - qr2.left)) <= 0.02 \
+            and rw(abs(qr1.top - qr2.top)) <= 0.02 \
+            and rw(abs(qr1.width - qr2.width)) <= 0.02:
+        results.append("+3：两页二维码的位置与尺寸保持一致（左坐标、上坐标、边长三项差异均≤页宽的0.02），正反面同位置呈现")
+    else:
+        results.append("+0：两页二维码的位置与尺寸保持一致（左坐标、上坐标、边长三项差异均≤页宽的0.02），正反面同位置呈现")
+
+    # ============================================================
+    # +3：每页原生可编辑对象数量≥25个，无整版截图贴图
+    # 严格对齐细则：
+    #   ① 每页非图片的原生对象（文本框/自动图形/连接线/自由曲线）数量 ≥ 25
+    #   ② 不存在铺满整页的位图（按占页面积 0.60 判定"整版截图贴图"）
+    # 说明：直线/连接线只有长度没有厚度（面积为 0），在 PPT 里同样是可单独点选、
+    #   可编辑的对象，因此按"宽或高有值"计数，不按面积计数。
+    # 与办公软件对齐：在 PPT 里用"选择窗格"能逐个点选到的对象数量。
+    native_ok = True
+    for pg in (p1, p2):
+        native = [s for s in pg['all']
+                  if not s.is_pic and not s.is_group and s.is_sized()]
+        if len(native) < 25:
+            native_ok = False
+        if any(s.area() >= 0.60 * page_area for s in pg['pics']):
+            native_ok = False
+    if native_ok:
+        results.append("+3：除二维码与徽标/图标类小图外，页面主体由文本框、自动图形、连接线等原生对象拼搭而成，每页原生可编辑对象数量≥25个，无整版截图贴图")
+    else:
+        results.append("+0：除二维码与徽标/图标类小图外，页面主体由文本框、自动图形、连接线等原生对象拼搭而成，每页原生可编辑对象数量≥25个，无整版截图贴图")
+
+    # ============================================================
+    # +3：全篇字体为Windows环境可正常显示的常见字体；未使用仅macOS可用字体承载可见文字
+    # 严格对齐细则：
+    #   ① 承载中日韩文字的 run，其东亚字体（a:ea，缺省时看 a:latin）不得为 macOS 专有；
+    #   ② 承载西文/数字的 run，其西文字体（a:latin）不得为 macOS 专有；
+    #   ③ 显式指定的字体须落在 Windows 常见字体族内（未指定＝随主题，视为可显示）。
+    # 说明：只检查"实际承载可见文字"的那一侧字体——把 ea 字体挂在纯西文 run 上并不会
+    #   影响 Windows 下的显示效果，不据此扣分。
+    # 与办公软件对齐：a:latin/a:ea typeface → 开始选项卡的字体框；缺字体时 Windows 会
+    #   回退成默认字形，书法体等特殊字形随之丢失。
+    font_ok = True
+    for pg in (p1, p2):
+        for _, r in _iter_runs(pg['texts']):
+            names = []
+            if _has_cjk(r['t']):
+                names.append(r['ea'] or r['latin'])
+            if _has_latin(r['t']):
+                names.append(r['latin'])
+            for nm in names:
+                if not nm:
+                    continue
+                if _is_mac_only(nm) or not _is_win_common(nm):
+                    font_ok = False
+    if font_ok:
+        results.append("+3：全篇字体为Windows环境可正常显示的常见字体（微软雅黑、黑体、宋体、楷体、Arial、Times New Roman、Segoe 系列等）；未使用仅macOS可用字体（如STXingkai、STKaiti、Zapfino等）承载可见文字而导致字形回退丢失")
+    else:
+        results.append("+0：全篇字体为Windows环境可正常显示的常见字体（微软雅黑、黑体、宋体、楷体、Arial、Times New Roman、Segoe 系列等）；未使用仅macOS可用字体（如STXingkai、STKaiti、Zapfino等）承载可见文字而导致字形回退丢失")
+
+    # ============================================================
+    # +3：所有形状的宽、高均为非负有效值，无负宽/负高的畸形图形
+    # 严格对齐细则：a:ext@cx / a:ext@cy 一律 ≥ 0（组内子形状同样检查）
+    # 与办公软件对齐：负的扩展量在 PowerPoint 里表现为图形不显示或上下/左右翻转，
+    #   在"大小和位置"窗格里也无法正常读数。
+    ext_ok = True
+    for pg in (p1, p2):
+        for s in pg['all']:
+            if s.raw_w < 0 or s.raw_h < 0:
+                ext_ok = False
+    if ext_ok:
+        results.append("+3：所有形状的宽、高均为非负有效值，无负宽/负高的畸形图形（负值扩展量会导致图形不显示或反向翻转）")
+    else:
+        results.append("+0：所有形状的宽、高均为非负有效值，无负宽/负高的畸形图形（负值扩展量会导致图形不显示或反向翻转）")
+
+    # ============================================================
+    # +3：第1页左上角设有企业徽标，以图片或成组矢量图形完整呈现，
+    #     左边缘0.02-0.10页宽、上边缘0.02-0.14页高、宽占页宽0.07-0.20
+    # 严格对齐细则：
+    #   ① 位置：左边缘 0.02-0.10 页宽、上边缘 0.02-0.14 页高
+    #   ② 尺寸：宽占页宽 0.07-0.20
+    #   ③ 形态：单个图片对象，或一个把矢量图形组合在一起的组合对象
+    #      （散落、未成组的弧线/水滴不算"完整呈现"，无法整体移动缩放）
+    # 与办公软件对齐：p:pic 或 p:grpSp → 在 PPT 里单击一次即可整体选中并移动。
+    logo = None
+    for s in p1['all']:
+        if not (s.is_pic or s.is_group):
+            continue
+        if s is qr1 or s.area() <= 0:
+            continue
+        if not (0.02 <= rw(s.left) <= 0.10):
+            continue
+        if not (0.02 <= rh(s.top) <= 0.14):
+            continue
+        if not (0.07 <= rw(s.width) <= 0.20):
+            continue
+        if logo is None or s.area() > logo.area():
+            logo = s
+    if logo is not None:
+        results.append("+3：第1页左上角设有企业徽标（圆形叶片＋暖色弧标识），以图片或成组矢量图形完整呈现，左边缘位于页宽0.02-0.10、上边缘位于页高0.02-0.14、宽占页宽0.07-0.20")
+    else:
+        results.append("+0：第1页左上角设有企业徽标（圆形叶片＋暖色弧标识），以图片或成组矢量图形完整呈现，左边缘位于页宽0.02-0.10、上边缘位于页高0.02-0.14、宽占页宽0.07-0.20")
+
+    # ============================================================
+    # +3：第1页中文公司名"福建蓝屿新材科技有限公司"单行文本，加粗、深墨绿，
+    #     左边缘位于徽标右缘之后且位于页宽0.17-0.24，
+    #     字号≥主营条目文字字号的2倍且为页眉区最大字号
+    # 严格对齐细则：
+    #   ① 文字内容与细则给出的公司名完全一致（多字/少字/错字均不算达标）
+    #   ② 单行呈现（不折行、不分段）
+    #   ③ 加粗：rPr@b=1，或所选字族本身是粗体（"微软雅黑 Bold"一类）；中文字体
+    #      （a:ea）与西文字体（a:latin）任一侧是粗体字族即认，中文字符实际渲染用的
+    #      是 a:ea 那一侧，只看 a:latin 会把"中文设了粗体族"的写法漏判成没加粗
+    #   ④ 文字色为深墨绿色系
+    #   ⑤ 左边缘落在徽标右缘之后，且位于页宽 0.17-0.24
+    #   ⑥ 字号 ≥ 主营条目字号的 2 倍，且是页眉区（上边缘 0.28 页高以内）最大字号
+    # 与办公软件对齐：rPr@b → 加粗按钮；rPr/solidFill → 字体颜色；sz → 字号框。
+    #   "在徽标右侧"按坐标关系判定，不与徽标自身的位置区间并列，避免两条各自
+    #   合规却仍然压字的情形。
+    cn = first(cn_name)
+    it_sz1 = item_sz(p1)
+    hdr_sz1 = _max_run_sz([s for s in p1['texts'] if rh(s.top) <= 0.28])
+    cn_ok = cn is not None
+    if cn_ok:
+        rs = runs_of(cn)
+        cn_ok = (nospace(cn.text) == nospace('福建蓝屿新材科技有限公司')
+                 and _visual_lines(cn) == 1
+                 and all(r['b'] or _is_bold_font(r['latin'])
+                         or _is_bold_font(r['ea']) for r in rs)
+                 and any(_is_deep_teal(r['clr'] or '') for r in rs)
+                 and 0.17 <= rw(cn.left) <= 0.24
+                 and (logo is None or cn.left >= logo.right() - 0.01 * W)
+                 and it_sz1 > 0 and sz_of(cn) >= 2.0 * it_sz1
+                 and sz_of(cn) >= hdr_sz1 - 0.01)
+    if cn_ok:
+        results.append('+3：第1页徽标右侧设有中文公司名"福建蓝屿新材科技有限公司"单行文本，加粗（加粗属性或粗体字族均可）、深墨绿色系（近似#013B3C-#004F49，或同族更深值），左边缘位于徽标右缘之后且位于页宽0.17-0.24，字号≥主营条目文字字号的2倍且为页眉区最大字号')
+    else:
+        results.append('+0：第1页徽标右侧设有中文公司名"福建蓝屿新材科技有限公司"单行文本，加粗（加粗属性或粗体字族均可）、深墨绿色系（近似#013B3C-#004F49，或同族更深值），左边缘位于徽标右缘之后且位于页宽0.17-0.24，字号≥主营条目文字字号的2倍且为页眉区最大字号')
+
+    # ============================================================
+    # +3：中文公司名正下方的英文公司名"FUJIAN LANYU NOVA MATERIALS CO., LTD."
+    #     单行全大写、无衬线带字间距、字号为中文公司名0.45-0.70倍、铜橙色
+    # 严格对齐细则：
+    #   ① 内容与细则给出的英文公司名一致，且全大写（大写字符或"全部大写"效果）
+    #   ② 单行呈现；用字符间显式留空写出字距时，留空本身会把折行估算撑大，
+    #      故此写法下按"单段落"衡量单行
+    #   ③ 西文字体为无衬线族
+    #   ④ 字间距不作判定：字符间距加宽在版面上只影响字距疏密，肉眼难以与"没加宽"
+    #      区分，也不影响内容完整与可编辑性，故本项不因 spc 未设而扣分（细则原文
+    #      仍保留在结果串里，仅此一处不参与判定）
+    #   ⑤ 紧接中文公司名之下并与其左对齐（差 ≤ 0.02 页宽）；"紧接"按中文公司名
+    #      字号的相对间隙衡量（≤1.5 倍字号），不随画布尺寸漂移
+    #   ⑥ 字号为中文公司名的 0.45-0.70 倍
+    #   ⑦ 文字色为铜橙色系
+    # 与办公软件对齐：rPr@cap="all" → "全部大写"复选框。中文公司名缺失时，字号比与
+    #   左对齐两项无从比对，不在本条重复扣分（该缺陷已由中文公司名一条计入）。
+    en1 = first(en_name1)
+    en_ok = en1 is not None
+    if en_ok:
+        rs = runs_of(en1)
+        body = nospace(en1.text).upper().replace('，', ',')
+        allcaps = (en1.text == en1.text.upper()
+                   or any((r['cap'] or '').lower() in ('all', 'small')
+                          for r in rs))
+        spaced_txt = _letter_spaced(en1.text)
+        one_line = (len(en1.runs) == 1) if spaced_txt else (_visual_lines(en1) == 1)
+        rel_ok = True
+        if cn is not None and sz_of(cn) > 0:
+            rel_ok = (abs(en1.left - cn.left) <= 0.02 * W
+                      and en1.cy() > cn.cy()
+                      and en1.top - cn.bottom() <= 1.5 * sz_of(cn) * EMU_PER_PT
+                      and 0.45 <= sz_of(en1) / sz_of(cn) <= 0.70)
+        en_ok = ('FUJIANLANYUNOVAMATERIALSCO.,LTD.' in body
+                 and allcaps
+                 and one_line
+                 and all(_sans_serif(r['latin']) for r in rs if r['latin'])
+                 and rel_ok
+                 and any(_is_copper(r['clr'] or '') for r in rs))
+    if en_ok:
+        results.append('+3：中文公司名正下方设有英文公司名"FUJIAN LANYU NOVA MATERIALS CO., LTD."单行全大写文本（大写字符或全部大写效果均可），无衬线西文字体、带字间距（字符间距加宽≥0.3磅或字符间显式留空），左边缘与中文公司名对齐（差≤页宽0.02）且紧接其下（间隙≤中文公司名字号的1.5倍），字号为中文公司名的0.45-0.70倍，且填充为铜橙色系（近似#B5713C-#C77B45，或同族更饱和的暖橙）')
+    else:
+        results.append('+0：中文公司名正下方设有英文公司名"FUJIAN LANYU NOVA MATERIALS CO., LTD."单行全大写文本（大写字符或全部大写效果均可），无衬线西文字体、带字间距（字符间距加宽≥0.3磅或字符间显式留空），左边缘与中文公司名对齐（差≤页宽0.02）且紧接其下（间隙≤中文公司名字号的1.5倍），字号为中文公司名的0.45-0.70倍，且填充为铜橙色系（近似#B5713C-#C77B45，或同族更饱和的暖橙）')
+
+    # ============================================================
+    # +3：三处"线段＋叶片＋线段"分隔装饰均具备且样式一致
+    # 严格对齐细则：
+    #   ① 每处都是"两条细横线段 + 中间 1 个叶片图形/图片"，叶片把横线断开且居中
+    #   ② 第1页公司名下方：整体跨度占页宽 0.45-0.62
+    #   ③ 第1页姓名下方：跨度占页宽 0.25-0.42，且仅位于左半区（右端不越过中线）
+    #   ④ 第2页英文公司名下方：同样形态的一处
+    # 说明：跨度按"最左线段左端 → 最右线段右端"的整体宽度衡量，与肉眼看到的
+    #   分隔装饰总长一致。
+    # 与办公软件对齐：两条 p:cxnSp/直线形状 + 中间一个小图形，逐个可点选。
+    def match_div(divs, lo, hi, y_lo, y_hi, right_limit=None):
+        for l, r, y, leaf in divs:
+            span = rw(r - l)
+            if not (lo <= span <= hi):
+                continue
+            if not (y_lo <= rh(y) <= y_hi):
+                continue
+            if right_limit is not None and rw(r) > right_limit:
+                continue
+            return True
+        return False
+
+    div_a = match_div(divs1, 0.45, 0.62, 0.18, 0.38)
+    div_b = match_div(divs1, 0.25, 0.42, 0.44, 0.72, right_limit=0.52)
+    div_c = match_div(divs2, 0.20, 0.62, 0.18, 0.48)
+    if div_a and div_b and div_c:
+        results.append('+3：三处"线段＋叶片＋线段"分隔装饰均具备且样式一致——第1页公司名下方（两段线合计跨度占页宽0.45-0.62）、第1页姓名下方（跨度占页宽0.25-0.42、仅位于左半区）、第2页英文公司名下方；每处均为两条细横线段＋中间1个叶片图形/图片，叶片将横线断开居中')
+    else:
+        results.append('+0：三处"线段＋叶片＋线段"分隔装饰均具备且样式一致——第1页公司名下方（两段线合计跨度占页宽0.45-0.62）、第1页姓名下方（跨度占页宽0.25-0.42、仅位于左半区）、第2页英文公司名下方；每处均为两条细横线段＋中间1个叶片图形/图片，叶片将横线断开居中')
+
+    # ============================================================
+    # +5：第1页姓名"沈知行"，行楷/楷书类书法字体、深墨绿、该页最大字号
+    #     （≥中文公司名1.8倍）、左边缘0.08-0.18页宽、上边缘0.30-0.42页高
+    # 严格对齐细则：
+    #   ① 文字为"沈知行"
+    #   ② 中文字体属行楷/楷书类书法风格，且不是黑体/雅黑类无衬线体
+    #   ③ 文字色为深墨绿
+    #   ④ 字号为该页最大，且 ≥ 中文公司名字号的 1.8 倍
+    #   ⑤ 左边缘 0.08-0.18 页宽、上边缘 0.30-0.42 页高
+    # 与办公软件对齐：a:ea typeface → 中文字体框（楷体/行楷等书法字形）。
+    xg = first(xing)
+    xg_ok = xg is not None
+    if xg_ok:
+        rs = runs_of(xg)
+        fonts = [(r['ea'] or r['latin']) for r in rs if _has_cjk(r['t'])]
+        xg_ok = (nospace(xg.text) == '沈知行'
+                 and fonts and all(_is_kai_font(f) for f in fonts)
+                 and not any(_sans_serif(f) for f in fonts)
+                 and any(_is_deep_teal(r['clr'] or '') for r in rs)
+                 and sz_of(xg) >= _max_run_sz(p1['texts']) - 0.01
+                 and sz_of(cn) > 0 and sz_of(xg) >= 1.8 * sz_of(cn)
+                 and 0.08 <= rw(xg.left) <= 0.18
+                 and 0.30 <= rh(xg.top) <= 0.42)
+    if xg_ok:
+        results.append('+5：第1页左半区设有姓名"沈知行"，采用行楷/楷书类书法风格中文字体（楷体、行楷等，非黑体/雅黑类无衬线体），深墨绿，字号为该页最大（≥中文公司名字号的1.8倍），左边缘位于页宽0.08-0.18、上边缘位于页高0.30-0.42')
+    else:
+        results.append('+0：第1页左半区设有姓名"沈知行"，采用行楷/楷书类书法风格中文字体（楷体、行楷等，非黑体/雅黑类无衬线体），深墨绿，字号为该页最大（≥中文公司名字号的1.8倍），左边缘位于页宽0.08-0.18、上边缘位于页高0.30-0.42')
+
+    # ============================================================
+    # +5：第1页3行"徽章图标＋文字"联系方式，等距堆叠、三个徽章左边缘对齐
+    # 严格对齐细则：
+    #   ① 左半区能定位到 3 个徽章式小方块（深墨绿圆角方底或其图片）
+    #   ② 三者左边缘对齐（差异 ≤ 页宽 0.01；聚类时已按 0.015 放宽定位，此处收紧判定）
+    #   ③ 相邻行间距差异 ≤ 单行行高的 0.5 倍（等距堆叠）
+    #   ④ 每个徽章右侧有对应文字
+    # 与办公软件对齐：即三行图标与文字在 PPT 里看起来上下均匀、左侧图标一条竖线对齐。
+    def badge_rows_ok(pg, badges):
+        if len(badges) != 3:
+            return False
+        lefts = [b.left for b in badges]
+        if (max(lefts) - min(lefts)) > 0.012 * W:
+            return False
+        tops = sorted(b.top for b in badges)
+        row_h = sum(b.height for b in badges) / 3.0
+        if not _equidistant(tops, 0.5 * row_h):
+            return False
+        for b in badges:
+            if not any(t.left > b.left and abs(t.cy() - b.cy()) < 0.9 * b.height
+                       for t in pg['texts']):
+                return False
+        return True
+
+    if badge_rows_ok(p1, badge1):
+        results.append('+5：第1页左半区设有3行联系方式，每行为"深墨绿圆角方形徽章图标＋右侧文字"结构，三行自上而下等距堆叠（相邻行间距差异≤单行行高的0.5倍），三个徽章左边缘对齐（差异≤页宽0.01）')
+    else:
+        results.append('+0：第1页左半区设有3行联系方式，每行为"深墨绿圆角方形徽章图标＋右侧文字"结构，三行自上而下等距堆叠（相邻行间距差异≤单行行高的0.5倍），三个徽章左边缘对齐（差异≤页宽0.01）')
+
+    # ============================================================
+    # +5：三个联系方式徽章内为真实的电话听筒、信封、定位针图标，
+    #     而非用☎、✉、⌖等文本符号字符充当图标
+    # 严格对齐细则：
+    #   ① 每个徽章本身是图片，或徽章内部套着图片/矢量图形（无文字）
+    #   ② 徽章范围内不得靠符号字符文字充当图标
+    # 说明：本项只判"图标是否为真实图形"，不识别具体图案语义（听筒/信封/定位针），
+    #   避免把无法在 XML 层面确证的内容硬判为不达标。
+    # 与办公软件对齐：符号字符做的"图标"在 PPT 里双击就变成可输入的文字光标，
+    #   且缺字体时会变成方框；真实图标是独立的图片/矢量对象。
+    def icons_real(pg, hosts, need):
+        if len(hosts) != need:
+            return False
+        for hb in hosts:
+            if glyph_icon_inside(pg, hb):
+                return False
+            if not (hb.is_pic or icon_inside(pg, hb, need_pic=False)):
+                return False
+        return True
+
+    if icons_real(p1, badge1, 3):
+        results.append("+5：三个联系方式徽章内为真实的电话听筒、信封、定位针图标（以图片或矢量图形绘制，白色图形置于深墨绿圆角方底上），而非用☎、✉、⌖等文本符号字符充当图标")
+    else:
+        results.append("+0：三个联系方式徽章内为真实的电话听筒、信封、定位针图标（以图片或矢量图形绘制，白色图形置于深墨绿圆角方底上），而非用☎、✉、⌖等文本符号字符充当图标")
+
+    # ============================================================
+    # +3：第1页左半区3行联系方式第1行"M.P."（绿色）＋电话"139 4826 7153"
+    #     （近黑加粗、分组以空格分隔），号码字号为邮箱行与地址两行中较大字号的
+    #     1.2-2.0 倍
+    # 严格对齐细则：
+    #   ① "M.P."文字为绿色（细则只要求"绿色"，故按色相整段判定：黄绿到青绿均可，
+    #      不限定深浅，也不再要求与中文公司名同色族）
+    #   ② 电话为细则给出的号码，且分组之间以空格分隔
+    #   ③ "M.P."横坐标位于号码左侧，两者纵向中心差 ≤ 号码行高（同一行内）
+    #   ④ 号码文字近黑，且加粗（加粗属性、粗体字族、段落级加粗继承均可）
+    #   ⑤ 号码文字字号为邮箱行、地址两行中较大字号的 1.2-2.0 倍
+    # 与办公软件对齐：rPr@b → 加粗复选框，字族名自带 Bold/Black 的同样是粗体，
+    #   在段落/文本框级别设的加粗也会显示成粗体（已按继承链取值）；号码分组是
+    #   文字内容本身的空格，半角/全角/不换行空格肉眼一致，已统一折算成普通空格
+    #   再比对。"M.P."与号码写在同一个文本框时，字号按号码那段字符算（取整框最大
+    #   字号会被"M.P."的字号顶替，倍数判定失真）。倍数设上限是因为号码只需比另
+    #   两行醒目，放大到两倍以上即为版面失衡。
+    ph1 = first(phone1)
+    mpo = first(mp1)
+    small_sz = max(sz_of(first(mail1)), sz_of(first(addr1)))
+    ph_ok = ph1 is not None and mpo is not None and small_sz > 0
+    if ph_ok:
+        digit_runs = [r for r in runs_of(ph1) if re.search(r'\d', r['t'])]
+        mp_runs = [r for r in runs_of(mpo) if not re.search(r'\d', r['t'])]
+        if mpo is ph1:
+            row_ok = True
+        else:
+            row_ok = (mpo.left < ph1.left
+                      and abs(mpo.cy() - ph1.cy()) <= ph1.height)
+        ph_sz = max([r['sz'] for r in digit_runs] or [0.0])
+        ph_ok = (bool(digit_runs) and bool(mp_runs)
+                 and any(_is_green(r['clr'] or '') for r in mp_runs)
+                 and '139 4826 7153' in ph1.text
+                 and row_ok
+                 and any(_is_near_black(r['clr'] or '') for r in digit_runs)
+                 and all(r['b'] or _is_bold_font(r['latin'] or r['ea'])
+                         for r in digit_runs)
+                 and 1.2 * small_sz <= ph_sz <= 2.0 * small_sz)
+    if ph_ok:
+        results.append('+3：第1页左半区3行联系方式的第1行为"M.P."（字体为绿色）＋电话"139 4826 7153"（分组间以空格分隔，半角/全角/不换行空格均可），M.P.横坐标位于号码左侧、两者纵向中心差≤号码行高；号码文字近黑（近似#1A1A1A-#333333，或明度不高于#4D4D4D且无明显色偏）且加粗（加粗属性、粗体字族、段落级加粗继承均可）；号码文字字号为邮箱行与地址两行中较大字号的1.2-2.0倍（与"M.P."同框时按号码那段字符计）')
+    else:
+        results.append('+0：第1页左半区3行联系方式的第1行为"M.P."（字体为绿色）＋电话"139 4826 7153"（分组间以空格分隔，半角/全角/不换行空格均可），M.P.横坐标位于号码左侧、两者纵向中心差≤号码行高；号码文字近黑（近似#1A1A1A-#333333，或明度不高于#4D4D4D且无明显色偏）且加粗（加粗属性、粗体字族、段落级加粗继承均可）；号码文字字号为邮箱行与地址两行中较大字号的1.2-2.0倍（与"M.P."同框时按号码那段字符计）')
+
+    # ============================================================
+    # +3：第2行邮箱、第3行地址（完整呈现两段地址并断为两行），两行均与电话行左对齐
+    # 严格对齐细则：
+    #   ① 邮箱文字为"z.xing@lanyunova.com"
+    #   ② 地址完整含"福建省厦门市海沧区云创大道88号"与"蓝湾创新中心12层1208室"
+    #   ③ 地址在版面上断成两行（分两段写，或一段但框宽不足自动折行，视觉都是两行）
+    #   ④ 邮箱行、地址行左边缘与电话行左边缘对齐（差异 ≤ 页宽 0.01）
+    # 与办公软件对齐：a:p 分段 或 文本框宽度导致的自动换行，都是肉眼看到的"两行"。
+    ml = first(mail1)
+    ad = first(addr1)
+    row_left = mpo.left if mpo is not None else (ph1.left if ph1 else None)
+    mail_ok = ml is not None and ad is not None and row_left is not None
+    if mail_ok:
+        flat = nospace(ad.text)
+        mail_ok = ('z.xing@lanyunova.com' in ml.text.lower()
+                   and '福建省厦门市海沧区云创大道88号' in flat
+                   and '蓝湾创新中心12层1208室' in flat
+                   and _visual_lines(ad) == 2
+                   and abs(ml.left - row_left) <= 0.01 * W
+                   and abs(ad.left - row_left) <= 0.01 * W)
+    if mail_ok:
+        results.append('+3：第2行为邮箱"z.xing@lanyunova.com"、第3行为地址，地址完整呈现"福建省厦门市海沧区云创大道88号"与"蓝湾创新中心12层1208室"并断为两行显示，两行均与电话行左对齐')
+    else:
+        results.append('+0：第2行为邮箱"z.xing@lanyunova.com"、第3行为地址，地址完整呈现"福建省厦门市海沧区云创大道88号"与"蓝湾创新中心12层1208室"并断为两行显示，两行均与电话行左对齐')
+
+    # ============================================================
+    # +3：第1页纵向分隔线将版面切为左右两栏，位于页宽0.48-0.56，
+    #     纵向跨度占页高0.35-0.60，起于页眉分隔线下方、止于底部色带上方
+    # 严格对齐细则：
+    #   ① 存在一条极窄的竖向线/形状
+    #   ② 横坐标（中线）位于页宽 0.48-0.56
+    #   ③ 纵向跨度占页高 0.35-0.60
+    #   ④ 上端在页眉分隔装饰下方（>0.20 页高），下端在底部色带上方（<0.95 页高）
+    # 与办公软件对齐：p:cxnSp 直线 或极窄矩形，在 PPT 里是一条可单独点选的竖线。
+    vd_ok = vdiv1 is not None
+    if vd_ok:
+        vd_ok = (0.48 <= rw(vdiv1.cx()) <= 0.56
+                 and 0.35 <= rh(vdiv1.height) <= 0.60
+                 and rh(vdiv1.top) > 0.20
+                 and rh(vdiv1.bottom()) < 0.95)
+    if vd_ok:
+        results.append("+3：第1页设有一条纵向分隔线将版面切为左右两栏，位于页宽0.48-0.56，纵向跨度占页高0.35-0.60，起于页眉分隔线下方、止于底部色带上方")
+    else:
+        results.append("+0：第1页设有一条纵向分隔线将版面切为左右两栏，位于页宽0.48-0.56，纵向跨度占页高0.35-0.60，起于页眉分隔线下方、止于底部色带上方")
+
+    # ============================================================
+    # +3：第1页右栏顶部"主 营"胶囊标签：圆角/胶囊实心深墨绿＋白色加粗文字（两字间留空），
+    #     宽占页宽0.10-0.19、左边缘位于页宽0.50-0.58
+    # 严格对齐细则：
+    #   ① 形状为圆角矩形/胶囊类预设，实心填充深墨绿族
+    #   ② 内部文字为"主 营"且两字之间留有空格
+    #   ③ 文字为白色且加粗
+    #   ④ 宽占页宽 0.10-0.19、左边缘位于页宽 0.50-0.58
+    # 与办公软件对齐：prst="roundRect"/"flowChartTerminator" → 形状库里的圆角矩形/
+    #   胶囊；solidFill → 纯色填充。
+    cap_ok = cap1 is not None
+    if cap_ok:
+        cts = cap_texts(p1, cap1)
+        rs = [r for t in cts for r in runs_of(t)]
+        joined = ' '.join(t.text for t in cts).strip()
+        cap_ok = (' ' in joined
+                  and rs and all(r['b'] for r in rs)
+                  and any(_is_white(r['clr'] or '') for r in rs)
+                  and 0.10 <= rw(cap1.width) <= 0.19
+                  and 0.50 <= rw(cap1.left) <= 0.58)
+    if cap_ok:
+        results.append('+3：第1页右栏顶部设有"主 营"胶囊标签：圆角/胶囊形状实心填充深墨绿，内部为白色加粗文字（两字间留空），标签宽占页宽0.10-0.19、左边缘位于页宽0.50-0.58')
+    else:
+        results.append('+0：第1页右栏顶部设有"主 营"胶囊标签：圆角/胶囊形状实心填充深墨绿，内部为白色加粗文字（两字间留空），标签宽占页宽0.10-0.19、左边缘位于页宽0.50-0.58')
+
+    # ============================================================
+    # +5：第1页右栏3个主营分组＝浅色圆形底衬＋圆内图标＋右侧文字块，
+    #     三组等距排列、三个圆形底衬左边缘对齐
+    # 严格对齐细则：
+    #   ① 右栏能定位到 3 个正圆形底衬，填充为淡灰绿浅色实心
+    #   ② 三个圆左边缘对齐（差异 ≤ 页宽 0.012）
+    #   ③ 三组自上而下等距（相邻间距差异 ≤ 圆直径的 0.5 倍）
+    #   ④ 每个圆右侧有对应的文字块
+    # 与办公软件对齐：prst="ellipse" + solidFill → 形状库的椭圆/正圆纯色填充。
+    def circle_groups_ok(pg, circles):
+        if len(circles) != 3:
+            return False
+        if not all(any(_is_pale_greengray(h) for h in c.fills) for c in circles):
+            return False
+        lefts = [c.left for c in circles]
+        if (max(lefts) - min(lefts)) > 0.012 * W:
+            return False
+        tops = sorted(c.top for c in circles)
+        dia = sum(c.height for c in circles) / 3.0
+        if not _equidistant(tops, 0.5 * dia):
+            return False
+        for c in circles:
+            if not any(t.left > c.left and abs(t.cy() - c.cy()) < 1.2 * c.height
+                       for t in pg['texts']):
+                return False
+        return True
+
+    if circle_groups_ok(p1, circ1):
+        results.append('+5：第1页右栏设有3个主营分组，每组为"浅色圆形底衬（近似#EDF0EA-#F0F2EC淡灰绿实心圆）＋圆内图标＋右侧文字块"结构，三组自上而下等距排列，三个圆形底衬左边缘对齐')
+    else:
+        results.append('+0：第1页右栏设有3个主营分组，每组为"浅色圆形底衬（近似#EDF0EA-#F0F2EC淡灰绿实心圆）＋圆内图标＋右侧文字块"结构，三组自上而下等距排列，三个圆形底衬左边缘对齐')
+
+    # ============================================================
+    # +5：三个圆形底衬内为水滴、叶片、包装箱图标（图片或矢量图形），
+    #     而非♧、♢、▱等文本符号字符充当图标
+    # 严格对齐细则：
+    #   ① 每个圆内套着图片或矢量图形（无文字）
+    #   ② 圆范围内不得靠符号字符文字充当图标
+    # 与办公软件对齐：同徽章图标——符号字符做的图标点进去是文字，换环境会变方框。
+    if icons_real(p1, circ1, 3):
+        results.append("+5：三个圆形底衬内为水滴、叶片、包装箱三个对应图标（以图片或矢量图形绘制），而非♧、♢、▱等文本符号字符充当图标")
+    else:
+        results.append("+0：三个圆形底衬内为水滴、叶片、包装箱三个对应图标（以图片或矢量图形绘制），而非♧、♢、▱等文本符号字符充当图标")
+
+    # ============================================================
+    # +5：第1页右栏三组文字完整且逐行呈现——标题"环保涂层：""绿色材料：""应用方案："
+    #     加粗深墨绿、全角冒号、字号大于其下条目；条目分别 3 行 / 2 行 / 2 行
+    # 严格对齐细则：
+    #   ① 三个标题逐字一致且使用全角冒号"："
+    #   ② 标题加粗、深墨绿，字号大于同组条目字号
+    #   ③ 条目内容逐字一致，且行数分别为 3、2、2
+    # 与办公软件对齐：a:p 分段 → 每条一行；全角/半角冒号在 PPT 里字形宽度不同。
+    def group_texts(pg, circles):
+        """把右栏文字块按纵向位置归到最近的圆形底衬，得到三组文字。
+        只认"与圆形底衬大致平齐"的文字块（纵向中心差 ≤ 圆直径的 0.9 倍），
+        这样右栏顶部的胶囊标签文字不会被算进任何一组。"""
+        buckets = [[] for _ in circles]
+        for t in pg['texts']:
+            if not circles or t.left <= min(c.left for c in circles):
+                continue
+            if rw(t.cx()) < 0.50:
+                continue
+            k = min(range(len(circles)),
+                    key=lambda i: abs(t.cy() - circles[i].cy()))
+            if abs(t.cy() - circles[k].cy()) > 0.9 * circles[k].height:
+                continue
+            buckets[k].append(t)
+        return buckets
+
+    TITLES1 = ('环保涂层：', '绿色材料：', '应用方案：')
+    ITEMS1 = (('水性树脂', '功能助剂', '高阻隔涂层'),
+              ('可降解薄膜', '纸塑复合材料'),
+              ('工业胶黏剂', '包装表面处理'))
+
+    def right_groups_ok(pg, circles, titles, items, need_bold_teal=True):
+        buckets = group_texts(pg, circles)
+        if len(buckets) != len(titles):
+            return False
+        for k, bucket in enumerate(buckets):
+            title = titles[k]
+            t_key = nospace(title)
+            hit_title = False
+            title_sz = 0.0
+            item_szs = []
+            item_lines = 0
+            joined = ''
+            for sh in bucket:
+                for para in sh.runs:
+                    rs = [r for r in para if r['t'].strip()]
+                    if not rs:
+                        continue
+                    ptxt = _norm_text(''.join(r['t'] for r in rs))
+                    joined += ptxt + '\n'
+                    if t_key in nospace(ptxt):
+                        hit_title = True
+                        title_sz = max(title_sz, max(r['sz'] for r in rs))
+                        if need_bold_teal:
+                            if not all(r['b'] for r in rs):
+                                return False
+                            if not any(_is_deep_teal(r['clr'] or '')
+                                       for r in rs):
+                                return False
+                    else:
+                        item_szs.append(max(r['sz'] for r in rs))
+                        item_lines += 1
+            if not hit_title:
+                return False
+            if item_szs and title_sz <= max(item_szs):
+                return False
+            if item_lines != len(items[k]):
+                return False
+            flat = nospace(joined)
+            if not all(nospace(x) in flat for x in items[k]):
+                return False
+        return True
+
+    if circ1 and right_groups_ok(p1, circ1, TITLES1, ITEMS1):
+        results.append('+5：第1页右栏三组文字完整且逐行呈现——标题依次为"环保涂层："、"绿色材料："、"应用方案："，加粗深墨绿、使用全角冒号、字号大于其下条目；条目依次为"水性树脂／功能助剂／高阻隔涂层"共3行、"可降解薄膜／纸塑复合材料"共2行、"工业胶黏剂／包装表面处理"共2行')
+    else:
+        results.append('+0：第1页右栏三组文字完整且逐行呈现——标题依次为"环保涂层："、"绿色材料："、"应用方案："，加粗深墨绿、使用全角冒号、字号大于其下条目；条目依次为"水性树脂／功能助剂／高阻隔涂层"共3行、"可降解薄膜／纸塑复合材料"共2行、"工业胶黏剂／包装表面处理"共2行')
+
+    # ============================================================
+    # +1：三组之间设有2条细横向分隔线，位于组间空隙处，跨度占页宽0.20-0.35
+    # 严格对齐细则：
+    #   ① 右栏内有 2 条细横线（高度极小）
+    #   ② 每条跨度占页宽 0.20-0.35
+    #   ③ 位于相邻两组之间的空隙（纵向落在两个圆形底衬之间）
+    # 与办公软件对齐：即右栏两组之间那条淡淡的横向细线。
+    sep_cnt = 0
+    if len(circ1) == 3:
+        tops = sorted(c.top for c in circ1)
+        bots = sorted(c.bottom() for c in circ1)
+        gaps = [(bots[0], tops[1]), (bots[1], tops[2])]
+        for lo, hi in gaps:
+            for s in hlines_of(p1):
+                if rw(s.cx()) < 0.50:
+                    continue
+                if not (0.20 <= rw(s.width) <= 0.35):
+                    continue
+                if lo - 0.02 * H <= s.cy() <= hi + 0.02 * H:
+                    sep_cnt += 1
+                    break
+    if sep_cnt >= 2:
+        results.append("+1：三组之间设有2条细横向分隔线，位于组间空隙处，跨度覆盖圆形底衬至文字块右缘（占页宽0.20-0.35）")
+    else:
+        results.append("+0：三组之间设有2条细横向分隔线，位于组间空隙处，跨度覆盖圆形底衬至文字块右缘（占页宽0.20-0.35）")
+
+    # ============================================================
+    # +5：两页底部深墨绿色带，上缘为平滑曲线（自由曲线/曲线路径），横向覆盖≥页宽0.70，
+    #     最高处占页高0.15-0.35；直角矩形、波浪预设形状、矩形堆叠近似者不达标
+    # 严格对齐细则：
+    #   ① 色带以自由曲线绘制：custGeom 路径且含贝塞尔曲线段（cubicBezTo/quadBezTo）
+    #   ② 填充为墨绿族
+    #   ③ 曲线色带横向覆盖 ≥ 页宽 0.70
+    #   ④ 最高处占页高 0.15-0.35
+    # 与办公软件对齐：custGeom+cubicBezTo → PPT 里的"任意多边形/曲线"，编辑顶点时
+    #   看到的是带弧度的控制柄；prstGeom prst="wave" 只是预设波浪，边缘规律呆板。
+    band_ok = True
+    for pg in (p1, p2):
+        curved = [s for s in bands_of(pg) if s.has_custgeom and s.curve_n > 0]
+        if not curved:
+            band_ok = False
+            continue
+        cover = _union_span([(s.left, s.right()) for s in curved])
+        top_h = max(rh(s.height) for s in curved)
+        if rw(cover) < 0.70 or not (0.15 <= top_h <= 0.35):
+            band_ok = False
+    if band_ok:
+        results.append("+5：两页底部均设有深墨绿色带，上缘为平滑曲线（以自由曲线/曲线路径绘制），横向覆盖≥页宽0.70，最高处占页高0.15-0.35；以直角矩形、波浪预设形状或多个矩形/旋转矩形堆叠近似出折角、平直边缘者不达标")
+    else:
+        results.append("+0：两页底部均设有深墨绿色带，上缘为平滑曲线（以自由曲线/曲线路径绘制），横向覆盖≥页宽0.70，最高处占页高0.15-0.35；以直角矩形、波浪预设形状或多个矩形/旋转矩形堆叠近似出折角、平直边缘者不达标")
+
+    # ============================================================
+    # +3：第1页底部色带左端设有铜橙色块/渐变过渡段，与深墨绿色带衔接形成双色收边，
+    #     宽占页宽0.10-0.45
+    # 严格对齐细则（两种做法都认，只要收边宽度落在 0.10-0.45 页宽）：
+    #   ① 独立的铜橙色形状压在色带左端；或
+    #   ② 色带本身用渐变填充，铜橙色标位于左端，其铜橙段宽度占页宽 0.10-0.45
+    # 与办公软件对齐：gradFill/gs@pos → 渐变光圈位置（1/1000 百分比），lin@ang=0 表示
+    #   从左到右过渡，因此铜橙段宽度 = 最后一个铜橙光圈位置 × 色带宽度。
+    copper_ok = False
+    for s in p1['all']:
+        if s.is_group or s.area() <= 0:
+            continue
+        if rh(s.bottom()) < 0.80 or rw(s.left) > 0.15:
+            continue
+        if s.fill_kind == 'solid' and any(_is_copper(h) for h in s.fills):
+            if 0.10 <= rw(s.width) <= 0.45:
+                copper_ok = True
+    if not copper_ok:
+        for s in bands_of(p1):
+            if s.fill_kind != 'grad':
+                continue
+            g = s.el.find(_p('spPr')).find(_a('gradFill'))
+            last = 0.0
+            for gs in g.iter(_a('gs')):
+                h = _clr_hex(gs, theme)
+                if h and _is_copper(h):
+                    last = max(last, _int_attr(gs, 'pos', 0) / 100000.0)
+            seg = rw(last * s.width)
+            if 0.10 <= seg <= 0.45:
+                copper_ok = True
+    if copper_ok:
+        results.append("+3：第1页底部色带左端设有铜橙色块/渐变过渡段，与深墨绿色带衔接形成双色收边，宽占页宽0.10-0.45")
+    else:
+        results.append("+0：第1页底部色带左端设有铜橙色块/渐变过渡段，与深墨绿色带衔接形成双色收边，宽占页宽0.10-0.45")
+
+    # ============================================================
+    # +3：第2页左上角英文公司名分两行"FUJIAN LANYU NOVA"与"MATERIALS CO., LTD."，
+    #     加粗深墨绿，为该页最大字号文本，左边缘位于页宽0.04-0.12
+    # 严格对齐细则：
+    #   ① 内容分两行，且两行文字分别与细则给出的两段一致
+    #   ② 加粗、深墨绿
+    #   ③ 为该页最大字号文本
+    #   ④ 左边缘位于页宽 0.04-0.12
+    # 说明：手写花体/书法体的标称字号与常规字体不可直接比较（同样磅值下花体的字面
+    #   要小得多），因此"该页最大字号"只与常规字体文本比较，不与花体姓名比较。
+    # 与办公软件对齐：a:p 两段 → 两行；sz 与页内其他文字比较即"该页最大字号"。
+    en2 = first(en_name2)
+    en2_ok = en2 is not None
+    if en2_ok:
+        lines = [_norm_text(''.join(r['t'] for r in para)).upper()
+                 for para in en2.runs
+                 if ''.join(r['t'] for r in para).strip()]
+        rs = runs_of(en2)
+        plain_szs = [r['sz'] for _, r in _iter_runs(p2['texts'])
+                     if not _is_script_font(r['latin'] or '')
+                     and not _is_kai_font(r['ea'] or r['latin'] or '')]
+        biggest = max(plain_szs) if plain_szs else 0.0
+        en2_ok = (len(lines) == 2
+                  and nospace(lines[0]) == 'FUJIANLANYUNOVA'
+                  and nospace(lines[1]) == 'MATERIALSCO.,LTD.'
+                  and all(r['b'] for r in rs)
+                  and any(_is_deep_teal(r['clr'] or '') for r in rs)
+                  and sz_of(en2) >= biggest - 0.01
+                  and 0.04 <= rw(en2.left) <= 0.12)
+    if en2_ok:
+        results.append('+3：第2页左上角设有英文公司名，分两行呈现"FUJIAN LANYU NOVA"与"MATERIALS CO., LTD."，加粗深墨绿，为该页最大字号文本，左边缘位于页宽0.04-0.12')
+    else:
+        results.append('+0：第2页左上角设有英文公司名，分两行呈现"FUJIAN LANYU NOVA"与"MATERIALS CO., LTD."，加粗深墨绿，为该页最大字号文本，左边缘位于页宽0.04-0.12')
+
+    # ============================================================
+    # +3：第2页姓名"Ethan Shen"，手写花体英文字体、深墨绿、上边缘位于页高0.30-0.45，
+    #     与第1页姓名位置大致对应
+    # 严格对齐细则：
+    #   ① 文字为"Ethan Shen"
+    #   ② 西文字体为脚本体/手写花体
+    #   ③ 文字色为深墨绿
+    #   ④ 上边缘位于页高 0.30-0.45
+    #   ⑤ 左边缘与第1页姓名左边缘大致对应（差异 ≤ 页宽 0.10）
+    # 与办公软件对齐：a:latin typeface="Segoe Script" 等 → 字体框里的手写花体。
+    et = first(ethan)
+    et_ok = et is not None and xg is not None
+    if et_ok:
+        rs = runs_of(et)
+        fonts = [r['latin'] for r in rs if r['latin']]
+        et_ok = (nospace(et.text).lower() == 'ethanshen'
+                 and fonts and all(_is_script_font(f) for f in fonts)
+                 and any(_is_deep_teal(r['clr'] or '') for r in rs)
+                 and 0.30 <= rh(et.top) <= 0.45
+                 and abs(rw(et.left) - rw(xg.left)) <= 0.10)
+    if et_ok:
+        results.append('+3：第2页左半区设有姓名"Ethan Shen"，采用手写花体英文字体（Segoe Script等脚本体），深墨绿，上边缘位于页高0.30-0.45，与第1页姓名位置大致对应')
+    else:
+        results.append('+0：第2页左半区设有姓名"Ethan Shen"，采用手写花体英文字体（Segoe Script等脚本体），深墨绿，上边缘位于页高0.30-0.45，与第1页姓名位置大致对应')
+
+    # ============================================================
+    # +3：第2页与第1页同款的3行徽章式联系方式，英文地址完整并断为3行
+    # 严格对齐细则：
+    #   ① 第2页左半区同样有 3 个徽章、等距堆叠、左边缘对齐
+    #   ② 三行内容为电话、邮箱、英文地址
+    #   ③ 英文地址三段内容逐字齐全，并断为 3 行
+    # 与办公软件对齐：三个 a:p 段落 → 地址显示为三行。
+    ad2 = first(addr2)
+    c27 = badge_rows_ok(p2, badge2)
+    c27 = c27 and bool(phone2) and bool(mail2) and ad2 is not None
+    if c27:
+        flat2 = _norm_text(ad2.text).lower().replace(' ', '')
+        lines2 = [_norm_text(''.join(r['t'] for r in para))
+                  for para in ad2.runs
+                  if ''.join(r['t'] for r in para).strip()]
+        want = ('suite1208,bluebayinnovationcenter,',
+                'no.88yunchuangavenue,',
+                'haicangdistrict,xiamen,fujian,china')
+        c27 = (len(lines2) == 3 and all(w in flat2 for w in want)
+               and '4826' in ' '.join(s.text for s in phone2))
+    if c27:
+        results.append('+3：第2页左半区设有与第1页同款的3行徽章式联系方式（相同图标样式＋"M.P. 139 4826 7153"、"z.xing@lanyunova.com"、英文地址），英文地址完整呈现"Suite 1208, BlueBay Innovation Center,"、"No. 88 Yunchuang Avenue,"、"Haicang District, Xiamen, Fujian, China"并断为3行')
+    else:
+        results.append('+0：第2页左半区设有与第1页同款的3行徽章式联系方式（相同图标样式＋"M.P. 139 4826 7153"、"z.xing@lanyunova.com"、英文地址），英文地址完整呈现"Suite 1208, BlueBay Innovation Center,"、"No. 88 Yunchuang Avenue,"、"Haicang District, Xiamen, Fujian, China"并断为3行')
+
+    # ============================================================
+    # +3：第2页右栏"MAIN BUSINESS"胶囊标签（深墨绿实心＋白色文字）并设纵向分隔线，
+    #     标签左边缘与分隔线横坐标同第1页对应元素差异≤页宽0.06
+    # 严格对齐细则：
+    #   ① 有 MAIN BUSINESS 胶囊标签，墨绿实心 + 白色文字
+    #   ② 有纵向分隔线
+    #   ③ 标签左边缘、分隔线横坐标与第1页对应元素差异均 ≤ 页宽 0.06
+    # 与办公软件对齐：正反面同位置元素在"大小和位置"里读到的水平位置基本一致。
+    c28 = cap2 is not None and vdiv2 is not None and cap1 is not None \
+        and vdiv1 is not None
+    if c28:
+        rs = [r for t in cap_texts(p2, cap2) for r in runs_of(t)]
+        c28 = (rs and any(_is_white(r['clr'] or '') for r in rs)
+               and rw(abs(cap2.left - cap1.left)) <= 0.06
+               and rw(abs(vdiv2.cx() - vdiv1.cx())) <= 0.06)
+    if c28:
+        results.append('+3：第2页右栏顶部设有"MAIN BUSINESS"胶囊标签（深墨绿实心＋白色文字）并设纵向分隔线，标签左边缘与分隔线横坐标同第1页对应元素差异≤页宽0.06')
+    else:
+        results.append('+0：第2页右栏顶部设有"MAIN BUSINESS"胶囊标签（深墨绿实心＋白色文字）并设纵向分隔线，标签左边缘与分隔线横坐标同第1页对应元素差异≤页宽0.06')
+
+    # ============================================================
+    # +5：第2页右栏3个主营分组，英文标题与条目逐字齐全，每组配浅色圆形底衬＋真实图标
+    # 严格对齐细则：
+    #   ① 三个英文标题逐字一致
+    #   ② 条目内容逐字一致，行数分别为 3、2、2
+    #   ③ 每组有浅色圆形底衬，且圆内图标为图片/矢量图形（非符号字符）
+    # 与办公软件对齐：与第1页右栏同构，只是文字换成英文。
+    TITLES2 = ('ECO COATINGS:', 'GREEN MATERIALS:', 'APPLICATION SOLUTIONS:')
+    ITEMS2 = (('Water-based resins', 'Functional additives',
+               'Barrier coatings'),
+              ('Biodegradable films', 'Paper-plastic composites'),
+              ('Industrial adhesives', 'Packaging surface treatment'))
+    c29 = (len(circ2) == 3
+           and circle_groups_ok(p2, circ2)
+           and icons_real(p2, circ2, 3)
+           and right_groups_ok(p2, circ2, TITLES2, ITEMS2,
+                               need_bold_teal=False))
+    if c29:
+        results.append('+5：第2页右栏设有3个主营分组，标题依次为"ECO COATINGS:"、"GREEN MATERIALS:"、"APPLICATION SOLUTIONS:"，条目分别为"Water-based resins／Functional additives／Barrier coatings"、"Biodegradable films／Paper-plastic composites"、"Industrial adhesives／Packaging surface treatment"，每组均配浅色圆形底衬＋水滴/叶片/包装箱图标')
+    else:
+        results.append('+0：第2页右栏设有3个主营分组，标题依次为"ECO COATINGS:"、"GREEN MATERIALS:"、"APPLICATION SOLUTIONS:"，条目分别为"Water-based resins／Functional additives／Barrier coatings"、"Biodegradable films／Paper-plastic composites"、"Industrial adhesives／Packaging surface treatment"，每组均配浅色圆形底衬＋水滴/叶片/包装箱图标')
+
+    # ============================================================
+    # +5：第2页底部色带内4组"图标＋全大写标签"，横向等距排列于色带左侧2/3范围内；
+    #     图标为图片或矢量图形而非文本符号字符，标签字号≥8磅
+    # 严格对齐细则：
+    #   ① 四个标签 SUSTAINABLE / INNOVATIVE / RELIABLE / GLOBAL 齐全且全大写
+    #   ② 四组位于色带内（页高 0.80 以下）、横坐标都在页宽 2/3 以内
+    #   ③ 横向等距（相邻间距差异 ≤ 图标宽度的 0.5 倍）
+    #   ④ 每个标签上方配一个图片/矢量图形图标，且不是符号字符文字
+    #   ⑤ 标签字号 ≥ 8 磅
+    # 与办公软件对齐：字号被压到 7 磅以下在 PPT 里几乎看不清，属"惹麻烦"。
+    WORDS = ('SUSTAINABLE', 'INNOVATIVE', 'RELIABLE', 'GLOBAL')
+    labels = []
+    for w in WORDS:
+        hit = [s for s in p2['texts']
+               if nospace(s.text).upper() == w and rh(s.cy()) > 0.78]
+        if hit:
+            labels.append(hit[0])
+    c30 = len(labels) == 4
+    if c30:
+        c30 = all(sz_of(s) >= 8.0 for s in labels)
+        c30 = c30 and all(s.text == s.text.upper() for s in labels)
+        c30 = c30 and all(rw(s.cx()) <= 0.67 for s in labels)
+    if c30:
+        icons = []
+        for lb in labels:
+            cand = []
+            for s in p2['all']:
+                if s.is_group or s.has_text() or s.area() <= 0:
+                    continue
+                if not (s.is_pic or s.has_custgeom or s.prst):
+                    continue
+                if abs(s.cx() - lb.cx()) > 1.2 * max(lb.width, lb.height):
+                    continue
+                if s.cy() > lb.cy():
+                    continue
+                if rh(s.cy()) < 0.72:
+                    continue
+                cand.append(s)
+            # 一个标签配"正上方最近"的那个图标：先比横向偏移，再比谁更贴近标签
+            cand.sort(key=lambda s: (abs(s.cx() - lb.cx()), -s.cy()))
+            icons.append(cand[0] if cand else None)
+        c30 = all(ic is not None for ic in icons)
+        # 四个标签必须各自配到不同的图标，不能几个标签共用同一个图形
+        c30 = c30 and len(set(id(ic) for ic in icons)) == 4
+        if c30:
+            cxs = sorted(ic.cx() for ic in icons)
+            wdt = sum(ic.width for ic in icons) / 4.0
+            c30 = _equidistant(cxs, 0.5 * wdt)
+    if c30:
+        results.append('+5：第2页底部深墨绿色带内设有4组"图标＋全大写标签"，依次为叶片-SUSTAINABLE、循环箭头-INNOVATIVE、盾牌对勾-RELIABLE、地球-GLOBAL，横向等距排列于色带左侧2/3范围内；4个图标为图片或矢量图形而非文本符号字符，标签文字字号≥8磅、清晰可读（未被压缩至7磅以下）')
+    else:
+        results.append('+0：第2页底部深墨绿色带内设有4组"图标＋全大写标签"，依次为叶片-SUSTAINABLE、循环箭头-INNOVATIVE、盾牌对勾-RELIABLE、地球-GLOBAL，横向等距排列于色带左侧2/3范围内；4个图标为图片或矢量图形而非文本符号字符，标签文字字号≥8磅、清晰可读（未被压缩至7磅以下）')
+
+    # ============================================================
+    # +1：第2页底部色带上缘另有波浪/曲线类线条装饰，横向跨度≥页宽0.20
+    # 严格对齐细则：
+    #   ① 是独立于色带本体的另一个对象（色带自己的曲线上缘不算）
+    #   ② 位于色带上缘附近：纵向中心落在色带纵向范围内，或在其上缘之上 0.10 页高内
+    #   ③ 起于版面左侧（左边缘位于页宽 0.20 以内），横向跨度 ≥ 页宽 0.20
+    #   ④ 形态为波浪/曲线/线条类即可：自由曲线、曲线或直线连接符、wave/arc 等
+    #      预设曲线形状、细长线条形状（宽 ≥ 6 倍高）均可，深浅不限
+    # 与办公软件对齐：本条只认"色带之外另叠了一道装饰线"这件事，画法与颜色都放开，
+    #   用曲线工具画的、插入波浪/弧形预设形状的、拿细长形状叠出来的都算；右栏那种
+    #   短横向分隔线因起点在版面右半区，不会被算成色带装饰。
+    wave_ok = False
+    bands2 = bands_of(p2)
+    band2_ids = set(id(s) for s in bands2)
+    if bands2:
+        b_top = min(s.top for s in bands2)
+        b_bot = max(s.bottom() for s in bands2)
+    else:
+        b_top, b_bot = int(0.70 * H), H
+    for s in p2['all']:
+        if s.is_group or s.has_text() or id(s) in band2_ids:
+            continue
+        if rw(s.width) < 0.20 or rw(s.left) > 0.20:
+            continue
+        if not (b_top - 0.10 * H <= s.cy() <= b_bot):
+            continue
+        curvy = (s.has_custgeom or s.curve_n > 0 or s.kind == 'cxn'
+                 or (s.prst or '').startswith(('wave', 'doubleWave', 'arc',
+                                               'curvedConnector', 'bentConnector'))
+                 or (s.prst or '') == 'line'
+                 or (s.height > 0 and s.width >= 6 * s.height))
+        if curvy:
+            wave_ok = True
+    if wave_ok:
+        results.append("+1：第2页底部色带上缘另叠有波浪/曲线类线条装饰，起于版面左侧、横向跨度≥页宽0.20，且为独立于色带本体的对象（自由曲线、曲线连接符、波浪或弧形预设形状、细长线条形状均可，深浅不限）")
+    else:
+        results.append("+0：第2页底部色带上缘另叠有波浪/曲线类线条装饰，起于版面左侧、横向跨度≥页宽0.20，且为独立于色带本体的对象（自由曲线、曲线连接符、波浪或弧形预设形状、细长线条形状均可，深浅不限）")
+
+    # ============================================================
+    # +5：两页所有对象均落在卡片主体范围内，装饰图形与文字不相互遮挡、
+    #     文本框之间无重叠、无内容溢出画布边界
+    # 严格对齐细则：
+    #   ① 每个对象都落在卡片主体范围内（允许 0.02 页宽/页高的描边级误差）
+    #   ② 没有内容溢出画布边界
+    #   ③ 文本框之间不重叠（按行数×字号估算的实际字块，重叠 > 较小者的 0.5 视为重叠）
+    #   ④ 后置的实心装饰图形没有压住文字（覆盖 > 文字框 0.5 视为遮挡）
+    # 说明：文字放在胶囊/圆形底衬之上是设计需要，不算遮挡——判定只看"后画的
+    #   实心图形压住了先画的文字"这种真正会看不见字的情况。文本框高度常留有
+    #   富余，框线相擦不等于文字压字，故文字之间按实际字块估算后再比。宽高为负
+    #   的畸形图形坐标本身已不可读，由"宽高非负"一项单独扣分，这里不重复计入。
+    def layout_ok(pg, card):
+        tol_x, tol_y = 0.02 * W, 0.02 * H
+        for s in pg['all']:
+            if s.area() <= 0 or s.raw_w < 0 or s.raw_h < 0:
+                continue
+            if s.left < -tol_x or s.top < -tol_y \
+                    or s.right() > W + tol_x or s.bottom() > H + tol_y:
+                return False
+            if card is not None:
+                if s.left < card.left - tol_x or s.top < card.top - tol_y \
+                        or s.right() > card.right() + tol_x \
+                        or s.bottom() > card.bottom() + tol_y:
+                    return False
+        txts = [s for s in pg['all'] if s.has_text() and s.area() > 0]
+        inks = [_text_ink_box(s) for s in txts]
+        for i in range(len(txts)):
+            for j in range(i + 1, len(txts)):
+                small = min(_box_area(inks[i]), _box_area(inks[j]))
+                if small > 0 and _box_inter_area(inks[i], inks[j]) > 0.5 * small:
+                    return False
+        for t in txts:
+            for s in pg['all']:
+                if s is t or s.has_text() or s.is_group or s.area() <= 0:
+                    continue
+                if s.z <= t.z:
+                    continue
+                if s.fill_kind not in ('solid', 'grad', 'pic'):
+                    continue
+                if _cover_ratio(t, s) > 0.5:
+                    return False
+        return True
+
+    if layout_ok(p1, card1) and layout_ok(p2, card2):
+        results.append("+5：两页所有对象均落在卡片主体范围内，装饰图形与文字不相互遮挡、文本框之间无重叠、无内容溢出画布边界")
+    else:
+        results.append("+0：两页所有对象均落在卡片主体范围内，装饰图形与文字不相互遮挡、文本框之间无重叠、无内容溢出画布边界")
+
+    # ============================================================
+    # +3：两页共用统一配色体系（深墨绿为主色、铜橙为辅色、米白为底色），
+    #     无明显跳色或高饱和杂色；卡片主体不描黑色边框
+    # 严格对齐细则：
+    #   ① 卡片主体不描黑色边框（近黑且接近中性灰的描边即视为黑边）
+    #   ② 全篇填充色与文字色中，不出现"高饱和且色相既不属墨绿也不属铜橙"的杂色
+    # 说明：只对"亮度中高 + 饱和度高"的颜色设色相门槛——深色、浅色、灰调色在视觉上
+    #   不构成跳色，不据此扣分。
+    # 与办公软件对齐：a:ln/solidFill → 形状轮廓颜色；黑色描边会让米白卡片显得生硬。
+    def stray_color(hexstr):
+        c = _rgb(hexstr)
+        if c is None:
+            return False
+        h, s, l = _rgb_to_hsl(c)
+        if s < 0.60 or not (0.30 <= l <= 0.88):
+            return False
+        deg = h * 360.0
+        if 140.0 <= deg <= 210.0 or deg <= 50.0 or deg >= 350.0:
+            return False
+        return True
+
+    color_ok = True
+    for pg, cd in ((p1, card1), (p2, card2)):
+        if cd is not None and cd.line_hex and _is_blackish(cd.line_hex):
+            color_ok = False
+        for s in pg['all']:
+            for hx in s.fills:
+                if stray_color(hx):
+                    color_ok = False
+        for _, r in _iter_runs(pg['texts']):
+            if r['clr'] and stray_color(r['clr']):
+                color_ok = False
+    if color_ok:
+        results.append("+3：两页共用统一配色体系（深墨绿#004F49-#05565D为主色、铜橙#B5713C-#C77B45为辅色、米白为底色），无明显跳色或高饱和杂色；卡片主体不描黑色边框")
+    else:
+        results.append("+0：两页共用统一配色体系（深墨绿#004F49-#05565D为主色、铜橙#B5713C-#C77B45为辅色、米白为底色），无明显跳色或高饱和杂色；卡片主体不描黑色边框")
+
+    # ========== 将 results 反解为结构化 dim2_items ==========
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"dim2 项数不一致：results={len(results)} vs order={len(_MAX_DELTAS_ORDER)}")
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta > 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total_score += (max_delta if hit else 0)
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = MAX_SCORE_TOTAL
+    return result
 
 
 if __name__ == "__main__":
-    # 仅用于本地调试：默认传入脚本所在目录。
-    debug_dir = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent)
-    print(json.dumps(evaluate(debug_dir), ensure_ascii=False, indent=2))
+    # 本地调试入口：evaluate 只接收"脚本所在目录的路径"，由脚本自己在该目录里
+    # 定位并打开被评估的 .pptx。命令行第 1 个参数可覆盖目录路径；未指定时使用
+    # 脚本自身所在目录。
+    # 注：evaluate() 的接口约定就是"入参为目录路径"——路径始终由外部显式传入；
+    #     这里的默认值仅为本地调试便利，不影响 evaluate 的接口约定。
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

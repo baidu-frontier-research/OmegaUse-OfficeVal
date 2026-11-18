@@ -1,1250 +1,963 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingImports=false, reportOptionalSubscript=false, reportOptionalMemberAccess=false
+"""officeval 074：「农业县低空经济发展方案.pptx」中译英交付稿完成度评测。
+
+指令要的活是「把 PPT 里所有中文翻译成英语」，禁止动的是「排版与图片背景」。
+因此加分项只判各类文字元素的英译覆盖面与译文质量，减分项只判指令未要求、
+却被改动而破坏版面的属性（字号、字色、加粗、对齐、填充、遮罩、图像数据、
+页数页序、编号文字等）。同一属性只按一条细则计扣，不跨条重复计分。
+
+按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。主结果统一由
+evaluate(dir_path) -> dict 返回；入参为「脚本所在目录的路径」，由脚本自己在该
+目录内定位并打开被评估的 .pptx。本文件仅在 __main__ 下作为本地调试入口，才把
+dict 序列化为 JSON 打印。
+
+原稿基线（46 页每页的形状/图片数量、每个文本形状的磅值·加粗·色值·对齐、
+色块与遮罩填充签名、配图几何与 srcRect、媒体 md5、编号文字等）已内嵌在
+_BASELINE_JSON 中，评测时无需另行提供原稿文件。
 """
-自动评估 PPT 文件：农业县低空经济发展方案_English.pptx
 
-评估流程：
-  维度1（可用与可修改性）—— 任一不满足直接判为 0 分，不再检查维度2。
-  维度2（完成度评分细则）—— 累计每条命中的细则分值（加 / 扣）。
-
-加分细则：必须 *全部* 满足该条所列的所有点，才计入加分。
-扣分细则：只要满足该条所列的 *任意一点*，即计入扣分。
-
-最终输出：命中的细则明细 + 最终得分。
-"""
-
-import json
 import os
 import re
 import sys
-
-from pptx import Presentation
-
-NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-
-# ----------------------------- 配置 -----------------------------
+import json
+import zipfile
+import hashlib
+from xml.etree import ElementTree as ET
 
 SCRIPT_ID = "074"
-# 期望的目标文档名（若在传入目录里找不到该名，会退化为该目录下任意 .pptx 文件）
-EXPECTED_DOC_NAME = "农业县低空经济发展方案_English.pptx"
 
-EXPECTED_PAGES = 46
-TITLE_SLIDES = {3, 6, 14, 17, 19, 23, 42}     # 章节标题页
-COVER_SLIDE = 1
-TOC_SLIDE = 2
-THANK_SLIDE = 46
-NON_CONTENT_SLIDES = {1, 2, 3, 6, 14, 17, 19, 23, 42, 46}
+# 满分只统计加分项：+5 全篇覆盖 + 11×(+3) 各类元素 + 2×(+1) 专项 = 40
+MAX_SCORE_TOTAL = 40
 
-# 字号容差（pt）。PPT 中字号常存在 ±0.5pt 的舍入。
-SZ_TOL = 0.5
+# dim2 各条的满分增量，必须与 _evaluate_impl 内 results 的追加顺序严格一致。
+# 正值为加分项（计入满分），负值为减分项（命中即扣，不计入满分）。
+_MAX_DELTAS_ORDER = [
+    5,    # 01 全篇 46 页无中文残留
+    3,    # 02 第1页封面主标题·副标题·右上角徽章英译
+    3,    # 03 第2页目录 7 条 PART 条目标题及说明文字英译
+    3,    # 04 章节分隔页章节标题与一句话导语英译
+    3,    # 05 各内容页顶部主标题英译
+    3,    # 06 主标题下方过渡副标题英译
+    3,    # 07 卡片小标题与卡片正文段落英译
+    3,    # 08 指标磁贴文字英译
+    3,    # 09 流程步骤条文字英译
+    3,    # 10 第16与第36页对比行行标题·说明·结论句英译
+    3,    # 11 全部 46 条底部页脚导航英译
+    3,    # 12 译文完整通顺（无中英混排、无漏译、无乱码）
+    1,    # 13 第46页"感谢观看"与署名行英译
+    1,    # 14 第18页横幅句·第5页强调句·第24页放大路径英译
+    -3,   # 15 页数页序与内容对应关系被改动
+    -3,   # 16 画布不再是 13.333 × 7.5 英寸
+    -3,   # 17 任一页面形状对象数量减少
+    -1,   # 18 封面主标题字号/字色被改动
+    -1,   # 19 封面副标题字号/字色被改动
+    -1,   # 20 满版底图上方深色遮罩被改动
+    -1,   # 21 目录 PART 条目标题与说明文字字号/字色被改动
+    -3,   # 22 章节分隔页两位数序号字号/字色被改动
+    -3,   # 23 章节分隔页标题与导语字号/字色被改动
+    -5,   # 24 内容页顶部主标题字号/字色被改动
+    -5,   # 25 卡片正文段落字号/字色被改动
+    -3,   # 26 过渡副标题字号/字色被改动
+    -3,   # 27 卡片小标题字号/字色被改动
+    -3,   # 28 加粗状态被改动
+    -3,   # 29 对齐方式被改动
+    -3,   # 30 指标磁贴字号/字色被改动
+    -3,   # 31 第16页对比行与结论句字号/字色被改动
+    -3,   # 32 第36页对比行与结论句字号被改动
+    -3,   # 33 流程步骤序号与步骤名称字号被改动
+    -1,   # 34 第18页横幅句与横幅底色被改动
+    -1,   # 35 第5页强调句被改动
+    -1,   # 36 第24页"放大路径"标题与说明被改动
+    -3,   # 37 底部页脚导航字号/字色被改动
+    -1,   # 38 页面底色·顶部色条·卡片底板填充或圆角被改动
+    -5,   # 39 配图图像数据未逐字节保持一致
+    -3,   # 40 配图裁剪范围·摆放·叠放层次被改动
+    -3,   # 41 说明性文字被删除或改写
+    -1,   # 42 编号类文字被改写或丢失
+    -1,   # 43 署名·机构名·地名等实体名称取值被改动
+    -5,   # 44 英文使行距被压缩（写入 lnSpcReduction）
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
 
-# ----------------------------- 工具函数 -----------------------------
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+_EMU_PER_INCH = 914400.0
+
+# 细则允许「位置偏差不超过 0.01 英寸」的另存等价改写，判定时取 0.011 作容差
+_POS_TOL = 0.011
+
+# 原稿主题的配色映射：细则允许「仅重写颜色写法而渲染色值不变」（如白色由 FFFFFF
+# 改写为主题背景色），故主题色一律先归一化为具体色值再比较
+_SCHEME_COLOR = {"bg1": "FFFFFF", "lt1": "FFFFFF", "tx1": "000000",
+                 "dk1": "000000", "bg2": "FFFFFF", "tx2": "000000"}
+
+_CJK_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
+# 中文标点（含全角标点）；不含 ‘’“” 等英文也常用的弯引号，避免误判正常英文排印
+_CJK_PUNCT_RE = re.compile(r"[　-〿！-～]")
+# 判定一个 run 是否承载可感知字形：含字母、数字或汉字才算，纯空白/纯标点不算
+_GLYPH_RE = re.compile(r"[0-9A-Za-z㐀-䶿一-鿿豈-﫿]")
+
+# 章节分隔页、指标磁贴页、流程步骤条页（按原稿页号）
+_SEC_PAGES = frozenset({3, 6, 14, 17, 19, 23, 42})
+_METRIC_PAGES = frozenset({15, 24})
+_STEP_PAGES = frozenset({8, 9, 22, 33, 34, 37, 44})
+
+# 实体名一致性判定时忽略的通用词（保留"青岚"音译一类专有名词参与比较）
+_ENTITY_STOP = frozenset({
+    "the", "and", "for", "with", "from", "into", "county", "countys", "county's",
+    "agricultural", "agriculture", "low", "altitude", "lowaltitude", "aerial",
+    "application", "applications", "implementation", "plan", "project", "program",
+    "research", "group", "team", "work", "task", "force", "study", "office",
+})
+
+# 细则中「为容纳英文而调整文本框的位置、尺寸、内边距或垂直锚点」一条已在评测口径
+# 中删除（英文本身比中文长，允许为容纳英文调整文本框）。经确认，【封面主标题】
+# 【内容页主标题】【底部页脚】等条目内含的文本框几何子句（如 L0.65/T0.52/W9.30/
+# H0.50）随该条一并豁免，一律不参与判定；本开关仅为留档，正常评测不应改动
+_JUDGE_TEXTBOX_GEOMETRY = False
+
+# 细则规定的文本框几何（英寸：左/上/宽/高），已随文本框调整条豁免，仅留档备查
+_BOX_COVER_TITLE = (0.66, 1.70, 5.10, 1.30)
+_BOX_MAIN_TITLE = (0.65, 0.52, 9.30, 0.50)
+_BOX_FOOTER = (0.55, 7.14, 12.15, 0.22)
+
+# 第33页配图应有的几何；封面与结束页配图应满版
+_PIC_P33 = (0.70, 1.45, 5.60, 4.90)
+_PIC_FULL = (0.00, 0.00, 13.333, 7.50)
+
+def _a(tag):
+    return "{%s}%s" % (_NS_A, tag)
 
 
-def iter_runs(slide):
-    """yield (shape, paragraph, run, text, raw_size_pt_or_None, bold_or_None, font_name)"""
-    for shape in slide.shapes:
-        if not shape.has_text_frame:
-            continue
-        for para in shape.text_frame.paragraphs:
-            for run in para.runs:
-                txt = run.text or ""
-                if not txt.strip():
-                    continue
-                sz = run.font.size.pt if run.font.size else None
-                bold = run.font.bold
-                fname = run.font.name
-                yield shape, para, run, txt, sz, bold, fname
+def _p(tag):
+    return "{%s}%s" % (_NS_P, tag)
 
 
-def slide_full_text(slide):
-    parts = []
-    for shape in slide.shapes:
-        if shape.has_text_frame:
-            parts.append(shape.text_frame.text)
-    return "\n".join(parts)
-
-
-def about(a, b, tol=SZ_TOL):
-    return a is not None and abs(a - b) <= tol
-
-
-def find_page_footer_run(slide, idx):
-    """页码行：例如 '01  Plan Cover  ·  Start  →  Next: Contents'。
-    通过以两位/三位页码数字开头并包含 '·' 或 '→' 来识别。"""
-    prefix = f"{idx:02d}"
-    for shape, para, run, txt, sz, bold, fname in iter_runs(slide):
-        t = txt.strip()
-        if t.startswith(prefix) and ("·" in t or "→" in t or "Previous" in t or "Next" in t or "Wrap" in t):
-            return run, sz, t
-    return None, None, None
-
-
-# ----------------------------- 维度1 -----------------------------
-
-
-def check_dim1(path: str):
-    """维度 1 硬体检，返回 (pass, reasons)。
-
-    规则简化（原细则 "交付文件为.pptx格式，文件可正常打开、编辑和播放" 已简化为
-    "交付文件为.pptx格式，文件可正常打开"）：
-      • 后缀为 .pptx；
-      • 文件存在，且可被 python-pptx 正常打开。
-    之前的 "文档保护 / 形状可编辑锁 / PowerPoint COM 播放性" 三项校验已弃用。
-    页数 = EXPECTED_PAGES 这一独立于本条的硬性要求保留。
-    """
-    reasons = []
-    ok = True
-
-    # 1) 格式 .pptx，能正常打开
-    ext = os.path.splitext(path)[1].lower()
-    if ext != ".pptx":
-        reasons.append(f"文件扩展名不是 .pptx：{ext}")
-        return False, reasons
-
-    if not os.path.isfile(path):
-        reasons.append("文件不存在")
-        return False, reasons
-
-    # 2) 能否被 python-pptx 正常打开（作为 pptx 包结构合法的最小充分条件）
+def _inch(value):
+    """EMU 转英寸，保留 4 位小数。"""
     try:
-        prs = Presentation(path)
-    except Exception as e:
-        reasons.append(f"文件无法正常打开：{e}")
-        return False, reasons
-
-    # 3) 页数 = EXPECTED_PAGES
-    n = len(prs.slides)
-    if n != EXPECTED_PAGES:
-        reasons.append(f"页数为 {n}，不等于 {EXPECTED_PAGES}")
-        ok = False
-
-    if ok:
-        reasons.append(f"✓ 文件为 {ext}，可正常打开；页数 {n}")
-
-    return ok, reasons
-
-
-# ----------------------------- 维度2：判定函数 -----------------------------
-
-
-# ===== 加分项 =====
-
-
-def rule_p1_cover_title_translated(prs):
-    """+1 第1页主标题文本框：中文"青岚县农业低空应用实施方案"
-        翻译为"Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-        或语义一致英文。
-
-    严格对齐细则原文，只判定细则要求的事——
-    第 1 页的主标题文本框，文本是"指定英文"或"语义一致英文"。
-    其它（中文原文是否还在、是否加粗、字号几何…）不在本条细则内，
-    不在此处加以约束。
-    """
-    slide = prs.slides[COVER_SLIDE - 1]                                # 第 1 页
-    expected_en = "Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-
-    # 主标题文本框：取该页字号最大的文本框（PPT 中"主标题"的通常定位方式）
-    main_title_text = None
-    main_title_size = -1
-    for shape in slide.shapes:
-        if not shape.has_text_frame:
-            continue
-        shape_text = shape.text_frame.text.strip()
-        if not shape_text:
-            continue
-        max_sz_in_shape = -1
-        for para in shape.text_frame.paragraphs:
-            for run in para.runs:
-                if not (run.text or "").strip():
-                    continue
-                sz = run.font.size.pt if run.font.size else 0
-                if sz > max_sz_in_shape:
-                    max_sz_in_shape = sz
-        if max_sz_in_shape > main_title_size:
-            main_title_size = max_sz_in_shape
-            main_title_text = shape_text
-
-    if not main_title_text:
-        return False, "第1页未找到主标题文本框"
-
-    # 指定英文（不区分大小写包含匹配）
-    is_exact = expected_en.lower() in main_title_text.lower()
-    # 语义一致英文：用与中文原文逐词对应的英文语义判断
-    # "青岚县" → Qinglan(County) / "农业" → agricultural / "低空" → low altitude /
-    # "应用" → application(s) / "实施方案" → implementation plan
-    low = main_title_text.lower()
-    has_place    = "qinglan" in low
-    has_agri     = "agricultur" in low                                  # agricultural / agriculture
-    has_lowalt   = ("low-altitude" in low) or ("low altitude" in low)
-    has_app      = "application" in low                                 # application / applications
-    has_implplan = ("implementation plan" in low) or ("implementation" in low and "plan" in low)
-    is_semantic  = has_place and has_agri and has_lowalt and has_app and has_implplan
-
-    hit = is_exact or is_semantic
-    detail = (
-        f"主标题文本框='{main_title_text[:80]}' | "
-        f"指定英文={is_exact}, 语义一致英文={is_semantic}"
-    )
-    return hit, detail
-
-
-def rule_p2_toc_all_english(prs):
-    """+1 第2页目录页文本：目录标题、PART 01至PART 07、各部分名称和说明全部为英文。
-
-    严格对齐细则的每一个点：
-      (a) 第 2 页；
-      (b) 目录标题——存在；且为英文（含合理英文词汇 + 不含非英文主要文字）；
-          目录标题不硬编码为"Contents"——先按 placeholder 定位目录标题对象，
-          失败再匹配已知英文目录标题词汇集合。
-      (c) PART 01 至 PART 07——七个标记齐全；且各自所在文本为英文；
-      (d) 各部分名称（PART 标题的后半段，如 "Project Background"）为英文；
-      (e) 各部分说明（紧跟在 PART 标题之后的描述文字）为英文。
-    """
-    slide = prs.slides[TOC_SLIDE - 1]                                  # (a) 第 2 页
-
-    # ---- 英文判定 ----
-    # 非英文主要文字区间：CJK / 假名 / 韩文 / 西里尔 / 阿拉伯 / 希伯来 / 天城文 / 泰文 / 希腊
-    NON_EN_RANGES = (
-        ("一", "鿿"), ("㐀", "䶿"),
-        ("぀", "ゟ"), ("゠", "ヿ"),
-        ("가", "힯"),
-        ("Ѐ", "ӿ"),
-        ("؀", "ۿ"), ("֐", "׿"),
-        ("ऀ", "ॿ"), ("฀", "๿"),
-        ("Ͱ", "Ͽ"),
-    )
-    # 强指示非英文的拉丁扩展字符（法/德/西/葡等重音字母），若出现直接判非英文
-    NON_EN_LATIN = set(
-        "àâäæçèéêëîïôœùûüÿñÀÂÄÆÇÈÉÊËÎÏÔŒÙÛÜŸÑßẞ" +
-        "áíóúÁÍÓÚãõÃÕ"
-    )
-    EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\-]{1,}")
-
-    def has_non_english_script(s: str) -> bool:
-        for c in s:
-            if c in NON_EN_LATIN:
-                return True
-            for lo, hi in NON_EN_RANGES:
-                if lo <= c <= hi:
-                    return True
-        return False
-
-    def is_english_text(s: str) -> bool:
-        """英文判定：不含非英文主要文字；至少一个长度≥2的英文单词；
-        ASCII 字母 / 所有字母 ≥ 0.9（排除拼音/乱码/纯数字）。"""
-        if not s or not s.strip():
-            return False
-        if has_non_english_script(s):
-            return False
-        if not EN_WORD_RE.search(s):
-            return False
-        ascii_letters = sum(1 for c in s if ("A" <= c <= "Z") or ("a" <= c <= "z"))
-        all_letters = sum(1 for c in s if c.isalpha())
-        if all_letters == 0 or ascii_letters / all_letters < 0.9:
-            return False
-        return True
-
-    # 已知英文目录标题词汇集合（用于 placeholder 定位失败时的兜底匹配）
-    KNOWN_EN_TOC_TITLES = {
-        "contents", "table of contents", "toc", "index", "outline",
-        "agenda", "directory", "chapters", "sections",
-    }
-
-    # 把该页所有"非空 run"按出现顺序收集起来，便于做"PART 标题 → 紧随说明"的配对
-    runs_seq = []  # [(text, shape_name)]
-    for shape in slide.shapes:
-        if not shape.has_text_frame:
-            continue
-        for para in shape.text_frame.paragraphs:
-            for run in para.runs:
-                t = (run.text or "").strip()
-                if t:
-                    runs_seq.append((t, shape.name))
-
-    missing = []   # 未找到的点
-    bad_lang = []  # 找到了但不是英文
-
-    # (b) 目录标题：先按目录标题对象（TITLE / CENTER_TITLE placeholder）定位；
-    #     失败再退化为"页面上半部字号最大的非 PART 文本框"或"匹配已知英文目录标题词"。
-    title_shape = None
-    for sh in slide.shapes:
-        if not sh.has_text_frame or not sh.text_frame.text.strip():
-            continue
-        try:
-            if sh.is_placeholder and sh.placeholder_format is not None:
-                pht = sh.placeholder_format.type
-                # 13 = TITLE, 15 = CENTER_TITLE（python-pptx 的枚举整数值）
-                if pht is not None and int(pht) in (13, 15):
-                    title_shape = sh
-                    break
-        except Exception:
-            pass
-
-    title_text = None
-    if title_shape is not None:
-        title_text = title_shape.text_frame.text.strip()
-    else:
-        # 退化 1：页面上半部字号最大的非 "PART 0X" 且非页脚的文本框
-        best_sh, best_sz = None, -1
-        page_top_half = (prs.slide_height or 0) / 2
-        for sh in slide.shapes:
-            if not sh.has_text_frame or not sh.text_frame.text.strip():
-                continue
-            t = sh.text_frame.text.strip()
-            if t.startswith("PART 0"):
-                continue
-            if "·" in t and ("→" in t or "Previous" in t or "Next" in t):
-                continue
-            if (sh.top or 0) > page_top_half:
-                continue
-            mx = -1
-            for para in sh.text_frame.paragraphs:
-                for run in para.runs:
-                    if (run.text or "").strip():
-                        sz = run.font.size.pt if run.font.size else 0
-                        if sz > mx:
-                            mx = sz
-            if mx > best_sz:
-                best_sz, best_sh = mx, sh
-        if best_sh is not None:
-            title_text = best_sh.text_frame.text.strip()
-        else:
-            # 退化 2：匹配已知英文目录标题词
-            for t, _ in runs_seq:
-                if t.strip().lower() in KNOWN_EN_TOC_TITLES:
-                    title_text = t.strip()
-                    break
-
-    if not title_text:
-        missing.append("目录标题")
-    else:
-        # 目录标题必须为英文；额外要求它"看起来像目录标题"——是已知英文目录标题词
-        # 或包含合理英文词汇（不再硬编码为 Contents）
-        if not is_english_text(title_text):
-            bad_lang.append(f"目录标题非英文：'{title_text[:40]}'")
-
-    # (c)(d)(e) PART 01 至 PART 07：标题 + 紧随其后的"说明"配对
-    for n in range(1, 8):
-        tag = f"PART 0{n}"
-        idx_part = None
-        for i, (t, _) in enumerate(runs_seq):
-            if t.startswith(tag):
-                idx_part = i
-                break
-        if idx_part is None:
-            missing.append(f"{tag} 标题")
-            continue
-
-        # PART 标题整段（含 "PART 0X" 与部分名称）必须为英文
-        part_title_text = runs_seq[idx_part][0]
-        # "PART 0X" 前缀本身是英文，去掉后剩余部分才是"部分名称"，用它做主要英文判定
-        part_name = part_title_text[len(tag):].strip()
-        if has_non_english_script(part_title_text):
-            bad_lang.append(f"{tag} 标题含非英文文字：'{part_title_text}'")
-        if not part_name:
-            missing.append(f"{tag} 各部分名称")
-        elif not is_english_text(part_name):
-            bad_lang.append(f"{tag} 各部分名称非英文：'{part_name}'")
-
-        # 各部分说明：紧跟在该 PART 标题之后、且不是下一个 PART 标题 / 页脚的 run
-        desc = None
-        for j in range(idx_part + 1, len(runs_seq)):
-            nxt = runs_seq[j][0]
-            if nxt.startswith("PART 0"):
-                break
-            # 跳过页脚行
-            if "·" in nxt and ("→" in nxt or "Previous" in nxt or "Next" in nxt):
-                continue
-            desc = nxt
-            break
-        if desc is None:
-            missing.append(f"{tag} 各部分说明")
-        elif not is_english_text(desc):
-            bad_lang.append(f"{tag} 各部分说明非英文：'{desc}'")
-
-    hit = (not missing) and (not bad_lang)
-    parts = []
-    parts.append("目录标题=" + (f"'{title_text[:30]}'" if title_text else "缺失"))
-    parts.append(f"PART01-07 标题齐全={all(any(t.startswith(f'PART 0{n}') for t,_ in runs_seq) for n in range(1,8))}")
-    if missing:
-        parts.append("缺失:" + "/".join(missing))
-    if bad_lang:
-        parts.append("非英文:" + "/".join(bad_lang))
-    detail = "目录页英文化检查：" + "； ".join(parts)
-    return hit, detail
-
-
-def rule_p3_to_p46_all_english(prs):
-    """+3 第3页至第46页内容文本全部为英文。
-
-    严格对齐细则的每一个点：
-      (a) 范围：第 3 页 至 第 46 页（含两端）；
-      (b) 内容文本：这些页面上所有文本框中的文本；
-      (c) 全部为英文：非英文脚本(CJK/假名/韩文/西里尔/阿拉伯/希伯来/天城文/泰文/希腊)
-          任一命中即非英文；同时排除"不含中文但也不是英文"的情况——
-          要求文本中至少含合理英文单词、且英文字符/字母比例达到阈值；
-          若安装了 langdetect 且文本较长(>=30字母)，还会做语言识别兜底。
-    """
-    # ---- 非英文脚本 / 强指示非英文的拉丁扩展字符 ----
-    NON_EN_RANGES = (
-        ("一", "鿿"), ("㐀", "䶿"),      # CJK 中日韩统一表意
-        ("぀", "ゟ"), ("゠", "ヿ"),      # 平假 / 片假
-        ("가", "힯"),                    # 韩文
-        ("Ѐ", "ӿ"),                     # 西里尔
-        ("؀", "ۿ"), ("֐", "׿"),        # 阿拉伯 / 希伯来
-        ("ऀ", "ॿ"), ("฀", "๿"),        # 天城文 / 泰文
-        ("Ͱ", "Ͽ"),                     # 希腊
-    )
-    NON_EN_LATIN = set(
-        "àâäæçèéêëîïôœùûüÿñÀÂÄÆÇÈÉÊËÎÏÔŒÙÛÜŸÑßẞ" +
-        "áíóúÁÍÓÚãõÃÕ"
-    )
-    EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\-]{1,}")
-
-    # 可选：语言识别（有则更稳，无则跳过）
-    # 用 importlib 动态加载，避免静态分析器在未安装 langdetect 时报"无法解析导入"
-    import importlib
-    _detect_fn = None
-    try:
-        _ld = importlib.import_module("langdetect")
-        _detect_fn = getattr(_ld, "detect", None)
-        _factory = getattr(_ld, "DetectorFactory", None)
-        if _factory is not None:
-            try:
-                _factory.seed = 0
-            except Exception:
-                pass
-    except Exception:
-        _detect_fn = None
-    _has_langdetect = _detect_fn is not None
-
-    def find_non_en_script(s: str):
-        for c in s:
-            if c in NON_EN_LATIN:
-                return c
-            for lo, hi in NON_EN_RANGES:
-                if lo <= c <= hi:
-                    return c
+        return round(int(value) / _EMU_PER_INCH, 4)
+    except (TypeError, ValueError):
         return None
 
-    def classify(text: str):
-        """返回 (is_english, reason)。reason 为非英文时的简短原因。"""
-        s = text or ""
-        stripped = s.strip()
-        if not stripped:
-            return True, ""   # 空文本不构成"非英文"
 
-        # 1) 非英文脚本 / 强非英拉丁扩展直接判非英文
-        bad_ch = find_non_en_script(s)
-        if bad_ch is not None:
-            return False, f"含非英文字符'{bad_ch}'"
-
-        # 2) 英文单词存在性（长度≥2 的字母序列）
-        if not EN_WORD_RE.search(s):
-            # 无字母（如纯数字/符号）不判为"非英文"内容，跳过
-            if not any(c.isalpha() for c in s):
-                return True, ""
-            return False, "无可识别英文单词"
-
-        # 3) 英文字母比例
-        ascii_letters = sum(1 for c in s if ("A" <= c <= "Z") or ("a" <= c <= "z"))
-        all_letters = sum(1 for c in s if c.isalpha())
-        if all_letters and ascii_letters / all_letters < 0.9:
-            return False, f"英文字母比例过低({ascii_letters}/{all_letters})"
-
-        # 4) 单词占比：英文单词字符 / 全部字母 ≥ 0.6，避免"一串重音+个别英文词"
-        word_chars = sum(len(m.group()) for m in EN_WORD_RE.finditer(s))
-        if all_letters and word_chars / all_letters < 0.6:
-            return False, f"英文单词字符占比过低({word_chars}/{all_letters})"
-
-        # 5) 语言识别兜底：对足够长的文本调用 langdetect
-        if _has_langdetect and _detect_fn is not None and all_letters >= 30:
-            try:
-                lang = _detect_fn(s)
-                if lang != "en":
-                    return False, f"语言识别为 '{lang}'"
-            except Exception:
-                pass
-
-        return True, ""
-
-    bad = []  # [(page, sample_text, reason)]
-    for page_no in range(3, EXPECTED_PAGES + 1):                       # (a) 第3-46页
-        slide = prs.slides[page_no - 1]
-        for shape in slide.shapes:                                     # (b) 内容文本
-            if not shape.has_text_frame:
-                continue
-            text = shape.text_frame.text
-            if not text or not text.strip():
-                continue
-            is_en, reason = classify(text)
-            if not is_en:
-                sample = "".join(c for c in text if not c.isspace())[:40]
-                bad.append((page_no, sample, reason))
-                break  # 该页已记录一次即可
-
-    hit = len(bad) == 0
-    if hit:
-        tail = "（含 langdetect 兜底）" if _has_langdetect else "（未安装 langdetect，未做语言识别兜底）"
-        detail = f"第3-46页所有内容文本均判定为英文{tail}"
-    else:
-        show = bad[:8]
-        more = f"…等共 {len(bad)} 页" if len(bad) > 8 else ""
-        detail = "存在非英文内容的页：" + ", ".join(
-            f"第{p}页[{r}]({s})" for p, s, r in show
-        ) + (" " + more if more else "")
-    return hit, detail
-
-
-# ===== 扣分项 =====
-
-
-def rule_m1_cover_title_font(prs):
-    """-1 首页"Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-        字体不是 32 磅加粗。
-
-    严格对齐细则的每一个点：
-      (a) 首页 —— 第 1 页；
-      (b) 目标文本 —— "Qinglan County Agricultural Low-Altitude Application Implementation Plan"；
-      (c) 字号是 32 磅；
-      (d) 加粗。
-      其中 (c)(d) 任一不满足即扣分（"不是 32 磅加粗"是对"32 磅 且 加粗"的否定）。
-    """
-    slide = prs.slides[COVER_SLIDE - 1]                                # (a) 首页
-    expected_text = "Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-
-    # (b) 在首页查找包含该指定英文文本的 run
-    target_size = None
-    target_bold = None
-    found = False
-    for _, _, _, txt, sz, bold, _ in iter_runs(slide):
-        if expected_text.lower() in txt.lower():
-            target_size = sz
-            target_bold = bold
-            found = True
-            break
-
-    if not found:
-        # 细则只在"首页存在该指定文本"的前提下检查字号/加粗。
-        # 文本不存在时，本条不命中扣分。
-        return False, f"首页未找到文本'{expected_text}'，本条扣分不适用"
-
-    # (c)(d) 32 磅 且 加粗
-    size_ok = about(target_size, 32.0)
-    bold_ok = bool(target_bold)
-    is_32pt_bold = size_ok and bold_ok
-    hit = not is_32pt_bold                                              # 不是 32 磅加粗 → 命中扣分
-    detail = (
-        f"首页'{expected_text[:50]}...'实测：字号={target_size}磅(需32磅), "
-        f"加粗={target_bold}(需True)"
-    )
-    return hit, detail
-
-
-def rule_m1_cover_subtitle_font(prs):
-    """-1 首页"Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-        下方文本字体不是 13 磅。
-
-    严格对齐细则的每一个点：
-      (a) 首页 —— 第 1 页；
-      (b) 锚点 —— 文本"Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-          所在的文本框（即首页主标题文本框）；
-      (c) "下方文本" —— 在锚点文本框正下方（top 大于锚点的 top + height/2，且水平方向有重叠）
-          的最近一个文本框中的文本；
-      (d) 字体是 13 磅。
-      不是 13 磅则命中扣分。
-    """
-    slide = prs.slides[COVER_SLIDE - 1]                                # (a) 首页
-    expected_text = "Qinglan County Agricultural Low-Altitude Application Implementation Plan"
-
-    # (b) 找锚点文本框
-    anchor = None
-    for shape in slide.shapes:
-        if not shape.has_text_frame:
-            continue
-        if expected_text.lower() in shape.text_frame.text.lower():
-            anchor = shape
-            break
-    if anchor is None:
-        return False, f"首页未找到锚点文本'{expected_text}'，本条扣分不适用"
-
-    a_top    = anchor.top or 0
-    a_left   = anchor.left or 0
-    a_right  = a_left + (anchor.width or 0)
-    a_bottom = a_top  + (anchor.height or 0)
-
-    # (c) 在锚点下方，水平方向与锚点有重叠的最近一个文本框
-    below = None  # (top, shape)
-    for shape in slide.shapes:
-        if shape is anchor or not shape.has_text_frame:
-            continue
-        if not shape.text_frame.text.strip():
-            continue
-        s_top   = shape.top or 0
-        s_left  = shape.left or 0
-        s_right = s_left + (shape.width or 0)
-        # "下方"：顶部在锚点底部之下（允许小幅交叠）
-        if s_top < a_bottom - (anchor.height or 0) * 0.3:
-            continue
-        # 水平重叠
-        if s_right <= a_left or s_left >= a_right:
-            continue
-        if below is None or s_top < below[0]:
-            below = (s_top, shape)
-
-    if below is None:
-        return False, "首页未找到主标题下方文本，本条扣分不适用"
-
-    sub_shape = below[1]
-    # (d) 取下方文本框内所有非空 run 的字号集合
-    sizes = []
-    for para in sub_shape.text_frame.paragraphs:
-        for run in para.runs:
-            if (run.text or "").strip():
-                sz = run.font.size.pt if run.font.size else None
-                sizes.append(sz)
-
-    is_13pt = (len(sizes) > 0) and all(about(sz, 13.0) for sz in sizes)
-    hit = not is_13pt                                                  # 不是 13 磅 → 命中扣分
-    sub_text_preview = sub_shape.text_frame.text.strip().replace("\n", " ")[:60]
-    detail = f"主标题下方文本='{sub_text_preview}...' 字号集合={sizes}（需 13 磅）"
-    return hit, detail
-
-
-def rule_m5_title_slides_font(prs):
-    """-5 PPT标题页（PPT第3、6、14、17、19、23、42页）标题文本字号不是34磅，
-        标题下方文本字号不是14磅。
-
-    严格对齐细则的每一个点：
-      (a) 范围 —— 第 3、6、14、17、19、23、42 页（仅这 7 页）；
-      (b) 标题文本 —— 这些页的"标题"文本框；按以下顺序定位：
-          1) 占位符类型为 TITLE(13) / CENTER_TITLE(15)；
-          2) 与该章节已知英文标题（PART 01~07 的部分名称）匹配；
-          3) 排除装饰性大数字（纯数字文本框，如 "01"）与页脚后，
-             再退化为字号最大、位置靠上的文本框。
-      (c) 标题字号是 34 磅；
-      (d) 标题下方文本 —— 副标题；按以下顺序定位：
-          1) 占位符类型为 SUBTITLE(4) / BODY(2)；
-          2) 与标题文本框同一形状内、位于标题段落之后的其它段落；
-          3) 位于标题文本框下方、水平方向重叠的最近文本框。
-      (e) 该下方文本字号是 14 磅。
-      "标题非 34 磅" 或 "下方文本非 14 磅"，任一不满足 → 命中扣分。
-    """
-    # 各标题页对应的已知英文章节名（与 PART 01~07 顺序一一对应）
-    KNOWN_TITLES_BY_PAGE = {
-        3:  ["project background"],
-        6:  ["current status", "current status and challenges", "status", "challenges"],
-        14: ["overall design", "overall plan", "design", "plan"],
-        17: ["implementation", "implementation plan", "implementation path"],
-        19: ["safety", "safety and compliance", "compliance"],
-        23: ["benefits", "benefit analysis", "expected benefits"],
-        42: ["roadmap", "future outlook", "outlook", "next steps"],
-    }
-    # python-pptx PP_PLACEHOLDER 枚举整数值
-    PH_TITLE, PH_CENTER_TITLE = 13, 15
-    PH_SUBTITLE, PH_BODY = 4, 2
-
-    def is_footer_text(t: str) -> bool:
-        return "·" in t and ("→" in t or "Previous" in t or "Next" in t or "Wrap" in t)
-
-    def para_text(para) -> str:
-        return "".join((r.text or "") for r in para.runs).strip()
-
-    def para_sizes(para):
-        return [r.font.size.pt if r.font.size else None
-                for r in para.runs if (r.text or "").strip()]
-
-    def shape_sizes(sh):
-        out = []
-        for para in sh.text_frame.paragraphs:
-            out.extend(para_sizes(para))
-        return out
-
-    def max_run_size(sh):
-        sizes = [s for s in shape_sizes(sh) if s is not None]
-        return max(sizes) if sizes else -1
-
-    def ph_type(sh):
-        try:
-            if sh.is_placeholder and sh.placeholder_format is not None:
-                pht = sh.placeholder_format.type
-                return int(pht) if pht is not None else None
-        except Exception:
-            return None
+def _solid_fill(node):
+    """把 <a:solidFill> 解析为 'RRGGBB' 或 'RRGGBB/alpha'；主题色归一化为具体色值。"""
+    if node is None:
         return None
-
-    bad = []
-    for idx in sorted(TITLE_SLIDES):                                   # (a) 7 个标题页
-        slide = prs.slides[idx - 1]
-
-        # 收集该页非空、非页脚文本框
-        text_shapes = []
-        for shape in slide.shapes:
-            if not shape.has_text_frame:
-                continue
-            txt = shape.text_frame.text.strip()
-            if not txt or is_footer_text(txt):
-                continue
-            text_shapes.append(shape)
-
-        # ---- (b) 标题定位 ----
-        title_shape = None
-
-        # 1) 占位符类型
-        for sh in text_shapes:
-            if ph_type(sh) in (PH_TITLE, PH_CENTER_TITLE):
-                title_shape = sh
-                break
-
-        # 2) 已知英文章节名匹配（大小写不敏感、去空白/标点）
-        if title_shape is None:
-            def norm(s: str) -> str:
-                return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
-            candidates = [norm(t) for t in KNOWN_TITLES_BY_PAGE.get(idx, [])]
-            for sh in text_shapes:
-                t = norm(sh.text_frame.text)
-                if any(c and c in t for c in candidates):
-                    title_shape = sh
-                    break
-
-        # 3) 排除装饰性纯数字后，取字号最大且靠上
-        if title_shape is None:
-            for sh in text_shapes:
-                t = sh.text_frame.text.strip()
-                if t.isdigit():
-                    continue
-                if title_shape is None:
-                    title_shape = sh
-                    continue
-                if max_run_size(sh) > max_run_size(title_shape):
-                    title_shape = sh
-                elif max_run_size(sh) == max_run_size(title_shape) \
-                        and (sh.top or 0) < (title_shape.top or 0):
-                    title_shape = sh
-
-        if title_shape is None:
-            bad.append(f"第{idx}页：未找到标题文本框")
-            continue
-
-        # ---- 找到标题段落索引（用于"同一文本框内后续段落即副标题"的场景）----
-        title_paras = list(title_shape.text_frame.paragraphs)
-        # 标题所在段落：取"最大字号所在段落"（若整框统一字号则为第一非空段落）
-        title_para_idx = None
-        best_max = -1
-        for pi, p in enumerate(title_paras):
-            sizes = [s for s in para_sizes(p) if s is not None]
-            if not sizes:
-                continue
-            mx = max(sizes)
-            if mx > best_max:
-                best_max, title_para_idx = mx, pi
-        if title_para_idx is None:
-            # 全部无字号信息时退化为第一非空段落
-            for pi, p in enumerate(title_paras):
-                if para_text(p):
-                    title_para_idx = pi
-                    break
-
-        # ---- (c) 标题字号 = 34 磅（取标题段落所在 run 字号集合）----
-        if title_para_idx is not None:
-            title_sizes = para_sizes(title_paras[title_para_idx])
-        else:
-            title_sizes = shape_sizes(title_shape)
-        title_ok = len(title_sizes) > 0 and all(about(sz, 34.0) for sz in title_sizes)
-
-        # ---- (d) 标题下方文本定位 ----
-        sub_sizes = []
-        sub_source = None  # "placeholder" / "same-shape" / "below-shape"
-
-        # 1) SUBTITLE / BODY 占位符
-        for sh in text_shapes:
-            if sh is title_shape:
-                continue
-            if ph_type(sh) in (PH_SUBTITLE, PH_BODY):
-                sub_sizes = shape_sizes(sh)
-                sub_source = "placeholder"
-                below_ref = sh
-                break
-        else:
-            below_ref = None
-
-        # 2) 同一文本框内、标题段落之后的其它非空段落
-        if not sub_sizes and title_para_idx is not None:
-            same_shape_sizes = []
-            for p in title_paras[title_para_idx + 1:]:
-                if para_text(p):
-                    same_shape_sizes.extend(para_sizes(p))
-            if same_shape_sizes:
-                sub_sizes = same_shape_sizes
-                sub_source = "same-shape"
-                below_ref = title_shape
-
-        # 3) 位于标题文本框下方、水平方向重叠的最近文本框
-        if not sub_sizes:
-            t_top    = title_shape.top or 0
-            t_left   = title_shape.left or 0
-            t_right  = t_left + (title_shape.width or 0)
-            t_bottom = t_top + (title_shape.height or 0)
-            below = None
-            for sh in text_shapes:
-                if sh is title_shape:
-                    continue
-                # 跳过装饰性纯数字
-                if sh.text_frame.text.strip().isdigit():
-                    continue
-                s_top   = sh.top or 0
-                s_left  = sh.left or 0
-                s_right = s_left + (sh.width or 0)
-                if s_top < t_bottom - (title_shape.height or 0) * 0.3:
-                    continue
-                if s_right <= t_left or s_left >= t_right:
-                    continue
-                if below is None or s_top < (below.top or 0):
-                    below = sh
-            if below is not None:
-                sub_sizes = shape_sizes(below)
-                sub_source = "below-shape"
-                below_ref = below
-
-        # (e) 下方文本字号 = 14 磅
-        sub_ok = len(sub_sizes) > 0 and all(about(sz, 14.0) for sz in sub_sizes)
-
-        if not (title_ok and sub_ok):
-            src = sub_source or "未找到"
-            title_preview = title_shape.text_frame.text.strip().replace("\n", " ")[:30]
-            bad.append(
-                f"第{idx}页：标题文本框='{title_preview}' "
-                f"字号={title_sizes}(需34磅); "
-                f"下方文本[来源={src}] 字号={sub_sizes}(需14磅)"
-            )
-
-    hit = len(bad) > 0
-    detail = "标题页字号检查：\n    " + "\n    ".join(bad) if bad else "7 个标题页字号均合规"
-    return hit, detail
-
-
-def rule_m5_page_footer_font(prs):
-    """-5 页码处"01  Plan Cover  ·  Start  →  Next: Contents"等文本字号不是7.8磅。
-
-    严格对齐细则的每一个点：
-      (a) 范围 —— 整本 PPT 的"页码处"文本；
-      (b) 文本形态 —— 例如"01  Plan Cover  ·  Start  →  Next: Contents"
-          即"两位页码 + 章节名 + '·' + 上一页/下一页指引"的页脚行；
-          页脚可能被拆成多个 run 或分布在多个文本框中，需按整框/整段文本识别。
-      (c) 所有组成该页脚的 run 字号都是 7.8 磅。
-      "不是 7.8 磅" → 命中扣分（任一页码处任一 run 不为 7.8 磅即命中）。
-    """
-    FOOTER_KEYS = ("·", "→", "Previous", "Next", "Wrap", "Start")
-
-    def is_footer_shape(sh, prefix: str) -> bool:
-        """页脚文本框判定：整框文本含页码前缀 + 至少一个页脚特征词。"""
-        t = sh.text_frame.text
-        if not t or prefix not in t:
-            return False
-        return any(k in t for k in FOOTER_KEYS)
-
-    def collect_footer_run_sizes(sh):
-        """收集页脚文本框内所有非空 run 的字号（含标签）；也覆盖'页脚被拆到多段/多 run'。"""
-        entries = []  # [(size_pt_or_None, text)]
-        for para in sh.text_frame.paragraphs:
-            for run in para.runs:
-                t = (run.text or "")
-                if not t.strip():
-                    continue
-                sz = run.font.size.pt if run.font.size else None
-                entries.append((sz, t))
-        return entries
-
-    bad = []
-    for i in range(1, EXPECTED_PAGES + 1):                             # (a) 整本 PPT
-        slide = prs.slides[i - 1]
-        prefix = f"{i:02d}"
-
-        # (b) 定位所有"页脚文本框"：整框文本含页码前缀 + 页脚特征词
-        footer_shapes = [
-            sh for sh in slide.shapes
-            if sh.has_text_frame and is_footer_shape(sh, prefix)
-        ]
-
-        # 退化：单个 run 或跨 run 拼接后含"前缀 + 特征词"的文本框
-        if not footer_shapes:
-            for sh in slide.shapes:
-                if not sh.has_text_frame:
-                    continue
-                for para in sh.text_frame.paragraphs:
-                    joined = "".join(r.text or "" for r in para.runs)
-                    if prefix in joined and any(k in joined for k in FOOTER_KEYS):
-                        footer_shapes.append(sh)
-                        break
-
-        if not footer_shapes:
-            bad.append(f"第{i}页：未找到页码处文本'{prefix}  …  ·  …'")
-            continue
-
-        # (c) 收集所有组成页脚的 run 字号，逐一校验必须 = 7.8 磅
-        all_entries = []
-        for sh in footer_shapes:
-            all_entries.extend(collect_footer_run_sizes(sh))
-        if not all_entries:
-            bad.append(f"第{i}页：页脚文本框存在但无可读 run 字号")
-            continue
-
-        bad_runs = [(sz, t) for sz, t in all_entries if not about(sz, 7.8)]
-        if bad_runs:
-            preview = "; ".join(f"'{t.strip()[:20]}'={sz}磅" for sz, t in bad_runs[:3])
-            more = f"…等 {len(bad_runs)} run" if len(bad_runs) > 3 else ""
-            joined_preview = "".join(t for _, t in all_entries).strip().replace("\n", " ")[:60]
-            bad.append(
-                f"第{i}页：页脚='{joined_preview}' 非 7.8 磅 run：{preview}{more}"
-            )
-
-    hit = len(bad) > 0
-    if hit:
-        show = bad[:6]
-        more = f"…等共 {len(bad)} 条" if len(bad) > 6 else ""
-        detail = "页码处字号不合规：\n    " + "\n    ".join(show) + ("\n    " + more if more else "")
-    else:
-        detail = "所有页码处字号均为 7.8 磅（覆盖多 run / 多文本框拼接的情况）"
-    return hit, detail
-
-
-def rule_m1_toc_font(prs):
-    """-1 目录页标题如"PART 01  Project Background"字号非11.5磅，
-        标题下方文本如"Policy window and regional conditions"字号非8.4磅。
-
-    严格对齐细则的每一个点：
-      (a) 目录页 —— 第 2 页；
-      (b) 目录页标题 —— 形如"PART 0X  XXX"的条目标题（示例为 PART 01）；
-      (c) 该标题字号是 11.5 磅；
-      (d) 标题下方文本 —— 紧跟在该 PART 标题下方的说明文字（示例为
-          "Policy window and regional conditions"）；
-      (e) 该下方文本字号是 8.4 磅。
-      标题非 11.5 磅 或 下方文本非 8.4 磅，任一不满足 → 命中扣分。
-    """
-    slide = prs.slides[TOC_SLIDE - 1]                                  # (a) 目录页 = 第 2 页
-
-    # 收集该页所有非空文本框（用于按几何位置匹配"标题下方文本"）
-    text_shapes = []
-    for shape in slide.shapes:
-        if not shape.has_text_frame:
-            continue
-        if shape.text_frame.text.strip():
-            text_shapes.append(shape)
-
-    def shape_sizes(sh):
-        out = []
-        for para in sh.text_frame.paragraphs:
-            for run in para.runs:
-                if (run.text or "").strip():
-                    out.append(run.font.size.pt if run.font.size else None)
-        return out
-
-    bad = []
-    # (b) 找所有"PART 0X  XXX"标题文本框
-    part_shapes = [sh for sh in text_shapes if sh.text_frame.text.strip().startswith("PART 0")]
-    if not part_shapes:
-        return False, "目录页未找到任何 'PART 0X' 标题，本条扣分不适用"
-
-    for ps in part_shapes:
-        title_text = ps.text_frame.text.strip().replace("\n", " ")
-        title_sizes = shape_sizes(ps)
-        # (c) 标题字号 = 11.5 磅（标题文本框内所有 run 字号都需为 11.5）
-        title_ok = len(title_sizes) > 0 and all(about(sz, 11.5) for sz in title_sizes)
-
-        # (d) 该 PART 标题"下方文本"：垂直方向位于其下、水平方向重叠的最近文本框
-        t_top    = ps.top or 0
-        t_left   = ps.left or 0
-        t_right  = t_left + (ps.width or 0)
-        t_bottom = t_top  + (ps.height or 0)
-        below = None
-        for sh in text_shapes:
-            if sh is ps:
-                continue
-            # 跳过其它 PART 标题（避免把"PART 02"当成"PART 01"的下方文本）
-            if sh.text_frame.text.strip().startswith("PART 0"):
-                continue
-            # 跳过页脚行
-            t = sh.text_frame.text.strip()
-            if "·" in t and ("→" in t or "Previous" in t or "Next" in t):
-                continue
-            s_top   = sh.top or 0
-            s_left  = sh.left or 0
-            s_right = s_left + (sh.width or 0)
-            if s_top < t_bottom - (ps.height or 0) * 0.3:
-                continue
-            if s_right <= t_left or s_left >= t_right:
-                continue
-            if below is None or s_top < (below.top or 0):
-                below = sh
-
-        if below is None:
-            sub_sizes = []
-            sub_ok = False
-            sub_text = "(未找到)"
-        else:
-            sub_sizes = shape_sizes(below)
-            # (e) 下方文本字号 = 8.4 磅
-            sub_ok = len(sub_sizes) > 0 and all(about(sz, 8.4) for sz in sub_sizes)
-            sub_text = below.text_frame.text.strip().replace("\n", " ")
-
-        if not (title_ok and sub_ok):
-            bad.append(
-                f"标题'{title_text[:40]}' 字号={title_sizes}(需11.5磅); "
-                f"下方文本'{sub_text[:40]}' 字号={sub_sizes}(需8.4磅)"
-            )
-
-    hit = len(bad) > 0
-    detail = "目录页字号不合规：\n    " + "\n    ".join(bad) if bad else "目录页所有 PART 条目字号均合规"
-    return hit, detail
-
-
-def rule_m5_content_pages_font(prs):
-    """-5 PPT内容页（除 1、2、3、6、14、17、19、23、42、46 页，其余都为内容页）
-        内容文本字号非 9.2 磅，标题文本字号非 12.5 磅加粗。
-
-    严格对齐细则的每一个点：
-      (a) 范围 —— 全 PPT 去除第 1、2、3、6、14、17、19、23、42、46 页之后的所有页（=内容页）；
-      (b) 标题文本 —— 该内容页上的"标题文本框"（占位符 TITLE/CENTER_TITLE 优先，
-          否则位于页顶部区域的、单行短文本框）；
-      (c) 标题字号 = 12.5 磅，且加粗；
-      (d) 内容文本 —— 该内容页上"正文占位符"或"主内容区文本框"；
-          明确排除：页脚、页码、装饰性纯数字、极短标签（图表/坐标轴标签、编号）、
-                    "Source:/Fig./Chart/图注/Note/Data:"等来源/注释类前缀；
-      (e) 内容字号 = 9.2 磅；
-      "标题非 12.5 磅加粗" 或 "内容非 9.2 磅"，任一不满足 → 命中扣分。
-    """
-    # 占位符类型枚举
-    PH_TITLE, PH_CENTER_TITLE = 13, 15
-    PH_SUBTITLE, PH_BODY, PH_OBJECT = 4, 2, 7
-
-    # 装饰/注释/图表标注类前缀（大小写不敏感包含判定）
-    DECOR_PREFIXES = (
-        "source:", "src:", "data source", "data:", "note:", "notes:",
-        "fig.", "figure ", "chart ", "table ", "ref:", "reference",
-        "©", "copyright", "footnote",
-    )
-    FOOTER_KEYS = ("·", "→", "Previous", "Next", "Wrap")
-
-    def ph_type(sh):
-        try:
-            if sh.is_placeholder and sh.placeholder_format is not None:
-                pht = sh.placeholder_format.type
-                return int(pht) if pht is not None else None
-        except Exception:
-            return None
-        return None
-
-    def is_footer_shape(sh) -> bool:
-        t = sh.text_frame.text
-        if not t:
-            return False
-        # 完整页脚形态：含 '·' + 导航词
-        if "·" in t and any(k in t for k in FOOTER_KEYS):
-            return True
-        return False
-
-    def is_decor_or_label(sh, page_top_half: float) -> bool:
-        """判定是否为装饰/图表标注/来源说明/极短标签——不纳入正文校验。"""
-        t = sh.text_frame.text.strip()
-        if not t:
-            return True
-        # 纯数字（页码、序号、坐标轴刻度）
-        stripped = t.replace("\n", " ").replace(" ", "")
-        if stripped.isdigit():
-            return True
-        # 单个字符 / 单符号（列表标记、装饰点）
-        if len(stripped) <= 1:
-            return True
-        # 明确的来源/图注前缀
-        low = t.lower().lstrip()
-        if any(low.startswith(p) for p in DECOR_PREFIXES):
-            return True
-        # 极短标签（<=4 字符）且位于页面上半部或角落 —— 图例/图表标签常见形态
-        if len(stripped) <= 4:
-            # 位于页面顶部区域（前 15%）通常是装饰性数字/角标
-            if (sh.top or 0) < page_top_half * 0.3:
-                return True
-        return False
-
-    def sizes_of(sh):
-        out = []
-        for para in sh.text_frame.paragraphs:
-            for run in para.runs:
-                if (run.text or "").strip():
-                    out.append(run.font.size.pt if run.font.size else None)
-        return out
-
-    def bolds_of(sh):
-        out = []
-        for para in sh.text_frame.paragraphs:
-            for run in para.runs:
-                if (run.text or "").strip():
-                    out.append(run.font.bold)
-        return out
-
-    def max_size_of(sh):
-        sz = [s for s in sizes_of(sh) if s is not None]
-        return max(sz) if sz else -1
-
-    bad = []
-    for i in range(1, EXPECTED_PAGES + 1):                             # (a) 范围
-        if i in NON_CONTENT_SLIDES:
-            continue
-        slide = prs.slides[i - 1]
-        page_h = prs.slide_height or 0
-
-        # 收集所有非空、非页脚文本框
-        all_shapes = []
-        for shape in slide.shapes:
-            if not shape.has_text_frame:
-                continue
-            if not shape.text_frame.text.strip():
-                continue
-            if is_footer_shape(shape):
-                continue
-            all_shapes.append(shape)
-        if not all_shapes:
-            bad.append(f"第{i}页：无可识别文本框")
-            continue
-
-        # ---- (b) 标题定位 ----
-        title_shape = None
-        # 1) 占位符 TITLE / CENTER_TITLE
-        for sh in all_shapes:
-            if ph_type(sh) in (PH_TITLE, PH_CENTER_TITLE):
-                title_shape = sh
-                break
-        # 2) 页面顶部（前 25%）、非装饰、非过长的单段短文本框（模板标题的典型几何）
-        if title_shape is None:
-            top_band = page_h * 0.25
-            top_candidates = []
-            for sh in all_shapes:
-                if (sh.top or 0) > top_band:
-                    continue
-                if is_decor_or_label(sh, page_h):
-                    continue
-                t = sh.text_frame.text.strip()
-                # 标题一般是单行、字符不超过 60
-                if "\n" in t or len(t) > 60:
-                    continue
-                top_candidates.append(sh)
-            if top_candidates:
-                # 顶部候选中：优先字号最大；同字号取更靠上
-                title_shape = max(
-                    top_candidates,
-                    key=lambda sh: (max_size_of(sh), -(sh.top or 0)),
-                )
-        # 3) 兜底：全页非装饰候选中字号最大且靠上
-        if title_shape is None:
-            non_decor = [sh for sh in all_shapes if not is_decor_or_label(sh, page_h)]
-            if non_decor:
-                title_shape = max(
-                    non_decor,
-                    key=lambda sh: (max_size_of(sh), -(sh.top or 0)),
-                )
-
-        if title_shape is None:
-            bad.append(f"第{i}页：未找到标题文本框")
-            continue
-
-        title_sizes = sizes_of(title_shape)
-        title_bolds = bolds_of(title_shape)
-        # (c) 标题字号 = 12.5 磅 且 加粗
-        title_size_ok = len(title_sizes) > 0 and all(about(sz, 12.5) for sz in title_sizes)
-        title_bold_ok = len(title_bolds) > 0 and all(bool(b) for b in title_bolds)
-        title_ok = title_size_ok and title_bold_ok
-
-        # ---- (d) 正文定位 ----
-        # 优先：BODY / OBJECT / SUBTITLE 占位符
-        body_shapes = [
-            sh for sh in all_shapes
-            if sh is not title_shape and ph_type(sh) in (PH_BODY, PH_OBJECT, PH_SUBTITLE)
-        ]
-        # 兜底：非标题、非页脚、非装饰/图表标注/来源说明的所有文本框
-        if not body_shapes:
-            body_shapes = [
-                sh for sh in all_shapes
-                if sh is not title_shape and not is_decor_or_label(sh, page_h)
-            ]
-
-        body_sizes = []
-        for sh in body_shapes:
-            body_sizes.extend(sizes_of(sh))
-        # (e) 内容字号 = 9.2 磅
-        body_ok = len(body_sizes) > 0 and all(about(sz, 9.2) for sz in body_sizes)
-
-        if not (title_ok and body_ok):
-            body_size_set = sorted({s for s in body_sizes if s is not None})
-            title_preview = title_shape.text_frame.text.strip().replace("\n", " ")[:30]
-            bad.append(
-                f"第{i}页：标题'{title_preview}' "
-                f"字号={title_sizes} 加粗={title_bolds}(需12.5磅加粗); "
-                f"正文框数={len(body_shapes)} 字号集合={body_size_set}(需9.2磅)"
-            )
-
-    hit = len(bad) > 0
-    if hit:
-        show = bad[:6]
-        more = f"…等共 {len(bad)} 条" if len(bad) > 6 else ""
-        detail = "内容页字号不合规：\n    " + "\n    ".join(show) + ("\n    " + more if more else "")
-    else:
-        detail = "所有内容页：标题=12.5磅加粗；内容=9.2磅（已排除页脚/图表标签/来源注释），均合规"
-    return hit, detail
-
-
-# ----------------------------- 主流程 -----------------------------
-
-
-def _locate_document(dir_path: str):
-    """在给定目录中定位被评估的 PPT 文件。
-    优先使用 EXPECTED_DOC_NAME；若不存在，则取目录中任意一个 .pptx 文件。
-    找不到则返回 None。
-    """
-    if not dir_path or not os.path.isdir(dir_path):
-        return None
-    expected = os.path.join(dir_path, EXPECTED_DOC_NAME)
-    if os.path.isfile(expected):
-        return expected
-    for name in os.listdir(dir_path):
-        if name.lower().endswith(".pptx") and not name.startswith("~$"):
-            return os.path.join(dir_path, name)
+    srgb = node.find(_a("srgbClr"))
+    if srgb is not None:
+        alpha = srgb.find(_a("alpha"))
+        val = (srgb.get("val") or "").upper()
+        return val + ("/" + alpha.get("val") if alpha is not None else "")
+    scheme = node.find(_a("schemeClr"))
+    if scheme is not None:
+        raw = scheme.get("val") or ""
+        val = _SCHEME_COLOR.get(raw, raw)
+        alpha = scheme.find(_a("alpha"))
+        return val + ("/" + alpha.get("val") if alpha is not None else "")
     return None
 
 
-# 加分 / 扣分规则表（label 与 rule 函数解耦，便于生成 dim2_items）
-ADD_RULES = [
-    (1, "第1页主标题文本框：中文“青岚县农业低空应用实施方案”翻译为“Qinglan County Agricultural Low-Altitude Application Implementation Plan”或语义一致英文。",
-     "rule_p1_cover_title_translated"),
-    (1, "第2页目录页文本：目录标题、PART 01至PART 07、各部分名称和说明全部为英文",
-     "rule_p2_toc_all_english"),
-    (3, "第3页至第46页内容文本全部为英文",
-     "rule_p3_to_p46_all_english"),
-]
-
-SUB_RULES = [
-    (1, "首页“Qinglan County Agricultural Low-Altitude Application Implementation Plan”字体不是32磅加粗",
-     "rule_m1_cover_title_font"),
-    (1, "首页“Qinglan County Agricultural Low-Altitude Application Implementation Plan”下方文本字体不是13磅",
-     "rule_m1_cover_subtitle_font"),
-    (5, "PPT标题页（PPT第3、6、14、17、19、23、42页）标题文本字号不是34磅，标题下方文本字号不是14磅",
-     "rule_m5_title_slides_font"),
-    (5, "页码处“01  Plan Cover  ·  Start  →  Next: Contents”等文本字号不是7.8磅",
-     "rule_m5_page_footer_font"),
-    (1, "目录页标题如“PART 01  Project Background”字号非11.5磅，标题下方文本如“Policy window and regional conditions”字号非8.4磅",
-     "rule_m1_toc_font"),
-    (5, "PPT内容页（除1、2、3、6、14、17、19、23、42、46页，其余都为内容页）内容文本字号非9.2磅，标题文本字号非12.5磅加粗",
-     "rule_m5_content_pages_font"),
-]
+def _shape_box(sp_pr):
+    """读取形状的 a:xfrm 偏移与尺寸，返回 [左, 上, 宽, 高]（英寸）。"""
+    if sp_pr is None:
+        return None
+    xfrm = sp_pr.find(_a("xfrm"))
+    if xfrm is None:
+        return None
+    off, ext = xfrm.find(_a("off")), xfrm.find(_a("ext"))
+    if off is None or ext is None:
+        return None
+    return [_inch(off.get("x")), _inch(off.get("y")),
+            _inch(ext.get("cx")), _inch(ext.get("cy"))]
 
 
-def evaluate(dir_path: str) -> dict:
-    """统一入口：接收脚本所在目录的路径，脚本自己在该目录里定位并打开被评估文档。
+def _parse_slide(xml_bytes):
+    """解析单页幻灯片，抽取与基线同构的属性集合。
 
-    返回结构见《脚本接口差异与统一建议》§2.2。
+    形状按 cNvPr/@name 归档（同名形状按文档顺序排队），另存一份文档顺序的扁平表
+    seq 作为配对兜底；不含文字的形状只贡献填充签名与计数。
     """
-    # dim2_items 中所有条目的满分之和，用于 max_score
-    max_score = sum(d for d, _, _ in ADD_RULES)
+    root = ET.fromstring(xml_bytes)
+    info = {"sp": 0, "pic": 0, "t": {}, "seq": [], "f": [], "p": [],
+            "lnsp": 0, "fsc": 0}
+    for sp in root.iter(_p("sp")):
+        info["sp"] += 1
+        cnv = sp.find(".//" + _p("cNvPr"))
+        name = (cnv.get("name") if cnv is not None else None) or "?"
+        sp_pr = sp.find(_p("spPr"))
+        box = _shape_box(sp_pr)
+        if sp_pr is not None:
+            color = _solid_fill(sp_pr.find(_a("solidFill")))
+            if color:
+                geom = sp_pr.find(_a("prstGeom"))
+                info["f"].append("%s:%s:%s" % (
+                    geom.get("prst") if geom is not None else "custom", color,
+                    "%.2fx%.2f" % (box[2], box[3]) if box else "-"))
+        runs, npara, text = [], 0, ""
+        for para in sp.iter(_a("p")):
+            p_pr = para.find(_a("pPr"))
+            algn = (p_pr.get("algn") if p_pr is not None else None) or "l"
+            ptext = "".join(t.text or "" for t in para.iter(_a("t")))
+            if ptext.strip():
+                npara += 1
+                text += ptext
+            for run in para.iter(_a("r")):
+                r_pr = run.find(_a("rPr"))
+                if r_pr is None or not r_pr.get("sz"):
+                    continue
+                rtext = "".join(t.text or "" for t in run.iter(_a("t")))
+                runs.append([int(r_pr.get("sz")), 1 if r_pr.get("b") == "1" else 0,
+                             _solid_fill(r_pr.find(_a("solidFill"))), algn, rtext])
+        for autofit in sp.iter(_a("normAutofit")):
+            if autofit.get("lnSpcReduction"):
+                info["lnsp"] += 1
+            if autofit.get("fontScale"):
+                info["fsc"] += 1
+        if runs:
+            item = {"r": runs, "np": npara, "b": box, "txt": text,
+                    "name": name, "idx": len(info["seq"])}
+            info["seq"].append(item)
+            info["t"].setdefault(name, []).append(item)
+    for pic in root.iter(_p("pic")):
+        info["pic"] += 1
+        box = _shape_box(pic.find(_p("spPr")))
+        src = pic.find(".//" + _a("srcRect"))
+        crop = {k: int(v) for k, v in (src.attrib.items() if src is not None else [])}
+        info["p"].append(((box or [None] * 4) + [crop])[:5])
+    info["f"].sort()
+    tree = root.find("%s/%s" % (_p("cSld"), _p("spTree")))
+    zmap = {_p("sp"): "s", _p("pic"): "p", _p("graphicFrame"): "g",
+            _p("grpSp"): "G", _p("cxnSp"): "c"}
+    info["z"] = "".join(zmap[c.tag] for c in (list(tree) if tree is not None else [])
+                        if c.tag in zmap)
+    return info
 
+
+def _slide_targets(pres_xml, rels_xml):
+    """按 sldIdLst 的真实放映顺序返回幻灯片部件路径（不依赖 slideN.xml 的编号顺序）。"""
+    rel_map = {}
+    for rel in ET.fromstring(rels_xml):
+        rel_map[rel.get("Id")] = rel.get("Target") or ""
+    targets = []
+    root = ET.fromstring(pres_xml)
+    lst = root.find(_p("sldIdLst"))
+    for sld in (list(lst) if lst is not None else []):
+        target = rel_map.get(sld.get("{%s}id" % _NS_R), "")
+        target = target.replace("../", "").lstrip("/")
+        if not target.startswith("ppt/"):
+            target = "ppt/" + target
+        targets.append(target)
+    return targets
+
+
+def _load_deck(file_path):
+    """打开 .pptx（zip 直读，不落地解压），返回画布尺寸、逐页解析结果与媒体 md5。"""
+    with zipfile.ZipFile(file_path) as zf:
+        names = zf.namelist()
+        pres_xml = zf.read("ppt/presentation.xml")
+        rels_xml = zf.read("ppt/_rels/presentation.xml.rels")
+        targets = [t for t in _slide_targets(pres_xml, rels_xml) if t in names]
+        if not targets:
+            targets = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                             key=lambda n: int(re.search(r"(\d+)", n.split("/")[-1]).group(1)))
+        slides = []
+        for pos, target in enumerate(targets, 1):
+            info = _parse_slide(zf.read(target))
+            info["pos"] = pos
+            slides.append(info)
+        md5 = sorted(hashlib.md5(zf.read(n)).hexdigest()
+                     for n in names if n.startswith("ppt/media/") and not n.endswith("/"))
+    sld_sz = ET.fromstring(pres_xml).find(_p("sldSz"))
+    return {"cx": _inch(sld_sz.get("cx")) if sld_sz is not None else None,
+            "cy": _inch(sld_sz.get("cy")) if sld_sz is not None else None,
+            "slides": slides, "md5": md5}
+
+
+def _page_order(deck, total):
+    """由页脚导航行开头的页码反推放映顺序对应的原稿页号。
+
+    页脚是全篇唯一自带页号的元素（形如「10 涉农场景 · 上页 … → 下页 …」），
+    比 slideN.xml 编号可靠；若页码不构成 1..total 的排列，则退化为按位置顺序对应。
+    """
+    order = []
+    for slide in deck["slides"]:
+        cand = None
+        for item in slide["seq"]:
+            top = item["b"][1] if item["b"] else None
+            is_footer = any(r[0] == 780 for r in item["r"]) or (top is not None and top >= 6.8)
+            if not is_footer:
+                continue
+            if cand is None or (top is not None and cand["b"] and top > cand["b"][1]):
+                cand = item
+        num = None
+        if cand is not None:
+            hit = re.search(r"\d{1,2}", cand["txt"][:28])
+            if hit:
+                num = int(hit.group(0))
+        order.append(num)
+    if len(order) == total and sorted(n for n in order if n) == list(range(1, total + 1)):
+        return order, True
+    return [i + 1 for i in range(len(deck["slides"]))], False
+
+
+def _pair_shapes(exp_slide, got_slide):
+    """页内按 cNvPr/@name 配对（同名按文档顺序消费），名称对不上的再按文档顺序兜底。
+
+    不按 a:off 几何配对：每页都有多个位于 (0,0) 的形状，且交付稿常有位移，
+    以几何为键会静默错配。
+    """
+    pool = {k: list(v) for k, v in got_slide["t"].items()}
+    pairs, pending, used = [], [], set()
+    for name, exp in exp_slide["t"].items():
+        bucket = pool.get(name)
+        if bucket:
+            got = bucket.pop(0)
+            used.add(got["idx"])
+            pairs.append((name, exp, got))
+        else:
+            pending.append((name, exp))
+    if pending:
+        rest = [it for it in got_slide["seq"] if it["idx"] not in used]
+        for (name, exp), got in zip(pending, rest):
+            pairs.append((name, exp, got))
+        pending = pending[len(rest):]
+    return pairs, [name for name, _ in pending]
+
+
+def _run_pairs(page, pairs):
+    """逐 run 配对；交付稿把一段拆成多个 run 时，多出的 run 与基线末个 run 比较。
+
+    只承载空白或标点的 run 不参与字号/字色/加粗比对：译文常把中文句子重排成
+    「正文 run + 句末标点 run」，这类碎片 run 没有可感知的字形，属另存产生的等价
+    改写，不作为字号被缩小或字色被改动的证据。
+    """
+    out = []
+    for name, exp, got in pairs:
+        exp_runs = exp["r"]
+        if not exp_runs:
+            continue
+        for idx, got_run in enumerate(got["r"]):
+            if len(got_run) > 4 and not _GLYPH_RE.search(got_run[4]):
+                continue
+            exp_run = exp_runs[idx] if idx < len(exp_runs) else exp_runs[-1]
+            out.append((page, name, idx, exp_run, got_run))
+    return out
+
+
+def _fmt(items, limit=5):
+    """把命中明细压缩成一行；超出 limit 只列前几处并给出总数。"""
+    if not items:
+        return ""
+    text = "；".join(items[:limit])
+    return text + ("…（共 %d 处）" % len(items) if len(items) > limit else "")
+
+
+def _is_translated(text):
+    """英译判定：非空、不含中日韩汉字、且至少含两个拉丁字母。"""
+    body = (text or "").strip()
+    if not body or _CJK_RE.search(body):
+        return False
+    return len(re.findall(r"[A-Za-z]", body)) >= 2
+
+
+def _text_ok(exp, got):
+    """按基线原文判断该形状的文字是否已妥善处理。
+
+    原文含中文的，必须变成不含中文且有实义字母的英文；原文本就是数字或英文的
+    （章节两位数序号、流程步骤序号、指标数字、已有的英文行）只要求未被删空、
+    未混入中文，其取值另由编号类细则核查。
+    """
+    if got is None:
+        return False
+    text = (got["txt"] or "").strip()
+    if not text or _CJK_RE.search(text):
+        return False
+    if exp.get("c"):
+        return len(re.findall(r"[A-Za-z]", text)) >= 2
+    return True
+
+
+def _diff_runs(run_pairs, pred, sz=False, col=False, bold=False, algn=False):
+    """在满足 pred(页号, 基线run) 的 run 上比较指定属性，返回可读的差异明细。"""
+    bad = []
+    for page, name, _idx, exp, got in run_pairs:
+        if not pred(page, exp):
+            continue
+        tag = "p%d/%s" % (page, name)
+        if sz and got[0] != exp[0]:
+            bad.append("%s 字号 %.1f→%.1f" % (tag, exp[0] / 100.0, got[0] / 100.0))
+        if col and (got[2] or "") != (exp[2] or ""):
+            bad.append("%s 字色 %s→%s" % (tag, exp[2] or "继承", got[2] or "继承"))
+        if bold and got[1] != exp[1]:
+            bad.append("%s 加粗 %s→%s" % (tag, "是" if exp[1] else "否",
+                                          "是" if got[1] else "否"))
+        if algn and got[3] != exp[3]:
+            bad.append("%s 对齐 %s→%s" % (tag, exp[3], got[3]))
+    return bad
+
+
+def _geo_bad(box, want):
+    """几何比较：任一维超过 0.01 英寸容差即算改动。"""
+    if box is None or any(v is None for v in box):
+        return True
+    return any(abs(box[i] - want[i]) > _POS_TOL for i in range(4))
+
+
+def _baseline():
+    """载入内嵌的原稿基线常量。"""
+    return json.loads(_BASELINE_JSON)
+
+
+# 交付物只接受 .pptx：细则要求交付「1 个可正常打开的 PowerPoint 演示文稿（.pptx）」，
+# 其余演示文稿/导出格式（.ppt / .pptm / .odp / .pdf 等）一律在维度一判不通过。
+_ACCEPTED_EXT = ".pptx"
+# 目录里没有 .pptx 时，这些扩展名仍收作被评对象，交给维度一判不通过（总分记 0），
+# 而不是当成「没有交付物」直接跳过评测。
+_WRONG_FMT_EXTS = (".ppt", ".pptm", ".ppsx", ".ppsm", ".pps", ".potx", ".pot",
+                   ".odp", ".key", ".pdf")
+
+
+def _fmt_reject(file_path):
+    """维度1的格式门禁：交付物必须是可正常打开的 .pptx（OOXML 演示文稿包）。
+
+    不通过返回原因文本，通过返回 None。判定与 PowerPoint 的「能不能双击打开」对齐：
+    扩展名须为 .pptx，文件须是 zip 容器，且包内含 ppt/presentation.xml。
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext != _ACCEPTED_EXT:
+        return "交付物为 %s 格式，只接受 .pptx 演示文稿" % (ext or "无扩展名")
+    if not zipfile.is_zipfile(file_path):
+        return "交付物不是有效的 .pptx 包（无法作为 zip 容器打开）"
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            names = set(zf.namelist())
+    except Exception as exc:
+        return "交付物无法作为 .pptx 打开：%s: %s" % (type(exc).__name__, exc)
+    if "ppt/presentation.xml" not in names:
+        return "交付物包内缺少 ppt/presentation.xml，不是 PowerPoint 演示文稿"
+    return None
+
+
+def _check_dim1(baseline, deck):
+    """维度1：可用与可修改性（格式门禁另见 _fmt_reject）。
+
+    只拦「无法使用」的情形：页数残缺、整页被导出为图片（文本对象大面积消失）、
+    文字整体跑出画布。细则口径中不把局部包围盒轻微交叠算作版面严重错乱。
+    """
+    fails = []
+    total = baseline["n"]
+    if len(deck["slides"]) != total:
+        fails.append("幻灯片为 %d 页，应为 %d 页" % (len(deck["slides"]), total))
+    blank = [s["pos"] for s in deck["slides"] if not s["seq"]]
+    if blank:
+        fails.append("第 %s 页无可单独点选编辑的文本对象" % ",".join(str(x) for x in blank[:6]))
+    exp_shapes = sum(len(s["t"]) for s in baseline["s"].values())
+    got_shapes = sum(len(s["seq"]) for s in deck["slides"])
+    if exp_shapes and got_shapes < exp_shapes * 0.6:
+        fails.append("可编辑文本对象仅 %d 个（原稿 %d 个），疑似整页转为位图"
+                     % (got_shapes, exp_shapes))
+    cx = deck["cx"] or baseline["cx"]
+    cy = deck["cy"] or baseline["cy"]
+    off_canvas = []
+    for slide in deck["slides"]:
+        for item in slide["seq"]:
+            box = item["b"]
+            if not box or any(v is None for v in box):
+                continue
+            if box[0] >= cx or box[1] >= cy or box[0] + box[2] <= 0 or box[1] + box[3] <= 0:
+                off_canvas.append("p%d/%s" % (slide["pos"], item["name"]))
+    if off_canvas:
+        fails.append("文本框完全超出画布：%s" % _fmt(off_canvas, 4))
+    return fails
+
+
+def _evaluate_impl(file_path, result):
+    # 维度一的第一道门禁：交付物格式只接受 .pptx，不合格即判 0，不再解析内容
+    reject = _fmt_reject(file_path)
+    if reject:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "维度一未通过：%s，完成度总分记 0" % reject
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+
+    baseline = _baseline()
+    deck = _load_deck(file_path)
+
+    dim1 = _check_dim1(baseline, deck)
+    if dim1:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "维度一未通过：%s，完成度总分记 0" % "；".join(dim1)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    result["dim1_pass"] = True
+
+    # 先由页脚页码把交付稿的放映顺序还原成原稿页号，再逐页配对形状
+    order, order_ok = _page_order(deck, baseline["n"])
+    pmap = {}
+    for pos, page in enumerate(order):
+        if page is not None:
+            pmap.setdefault(page, pos)
+
+    page_pairs, shape_pairs, run_pairs, missing = [], [], [], []
+    for key in sorted(baseline["s"], key=int):
+        page, exp_slide = int(key), baseline["s"][key]
+        pos = pmap.get(page)
+        got_slide = deck["slides"][pos] if pos is not None and pos < len(deck["slides"]) else None
+        if got_slide is None:
+            missing.extend((page, nm) for nm in exp_slide["t"])
+            continue
+        page_pairs.append((page, exp_slide, got_slide))
+        pairs, lost = _pair_shapes(exp_slide, got_slide)
+        missing.extend((page, nm) for nm in lost)
+        shape_pairs.extend((page, nm, exp, got) for nm, exp, got in pairs)
+        run_pairs.extend(_run_pairs(page, pairs))
+
+    got_of = {(page, name): got for page, name, _exp, got in shape_pairs}
+    slide_of = {page: got_slide for page, _exp, got_slide in page_pairs}
+    mask_pages = {1} | set(_SEC_PAGES)
+
+    def cls(sizes, pages=None, color=None):
+        """按基线属性挑出某类文字元素：[(页号, 形状名, 基线项, 交付项或 None)]。"""
+        picked = []
+        for key in sorted(baseline["s"], key=int):
+            page = int(key)
+            if pages is not None and page not in pages:
+                continue
+            for name, exp in baseline["s"][key]["t"].items():
+                if any(r[0] in sizes and (color is None or r[2] == color) for r in exp["r"]):
+                    picked.append((page, name, exp, got_of.get((page, name))))
+        return picked
+
+    def untranslated(group):
+        return ["p%d/%s" % (page, name) for page, name, exp, got in group
+                if not _text_ok(exp, got)]
+
+    def geo_bad_list(group, want):
+        """文本框几何核查；口径中该条已删，默认不参与判定。"""
+        if not _JUDGE_TEXTBOX_GEOMETRY:
+            return []
+        return ["p%d/%s 文本框几何偏离 %s" % (page, name, want)
+                for page, name, _exp, got in group
+                if got is None or _geo_bad(got["b"], want)]
+
+    results = []
+
+    def bonus(score, rule, ok, detail=""):
+        results.append(("+%d：%s" % (score if ok else 0, rule), "" if ok else detail))
+
+    def penalty(score, rule, hit, detail=""):
+        results.append(("-%d：%s" % (score if hit else 0, rule), detail if hit else ""))
+
+    # 01 +5：全部 46 页幻灯片内不残留任何中文字符（含标题、副标题、卡片、指标、
+    # 流程标签、结论句、页脚导航）。逐形状扫描交付稿全部文字，不依赖配对结果。
+    cjk = ["p%d/%s" % (s["pos"], it["name"]) for s in deck["slides"] for it in s["seq"]
+           if _CJK_RE.search(it["txt"])]
+    bonus(5, "全部 46 页幻灯片内不残留任何中文字符", not cjk, _fmt(cjk))
+
+    # 02 +3：第1页封面主标题（32磅）、副标题（13磅）与右上角徽章（8.2磅）均译为英文
+    group = cls({3200, 1300, 820}, pages={1})
+    bad = untranslated(group)
+    bonus(3, "第1页封面主标题、副标题与右上角徽章均译为英文", not bad, _fmt(bad))
+
+    # 03 +3：第2页目录 7 条 PART 条目标题（11.5磅）及其下方说明文字（8.4磅）均译为英文
+    group = cls({1150, 840}, pages={2})
+    bad = untranslated(group)
+    bonus(3, "第2页目录 7 条 PART 条目标题及其说明文字均译为英文", not bad, _fmt(bad))
+
+    # 04 +3：第3、6、14、17、19、23、42 页章节标题（34磅）与一句话导语（14磅）均译为英文
+    group = cls({3400}, pages=_SEC_PAGES) + cls({1400}, pages=_SEC_PAGES)
+    bad = untranslated(group)
+    bonus(3, "7 个章节分隔页的章节标题与一句话导语均译为英文", not bad, _fmt(bad))
+
+    # 05 +3：各内容页顶部主标题（26磅）全部译为英文
+    group = cls({2600})
+    bad = untranslated(group)
+    bonus(3, "各内容页顶部主标题全部译为英文", not bad, _fmt(bad))
+
+    # 06 +3：主标题下方过渡副标题（11磅、6A7F7D）全部译为英文
+    group = cls({1100}, color="6A7F7D")
+    bad = untranslated(group)
+    bonus(3, "各内容页主标题下方的过渡副标题全部译为英文", not bad, _fmt(bad))
+
+    # 07 +3：卡片小标题（12.5磅、063D3B）与卡片正文段落（9.2磅）全部译为英文
+    group = cls({1250}, color="063D3B") + cls({920})
+    bad = untranslated(group)
+    bonus(3, "各卡片的小标题与卡片正文段落全部译为英文", not bad, _fmt(bad))
+
+    # 08 +3：第15、24 页指标磁贴的程度词（25磅）、指标名（11磅）与注解（8.2磅）全部译为英文
+    group = cls({2500, 1100, 820}, pages=_METRIC_PAGES)
+    bad = untranslated(group)
+    bonus(3, "指标磁贴文字全部译为英文", not bad, _fmt(bad))
+
+    # 09 +3：第8、9、22、33、34、37、44 页流程步骤条的序号（10磅）与步骤名（8.4磅）译为英文
+    group = cls({1000}) + cls({840}, pages=_STEP_PAGES)
+    bad = untranslated(group)
+    bonus(3, "流程步骤条文字全部译为英文", not bad, _fmt(bad))
+
+    # 10 +3：第16页「植保环节/传统方式—低空方式」与第36页「人工踏勘/特点—适用建议」
+    # 的行标题、行内说明及底部结论句全部译为英文
+    group = cls({1300, 1050, 870}, pages={16}) + cls({1250, 1050, 880}, pages={36})
+    bad = untranslated(group)
+    bonus(3, "第16与第36页对比行的行标题、行内说明及底部结论句全部译为英文",
+          not bad, _fmt(bad))
+
+    # 11 +3：全部 46 条底部页脚导航文字（7.8磅）译为英文，且 46 条一条不缺
+    group = cls({780})
+    bad = untranslated(group)
+    if len([1 for _p2, _n, _e, got in group if got is not None]) != baseline["n"]:
+        bad.append("页脚条数不足 %d 条" % baseline["n"])
+    bonus(3, "全部 46 条底部页脚导航文字译为英文", not bad, _fmt(bad))
+
+    # 12 +3：译文完整通顺——无中英混排、无漏译半句、无空文本、无中文标点残留、无乱码
+    quality = ["p%d/%s 文本框缺失" % t for t in missing]
+    for page, name, exp, got in shape_pairs:
+        tag = "p%d/%s" % (page, name)
+        if not _text_ok(exp, got):
+            quality.append("%s 为空或未译" % tag)
+            continue
+        if _CJK_PUNCT_RE.search(got["txt"]):
+            quality.append("%s 残留中文标点" % tag)
+        if "�" in got["txt"] or "???" in got["txt"]:
+            quality.append("%s 含乱码或占位符" % tag)
+    bonus(3, "译文完整通顺，无中英混排、无漏译半句、无断句错乱", not quality, _fmt(quality))
+
+    # 13 +1：第46页「感谢观看」（26磅）与署名行（12磅）译为英文；
+    # 「THANKS FOR YOUR TIME」本已为英文，保持不变即可
+    group = cls({2600, 1200}, pages={46})
+    bad = untranslated(group)
+    for _pg, name, exp, got in cls({1700}, pages={46}):
+        text = re.sub(r"\s+", " ", (got["txt"] if got else "")).strip().upper()
+        if text != "THANKS FOR YOUR TIME":
+            bad.append("p46/%s 原有英文行被改写：%s" % (name, text or "空"))
+    bonus(1, "第46页「感谢观看」与署名行译为英文，原有英文行保持不变", not bad, _fmt(bad))
+
+    # 14 +1：第18页横幅句（16磅）、第5页强调句（20磅）、第24页「放大路径」标题（15磅）
+    # 及其说明（12磅）均译为英文
+    group = (cls({1600}, pages={18}) + cls({2000}, pages={5})
+             + cls({1500, 1200}, pages={24}))
+    bad = untranslated(group)
+    bonus(1, "第18页横幅句、第5页强调句与第24页「放大路径」标题及说明均译为英文",
+          not bad, _fmt(bad))
+
+    # 15 -3：交付稿不满足 46 页、页序与内容对应关系不变（缺页、并页、加页、调序均计）。
+    # 页序以页脚自带页码为准；页码若整体无法解析则只判页数，不臆断页序。
+    hit = len(deck["slides"]) != baseline["n"]
+    detail = "幻灯片 %d 页" % len(deck["slides"]) if hit else ""
+    if order_ok and order != list(range(1, baseline["n"] + 1)):
+        moved = ["第%d位=原第%d页" % (i + 1, n) for i, n in enumerate(order) if n != i + 1]
+        hit, detail = True, "页序错位：%s" % _fmt(moved, 6)
+    penalty(3, "交付稿不满足 46 页、页序与内容对应关系不变", hit, detail)
+
+    # 16 -3：幻灯片画布不满足 13.333 英寸 × 7.5 英寸（16:9）
+    hit = (deck["cx"] is None or deck["cy"] is None
+           or abs(deck["cx"] - baseline["cx"]) > _POS_TOL
+           or abs(deck["cy"] - baseline["cy"]) > _POS_TOL)
+    penalty(3, "幻灯片画布不满足 13.333 × 7.5 英寸（16:9）", hit,
+            "画布 %s × %s 英寸" % (deck["cx"], deck["cy"]))
+
+    # 17 -3：任一页面中的形状对象数量减少（色块、卡片、分隔线、遮罩、图片、文本框被删或合并）
+    shrink = []
+    for page, exp_slide, got_slide in page_pairs:
+        if got_slide["sp"] < exp_slide["sp"]:
+            shrink.append("p%d 形状 %d→%d" % (page, exp_slide["sp"], got_slide["sp"]))
+        if got_slide["pic"] < exp_slide["pic"]:
+            shrink.append("p%d 图片 %d→%d" % (page, exp_slide["pic"], got_slide["pic"]))
+    shrink += ["p%d/%s 文本框缺失" % t for t in missing]
+    penalty(3, "任一页面中的形状对象数量减少", bool(shrink), _fmt(shrink))
+
+    # 18 -1：封面主标题不满足 32 磅、颜色 FFFFFF（加粗另按【加粗状态】条计；
+    # 文本框几何按口径不再判定）
+    bad = _diff_runs(run_pairs, lambda p, r: p == 1 and r[0] == 3200, sz=True, col=True)
+    bad += geo_bad_list(cls({3200}, pages={1}), _BOX_COVER_TITLE)
+    penalty(1, "封面主标题不满足 32 磅、颜色 FFFFFF", bool(bad), _fmt(bad))
+
+    # 19 -1：封面副标题不满足 13 磅、颜色 EAF7F4
+    bad = _diff_runs(run_pairs, lambda p, r: p == 1 and r[0] == 1300, sz=True, col=True)
+    penalty(1, "封面副标题不满足 13 磅、颜色 EAF7F4", bool(bad), _fmt(bad))
+
+    # 20 -1：满版底图上方的深色遮罩透明度被改动（封面 000000/82000 + 063D3B/92000；
+    # 章节分隔页 000000/62000 + 063D3B/78000。遮罩被删除、加深、变浅或换色均计；
+    # 只比较色值与透明度，不比较遮罩尺寸）
+    def alpha_fills(sig_list):
+        out = []
+        for sig in sig_list:
+            parts = sig.split(":")
+            if len(parts) >= 2 and "/" in parts[1]:
+                out.append(parts[1])
+        return sorted(out)
+
+    bad = []
+    for page, exp_slide, got_slide in page_pairs:
+        if page not in mask_pages:
+            continue
+        want, have = alpha_fills(exp_slide["f"]), alpha_fills(got_slide["f"])
+        if want != have:
+            bad.append("p%d 遮罩 %s→%s" % (page, want, have))
+    penalty(1, "满版底图上方的深色遮罩透明度被改动", bool(bad), _fmt(bad))
+
+    # 21 -1：7 条 PART 条目标题不满足 11.5 磅、颜色 0E7C7B 与 1F6E86 逐条交替，
+    # 其下方说明文字不满足 8.4 磅
+    bad = _diff_runs(run_pairs, lambda p, r: p == 2 and r[0] == 1150, sz=True, col=True)
+    bad += _diff_runs(run_pairs, lambda p, r: p == 2 and r[0] == 840, sz=True)
+    penalty(1, "目录 PART 条目标题不满足 11.5 磅与 0E7C7B/1F6E86 交替、说明不满足 8.4 磅",
+            bool(bad), _fmt(bad))
+
+    # 22 -3：章节分隔页的两位数序号不满足 48 磅、颜色 E5A63B
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 4800, sz=True, col=True)
+    penalty(3, "章节分隔页两位数序号不满足 48 磅、颜色 E5A63B", bool(bad), _fmt(bad))
+
+    # 23 -3：章节分隔页标题不满足 34 磅、颜色 FFFFFF；其下导语不满足 14 磅、颜色 EAF7F4
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 3400, sz=True, col=True)
+    bad += _diff_runs(run_pairs, lambda p, r: p in _SEC_PAGES and r[0] == 1400,
+                      sz=True, col=True)
+    penalty(3, "章节分隔页标题不满足 34 磅 FFFFFF、导语不满足 14 磅 EAF7F4",
+            bool(bad), _fmt(bad))
+
+    # 24 -5：内容页顶部主标题不满足 26 磅、颜色 112B2D（被整体缩放字号计）
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 2600, sz=True, col=True)
+    bad += geo_bad_list(cls({2600}), _BOX_MAIN_TITLE)
+    penalty(5, "内容页顶部主标题不满足 26 磅、颜色 112B2D", bool(bad), _fmt(bad))
+
+    # 25 -5：卡片正文段落不满足 9.2 磅、颜色 112B2D（被整体缩放字号计）
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 920, sz=True, col=True)
+    penalty(5, "卡片正文段落不满足 9.2 磅、颜色 112B2D", bool(bad), _fmt(bad))
+
+    # 26 -3：主标题下方过渡副标题不满足 11 磅、颜色 6A7F7D
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 1100 and r[2] == "6A7F7D",
+                     sz=True, col=True)
+    penalty(3, "主标题下方过渡副标题不满足 11 磅、颜色 6A7F7D", bool(bad), _fmt(bad))
+
+    # 27 -3：卡片小标题不满足 12.5 磅、颜色 063D3B
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 1250 and r[2] == "063D3B",
+                     sz=True, col=True)
+    penalty(3, "卡片小标题不满足 12.5 磅、颜色 063D3B", bool(bad), _fmt(bad))
+
+    # 28 -3：各页标题与正文的加粗状态被改动。按计分约定，全篇加粗差异只在本条计扣，
+    # 其余各条不再重复判定加粗
+    bad = _diff_runs(run_pairs, lambda p, r: True, bold=True)
+    penalty(3, "各页标题与正文的加粗状态被改动", bool(bad), _fmt(bad))
+
+    # 29 -3：各页文字的对齐方式被改动。按计分约定只在本条计扣；补写与继承值一致的
+    # 对齐属性视为等价改写（缺省 algn 一律按继承值 l 处理），不计
+    bad = _diff_runs(run_pairs, lambda p, r: True, algn=True)
+    penalty(3, "各页文字的对齐方式被改动", bool(bad), _fmt(bad))
+
+    # 30 -3：指标磁贴的大号数字/程度词不满足 25 磅及 0E7C7B/1F6E86/E5A63B/C96B3C 的
+    # 分列取值，其下指标名不满足 11 磅、注解不满足 8.2 磅（三行居中另按【对齐方式】条计）
+    bad = _diff_runs(run_pairs, lambda p, r: p in _METRIC_PAGES and r[0] == 2500,
+                     sz=True, col=True)
+    bad += _diff_runs(run_pairs, lambda p, r: p in _METRIC_PAGES and r[0] in (1100, 820),
+                      sz=True)
+    penalty(3, "指标磁贴数字/指标名/注解不满足 25 磅分列取色与 11、8.2 磅", bool(bad), _fmt(bad))
+
+    # 31 -3：第16页对比行不满足 13 磅（行标题）/ 10.5 磅（方式名）/ 8.7 磅（说明），
+    # 底部结论句不满足 13 磅、颜色 0E7C7B
+    bad = _diff_runs(run_pairs, lambda p, r: p == 16 and r[0] in (1300, 1050, 870), sz=True)
+    bad += _diff_runs(run_pairs, lambda p, r: p == 16 and r[2] == "0E7C7B", col=True)
+    penalty(3, "第16页对比行不满足 13/10.5/8.7 磅或结论句不满足 13 磅 0E7C7B",
+            bool(bad), _fmt(bad))
+
+    # 32 -3：第36页对比行不满足 12.5 磅 / 10.5 磅 / 8.8 磅，底部结论句不满足 12.5 磅
+    bad = _diff_runs(run_pairs, lambda p, r: p == 36 and r[0] in (1250, 1050, 880), sz=True)
+    penalty(3, "第36页对比行不满足 12.5/10.5/8.8 磅", bool(bad), _fmt(bad))
+
+    # 33 -3：流程步骤序号不满足 10 磅、步骤名称不满足 8.4 磅。按口径「框被拉宽」一项
+    # 已随文本框调整条删除，本条只判字号
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 1000, sz=True)
+    bad += _diff_runs(run_pairs, lambda p, r: p in _STEP_PAGES and r[0] == 840, sz=True)
+    penalty(3, "流程步骤序号不满足 10 磅、步骤名称不满足 8.4 磅", bool(bad), _fmt(bad))
+
+    # 34 -1：第18页横幅句不满足 16 磅、颜色 FFFFFF，其下横幅底色不满足 000000 透明度 65000
+    bad = _diff_runs(run_pairs, lambda p, r: p == 18 and r[0] == 1600, sz=True, col=True)
+    banner = slide_of.get(18)
+    if banner is not None and not any(sig.split(":")[1] == "000000/65000"
+                                      for sig in banner["f"] if len(sig.split(":")) >= 2):
+        bad.append("p18 横幅底色 000000/65000 缺失或被改写")
+    penalty(1, "第18页横幅句不满足 16 磅 FFFFFF 或横幅底色不满足 000000/65000",
+            bool(bad), _fmt(bad))
+
+    # 35 -1：第5页「政策可行 → 场景可用 → 运营可持续」一行不满足 20 磅、颜色 063D3B
+    bad = _diff_runs(run_pairs, lambda p, r: p == 5 and r[0] == 2000, sz=True, col=True)
+    penalty(1, "第5页强调句不满足 20 磅、颜色 063D3B", bool(bad), _fmt(bad))
+
+    # 36 -1：第24页「放大路径」标题不满足 15 磅、其说明不满足 12 磅
+    bad = _diff_runs(run_pairs, lambda p, r: p == 24 and r[0] in (1500, 1200), sz=True)
+    penalty(1, "第24页「放大路径」标题不满足 15 磅、说明不满足 12 磅", bool(bad), _fmt(bad))
+
+    # 37 -3：底部页脚导航不满足 7.8 磅，深色页不满足 DDF3EC、浅色页不满足 6A7F7D
+    # （文本框几何按口径不再判定）
+    bad = _diff_runs(run_pairs, lambda p, r: r[0] == 780, sz=True, col=True)
+    bad += geo_bad_list(cls({780}), _BOX_FOOTER)
+    penalty(3, "底部页脚导航不满足 7.8 磅或深/浅页色值 DDF3EC/6A7F7D", bool(bad), _fmt(bad))
+
+    # 38 -1：页面底色不满足 FFF9EE、顶部色条不满足 0E7C7B 且高 0.22 英寸，卡片与底板
+    # 填充不满足 FFFFFF/F8FFFC/F4FBFF/FFF7E8/E8F6F2 的分区取值，或圆角矩形被改为直角。
+    # 逐页比较「几何形状类型 + 色值」的多重集合；遮罩与第18页横幅底色分别由第20、34条判定
+    def plain_fills(page, sig_list):
+        out = []
+        for sig in sig_list:
+            parts = sig.split(":")
+            if len(parts) < 2:
+                continue
+            color = parts[1]
+            if "/" in color and (page in mask_pages or (page == 18 and color == "000000/65000")):
+                continue
+            out.append(parts[0] + ":" + color)
+        return sorted(out)
+
+    bad = []
+    for page, exp_slide, got_slide in page_pairs:
+        want, have = plain_fills(page, exp_slide["f"]), plain_fills(page, got_slide["f"])
+        if want != have:
+            only_exp = sorted(set(want) - set(have))
+            only_got = sorted(set(have) - set(want))
+            bad.append("p%d 填充差异 -%s +%s" % (page, only_exp or "无", only_got or "无"))
+        for sig in got_slide["f"]:
+            parts = sig.split(":")
+            if len(parts) == 3 and parts[0] == "rect" and parts[1] == "0E7C7B" and "x" in parts[2]:
+                height = float(parts[2].split("x")[1])
+                if abs(height - 0.22) > _POS_TOL:
+                    bad.append("p%d 顶部色条高 %.2f 英寸" % (page, height))
+    penalty(1, "页面底色、顶部色条、卡片底板填充或圆角矩形被改动", bool(bad), _fmt(bad))
+
+    # 39 -5：7 张配图的图像数据未保持逐字节一致（以 ppt/media 下各文件的 md5 比对，
+    # 被替换、重新编码、调色、加滤镜、去背或改为占位灰底都会改变 md5）
+    hit = deck["md5"] != baseline["md5"]
+    detail = ""
+    if hit:
+        detail = "媒体文件 %d 个（应为 %d 个），md5 不一致 %d 处" % (
+            len(deck["md5"]), len(baseline["md5"]),
+            len(set(baseline["md5"]) ^ set(deck["md5"])))
+    penalty(5, "7 张配图的图像数据未保持逐字节一致", hit, detail)
+
+    # 40 -3：配图的裁剪范围、摆放与叠放层次被改动（第33页配图应位于 0.7/1.45/5.6/4.9；
+    # 封面与结束页配图应满版 13.333×7.5 并置于遮罩之下）
+    bad = []
+    for page, exp_slide, got_slide in page_pairs:
+        exp_pics, got_pics = exp_slide["p"], got_slide["p"]
+        if len(exp_pics) != len(got_pics):
+            bad.append("p%d 图片数 %d→%d" % (page, len(exp_pics), len(got_pics)))
+            continue
+        for i, (exp_pic, got_pic) in enumerate(zip(exp_pics, got_pics), 1):
+            if _geo_bad(got_pic[:4], exp_pic[:4]):
+                bad.append("p%d 图%d 几何 %s→%s" % (page, i, exp_pic[:4], got_pic[:4]))
+            if (exp_pic[4] or {}) != (got_pic[4] or {}):
+                bad.append("p%d 图%d 裁剪 %s→%s" % (page, i, exp_pic[4], got_pic[4]))
+        if exp_slide.get("z") and got_slide.get("z") != exp_slide["z"]:
+            bad.append("p%d 叠放层次 %s→%s" % (page, exp_slide["z"], got_slide["z"]))
+    for page, want in ((33, _PIC_P33), (1, _PIC_FULL), (46, _PIC_FULL)):
+        slide = slide_of.get(page)
+        if slide is None or not slide["p"]:
+            bad.append("p%d 配图缺失" % page)
+        elif all(_geo_bad(pic[:4], want) for pic in slide["p"]):
+            bad.append("p%d 配图未位于 %s 英寸" % (page, want))
+    penalty(3, "配图的裁剪范围、摆放与叠放层次被改动", bool(bad), _fmt(bad))
+
+    # 41 -3：删除或改写页面上的说明性文字内容（非翻译需要的增删、改写、缩写、合并句子）。
+    # 可机械判定的是「文字被删空」与「段落数减少（合并句子）」，以及整块文本框丢失
+    bad = ["p%d/%s 文本框缺失" % t for t in missing]
+    for page, name, exp, got in shape_pairs:
+        if exp["np"] and not got["np"]:
+            bad.append("p%d/%s 文字被删空" % (page, name))
+        elif got["np"] < exp["np"]:
+            bad.append("p%d/%s 段落 %d→%d（疑似合并句子）" % (page, name, exp["np"], got["np"]))
+    penalty(3, "删除或改写页面上的说明性文字内容", bool(bad), _fmt(bad))
+
+    # 42 -1：编号类文字被改写或丢失——目录 PART 序号、章节页两位数序号、流程步骤序号、
+    # 页脚页码。按数值比较，"01"→"1" 这类零填充写法差异不计
+    bad = []
+    for group in (cls({4800}), cls({1150}, pages={2}), cls({1000}), cls({780})):
+        for page, name, exp, got in group:
+            want = {int(x) for x in exp.get("x", [])}
+            have = {int(x) for x in re.findall(r"\d+", got["txt"])} if got else set()
+            if want - have:
+                bad.append("p%d/%s 编号 %s 丢失" % (page, name,
+                                                   sorted(want - have)))
+    penalty(1, "编号类文字被改写或丢失", bool(bad), _fmt(bad))
+
+    # 43 -1：改动署名「青岚县农业低空应用课题组」、机构名、地名等信息中的实体名称取值。
+    # 判据：原文出现县名的各处文字都须存在且已英译，且这些文字之间仍共享同一专有名词
+    # （通用词如 county/agricultural/plan 等不参与比较）
+    bad, token_sets = [], []
+    for key in sorted(baseline["s"], key=int):
+        page = int(key)
+        for name, exp in baseline["s"][key]["t"].items():
+            if not exp.get("e"):
+                continue
+            got = got_of.get((page, name))
+            if got is None or not (got["txt"] or "").strip():
+                bad.append("p%d/%s 含实体名的文字缺失或被删空" % (page, name))
+                continue
+            if _CJK_RE.search(got["txt"]):
+                continue    # 仍是中文，属英译覆盖面问题，由加分项判定，本条不重复计扣
+            words = re.findall(r"[A-Za-z][A-Za-z'\-]{3,}", got["txt"])
+            token_sets.append({w.lower() for w in words} - _ENTITY_STOP)
+    if token_sets and not set.intersection(*token_sets):
+        bad.append("含地名/署名的 %d 处文字之间已无共同专有名词" % len(token_sets))
+    penalty(1, "署名、机构名、地名等实体名称取值被改动", bool(bad), _fmt(bad))
+
+    # 44 -5：英文使行距被压缩——全篇文本体不得被写入行距压缩比例 lnSpcReduction，
+    # 34/12.5/10.5/9.2/8.2/7.8 磅等各类文字的行间距须保持原值
+    total_lnsp = sum(slide["lnsp"] for slide in deck["slides"])
+    penalty(5, "英文使行距被压缩（写入 lnSpcReduction）", total_lnsp > 0,
+            "%d 处文本体写入 lnSpcReduction" % total_lnsp)
+
+    return _finalize(result, results)
+
+
+def _finalize(result, results):
+    """把 results 反解为 dim2_items：加分项计入满分，减分项命中即扣、不计入满分。"""
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError("dim2 项数不一致：results=%d vs order=%d"
+                           % (len(results), len(_MAX_DELTAS_ORDER)))
+    dim2_items, total_score, max_score = [], 0, 0
+    for (raw, _detail), max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            magnitude = int(head.replace("+", "").replace("-", "").strip())
+        except ValueError:
+            magnitude = 0
+        hit = magnitude > 0
+        delta = max_delta if hit else 0
+        total_score += delta
+        if max_delta > 0:
+            max_score += max_delta
+        dim2_items.append({"rule": rule, "max_delta": max_delta, "delta": delta,
+                           "hit": hit})
+    result["dim2_items"] = dim2_items
+    result["total_score"] = total_score
+    result["max_score"] = max_score
+    return result
+
+
+def evaluate(dir_path):
+    """评测入口：在 dir_path 内定位交付的 .pptx 并给出完成度评分。
+
+    交付物只接受 .pptx：目录内优先取 .pptx；若只交了 .ppt / .pptm / .odp / .pdf 等
+    其他格式，仍把它收作被评对象，由维度一判不通过（total_score 记 0），而不是当成
+    「没有交付物」跳过评测。
+
+    返回固定 9 个字段：id / file_name / status / error / dim1_pass / dim1_reason /
+    dim2_items / total_score / max_score，其中 dim2_items 每项为
+    {rule, max_delta, delta, hit}。
+
+    两类异常分开回传：
+      · 目录不存在 / 目录内没有任何演示文稿——维度一根本没进入判定，error 只带纯文本
+        原因（不带异常类名），file_name、dim1_pass、dim1_reason 一律留空（dim1_pass 为
+        空字符串而非 False），dim2 不出项，总分与满分一并归零；
+      · 其他运行期异常——error 以「脚本运行异常：」打头，dim1_pass 记 False 并在
+        dim1_reason 中给出错误摘要。
+    """
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
@@ -1254,81 +967,65 @@ def evaluate(dir_path: str) -> dict:
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": max_score,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        # --- 定位被评估文档 ---
-        path = _locate_document(dir_path)
-        if path is None:
-            result["status"] = "error"
-            result["error"] = f"目录 '{dir_path}' 下未找到被评估的 .pptx 文件"
-            return result
-        result["file_name"] = os.path.basename(path)
-
-        # --- 维度1 ---
-        ok1, reasons = check_dim1(path)
-        result["dim1_pass"] = bool(ok1)
-        if not ok1:
-            # 未通过：给出未通过原因，dim2 不参与、总分 0
-            result["dim1_reason"] = "；".join(reasons) if reasons else "维度一未通过"
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError("目录不存在或不是目录：%s" % dir_path)
+        files = sorted(f for f in os.listdir(dir_path)
+                       if not f.startswith("~$")
+                       and os.path.isfile(os.path.join(dir_path, f)))
+        cands = [f for f in files if f.lower().endswith(_ACCEPTED_EXT)]
+        if not cands:
+            # 没有 .pptx，但交了 .ppt/.odp/.pdf 等其他格式：仍收作被评对象，由维度一判不通过
+            cands = [f for f in files if f.lower().endswith(_WRONG_FMT_EXTS)]
+        if not cands:
+            raise FileNotFoundError("目录中未找到 .pptx 文件：%s" % dir_path)
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except FileNotFoundError as exc:
+        # 找不到被评估文件：error 只回传纯文本原因，维度一未进入判定，各字段留空、分数归零。
+        result["status"] = "error"
+        result["error"] = str(exc)
+        result["file_name"] = ""
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        if type(exc).__name__ in ("ParseError", "XMLSyntaxError", "BadZipFile") or (
+            isinstance(exc, KeyError) and "There is no item named" in str(exc)
+        ):
+            # 交付文件本身结构/XML 损坏：记为维度一不通过、正常 0 分
+            result["status"] = "ok"
+            result["error"] = None
+            result["dim1_pass"] = False
+            result["dim1_reason"] = "文件无法打开或解析：%s: %s" % (
+                type(exc).__name__, exc,
+            )
+            result["dim2_items"] = []
             result["total_score"] = 0
             return result
-
-        # --- 维度1 通过，进入维度2 ---
-        prs = Presentation(path)
-        # 规则函数在本模块中通过名字查表
-        module_globals = globals()
-
-        total = 0
-        items = []
-
-        # 加分项：命中则计入 +delta
-        for delta, label, fn_name in ADD_RULES:
-            fn = module_globals[fn_name]
-            try:
-                hit, detail = fn(prs)
-            except Exception as e:  # 单条规则异常，视为未命中并在 detail 中说明
-                hit, detail = False, f"规则执行异常：{e}"
-            _ = detail  # detail 已计算但按需求不在结果中输出
-            gained = delta if hit else 0
-            total += gained
-            items.append({
-                "rule": label,
-                "max_delta": delta,
-                "delta": gained,
-                "hit": bool(hit),
-                "detail": "",
-            })
-
-        # 扣分项：命中则计入 -delta（max_delta 记为 -delta 以体现该项对总分的最大影响）
-        for delta, label, fn_name in SUB_RULES:
-            fn = module_globals[fn_name]
-            try:
-                hit, _detail = fn(prs)
-            except Exception:
-                hit = False
-            lost = -delta if hit else 0
-            total += lost
-            items.append({
-                "rule": label,
-                "max_delta": -delta,
-                "delta": lost,
-                "hit": bool(hit),
-                "detail": "",
-            })
-
-        result["dim2_items"] = items
-        result["total_score"] = total
-        return result
-
-    except Exception as e:
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = "脚本运行异常：%s: %s" % (type(exc).__name__, exc)
+        result["dim1_pass"] = False
+        result["dim1_reason"] = "文件无法打开或解析：%s: %s" % (type(exc).__name__, exc)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
         return result
+
+
+_BASELINE_JSON = r"""{"cx":13.3326,"cy":7.5,"md5":["247b0d69ea34a5bd009ab93dcb7071fc","6b0d9e0926904e53ad8e8b5a0ce9e072","81c4399df273b45b134df34b8c76cb38","b1a5fa435c5661dd9ff4d9f838cbf38b","c226db814c0e67a1775e12ed89efaffa","dd40b802097fa2990c055c1d5ddee6cc","f6e35fe11d2ca8d634ec0c83ef25e750"],"n":46,"s":{"1":{"f":["rect:000000/82000:13.33x7.50","rect:063D3B/92000:6.10x6.95","roundRect:E5A63B:1.85x0.28"],"no":1,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"b":[0.66,1.7,5.1,1.3],"c":1,"e":1,"np":1,"r":[[3200,1,"FFFFFF","l"]]},"Text 3":{"c":1,"np":1,"r":[[1300,0,"EAF7F4","l"]]},"Text 5":{"c":1,"np":1,"r":[[820,1,"FFFFFF","ctr"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["01"]}},"z":"pssssssss"},"10":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.30x0.90","roundRect:F8FFFC:5.30x0.90","roundRect:F8FFFC:5.30x0.90","roundRect:FFF7E8:5.30x0.90"],"no":10,"p":[[6.75,1.45,5.85,4.65,{"l":14617,"r":14617}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["10"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"11":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFFFFF:4.80x0.75","roundRect:FFFFFF:4.80x0.75","roundRect:FFFFFF:4.80x0.75","roundRect:FFFFFF:4.80x0.75"],"no":11,"p":[[0.7,1.45,6.4,4.95,{"l":13636,"r":13636}]],"pic":1,"sp":19,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 16":{"c":1,"np":1,"r":[[1100,1,"0E7C7B","l"]]},"Text 18":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["11"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspsssssssssssssss"},"12":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:6.17x1.55","roundRect:FFFFFF:2.90x1.14","roundRect:FFFFFF:2.90x1.14","roundRect:FFFFFF:2.90x1.14","roundRect:FFFFFF:2.90x1.14"],"no":12,"p":[[0.72,1.45,5.2,4.8,{"l":19531,"r":19531}]],"pic":1,"sp":21,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 18":{"c":1,"np":1,"r":[[1050,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["12"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspsssssssssssssssss"},"13":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.40x0.80","roundRect:FFFFFF:5.40x1.00","roundRect:FFFFFF:5.40x1.00","roundRect:FFFFFF:5.40x1.00"],"no":13,"p":[[0.72,1.45,5.8,4.6,{"l":14538,"r":14538}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["13"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"14":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":14,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["03"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["14"]}},"z":"pssssssss"},"15":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:3.60x1.30","roundRect:F8FFFC:3.60x1.30","roundRect:F8FFFC:3.60x1.30","roundRect:FFFFFF:2.60x1.62","roundRect:FFFFFF:2.60x1.62","roundRect:FFFFFF:2.60x1.62","roundRect:FFFFFF:2.60x1.62"],"no":15,"p":[],"pic":0,"sp":31,"t":{"Text 10":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 11":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 13":{"c":1,"np":1,"r":[[2500,1,"E5A63B","ctr"]]},"Text 14":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 15":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 17":{"c":1,"np":1,"r":[[2500,1,"C96B3C","ctr"]]},"Text 18":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 19":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 21":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 22":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 24":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 25":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 27":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 28":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["15"]},"Text 5":{"c":1,"np":1,"r":[[2500,1,"0E7C7B","ctr"]]},"Text 6":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 7":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 9":{"c":1,"np":1,"r":[[2500,1,"1F6E86","ctr"]]}},"z":"sssssssssssssssssssssssssssssss"},"16":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F4FBFF:2.40x0.82","roundRect:F4FBFF:2.40x0.82","roundRect:F8FFFC:2.40x0.82","roundRect:F8FFFC:2.40x0.82","roundRect:FFF7E8:4.75x0.82","roundRect:FFF7E8:4.75x0.82","roundRect:FFF7E8:4.75x0.82","roundRect:FFF7E8:4.75x0.82","roundRect:FFFFFF:4.20x0.82","roundRect:FFFFFF:4.20x0.82","roundRect:FFFFFF:4.20x0.82","roundRect:FFFFFF:4.20x0.82"],"no":16,"p":[],"pic":0,"sp":43,"t":{"Text 11":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 17":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 18":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 23":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 26":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 27":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 29":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 32":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 35":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 36":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 38":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 39":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]},"Text 40":{"c":1,"np":1,"r":[[1300,1,"0E7C7B","ctr"]]},"Text 42":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["16"]},"Text 5":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 8":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[870,0,"112B2D","l"]]}},"z":"sssssssssssssssssssssssssssssssssssssssssss"},"17":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":17,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["04"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["17"]}},"z":"pssssssss"},"18":{"f":["rect:000000/65000:11.62x1.00","rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFFFFF:5.55x1.10","roundRect:FFFFFF:5.55x1.10","roundRect:FFFFFF:5.55x1.10","roundRect:FFFFFF:5.55x1.10"],"no":18,"p":[[0.85,5.0,11.62,1.0,{"b":42350,"t":42350}]],"pic":1,"sp":20,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"c":1,"np":1,"r":[[1600,1,"FFFFFF","ctr"]]},"Text 19":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["18"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssssssssssssssspssss"},"19":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":19,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["05"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["19"]}},"z":"pssssssss"},"2":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.20x0.78","roundRect:F8FFFC:5.20x0.78","roundRect:F8FFFC:5.20x0.78","roundRect:FFFFFF:5.20x0.78","roundRect:FFFFFF:5.20x0.78","roundRect:FFFFFF:5.20x0.78","roundRect:FFFFFF:5.20x0.78"],"no":2,"p":[],"pic":0,"sp":27,"t":{"Text 11":{"c":1,"np":1,"r":[[1150,1,"0E7C7B","l"]],"x":["03"]},"Text 12":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1150,1,"1F6E86","l"]],"x":["04"]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"c":1,"np":1,"r":[[1150,1,"0E7C7B","l"]],"x":["05"]},"Text 18":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1150,1,"1F6E86","l"]],"x":["06"]},"Text 21":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 23":{"c":1,"np":1,"r":[[1150,1,"0E7C7B","l"]],"x":["07"]},"Text 24":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 26":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["02"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1150,1,"0E7C7B","l"]],"x":["01"]},"Text 6":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1150,1,"1F6E86","l"]],"x":["02"]},"Text 9":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]}},"z":"sssssssssssssssssssssssssss"},"20":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.30x0.70","roundRect:FFFFFF:5.30x0.95","roundRect:FFFFFF:5.30x0.95","roundRect:FFFFFF:5.30x0.95"],"no":20,"p":[[6.75,1.4,5.75,4.9,{"l":16996,"r":16996}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["20"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"21":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.40x0.62","roundRect:FFFFFF:5.40x1.10","roundRect:FFFFFF:5.40x1.10","roundRect:FFFFFF:5.40x1.10"],"no":21,"p":[[0.75,1.45,5.7,4.9,{"l":17283,"r":17283}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["21"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"22":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:2.20x0.82","roundRect:E8F6F2:2.20x0.82","roundRect:FFF7E8:5.60x1.20","roundRect:FFFFFF:2.20x0.82","roundRect:FFFFFF:2.20x0.82","roundRect:FFFFFF:2.20x0.82","roundRect:FFFFFF:2.65x1.20","roundRect:FFFFFF:2.65x1.20","roundRect:FFFFFF:2.65x1.20","roundRect:FFFFFF:2.65x1.20"],"no":22,"p":[],"pic":0,"sp":36,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 18":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["1"]},"Text 21":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 23":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["2"]},"Text 24":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 26":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["3"]},"Text 27":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 29":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["4"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 32":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["5"]},"Text 33":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 35":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["22"]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"ssssssssssssssssssssssssssssssssssss"},"23":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":23,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["06"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["23"]}},"z":"pssssssss"},"24":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:11.30x1.35","roundRect:FFFFFF:2.60x1.62","roundRect:FFFFFF:2.60x1.62","roundRect:FFFFFF:2.60x1.62","roundRect:FFFFFF:2.60x1.62"],"no":24,"p":[],"pic":0,"sp":25,"t":{"Text 10":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 11":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 13":{"c":1,"np":1,"r":[[2500,1,"E5A63B","ctr"]]},"Text 14":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 15":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 17":{"c":1,"np":1,"r":[[2500,1,"C96B3C","ctr"]]},"Text 18":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 19":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 21":{"c":1,"np":1,"r":[[1500,1,"063D3B","l"]]},"Text 22":{"c":1,"np":1,"r":[[1200,0,"112B2D","l"]]},"Text 24":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["24"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[2500,1,"0E7C7B","ctr"]]},"Text 6":{"c":1,"np":1,"r":[[1100,1,"112B2D","ctr"]]},"Text 7":{"c":1,"np":1,"r":[[820,0,"6A7F7D","ctr"]]},"Text 9":{"c":1,"np":1,"r":[[2500,1,"1F6E86","ctr"]]}},"z":"sssssssssssssssssssssssss"},"25":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.35x0.90","roundRect:FFFFFF:5.35x0.90","roundRect:FFFFFF:5.35x0.90","roundRect:FFFFFF:5.35x0.90"],"no":25,"p":[[0.7,1.45,5.85,4.95,{"l":16761,"r":16761}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["25"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"26":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.75x0.72","roundRect:FFFFFF:5.75x1.00","roundRect:FFFFFF:5.75x1.00","roundRect:FFFFFF:5.75x1.00"],"no":26,"p":[[0.7,1.45,5.5,4.95,{"l":18750,"r":18750}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["26"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"27":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.50x0.70","roundRect:FFFFFF:5.50x1.00","roundRect:FFFFFF:5.50x1.00","roundRect:FFFFFF:5.50x1.00"],"no":27,"p":[[7.0,1.45,5.35,4.95,{"l":19602,"r":19602}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[3600,0,"112B2D","l"],[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["27"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"28":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.75x0.92","roundRect:FFFFFF:5.75x0.92","roundRect:FFFFFF:5.75x0.92","roundRect:FFFFFF:5.75x0.92"],"no":28,"p":[[0.75,1.45,5.4,4.95,{"l":19318,"r":19318}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["28"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"29":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.50x0.90","roundRect:FFFFFF:5.50x0.90","roundRect:FFFFFF:5.50x0.90","roundRect:FFFFFF:5.50x0.90"],"no":29,"p":[[7.0,1.45,5.35,4.95,{"l":19602,"r":19602}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["29"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"3":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":3,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["01"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["03"]}},"z":"pssssssss"},"30":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.80x0.72","roundRect:FFFFFF:5.80x0.96","roundRect:FFFFFF:5.80x0.96","roundRect:FFFFFF:5.80x0.96"],"no":30,"p":[[0.75,1.45,5.35,4.95,{"l":19602,"r":19602}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["30"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"31":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.20x0.75","roundRect:FFFFFF:5.20x0.95","roundRect:FFFFFF:5.20x0.95","roundRect:FFFFFF:5.20x0.95"],"no":31,"p":[[0.75,1.45,5.9,4.95,{"l":16477,"r":16477}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["31"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"32":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.50x0.90","roundRect:FFFFFF:5.50x0.90","roundRect:FFFFFF:5.50x0.90","roundRect:FFFFFF:5.50x0.90"],"no":32,"p":[[7.0,1.45,5.35,4.95,{"l":19602,"r":19602}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["32"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"33":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:1.04x2.60","roundRect:E8F6F2:1.04x2.60","roundRect:FFF7E8:5.70x1.25","roundRect:FFFFFF:1.04x2.60","roundRect:FFFFFF:1.04x2.60","roundRect:FFFFFF:1.04x2.60"],"no":33,"p":[[0.7,1.45,5.6,4.9,{"l":17857,"r":17857}]],"pic":1,"sp":24,"t":{"Text 11":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["3"]},"Text 12":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 14":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["4"]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["5"]},"Text 18":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[1020,0,"112B2D","l"]]},"Text 23":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["33"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["1"]},"Text 6":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 8":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["2"]},"Text 9":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]}},"z":"sssspssssssssssssssssssss"},"34":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:0.99x2.65","roundRect:E8F6F2:0.99x2.65","roundRect:F8FFFC:5.45x1.25","roundRect:FFFFFF:0.99x2.65","roundRect:FFFFFF:0.99x2.65","roundRect:FFFFFF:0.99x2.65"],"no":34,"p":[[6.8,1.4,5.75,4.9,{"l":16996,"r":16996}]],"pic":1,"sp":24,"t":{"Text 11":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["3"]},"Text 12":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 14":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["4"]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["5"]},"Text 18":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[1050,0,"112B2D","l"]]},"Text 23":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["34"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["1"]},"Text 6":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 8":{"np":1,"r":[[1000,1,"E5A63B","l"]],"x":["2"]},"Text 9":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]}},"z":"sssspssssssssssssssssssss"},"35":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.25x0.88","roundRect:FFFFFF:5.25x0.88","roundRect:FFFFFF:5.25x0.88","roundRect:FFFFFF:5.25x0.88"],"no":35,"p":[[0.75,1.45,5.85,4.9,{"l":16422,"r":16422}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["35"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"36":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F4FBFF:2.60x0.82","roundRect:F4FBFF:2.60x0.82","roundRect:F8FFFC:2.60x0.82","roundRect:F8FFFC:2.60x0.82","roundRect:FFF7E8:4.30x0.82","roundRect:FFF7E8:4.30x0.82","roundRect:FFF7E8:4.30x0.82","roundRect:FFF7E8:4.30x0.82","roundRect:FFFFFF:4.20x0.82","roundRect:FFFFFF:4.20x0.82","roundRect:FFFFFF:4.20x0.82","roundRect:FFFFFF:4.20x0.82"],"no":36,"p":[],"pic":0,"sp":43,"t":{"Text 11":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 17":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 18":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 23":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 26":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 27":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 29":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 32":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 35":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 36":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 38":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 39":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]},"Text 40":{"c":1,"np":1,"r":[[1250,1,"0E7C7B","ctr"]]},"Text 42":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["36"]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 8":{"c":1,"np":1,"r":[[1050,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[880,0,"112B2D","l"]]}},"z":"sssssssssssssssssssssssssssssssssssssssssss"},"37":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:1.06x2.40","roundRect:E8F6F2:1.06x2.40","roundRect:F8FFFC:5.80x1.35","roundRect:FFFFFF:1.06x2.40","roundRect:FFFFFF:1.06x2.40","roundRect:FFFFFF:1.06x2.40"],"no":37,"p":[[7.05,1.45,5.2,4.9,{"l":20153,"r":20153}]],"pic":1,"sp":24,"t":{"Text 11":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["3"]},"Text 12":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 14":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["4"]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["5"]},"Text 18":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[1020,0,"112B2D","l"]]},"Text 23":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["37"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["1"]},"Text 6":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 8":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["2"]},"Text 9":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]}},"z":"sssspssssssssssssssssssss"},"38":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.65x0.90","roundRect:FFFFFF:5.65x0.90","roundRect:FFFFFF:5.65x0.90","roundRect:FFFFFF:5.65x0.90"],"no":38,"p":[[0.72,1.45,5.5,4.95,{"l":18750,"r":18750}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["38"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"39":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.55x0.90","roundRect:FFFFFF:5.55x0.90","roundRect:FFFFFF:5.55x0.90","roundRect:FFFFFF:5.55x0.90"],"no":39,"p":[[6.8,1.45,5.55,4.95,{"l":18466,"r":18466}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["39"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"4":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFFFFF:5.35x0.72","roundRect:FFFFFF:5.35x1.05","roundRect:FFFFFF:5.35x1.05","roundRect:FFFFFF:5.35x1.05"],"no":4,"p":[[6.65,1.45,6.0,4.95,{"l":15909,"r":15909}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1100,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[900,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["04"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"40":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.55x0.90","roundRect:FFFFFF:5.55x0.90","roundRect:FFFFFF:5.55x0.90","roundRect:FFFFFF:5.55x0.90"],"no":40,"p":[[0.75,1.45,5.55,4.95,{"l":18466,"r":18466}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["40"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"41":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:5.55x0.70","roundRect:FFFFFF:5.55x1.00","roundRect:FFFFFF:5.55x1.00","roundRect:FFFFFF:5.55x1.00"],"no":41,"p":[[6.9,1.45,5.4,4.95,{"l":19318,"r":19318}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[900,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["41"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"42":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":42,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["07"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["42"]}},"z":"pssssssss"},"43":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFF7E8:5.20x0.65","roundRect:FFFFFF:5.20x0.95","roundRect:FFFFFF:5.20x0.95","roundRect:FFFFFF:5.20x0.95"],"no":43,"p":[[0.75,1.45,5.9,4.95,{"l":16477,"r":16477}]],"pic":1,"sp":18,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[820,0,"112B2D","l"]]},"Text 17":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["43"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssspssssssssssssss"},"44":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:2.22x1.00","roundRect:E8F6F2:2.22x1.00","roundRect:FFF7E8:9.10x0.80","roundRect:FFFFFF:2.22x1.00","roundRect:FFFFFF:2.22x1.00","roundRect:FFFFFF:2.22x1.00","roundRect:FFFFFF:3.55x1.35","roundRect:FFFFFF:3.55x1.35","roundRect:FFFFFF:3.55x1.35"],"no":44,"p":[],"pic":0,"sp":33,"t":{"Text 11":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["3"]},"Text 12":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 14":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["4"]},"Text 15":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 17":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["5"]},"Text 18":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 23":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 24":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 26":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 27":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 29":{"c":1,"np":1,"r":[[1300,1,"063D3B","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 32":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["44"]},"Text 5":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["1"]},"Text 6":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]},"Text 8":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["2"]},"Text 9":{"c":1,"np":1,"r":[[1000,0,"112B2D","l"]]}},"z":"sssssssssssssssssssssssssssssssss"},"45":{"f":["rect:000000/80000:11.90x2.15","rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:FFFFFF:3.70x1.25","roundRect:FFFFFF:3.70x1.25","roundRect:FFFFFF:3.70x1.25"],"no":45,"p":[[0.75,3.25,11.9,2.15,{"b":33940,"t":33940}]],"pic":1,"sp":17,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[2300,1,"FFFFFF","ctr"]]},"Text 16":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["45"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"ssssssssssssspssss"},"46":{"f":["rect:000000/67000:13.33x7.50","rect:063D3B/75000:13.33x7.50","rect:063D3B:13.33x7.50","rect:25A7A1:13.33x0.22"],"no":46,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":10,"t":{"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"FFFFFF","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"CFEDE7","l"]]},"Text 6":{"np":1,"r":[[1700,1,"DDF3EC","ctr"]]},"Text 7":{"c":1,"e":1,"np":1,"r":[[1200,0,"EAF7F4","ctr"]]},"Text 9":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["46"]}},"z":"sssspssssss"},"5":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F4FBFF:3.55x2.85","roundRect:F8FFFC:3.55x2.85","roundRect:FFF7E8:3.55x2.85"],"no":5,"p":[],"pic":0,"sp":17,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[2000,1,"063D3B","ctr"]]},"Text 16":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["05"]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"e":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"sssssssssssssssss"},"6":{"f":["rect:000000/62000:13.33x7.50","rect:063D3B/78000:13.33x7.50"],"no":6,"p":[[0.0,0.0,13.333,7.5,{"l":1,"r":1}]],"pic":1,"sp":8,"t":{"Text 2":{"np":1,"r":[[4800,1,"E5A63B","l"]],"x":["02"]},"Text 3":{"c":1,"np":1,"r":[[3400,1,"FFFFFF","l"]]},"Text 5":{"c":1,"np":1,"r":[[1400,0,"EAF7F4","l"]]},"Text 7":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"DDF3EC","l"]],"x":["06"]}},"z":"pssssssss"},"7":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:F8FFFC:2.75x1.05","roundRect:F8FFFC:2.75x1.05","roundRect:FFFFFF:3.55x1.05","roundRect:FFFFFF:3.55x1.05","roundRect:FFFFFF:3.55x1.05"],"no":7,"p":[[0.75,1.55,4.25,2.45,{"l":1212,"r":1212}],[8.35,1.55,4.25,2.45,{"l":1212,"r":1212}]],"pic":2,"sp":21,"t":{"Text 11":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 12":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 14":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 15":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 17":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 18":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["07"]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 5":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 6":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 8":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 9":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]}},"z":"ssssppsssssssssssssssss"},"8":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:2.24x0.92","roundRect:E8F6F2:2.24x0.92","roundRect:FFF7E8:5.70x1.75","roundRect:FFFFFF:2.24x0.92","roundRect:FFFFFF:2.24x0.92","roundRect:FFFFFF:2.24x0.92","roundRect:FFFFFF:3.70x1.28","roundRect:FFFFFF:3.70x1.28","roundRect:FFFFFF:3.70x1.28"],"no":8,"p":[[0.85,4.72,5.5,1.75,{"b":21717,"t":21717}]],"pic":1,"sp":33,"t":{"Text 11":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["3"]},"Text 12":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 14":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["4"]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["5"]},"Text 18":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 23":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 24":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 26":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 27":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 29":{"c":1,"np":1,"r":[[1400,1,"063D3B","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"c":1,"np":1,"r":[[1050,0,"112B2D","l"]]},"Text 32":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["08"]},"Text 5":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["1"]},"Text 6":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 8":{"np":1,"r":[[1000,1,"0E7C7B","l"]],"x":["2"]},"Text 9":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]}},"z":"sssssssssssssssssssssssssssspsssss"},"9":{"f":["rect:0E7C7B:13.33x0.22","rect:FFF9EE:13.33x7.50","roundRect:E8F6F2:2.28x1.05","roundRect:E8F6F2:2.28x1.05","roundRect:FFFFFF:2.28x1.05","roundRect:FFFFFF:2.28x1.05","roundRect:FFFFFF:2.28x1.05","roundRect:FFFFFF:2.70x1.15","roundRect:FFFFFF:2.70x1.15","roundRect:FFFFFF:2.70x1.15","roundRect:FFFFFF:2.70x1.15"],"no":9,"p":[[0.8,3.0,5.7,2.55,{"b":10234,"t":10234}]],"pic":1,"sp":33,"t":{"Text 11":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["3"]},"Text 12":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 14":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["4"]},"Text 15":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 17":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["5"]},"Text 18":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 2":{"b":[0.65,0.52,9.3,0.5],"c":1,"np":1,"r":[[2600,1,"112B2D","l"]]},"Text 20":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 21":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 23":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 24":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 26":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 27":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 29":{"c":1,"np":1,"r":[[1250,1,"063D3B","l"]]},"Text 3":{"c":1,"np":1,"r":[[1100,0,"6A7F7D","l"]]},"Text 30":{"c":1,"np":1,"r":[[920,0,"112B2D","l"]]},"Text 32":{"b":[0.55,7.14,12.15,0.22],"c":1,"np":1,"r":[[780,0,"6A7F7D","l"]],"x":["09"]},"Text 5":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["1"]},"Text 6":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]},"Text 8":{"np":1,"r":[[1000,1,"1F6E86","l"]],"x":["2"]},"Text 9":{"c":1,"np":1,"r":[[840,0,"112B2D","l"]]}},"z":"ssssssssssssssssssspssssssssssssss"}}}"""
 
 
 if __name__ == "__main__":
-    # 本地调试：默认以脚本所在目录作为 dir_path；也可通过 argv[1] 覆盖
-    target_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    print(json.dumps(evaluate(target_dir), ensure_ascii=False, indent=2))
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

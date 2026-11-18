@@ -25,7 +25,7 @@ not stop unrelated evaluations.
 
 ## Office Automation
 
-Office COM is disabled outside Windows and restricted to four verifier IDs.
+Office COM is disabled outside Windows and restricted to six verifier IDs.
 COM tasks run serially, create independent application instances, close opened
 documents in `finally` paths, and trigger process cleanup after timeout or
 failure. Run COM evaluation under a dedicated, non-administrator account.

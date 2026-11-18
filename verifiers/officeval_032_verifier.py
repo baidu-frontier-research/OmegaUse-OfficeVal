@@ -1,933 +1,1431 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingModuleSource=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportIndexIssue=false, reportArgumentType=false, reportCallIssue=false, reportGeneralTypeIssues=false
 """
-自动评估“求学申请材料_林绯绯_志愿服务版.pdf”。
+officeval_032_verifier —「求学申请材料_林绯绯」简历改动评测脚本
 
-按批量评估统一约定，本脚本对外只暴露一个函数：
-    evaluate(dir_path: str) -> dict
-- 入参 dir_path 为脚本所在目录路径，脚本自行在该目录下定位并打开被评估文档。
-- 返回结构化字典（含维度一通过与否、维度二逐项得分、总分），主结果不走 print。
+说明
+----
+对外只暴露一个入口：
 
-评分逻辑：
-1. 先检查维度1（PDF 格式、可正常打开）。维度1不通过，直接以 0 分记结果。
-2. 维度1通过后，按维度2的所有得分点/扣分点逐条自动检测并累计分数。
+    evaluate(dir_path) -> dict
 
-依赖：pdfplumber（经 pdf_backend 适配层访问）。
+dir_path 为存放交付文档的目录；交付物只接受可正常打开的 .pdf——目录内若只有
+.docx / .doc / .pptx 等其他格式，仍收作被评对象，但在维度一直接判不通过。
+
+返回值结构：
+
+    {
+        "id":          "032",
+        "file_name":   "xxx.pdf",
+        "status":      "ok" | "error",
+        "error":       None | "可读原因" | "脚本运行异常：ExcType: msg",
+        "dim1_pass":   True | False | ""，  # 维度1 可用与可修改性；"" = 未进入判定
+        "dim1_reason": "……",
+        "dim2_items":  [ {rule, max_delta, delta, hit}, … ],
+        "total_score": 0,
+        "max_score":   34,
+    }
+
+维度1 不通过时 dim2_items 为空、total_score 记 0，dim1_reason 带错误摘要；
+定位不到交付文件时 dim1_pass 与 dim1_reason 留空、max_score 一并记 0。
+本模块不打印任何内容、不改动 sys.stdout、不调用 sys.exit；
+仅在 __main__ 下以 JSON 形式输出，便于命令行调试。
 """
 
-from __future__ import annotations
-
+import io
 import json
-import math
 import os
 import re
+import shutil
 import sys
-from dataclasses import dataclass
-from typing import Iterable, Optional
+import tempfile
 
-try:
-    try:
-        import pdf_backend
-    except ImportError:
-        from verifiers import pdf_backend
-except Exception as exc:  # pragma: no cover
-    print("缺少依赖 pdfplumber：请先安装 pip install pdfplumber", file=sys.stderr)
-    raise
-
-
-class _Page:
-    """单页访问句柄：封装 pdf_backend 文档的页级接口。"""
-
-    def __init__(self, doc, index: int):
-        self._doc = doc
-        self.index = index
-
-    @property
-    def rect(self):
-        w, h = self._doc.page_size(self.index)
-        return pdf_backend.PdfRect(0.0, 0.0, w, h)
-
-    def get_text(self) -> str:
-        return self._doc.page_text(self.index)
-
-    def span_lines(self):
-        return self._doc.extract_span_lines(self.index)
-
-    def get_drawings(self):
-        return [{"rect": d.rect, "fill": d.fill}
-                for d in self._doc.extract_drawings(self.index)]
+# PyMuPDF 已从本项目移除（AGPL 与本项目许可证不兼容），运行环境不安装 fitz。
+# 改用同目录的 pymupdf_compat：用 pdfplumber + pypdfium2 实现本脚本用到的
+# PyMuPDF 子集。verifier 由 core/worker.py 按文件路径加载（其所在目录已被插入
+# sys.path），作为 verifiers 包导入时下面这两行会补齐目录，两种方式都成立。
+_VERIFIER_DIR = os.path.dirname(os.path.abspath(__file__))
+if _VERIFIER_DIR not in sys.path:
+    sys.path.insert(0, _VERIFIER_DIR)
+import pymupdf_compat as fitz
 
 SCRIPT_ID = "032"
-PREFERRED_PDF_NAME = "求学申请材料_林绯绯_志愿服务版.pdf"
 
-DARK_GREEN = (0.141176, 0.368627, 0.360784)
-GOLD = (0.831373, 0.650980, 0.345098)
-
-MAIN_TITLES = [
-    "教育背景",
-    "实践经历",
-    "技能证书与获奖",
-    "志愿服务",
-    "研修规划",
+# ---------------------------------------------------------------------------
+# 分值序列：顺序必须与 _check_all() 中 results 的追加顺序严格一致
+# ---------------------------------------------------------------------------
+_ADD_DELTAS_ORDER = [
+    3,  # A01 被横线标注的整句被完整删除，未残留孤立句号或空行
+    1,  # A02 该段剩余文字措辞与用字未被改写或缩写
+    1,  # A03 该段排版属性保持（9磅/深灰/非加粗/行宽351/2行/行距13.5）
+    5,  # A04 新增独立"志愿服务"模块，置于正文流模块之间、间距正常、未重叠溢出
+    3,  # A05 标题栏与其他模块同款（深绿横条 355×18 + 橙色竖条 4×12）
+    1,  # A06 标题文字"志愿服务"白色加粗 10.5 磅
+    3,  # A07 两条内容分成两个独立行、文字无错漏
+    1,  # A08 两行内容 9磅/深灰/非加粗
+    1,  # A09 两行内容带橙色圆点且左边界与模块条目对齐
+    1,  # A10 两行内容之间行距与其他模块条目一致
+    1,  # A11 两行内容句末标点完整
+    3,  # A12 "技能证书与获奖"末尾另起一行新增条目，未并入上一条
+    1,  # A13 新增条目带橙色圆点且与前三条严格左对齐
+    1,  # A14 新增条目 9磅/深灰/非加粗且行距与前三条一致
+    1,  # A15 新增条目以句号收尾
+    5,  # A16 已添加新增内容且仍为 1 页 A4 纵向
+    1,  # A17 页脚带与页脚文字仍在页面下沿原位置
+    1,  # A18 "调整。"与页脚带之间仍留可见空白
 ]
 
-VOLUNTEER_1 = "2022年1-2月在社区做抗击疫情先进志愿者"
-VOLUNTEER_2 = "2023年7-9月在山底村做志愿者"
-SKILL_ADDED = "2021年11月-2023年9月参加青年马克思主义者培养工程，培训合格"
-BANNED_PRACTICE = "项目内容聚焦设备运行状态识别与远程诊断，未保留原始业务数据。"
-FOOTER_TEXT = "求学申请材料 · 2026"
+_DED_DELTAS_ORDER = [
+    -1,  # D01 大标题"求学申请材料" 24磅/#173C3B/加粗/左对齐右栏
+    -1,  # D02 副标题"面向能源信息与智能控制方向" 11磅/#6B7474/非加粗
+    -1,  # D03 标题下金色分隔横线 #D4A557 宽约352磅 位于约75磅处
+    -1,  # D04 "报考与初试情况"四组标签/取值格式与左右两列对齐
+    -1,  # D05 初试成绩表 5列2行/单元格71×24/表头底色/框线/字号
+    -1,  # D06 "教育背景"年月·院校·专业行 深绿加粗 左中右
+    -1,  # D07 "课程结构以算法设计…"段落 9.1磅/深灰/3行/行宽355/行距14
+    -1,  # D08 "实践经历"年月·公司·岗位行 深绿加粗 左中右
+    -1,  # D09 "课程项目""楼宇能耗预测与调度小组项目" 深绿加粗
+    -1,  # D10 "围绕温湿度…"段落 9磅/深灰/2行/行宽351
+    -1,  # D11 "课程项目"行上下垂直间距未出现紧贴、重叠或大片空洞
+    -1,  # D12 "技能证书与获奖"原有三条 9磅/深灰/橙点/行距16.5/缩进12
+    -1,  # D13 "研修规划"段落 9磅/深灰/首行缩进18/5行/行距14
+    -1,  # D14 五个模块标题栏 深绿355×18 + 白色加粗10.5 + 橙色竖条4×12
+    -1,  # D15 页脚文字 7.6磅/#6B7474/非加粗/右对齐/位于页脚带内
+    -1,  # D16 左侧深绿通栏 175磅满高 + 最左深色窄条 18磅
+    -1,  # D17 圆形头像 圆形裁切/直径84磅/水平居中于左栏
+    -1,  # D18 "林绯绯"/"本科 · 计算机与自动化技术"/"跨学科申请"胶囊
+    -1,  # D19 左栏四个分组标题 白色加粗10.2 位于120×24 #3F7774 圆角条内
+    -1,  # D20 左栏五行标签 8.8磅浅绿 / 取值 8.8磅白色 / 两列对齐
+    -1,  # D21 "联系方式"三行 8.5磅/白色/非加粗/行距17
+    -1,  # D22 "能力概览"五条 8.6磅/白色/橙点4.4/行距18
+    -1,  # D23 "申请信息"三行标签 8.6磅浅绿 / 取值 8.6磅白色
+    -1,  # D24 左栏底部浅色装饰圆弧 #C8DDD6 未被删除移位改色
+    -3,  # D25 删除或改写指令未指定改动的文字内容
+    -3,  # D26 删除或破坏头像、成绩表、模块标题栏、圆点、装饰弧形等既有对象
+    -3,  # D27 删除任一既有模块或段落
+    -1,  # D28 改动姓名/出生年月/成绩/院校/专业/起止年月等具体数值
+    -1,  # D29 在指令未要求处新增多余内容
+]
 
-RUBRIC_TEXT = {
-    "+3 实践经历未出现禁用文本": "第1页实践经历段落：实践经历模块中未出现文本“项目内容聚焦设备运行状态识别与远程诊断，未保留原始业务数据。”",
-    "+3 志愿服务模块标题条": "第1页志愿服务模块标题条：志愿服务模块位于右侧主内容区，放置在“技能证书与获奖”模块之后、“研修规划”模块之前，或在不破坏一页排版的情况下位于右侧内容区合适位置；新增“志愿服务”模块，标题条样式与“教育背景”“实践经历”“技能证书与获奖”“研修规划”模块一致，使用深绿色圆角矩形条，左侧有金色竖向小装饰块，标题文字为宋体或近似宋体，字号为五号或近似五号大小，白色加粗。",
-    "+5 志愿服务第一/第二行文本": "第1页志愿服务第一行文本：新增文本“2022年1-2月在社区做抗击疫情先进志愿者”，作为志愿服务模块正文第一行，字体为宋体或近似宋体，字号为小五号或近似小五号大小，颜色为黑色或深灰色。第二行文本：新增文本“2023年7-9月在山底村做志愿者”，作为志愿服务模块正文第二行，与第一行分行显示，字体、字号、颜色与第一行一致。",
-    "+3 志愿服务正文格式": "第1页志愿服务正文格式：两段志愿服务文本左对齐，行距与“技能证书与获奖”正文一致，段前段后为0磅或与原简历正文一致，不出现项目符号混乱或过大行距。",
-    "+3 志愿服务模块间距": "第1页志愿服务模块间距：志愿服务模块标题与上方模块、下方模块之间保持单倍行间距或近似单倍间距，正文与标题条之间间距与正文间间距一样，不与其他模块重叠。",
-    "+5 技能证书与获奖新增行": "第1页技能证书与获奖模块新增行：在“技能证书与获奖”模块中另起一行添加文本“2021年11月-2023年9月参加青年马克思主义者培养工程，培训合格”字体为宋体或近似宋体，字号为小五号或近似小五号大小。位于技能证书与获奖模块原有条目之后、下一模块之前，不能插入到标题条内部或覆盖原有条目。",
-    "+3 技能证书新增行项目符号": "第1页技能证书新增行项目符号：若技能证书与获奖模块原有条目使用金色圆点项目符号，新增行也使用相同金色圆点；若原有条目无项目符号，新增行也保持无项目符号，格式一致。",
-    "-5 实践经历下方大空白/多页": "交付简历“实践经历”下方不可出现超过页面50%的空白导致简历变成2页或更多页。",
-    "-3 志愿服务两段未分行": "志愿服务两段文字没有分行显示。",
-    "-3 志愿服务标题样式不一致": "“志愿服务”模块标题样式与其他模块标题条明显不一致。",
-    "-3 志愿服务内容位置错误": "志愿服务内容被放入左侧信息栏、页眉、页脚或页面空白处，未作为右侧正文模块呈现。",
-    "-3 技能证书新增内容覆盖原文": "技能证书新增内容覆盖原有“英语能力”“工具能力”或“综合表现”文本。",
-    "-3 研修规划正文截断/越界": "新增内容后“研修规划”模块正文被截断或超出页面底部。",
-    "-3 成绩表数字缺失": "新增内容后成绩表中的64、71、118、96、349任意一个文本缺失。",
-    "-3 页脚消失或被覆盖": "第1页底部页脚“求学申请材料 · 2026”被正文内容覆盖或完全消失。",
-    "-3 研修规划移到教育背景前": "新增内容后“研修规划”不可被移动到教育背景前。",
+MAX_SCORE_TOTAL = sum(_ADD_DELTAS_ORDER)
+_MIN_TOTAL = MAX_SCORE_TOTAL + sum(_DED_DELTAS_ORDER)
+assert MAX_SCORE_TOTAL == 34, MAX_SCORE_TOTAL
+assert sum(_DED_DELTAS_ORDER) == -35, sum(_DED_DELTAS_ORDER)
+assert len(_ADD_DELTAS_ORDER) == 18
+assert len(_DED_DELTAS_ORDER) == 29
+
+_MAX_DELTAS_ORDER = _ADD_DELTAS_ORDER + _DED_DELTAS_ORDER
+_ADD_COUNT = len(_ADD_DELTAS_ORDER)
+
+# ---------------------------------------------------------------------------
+# 版面基准常量（单位：磅；颜色为 0xRRGGBB）
+# ---------------------------------------------------------------------------
+C_ACCENT = 0x173C3B      # 右栏标题/小标题深绿
+C_BODY = 0x2F3333        # 正文深灰
+C_BAR = 0x235D5B         # 模块标题栏 / 左侧通栏深绿
+C_STRIP = 0x163B3B       # 左侧最窄深色条
+C_ORANGE = 0xD4A557      # 橙色（竖条、圆点、金线、胶囊）
+C_WHITE = 0xFFFFFF
+C_MUTED = 0x6B7474       # 副标题 / 页脚文字灰
+C_SUBTITLE_L = 0xD8E7E4  # 左栏"本科 · …"浅绿
+C_LABEL_L = 0xCFE1DE     # 左栏标签浅绿
+C_GROUP_BAR = 0x3F7774   # 左栏分组标题条
+C_TBL_HEAD = 0xDDEBE6    # 成绩表表头底色
+C_TBL_LINE = 0xC3D1CD    # 成绩表框线
+C_FOOTER = 0xE8EFE9      # 页脚带
+C_ARC = 0xC8DDD6         # 左下装饰弧
+
+RIGHT_X = 205.0          # 右栏左边缘
+RIGHT_W = 355.3          # 右栏栏宽 / 模块标题栏宽
+COL_SPLIT = 200.0        # 左右栏切分线
+A4_W, A4_H = 595.28, 841.89
+
+BAND_X0 = 175.0          # 页脚色带左端（贴左栏右边缘）
+BAND_H = 22.0            # 页脚色带高
+ARC_D = 230.0            # 左下装饰弧直径
+
+_SAMPLE_DPI = 150
+_SIZE_TOL = 0.12         # 字号相对容差（吸收 docx↔pdf 转换的全局缩放）
+_TOL_VEC = 18            # 矢量填充色比较容差
+_TOL_IMG = 40            # 位图取样色比较容差（抗锯齿）
+
+_BOLD_RE = re.compile(r"bold|black|heavy|semibold|demi|\bbd\b", re.I)
+
+_PUNCT_MAP = {
+    "，": ",", "；": ";", "：": ":", "、": ",", "。": ".",
+    "（": "(", "）": ")", "【": "[", "】": "]", "％": "%",
+    "－": "-", "—": "-", "–": "-", "﹣": "-", "～": "~",
+    "！": "!", "？": "?", "／": "/", "＋": "+",
+    " ": "", "　": "", "​": "",
 }
 
+_END_PUNCT = ("。", "；", ".", ";")
+_END_PERIOD = ("。", ".")
 
-@dataclass
-class Line:
-    text: str
-    x0: float
-    y0: float
-    x1: float
-    y1: float
-    size: float
-    font: str
-    color: int
-    flags: int = 0
-    duplicate_count: int = 1
+# 指令未要求改动、必须原样保留的内容锚点（用于 D25 / D27）
+_ANCHORS_RIGHT = [
+    "求学申请材料", "面向能源信息与智能控制方向", "报考与初试情况",
+    "报考院校", "南港理工学院", "报考方向", "新能源控制工程",
+    "培养类型", "专业型硕士", "当前学历", "本科在读",
+    "思政", "外语", "专业基础", "数学", "总分",
+    "教育背景", "2022.09-2026.06", "东序信息学院", "计算机与自动化技术(本科)",
+    "课程结构以算法设计", "本化处理与版本协作",
+    "实践经历", "2025.02-2025.07", "青封智能装配有限公司", "智能监测开发助理",
+    "参与传感数据采集", "和模型推理接口联调",
+    "课程项目", "楼宇能耗预测与调度小组项目",
+    "围绕温湿度", "项目说明书与演示看板",
+    "技能证书与获奖", "英语能力:通过大学英语四级", "工具能力:熟悉Git",
+    "综合表现:曾获校级学业进步奖",
+    "研修规划", "进入研究生阶段后", "后续方向将根据导师课题与团队安排动态调整",
+]
+_ANCHORS_LEFT = [
+    "林绯绯", "本科·计算机与自动化技术", "跨学科申请",
+    "基本信息", "出生年月", "2001.11", "政治面貌", "共青团员",
+    "民族", "汉族", "最高学历", "本科学历", "毕业院校", "东序信息学院",
+    "联系方式", "校内申请系统转接", "联系邮箱:申请系统转接", "常驻城市:江南片区",
+    "能力概览", "Python/C++/C#", "数据处理与可视化", "边缘计算部署",
+    "控制系统仿真", "技术文档写作",
+    "申请信息", "报考院校", "报考专业", "报考属性",
+]
+_MODULE_TITLES = ["报考与初试情况", "教育背景", "实践经历", "技能证书与获奖", "研修规划"]
+_GROUP_TITLES = ["基本信息", "联系方式", "能力概览", "申请信息"]
+_DELETED_SENTENCE = ["项目内容聚焦设备运行状态识别与远程诊断", "未保留原始业务数据"]
 
-    @property
-    def cx(self) -> float:
-        return (self.x0 + self.x1) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.y0 + self.y1) / 2
-
-    @property
-    def height(self) -> float:
-        return self.y1 - self.y0
-
-
-@dataclass
-class Hit:
-    code: str
-    score: int
-    matched: bool
-    detail: str
-
-
-def normalize_text(text: str) -> str:
-    """去除空白，保留中文标点，便于跨行文本检测。"""
-    return re.sub(r"\s+", "", text or "")
+# ---------------------------------------------------------------------------
+# 通用小工具
+# ---------------------------------------------------------------------------
 
 
-def color_to_rgb(color: int) -> tuple[int, int, int]:
-    return ((color >> 16) & 255, (color >> 8) & 255, color & 255)
-
-
-def rgb_distance_int(color: int, target: tuple[int, int, int]) -> float:
-    rgb = color_to_rgb(color)
-    return math.sqrt(sum((rgb[i] - target[i]) ** 2 for i in range(3)))
-
-
-def rgb_distance_float(color: Optional[tuple[float, float, float]], target: tuple[float, float, float]) -> float:
-    if color is None:
-        return 999.0
-    return math.sqrt(sum((color[i] - target[i]) ** 2 for i in range(3)))
-
-
-def rects_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float], pad: float = 0) -> bool:
-    ax0, ay0, ax1, ay1 = a
-    bx0, by0, bx1, by1 = b
-    return not (ax1 + pad < bx0 or bx1 + pad < ax0 or ay1 + pad < by0 or by1 + pad < ay0)
-
-
-def line_rect(line: Line) -> tuple[float, float, float, float]:
-    return (line.x0, line.y0, line.x1, line.y1)
-
-
-def extract_lines(page) -> tuple[list[Line], list[Line]]:
-    """返回去重后的行、原始行。该 PDF 中加粗/阴影常以微小位移重复文本呈现。"""
-    raw: list[Line] = []
-    for sp in page.span_lines():
-        text = sp.text.strip()
-        if not text:
-            continue
-        raw.append(Line(text, sp.bbox.x0, sp.bbox.y0, sp.bbox.x1, sp.bbox.y1,
-                        sp.size, sp.font, sp.color, sp.flags))
-
-    deduped: list[Line] = []
-    for ln in sorted(raw, key=lambda l: (round(l.y0, 1), round(l.x0, 1), l.text)):
-        found: Optional[Line] = None
-        for old in deduped:
-            if (
-                old.text == ln.text
-                and abs(old.x0 - ln.x0) <= 0.8
-                and abs(old.y0 - ln.y0) <= 0.8
-                and abs(old.x1 - ln.x1) <= 0.8
-                and abs(old.y1 - ln.y1) <= 0.8
-            ):
-                found = old
-                break
-        if found:
-            found.duplicate_count += 1
-        else:
-            deduped.append(ln)
-    return deduped, raw
-
-
-def page_text(lines: Iterable[Line]) -> str:
-    return "\n".join(l.text for l in sorted(lines, key=lambda l: (l.y0, l.x0)))
-
-
-def find_lines(lines: list[Line], needle: str, *, exact: bool = False, min_x: Optional[float] = None) -> list[Line]:
-    n = normalize_text(needle)
+def _norm(text):
+    """归一化：去空白、全角标点折叠为半角，用于内容比对。"""
     out = []
-    for line in lines:
-        if min_x is not None and line.x0 < min_x:
+    for ch in text or "":
+        if ch.isspace() or ord(ch) in (0x200B, 0x200E, 0x200F, 0xFEFF, 0xA0, 0x3000):
             continue
-        t = normalize_text(line.text)
-        if (exact and t == n) or (not exact and n in t):
-            out.append(line)
-    return sorted(out, key=lambda l: (l.y0, l.x0))
+        out.append(_PUNCT_MAP.get(ch, ch))
+    return "".join(out)
 
 
-def first_line(lines: list[Line], needle: str, *, exact: bool = False, min_x: Optional[float] = None) -> Optional[Line]:
-    matches = find_lines(lines, needle, exact=exact, min_x=min_x)
-    return matches[0] if matches else None
+def _fill_geom(mark):
+    mark["w"] = mark["x1"] - mark["x0"]
+    mark["h"] = mark["y1"] - mark["y0"]
+    mark["cx"] = (mark["x0"] + mark["x1"]) / 2.0
+    mark["cy"] = (mark["y0"] + mark["y1"]) / 2.0
+    return mark
 
 
-def module_region(lines: list[Line], title: str, next_titles: Iterable[str], *, min_x: float = 180) -> tuple[Optional[Line], list[Line]]:
-    title_line = first_line(lines, title, exact=True, min_x=min_x)
-    if not title_line:
-        return None, []
-    next_candidates = []
-    for nt in next_titles:
-        ln = first_line(lines, nt, exact=True, min_x=min_x)
-        if ln and ln.y0 > title_line.y0 + 1:
-            next_candidates.append(ln)
-    y_end = min((ln.y0 for ln in next_candidates), default=10_000)
-    # 没有下一个模块时，不把页脚误判为模块正文；常规页脚位于页面最底部约 25pt 区域。
-    if y_end == 10_000:
-        y_end = float(getattr(title_line, "page_height", 10_000)) if hasattr(title_line, "page_height") else 10_000
-    body = [
-        l
-        for l in lines
-        if l.y0 > title_line.y1 + 1 and l.y0 < y_end - 1 and l.x0 >= min_x and "求学申请材料 · 2026" not in l.text
-    ]
-    return title_line, sorted(body, key=lambda l: (l.y0, l.x0))
+def _rgb(value):
+    return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
 
 
-def drawings(page) -> list[dict]:
-    return page.get_drawings()
+def _cdiff(a, b):
+    """两个 (r,g,b) 的最大通道差。"""
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
 
 
-def drawing_rect(d: dict) -> Optional[tuple[float, float, float, float]]:
-    r = d.get("rect")
-    if not r:
-        return None
-    return (float(r.x0), float(r.y0), float(r.x1), float(r.y1))
-
-
-def has_dark_green_title_bar(page, title_line: Line) -> bool:
-    """检测标题文字背后的深绿色圆角矩形条：用若干块深绿色绘图拼成也算。"""
-    cy = title_line.cy
-    candidates = []
-    for d in drawings(page):
-        r = drawing_rect(d)
-        if not r:
-            continue
-        x0, y0, x1, y1 = r
-        fill = d.get("fill")
-        if rgb_distance_float(fill, DARK_GREEN) <= 0.08 and y0 <= cy <= y1 and x0 <= title_line.x0 <= x1 + 15:
-            candidates.append(r)
-    if not candidates:
+def _color_ok(got, ref, tol=_TOL_VEC):
+    """got 为 int 或 (r,g,b)；ref 为 int 常量。"""
+    if got is None:
         return False
-    min_x = min(r[0] for r in candidates)
-    max_x = max(r[2] for r in candidates)
-    min_y = min(r[1] for r in candidates)
-    max_y = max(r[3] for r in candidates)
-    return min_x <= title_line.x0 - 3 and max_x >= max(title_line.x1 + 20, 400) and 14 <= max_y - min_y <= 26
+    g = _rgb(got) if isinstance(got, int) else tuple(got)
+    return _cdiff(g, _rgb(ref)) <= tol
 
 
-def has_gold_decorator(page, title_line: Line) -> bool:
-    cy = title_line.cy
-    for d in drawings(page):
-        r = drawing_rect(d)
-        if not r:
+def _size_ok(got, ref, tol=_SIZE_TOL):
+    if not got:
+        return False
+    return abs(float(got) - ref) <= max(ref * tol, 0.35)
+
+
+def _near(a, b, tol):
+    return abs(a - b) <= tol
+
+
+def _median(values):
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def _all(*flags):
+    return all(bool(f) for f in flags)
+
+
+# ---------------------------------------------------------------------------
+# 交付文件定位与格式门禁
+# ---------------------------------------------------------------------------
+# 交付物只接受 .pdf：细则要求交的是可正常打开的 PDF，其余版式/源文件格式
+# （.docx / .doc / .pptx / .odt 等）一律在维度一判不通过。
+_ACCEPTED_EXT = ".pdf"
+_PDF_EXT = (".pdf",)
+# 目录里没有 .pdf 时，这些扩展名仍收作被评对象，交给维度一判不通过（完成度记 0），
+# 而不是当成「没有交付物」直接跳过评测。
+_WRONG_FMT_EXTS = (".docx", ".doc", ".docm", ".dotx", ".dot", ".rtf", ".odt", ".wps",
+                   ".pages", ".pptx", ".ppt", ".pptm", ".ppsx", ".potx", ".odp", ".key")
+
+
+def _list_candidates(dir_path, exts):
+    out = []
+    for name in sorted(os.listdir(dir_path)):
+        if name.startswith("~$") or name.startswith("."):
             continue
-        x0, y0, x1, y1 = r
-        fill = d.get("fill")
-        if rgb_distance_float(fill, GOLD) <= 0.08 and y0 - 2 <= cy <= y1 + 2 and title_line.x0 - 18 <= x0 <= title_line.x0:
-            if 2 <= x1 - x0 <= 8 and 4 <= y1 - y0 <= 14:
+        if name.lower().endswith(exts):
+            out.append(os.path.join(dir_path, name))
+    return out
+
+
+def _fmt_reject(file_path):
+    """维度1的格式门禁：交付物必须是可正常打开的 .pdf。
+
+    不通过返回原因文本，通过返回 None。判定与阅读器的「能不能双击打开」对齐：
+    扩展名须为 .pdf，文件头须含 %PDF- 标识，且能被 PDF 解析后端打开、至少有 1 页、
+    不需要口令。
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext != _ACCEPTED_EXT:
+        return "交付物为 %s 格式，只接受 .pdf 文档" % (ext or "无扩展名")
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(1024)
+    except OSError as exc:
+        return "交付物无法读取：%s: %s" % (type(exc).__name__, exc)
+    if b"%PDF-" not in head:
+        return "交付物不是有效的 PDF（文件头缺少 %PDF- 标识）"
+    try:
+        doc = fitz.open(file_path)
+    except Exception as exc:
+        return "交付物无法作为 PDF 打开：%s: %s" % (type(exc).__name__, exc)
+    try:
+        if doc.needs_pass:
+            return "交付物 PDF 已加密，需要口令才能打开"
+        if doc.page_count < 1:
+            return "交付物 PDF 内没有任何页面"
+    finally:
+        doc.close()
+    return None
+
+
+def _resolve_pdf(dir_path, work_dir):
+    """返回 (用于展示的交付文件名, 实际用于解析的 PDF 路径)。
+
+    交付物只接受 .pdf：目录内优先取 .pdf；没有 .pdf 时把 .docx/.pptx 等其他格式
+    原样收作被评对象（不再转成 PDF 后放行），由 _fmt_reject 在维度一判不通过。
+    work_dir 保留在签名里，供放宽门禁、需要转档时复用。
+    """
+    pdfs = _list_candidates(dir_path, _PDF_EXT)
+    if pdfs:
+        return os.path.basename(pdfs[0]), pdfs[0]
+    others = _list_candidates(dir_path, _WRONG_FMT_EXTS)
+    if others:
+        return os.path.basename(others[0]), others[0]
+    raise FileNotFoundError(f"目录中未找到 .pdf 文件：{dir_path}")
+
+
+# ---------------------------------------------------------------------------
+# 页面模型：文本行 + 图形元素（矢量与位图统一看待）
+# ---------------------------------------------------------------------------
+class _Doc(object):
+    """把一页 PDF 拍平成"文本行列表 + 图形块列表"，供细则逐条比对。
+
+    好文件与坏文件出自不同渲染管线：一方把圆点/竖条/细线画成矢量，另一方
+    压成小位图。因此图形块统一由 get_drawings() 与 get_image_info() 汇总，
+    颜色对矢量取 fill/stroke、对位图取渲染像素众数，并把同色相邻碎块合并
+    （某些管线会把一根圆角横条拆成左中右三段）。
+    """
+
+    def __init__(self, pdf_path):
+        self.doc = fitz.open(pdf_path)
+        self.n_pages = self.doc.page_count
+        self.page = self.doc[0]
+        self.width = self.page.rect.width
+        self.height = self.page.rect.height
+        pix = self.page.get_pixmap(dpi=_SAMPLE_DPI)
+        self._pw, self._ph, self._n = pix.width, pix.height, pix.n
+        self._buf = pix.samples
+        self._scale = _SAMPLE_DPI / 72.0
+        self.bg = self._page_bg()
+        self.lines = self._collect_lines(self.page)
+        self.right = [ln for ln in self.lines if ln["x0"] >= COL_SPLIT]
+        self.left = [ln for ln in self.lines if ln["x0"] < COL_SPLIT]
+        self.flat_right = "".join(ln["ntext"] for ln in self.right)
+        self.flat_left = "".join(ln["ntext"] for ln in self.left)
+        self.flat_all = self.flat_right + self.flat_left
+        self.full_text = "".join(
+            _norm(self.doc[i].get_text("text")) for i in range(self.n_pages))
+        self.images = self._collect_images(self.page)
+        self.marks = self._collect_marks(self.page)
+
+    def close(self):
+        try:
+            self.doc.close()
+        except Exception:
+            pass
+
+    # -- 像素取样 ---------------------------------------------------------
+    def px(self, x, y):
+        ix = min(max(int(x * self._scale), 0), self._pw - 1)
+        iy = min(max(int(y * self._scale), 0), self._ph - 1)
+        off = (iy * self._pw + ix) * self._n
+        return (self._buf[off], self._buf[off + 1], self._buf[off + 2])
+
+    def _page_bg(self):
+        """全页粗网格取样的众数色，即纸张底色。"""
+        tally = {}
+        for i in range(24):
+            for j in range(24):
+                c = self.px(self.width * (i + 0.5) / 24.0, self.height * (j + 0.5) / 24.0)
+                slot = tally.setdefault((c[0] // 16, c[1] // 16, c[2] // 16), [0, c])
+                slot[0] += 1
+        return max(tally.values(), key=lambda s: s[0])[1]
+
+    def _dominant(self, x0, y0, x1, y1):
+        """块内向内收缩后密集取样的众数色；忽略与纸张底色接近的取样点。
+
+        小尺寸装饰件（圆点、竖条）边缘抗锯齿严重，直接取中心或不加过滤的
+        众数都会把纸张底色误当成对象颜色，故此处先剔除底色再取众数。
+        """
+        w, h = x1 - x0, y1 - y0
+        fx0 = x0 + (w * 0.18 if w >= 1.5 else w * 0.5)
+        fx1 = x1 - (w * 0.18 if w >= 1.5 else w * 0.5)
+        fy0 = y0 + (h * 0.18 if h >= 1.5 else h * 0.5)
+        fy1 = y1 - (h * 0.18 if h >= 1.5 else h * 0.5)
+        tally = {}
+        fallback = {}
+        for i in range(9):
+            for j in range(9):
+                x = fx0 + (fx1 - fx0) * (i / 8.0)
+                y = fy0 + (fy1 - fy0) * (j / 8.0)
+                c = self.px(x, y)
+                key = (c[0] // 16, c[1] // 16, c[2] // 16)
+                slot = fallback.setdefault(key, [0, c])
+                slot[0] += 1
+                if _cdiff(c, self.bg) <= 14:
+                    continue
+                slot2 = tally.setdefault(key, [0, c])
+                slot2[0] += 1
+        pool = tally if tally else fallback
+        return max(pool.values(), key=lambda s: (s[0], _cdiff(s[1], self.bg)))[1]
+
+    # -- 文本行 -----------------------------------------------------------
+    @staticmethod
+    def _collect_lines(page):
+        raw = []
+        for blk in page.get_text("dict").get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for ln in blk.get("lines", []):
+                spans = [sp for sp in ln.get("spans", []) if (sp.get("text") or "").strip()]
+                if not spans:
+                    continue
+                text = "".join(sp["text"] for sp in spans)
+                bbox = ln["bbox"]
+                raw.append({
+                    "text": text.strip(),
+                    "ntext": _norm(text),
+                    "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3],
+                    "size": max(sp.get("size", 0.0) for sp in spans),
+                    "color": spans[0].get("color", 0),
+                    "font": spans[0].get("font", "") or "",
+                    "bold": any(_BOLD_RE.search(sp.get("font", "") or "") for sp in spans),
+                })
+        raw.sort(key=lambda ln: (round(ln["y0"], 1), ln["x0"]))
+        # 部分管线用"同字重叠描两遍"模拟加粗：去重并据此判定 bold
+        out = []
+        for ln in raw:
+            dup = None
+            for kept in out:
+                if (kept["ntext"] == ln["ntext"]
+                        and _near(kept["y0"], ln["y0"], 1.5)
+                        and _near(kept["x0"], ln["x0"], 1.5)):
+                    dup = kept
+                    break
+            if dup is not None:
+                dup["bold"] = True
+                continue
+            out.append(ln)
+        return out
+
+    @staticmethod
+    def _collect_images(page):
+        out = []
+        try:
+            infos = page.get_image_info(xrefs=True)
+        except Exception:
+            infos = []
+        for im in infos:
+            b = im.get("bbox")
+            if not b:
+                continue
+            out.append({"x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3],
+                        "w": b[2] - b[0], "h": b[3] - b[1]})
+        return out
+
+    # -- 图形块 -----------------------------------------------------------
+    def _collect_marks(self, page):
+        raw = []
+        for g in page.get_drawings():
+            r = g["rect"]
+            fill = g.get("fill")
+            stroke = g.get("color")
+            base = fill if fill else stroke
+            if base is None:
+                continue
+            color = tuple(int(round(c * 255)) for c in base)
+            raw.append({
+                "kind": "V", "x0": r.x0, "y0": r.y0, "x1": r.x1, "y1": r.y1,
+                "color": color, "tol": _TOL_VEC,
+                "stroke": (tuple(int(round(c * 255)) for c in stroke) if stroke else None),
+            })
+        for im in self.images:
+            raw.append({
+                "kind": "I", "x0": im["x0"], "y0": im["y0"], "x1": im["x1"], "y1": im["y1"],
+                "color": self._dominant(im["x0"], im["y0"], im["x1"], im["y1"]),
+                "tol": _TOL_IMG, "stroke": None,
+            })
+        for m in raw:
+            _fill_geom(m)
+            m["strokes"] = [m["stroke"]] if m["stroke"] else []
+            m["parts"] = 1
+        self.raw = sorted(raw, key=lambda m: (round(m["y0"], 1), m["x0"]))
+        merged = self._merge(raw, self.width * self.height * 0.5)
+        for m in merged:
+            _fill_geom(m)
+        return merged
+
+    @staticmethod
+    def _merge(marks, area_cap):
+        """同色且相邻/相交的碎块合并为一个整体（横条被拆成三段时尤为必要）。
+
+        整页底色块之类的巨幅色块不参与合并，否则会把其上的浅色小块吞掉。
+        """
+        n = len(marks)
+        parent = list(range(n))
+        big = [((m["x1"] - m["x0"]) * (m["y1"] - m["y0"])) >= area_cap for m in marks]
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(n):
+            a = marks[i]
+            if big[i]:
+                continue
+            for j in range(i + 1, n):
+                b = marks[j]
+                if big[j]:
+                    continue
+                if _cdiff(a["color"], b["color"]) > max(a["tol"], b["tol"]):
+                    continue
+                if a["x0"] - 2.0 > b["x1"] or b["x0"] - 2.0 > a["x1"]:
+                    continue
+                if a["y0"] - 2.0 > b["y1"] or b["y0"] - 2.0 > a["y1"]:
+                    continue
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    parent[rb] = ra
+        groups = {}
+        for i, m in enumerate(marks):
+            groups.setdefault(find(i), []).append(m)
+        out = []
+        for members in groups.values():
+            head = max(members, key=lambda m: (m["x1"] - m["x0"]) * (m["y1"] - m["y0"]) + 1e-6)
+            out.append({
+                "kind": head["kind"], "tol": head["tol"],
+                "color": head["color"], "stroke": head["stroke"],
+                "x0": min(m["x0"] for m in members), "y0": min(m["y0"] for m in members),
+                "x1": max(m["x1"] for m in members), "y1": max(m["y1"] for m in members),
+                "strokes": [m["stroke"] for m in members if m["stroke"]],
+                "parts": len(members),
+            })
+        out.sort(key=lambda m: (round(m["y0"], 1), m["x0"]))
+        return out
+
+    # -- 查询辅助 ---------------------------------------------------------
+    def find(self, needle, side=None, y_range=None):
+        got = self.finds(needle, side, y_range)
+        return got[0] if got else None
+
+    def finds(self, needle, side=None, y_range=None):
+        key = _norm(needle)
+        pool = self.lines
+        if side == "R":
+            pool = self.right
+        elif side == "L":
+            pool = self.left
+        out = []
+        for ln in pool:
+            if key not in ln["ntext"]:
+                continue
+            if y_range and not (y_range[0] <= ln["y0"] <= y_range[1]):
+                continue
+            out.append(ln)
+        return out
+
+    def exact(self, text, side=None):
+        key = _norm(text)
+        pool = self.right if side == "R" else (self.left if side == "L" else self.lines)
+        for ln in pool:
+            if ln["ntext"] == key:
+                return ln
+        return None
+
+    def has(self, needle):
+        return _norm(needle) in self.flat_all or _norm(needle) in self.full_text
+
+    def marks_of(self, ref, wrange=None, hrange=None, xrange=None, yrange=None, pool="merged"):
+        out = []
+        for m in (self.raw if pool == "raw" else self.marks):
+            if not _color_ok(m["color"], ref, m["tol"]):
+                continue
+            if wrange and not (wrange[0] <= m["w"] <= wrange[1]):
+                continue
+            if hrange and not (hrange[0] <= m["h"] <= hrange[1]):
+                continue
+            if xrange and not (xrange[0] <= m["x0"] <= xrange[1]):
+                continue
+            if yrange and not (yrange[0] <= m["y0"] <= yrange[1]):
+                continue
+            out.append(m)
+        return out
+
+    def module_bars(self):
+        """右栏模块标题横条（深绿、宽约 355、高约 18）。"""
+        return self.marks_of(C_BAR, wrange=(330.0, 380.0), hrange=(14.0, 23.0),
+                             xrange=(196.0, 214.0))
+
+    def ticks(self):
+        """模块标题栏左端的橙色竖条（约 4×12）。"""
+        return self.marks_of(C_ORANGE, wrange=(2.5, 6.5), hrange=(8.0, 16.0),
+                             xrange=(204.0, 224.0))
+
+    def dots_right(self):
+        """右栏条目的橙色圆点（约 4.6×4.6）；排除标题栏内竖条被拆出的小碎片。"""
+        cand = self.marks_of(C_ORANGE, wrange=(3.0, 6.0), hrange=(3.0, 6.0),
+                             xrange=(198.0, 218.0), pool="raw")
+        bars = self.module_bars()
+        return [m for m in cand
+                if not any(b["y0"] - 1.0 <= m["cy"] <= b["y1"] + 1.0
+                           and b["x0"] - 1.0 <= m["cx"] <= b["x1"] + 1.0 for b in bars)]
+
+    def dots_left(self):
+        return self.marks_of(C_ORANGE, wrange=(3.0, 6.0), hrange=(3.0, 6.0),
+                             xrange=(28.0, 46.0), pool="raw")
+
+    def footer_band(self):
+        bands = self.marks_of(C_FOOTER, wrange=(300.0, 460.0), hrange=(15.0, 30.0),
+                              yrange=(self.height - 60.0, self.height), pool="raw")
+        return bands[0] if bands else None
+
+    def dot_for(self, line, dots, tol=6.0):
+        cy = (line["y0"] + line["y1"]) / 2.0
+        for d in dots:
+            if abs(d["cy"] - cy) <= tol and d["x1"] <= line["x0"] + 3.0:
+                return d
+        return None
+
+    def bar_of_title(self, line):
+        for m in self.module_bars():
+            if (m["y0"] - 4.0 <= line["y0"] and line["y1"] <= m["y1"] + 6.0
+                    and m["x0"] - 4.0 <= line["x0"] and line["x1"] <= m["x1"] + 4.0):
+                return m
+        return None
+
+    def gap_above(self, bar):
+        """横条顶边与其上方最近的右栏正文底边之间的净空白。"""
+        best = None
+        for ln in self.right:
+            if ln["y1"] <= bar["y0"] + 0.5 and (best is None or ln["y1"] > best):
+                best = ln["y1"]
+        if best is None:
+            return bar["y0"]
+        return bar["y0"] - best
+
+
+# ---------------------------------------------------------------------------
+# 维度1：可用与可修改性
+# ---------------------------------------------------------------------------
+
+
+def _dim1(d):
+    # 格式门禁（必须是可正常打开的 .pdf）已由 _fmt_reject 在 _evaluate_impl 里先判过
+    if d.n_pages < 1 or not d.lines:
+        return False, "文档无有效页面或页面内无可选取文字"
+    if len(d.flat_all) < 350:
+        return False, "页面可选取文字过少，疑为整页位图截图或扫描件"
+    for im in d.images:
+        if im["w"] * im["h"] >= d.width * d.height * 0.85:
+            return False, "页面主体为整页位图，正文不可编辑"
+    if any(ln["x1"] > COL_SPLIT - 4.0 for ln in d.left):
+        return False, "左栏文字越界压入右栏，左右两栏互相压盖"
+    if any(ln["x1"] > d.width + 1.0 or ln["y1"] > d.height + 1.0 for ln in d.lines):
+        return False, "存在超出纸张边界、被裁切丢失的文字"
+    lines = d.lines
+    clashes = 0
+    for i, a in enumerate(lines):
+        for b in lines[i + 1:]:
+            if b["y0"] >= a["y1"] - 0.5:
+                break
+            ov_y = min(a["y1"], b["y1"]) - max(a["y0"], b["y0"])
+            ov_x = min(a["x1"], b["x1"]) - max(a["x0"], b["x0"])
+            hmin = min(a["y1"] - a["y0"], b["y1"] - b["y0"]) or 1.0
+            wmin = min(a["x1"] - a["x0"], b["x1"] - b["x0"]) or 1.0
+            if ov_y > hmin * 0.5 and ov_x > wmin * 0.4:
+                clashes += 1
+    if clashes > 8:
+        return False, f"版面严重错乱：检出 {clashes} 处文字大面积重叠"
+    return True, "文件可正常打开，正文为可选取文字与矢量/图形对象，版面未见严重错乱"
+
+
+# ---------------------------------------------------------------------------
+# 维度2：逐条细则
+# ---------------------------------------------------------------------------
+_VOL1 = "2022年1-2月在社区做抗击疫情先进志愿者"
+_VOL2 = "2023年7-9月在山底村做志愿者"
+_SKILL_NEW = "2021年11月-2023年9月参加青年马克思主义者培养工程，培训合格"
+_KEEP_PARA = ("参与传感数据采集、状态识别与可视化看板搭建，"
+              "负责部分边缘网关脚本、异常日志清洗和模型推理接口联调。")
+
+
+def _fmt_ok(line, size=None, color=None, bold=None):
+    if line is None:
+        return False
+    if size is not None and not _size_ok(line["size"], size):
+        return False
+    if color is not None and not _color_ok(line["color"], color):
+        return False
+    if bold is not None and bool(line["bold"]) != bool(bold):
+        return False
+    return True
+
+
+def _consecutive(pool, lines):
+    try:
+        idx = [pool.index(ln) for ln in lines]
+    except ValueError:
+        return False
+    return all(idx[i + 1] == idx[i] + 1 for i in range(len(idx) - 1))
+
+
+def _ends_with(line, endings):
+    return bool(line) and line["text"].rstrip().endswith(endings)
+
+
+def _has_color_inside(d, mark, ref, tol):
+    for fx in (0.15, 0.35, 0.5, 0.65, 0.85):
+        for fy in (0.15, 0.35, 0.5, 0.65, 0.85):
+            if _color_ok(d.px(mark["x0"] + mark["w"] * fx, mark["y0"] + mark["h"] * fy),
+                         ref, tol):
                 return True
     return False
 
 
-def near_song_font(font: str) -> bool:
-    f = (font or "").lower()
-    # PDF 子集字体名不一定直接叫 SimSun/宋体；Bousung/GBSong/serif 通常可视为宋体或近似宋体。
-    return any(k in f for k in ["song", "sung", "bousung", "serif", "ming", "stkaiti", "kai"])
+def _band_intact(d, band):
+    """页脚色带是否仍是原样：左端贴左栏右边缘、右端贯通到页面右边缘、高约22磅、位于页面下沿。
 
-
-def is_dark_text(color: int) -> bool:
-    r, g, b = color_to_rgb(color)
-    return max(r, g, b) <= 90
-
-
-def is_white_text(color: int) -> bool:
-    return rgb_distance_int(color, (255, 255, 255)) <= 35
-
-
-def is_bold_text(line: Line) -> bool:
-    f = (line.font or "").lower()
-    return "bold" in f or "black" in f or "heavy" in f or bool(line.flags & 16) or line.duplicate_count >= 2
-
-
-def title_style_ok(page, title_line: Optional[Line]) -> bool:
-    if not title_line:
+    footer_band() 的筛选窗口很宽（宽 300~460、高 15~30），只够"找到"色带；
+    尺寸与位置是否被改动要在这里判。
+    """
+    if band is None:
         return False
-    return (
-        has_dark_green_title_bar(page, title_line)
-        and has_gold_decorator(page, title_line)
-        and near_song_font(title_line.font)
-        and 9.5 <= title_line.size <= 11.5
-        and is_white_text(title_line.color)
-        and is_bold_text(title_line)
-    )
+    return (_near(band["x0"], BAND_X0, 12.0)
+            and band["x1"] >= d.width - 6.0
+            and _near(band["h"], BAND_H, 5.0)
+            and band["y0"] >= d.height - 60.0)
 
 
-def body_text_style_ok(line: Optional[Line]) -> bool:
-    if not line:
-        return False
-    return near_song_font(line.font) and 8.0 <= line.size <= 10.2 and is_dark_text(line.color)
+def _find_arc(d):
+    """左下装饰弧：贴页面左下角、尺寸在弧形量级内（原稿 230×230，转换后常被页面裁去大半）。
 
-
-def gold_bullets_near_line(page, line: Line, *, x_min: float = 180, x_max: Optional[float] = None) -> list[tuple[float, float, float, float]]:
-    if x_max is None:
-        x_max = line.x0 + 2
-    out = []
-    for d in drawings(page):
-        r = drawing_rect(d)
-        if not r:
+    候选先按"填充色即弧色"命中，再退回像素取样。整页底色块与左栏通栏都够大且
+    位置也贴着左下角，若不设尺寸上限，它们会抢在真弧之前命中，把"弧形已被删除"
+    掩盖成通过。
+    """
+    cand = []
+    for m in d.raw:
+        if m["x0"] > 78.0 or m["y1"] < d.height - 95.0:
             continue
-        x0, y0, x1, y1 = r
-        fill = d.get("fill")
-        if rgb_distance_float(fill, GOLD) <= 0.08 and x_min <= x0 <= x_max:
-            if abs(((y0 + y1) / 2) - line.cy) <= 5 and 2 <= x1 - x0 <= 8 and 2 <= y1 - y0 <= 8:
-                out.append(r)
-    return out
-
-
-def lines_overlap(a: Line, b: Line) -> bool:
-    return rects_overlap(line_rect(a), line_rect(b), pad=0)
-
-
-def _evaluate_pdf(pdf_path: str) -> tuple[bool, list[Hit], int, list[str]]:
-    notes: list[str] = []
-
-    # 维度1：PDF 格式且可正常打开。
-    if not os.path.isfile(pdf_path):
-        return False, [Hit("维度1", 0, False, f"文件不存在：{pdf_path}")], 0, notes
-    if os.path.splitext(pdf_path)[1].lower() != ".pdf":
-        return False, [Hit("维度1", 0, False, "交付文件不是 .pdf 格式")], 0, notes
-    try:
-        doc = pdf_backend.open_pdf(pdf_path)
-        page_count = doc.page_count
-        if page_count <= 0:
-            return False, [Hit("维度1", 0, False, "PDF可打开但页数为0")], 0, notes
-        first_page = _Page(doc, 0)
-        # 触发一次解析，避免损坏 PDF 到维度2才报错。
-        _ = first_page.get_text()
-    except Exception as exc:
-        return False, [Hit("维度1", 0, False, f"PDF无法正常打开或解析：{exc}")], 0, notes
-
-    page = _Page(doc, 0)
-    lines, raw_lines = extract_lines(page)
-    text = page_text(lines)
-    compact_text = normalize_text(text)
-    width, height = float(page.rect.width), float(page.rect.height)
-    notes.append(f"PDF可打开，共 {page_count} 页；第1页尺寸约 {width:.1f}×{height:.1f} pt。")
-
-    hits: list[Hit] = [Hit("维度1", 0, True, "交付文件为PDF格式，且可正常打开。")]
-
-    # 常用定位。
-    education_title = first_line(lines, "教育背景", exact=True, min_x=180)
-    practice_title, practice_body = module_region(lines, "实践经历", ["技能证书与获奖", "志愿服务", "研修规划"], min_x=180)
-    skill_title, skill_body = module_region(lines, "技能证书与获奖", ["志愿服务", "研修规划"], min_x=180)
-    volunteer_title, volunteer_body = module_region(lines, "志愿服务", ["研修规划"], min_x=180)
-    plan_title, plan_body = module_region(lines, "研修规划", [], min_x=180)
-
-    v1 = first_line(lines, VOLUNTEER_1, min_x=None)
-    v2 = first_line(lines, VOLUNTEER_2, min_x=None)
-    skill_added = first_line(lines, SKILL_ADDED, min_x=None)
-
-    # +3：实践经历模块（标题行+正文）中未出现指定禁用文本。
-    practice_all_lines = ([practice_title] if practice_title else []) + practice_body
-    practice_region_text = normalize_text(page_text(practice_all_lines)) if practice_title else ""
-    if practice_title and normalize_text(BANNED_PRACTICE) not in practice_region_text:
-        hits.append(Hit("+3 实践经历未出现禁用文本", 3, True, "实践经历模块内未检测到指定禁用文本。"))
-    else:
-        detail = "未能定位实践经历模块。" if not practice_title else "实践经历模块内出现了指定禁用文本。"
-        hits.append(Hit("+3 实践经历未出现禁用文本", 3, False, detail))
-
-    # +3：志愿服务标题条位置与样式。
-    volunteer_title_position_ok = False
-    if volunteer_title:
-        in_right = volunteer_title.x0 >= 180
-        after_skill = skill_title is None or volunteer_title.y0 > skill_title.y0
-        before_plan = plan_title is None or volunteer_title.y0 < plan_title.y0
-        standard_order = after_skill and before_plan
-        suitable_right_position = in_right and page_count == 1 and volunteer_title.y1 < height - 35
-        volunteer_title_position_ok = in_right and (standard_order or suitable_right_position)
-    volunteer_title_style_checks = {
-        "深绿色圆角矩形条": bool(volunteer_title and has_dark_green_title_bar(page, volunteer_title)),
-        "金色竖向小装饰块": bool(volunteer_title and has_gold_decorator(page, volunteer_title)),
-        "宋体或近似宋体": bool(volunteer_title and near_song_font(volunteer_title.font)),
-        "五号或近似五号大小": bool(volunteer_title and 9.5 <= volunteer_title.size <= 11.5),
-        "白色": bool(volunteer_title and is_white_text(volunteer_title.color)),
-        "加粗": bool(volunteer_title and is_bold_text(volunteer_title)),
-    }
-    volunteer_title_style = all(volunteer_title_style_checks.values())
-    if volunteer_title and volunteer_title_position_ok and volunteer_title_style:
-        hits.append(Hit("+3 志愿服务模块标题条", 3, True, "志愿服务位于右侧主内容区，放置在技能证书与获奖之后、研修规划之前，或在不破坏一页排版的情况下位于右侧内容区合适位置；标题条为深绿色圆角矩形条，左侧有金色竖向小装饰块，标题文字为近宋体五号白色加粗。"))
-    else:
-        reasons = []
-        if not volunteer_title:
-            reasons.append("未检测到右侧主内容区的“志愿服务”标题")
-        elif not volunteer_title_position_ok:
-            reasons.append("未位于右侧主内容区，或未满足技能证书与获奖之后、研修规划之前/一页排版内右侧合适位置")
-        missing_style = [name for name, ok in volunteer_title_style_checks.items() if not ok]
-        if missing_style:
-            reasons.append("标题条样式缺少" + "、".join(missing_style))
-        hits.append(Hit("+3 志愿服务模块标题条", 3, False, "；".join(reasons)))
-
-    # +5：志愿服务第一、第二行正文文本。
-    # 第一行：v1 存在，字体宋体/近似宋体，字号小五号/近似小五号（8~10.2pt），颜色黑色或深灰色。
-    v1_exists = bool(v1)
-    v1_font_ok = bool(v1 and near_song_font(v1.font))
-    v1_size_ok = bool(v1 and 8.0 <= v1.size <= 10.2)
-    v1_color_ok = bool(v1 and is_dark_text(v1.color))
-    v1_style_ok = v1_font_ok and v1_size_ok and v1_color_ok
-    # 第二行：v2 存在，与第一行分行显示（y坐标不同），字体/字号/颜色与第一行一致。
-    v2_exists = bool(v2)
-    v_lines_separate = bool(v1 and v2 and abs(v1.y0 - v2.y0) > 3)
-    v2_font_consistent = bool(v1 and v2 and near_song_font(v2.font))
-    v2_size_consistent = bool(v1 and v2 and abs(v1.size - v2.size) <= 0.5)
-    v2_color_consistent = bool(v1 and v2 and rgb_distance_int(v1.color, color_to_rgb(v2.color)) <= 20)
-    v2_style_consistent = v2_font_consistent and v2_size_consistent and v2_color_consistent
-    # 第一行须是志愿服务模块正文第一行，第二行须是第二行。
-    volunteer_body_lines = [l for l in volunteer_body] if volunteer_title else []
-    v1_is_first_body_line = bool(
-        v1 and volunteer_body_lines
-        and normalize_text(VOLUNTEER_1) in normalize_text(volunteer_body_lines[0].text)
-    )
-    v2_is_second_body_line = bool(
-        v2 and len(volunteer_body_lines) >= 2
-        and normalize_text(VOLUNTEER_2) in normalize_text(volunteer_body_lines[1].text)
-    )
-    all_ok = (
-        v1_exists and v1_style_ok and v1_is_first_body_line
-        and v2_exists and v_lines_separate and v2_style_consistent and v2_is_second_body_line
-    )
-    if all_ok:
-        hits.append(Hit("+5 志愿服务第一/第二行文本", 5, True,
-            "第一行文本存在，字体宋体/近似宋体，字号小五号/近似小五号，颜色黑色或深灰色，作为志愿服务正文第一行；"
-            "第二行文本存在，与第一行分行显示，字体/字号/颜色与第一行一致，作为正文第二行。"))
-    else:
-        reasons = []
-        if not v1_exists:
-            reasons.append('缺少第一行指定文本‘2022年1-2月在社区做抗击疫情先进志愿者’')
-        else:
-            if not v1_font_ok:
-                reasons.append("第一行字体不是宋体或近似宋体")
-            if not v1_size_ok:
-                reasons.append(f"第一行字号 {v1.size:.1f}pt 不符合小五号/近似小五号（8~10.2pt）")
-            if not v1_color_ok:
-                reasons.append("第一行颜色不是黑色或深灰色")
-            if not v1_is_first_body_line:
-                reasons.append("第一行指定文本不是志愿服务模块正文第一行")
-        if not v2_exists:
-            reasons.append(f"缺少第二行指定文本‘{VOLUNTEER_2}’")
-        else:
-            if v1 and not v_lines_separate:
-                reasons.append("第二行与第一行未分行显示")
-            if not v2_font_consistent:
-                reasons.append("第二行字体与第一行不一致")
-            if not v2_size_consistent:
-                reasons.append(f"第二行字号与第一行不一致（差值超过0.5pt）")
-            if not v2_color_consistent:
-                reasons.append("第二行颜色与第一行不一致")
-            if not v2_is_second_body_line:
-                reasons.append("第二行指定文本不是志愿服务模块正文第二行")
-        hits.append(Hit("+5 志愿服务第一/第二行文本", 5, False, "；".join(reasons)))
-
-    # +3：志愿服务正文格式。
-    volunteer_format_ok = False
-    volunteer_format_reasons: list[str] = []
-    if v1 and v2:
-        # 1. 两段文本左对齐。
-        left_aligned = abs(v1.x0 - v2.x0) <= 3
-
-        # 2. 行距与”技能证书与获奖”正文一致。
-        line_gap = v2.y0 - v1.y0
-        skill_y_positions = sorted({round(l.y0, 2) for l in skill_body})
-        skill_line_gaps = [b - a for a, b in zip(skill_y_positions, skill_y_positions[1:]) if b - a > 3]
-        reference_gap = sorted(skill_line_gaps)[len(skill_line_gaps) // 2] if skill_line_gaps else None
-        line_gap_matches_skill = bool(reference_gap is not None and abs(line_gap - reference_gap) <= 1.5)
-
-        # 3. 过大行距：行距不超过参考行距的2倍且不超过40pt绝对上限。
-        no_excessive_gap = line_gap <= (reference_gap * 2 if reference_gap else 40) and line_gap <= 40
-
-        # 4. 段前段后为0磅或与原简历正文一致：检测v1之前、v2之后与相邻行的间距是否在正文正常范围内。
-        # 取技能证书与获奖正文第一行与其标题底部的间距作为”正文与标题间距”（段前）参照。
-        skill_title_to_body_gap: Optional[float] = None
-        if skill_title and skill_body:
-            first_skill_body = min(skill_body, key=lambda l: l.y0)
-            skill_title_to_body_gap = first_skill_body.y0 - skill_title.y1
-        # 志愿服务标题底部到第一行正文的间距。
-        v1_para_before = (v1.y0 - volunteer_title.y1) if volunteer_title else None
-        # 容忍范围：与技能参照间距相差不超过3pt，或落在[0, 20]pt合理区间内。
-        if v1_para_before is not None and skill_title_to_body_gap is not None:
-            para_before_ok = abs(v1_para_before - skill_title_to_body_gap) <= 3 or 0 <= v1_para_before <= 20
-        else:
-            para_before_ok = v1_para_before is None or (0 <= v1_para_before <= 20)
-
-        # 4b. 段后：v2 下沿到下一模块/下方最近正文内容的间距。
-        # 参照标准：技能证书正文最后一行到"志愿服务"标题条的间距（即简历中"正文→下一模块标题"的实际段后）。
-        skill_body_to_next_title_gap: Optional[float] = None
-        if skill_body and volunteer_title:
-            last_skill_body = max(skill_body, key=lambda l: l.y1)
-            skill_body_to_next_title_gap = volunteer_title.y0 - last_skill_body.y1
-        # 志愿服务下方最近的内容 y0：优先取"研修规划"标题；若不存在，取整页中位于 v2 之下的最高非志愿服务行。
-        next_after_v2_y0: Optional[float] = None
-        if plan_title is not None and plan_title.y0 > v2.y1:
-            next_after_v2_y0 = plan_title.y0
-        else:
-            volunteer_line_ids = {id(v1), id(v2)} | ({id(volunteer_title)} if volunteer_title else set())
-            below: list[float] = []
-            for line in lines:
-                if id(line) in volunteer_line_ids:
-                    continue
-                if line.y0 > v2.y1:
-                    below.append(line.y0)
-            if below:
-                next_after_v2_y0 = min(below)
-        v2_para_after: Optional[float] = None
-        if next_after_v2_y0 is not None:
-            v2_para_after = next_after_v2_y0 - v2.y1
-        # 容忍：与参照相差不超过3pt，或落在[0, 20]pt区间；找不到下方内容视为满足（v2 已到页尾）。
-        if v2_para_after is None:
-            para_after_ok = True
-        elif skill_body_to_next_title_gap is not None:
-            para_after_ok = abs(v2_para_after - skill_body_to_next_title_gap) <= 3 or 0 <= v2_para_after <= 20
-        else:
-            para_after_ok = 0 <= v2_para_after <= 20
-
-        # 5. 不出现项目符号混乱：文本型项目符号检测 + 绘制型金色圆点一致性。
-        text_bullets_ok = (
-            not v1.text.strip().startswith(("•", "·", "-"))
-            and not v2.text.strip().startswith(("•", "·", "-"))
-        )
-        drawn_bullets = [bool(gold_bullets_near_line(page, l, x_min=180, x_max=l.x0)) for l in (v1, v2)]
-        drawn_bullets_consistent = drawn_bullets[0] == drawn_bullets[1]
-        no_bullet_chaos = text_bullets_ok and drawn_bullets_consistent
-
-        volunteer_format_ok = (
-            left_aligned
-            and line_gap_matches_skill
-            and no_excessive_gap
-            and para_before_ok
-            and para_after_ok
-            and no_bullet_chaos
-        )
-        if not left_aligned:
-            volunteer_format_reasons.append("两段文本未左对齐")
-        if not line_gap_matches_skill:
-            if reference_gap is None:
-                volunteer_format_reasons.append("无法取得技能证书与获奖正文行距作为参照")
-            else:
-                volunteer_format_reasons.append(f"志愿服务行距 {line_gap:.1f}pt 与技能证书与获奖正文行距 {reference_gap:.1f}pt 不一致")
-        if not no_excessive_gap:
-            volunteer_format_reasons.append(f"行距 {line_gap:.1f}pt 过大")
-        if not para_before_ok:
-            volunteer_format_reasons.append("段前间距与原简历正文不一致")
-        if not para_after_ok:
-            ref_txt = f"，参照 {skill_body_to_next_title_gap:.1f}pt" if skill_body_to_next_title_gap is not None else ""
-            volunteer_format_reasons.append(
-                f"段后间距 {v2_para_after:.1f}pt 既不接近0磅也不与原简历正文一致{ref_txt}"
-                if v2_para_after is not None else "段后间距未通过校验"
-            )
-        if not no_bullet_chaos:
-            volunteer_format_reasons.append("存在项目符号混乱")
-    else:
-        volunteer_format_reasons.append("缺少两段志愿服务文本，无法判断正文格式")
-    if volunteer_format_ok:
-        hits.append(Hit("+3 志愿服务正文格式", 3, True, "两段志愿服务文本左对齐，行距与技能证书与获奖正文一致，段前段后与原简历正文一致，未检测到项目符号混乱或过大行距。"))
-    else:
-        hits.append(Hit("+3 志愿服务正文格式", 3, False, "；".join(volunteer_format_reasons)))
-
-    # +3：志愿服务模块间距。
-    spacing_ok = False
-    spacing_reasons: list[str] = []
-    if volunteer_title and skill_body and plan_title and v1 and v2:
-        # 用技能证书与获奖正文的实际行距作为"原简历单倍行距"参照。
-        skill_y_positions = sorted({round(l.y0, 2) for l in skill_body})
-        skill_gaps = [b - a for a, b in zip(skill_y_positions, skill_y_positions[1:]) if b - a > 3]
-        ref_line_gap = sorted(skill_gaps)[len(skill_gaps) // 2] if skill_gaps else (v2.y0 - v1.y0)
-
-        # 近似单倍间距：允许偏差为参照行距的50%（上下模块间距通常略大于行距）。
-        def near_single_gap(gap: float) -> bool:
-            return gap > 0 and gap <= ref_line_gap * 2.0
-
-        upper_lines = [l for l in skill_body if l.y1 < volunteer_title.y0]
-        gap_prev = volunteer_title.y0 - max(l.y1 for l in upper_lines) if upper_lines else None
-        gap_title_body = v1.y0 - volunteer_title.y1
-        gap_body_next = plan_title.y0 - v2.y1
-
-        # 1. 标题与上方模块间距：近似单倍间距。
-        upper_gap_ok = bool(gap_prev is not None and near_single_gap(gap_prev))
-        # 2. 标题与下方模块间距：近似单倍间距。
-        lower_gap_ok = near_single_gap(gap_body_next)
-        # 3. 正文与标题条之间间距与正文行间间距一样：与参考行距相差不超过参照的50%。
-        title_body_gap_ok = gap_title_body > 0 and abs(gap_title_body - ref_line_gap) <= ref_line_gap * 0.5
-        # 4. 不与其他模块重叠。
-        volunteer_rects = [line_rect(l) for l in (volunteer_title, v1, v2)]
-        other_module_lines = skill_body + [plan_title] + plan_body
-        no_overlap = not any(
-            rects_overlap(vr, line_rect(other), pad=0)
-            for vr in volunteer_rects
-            for other in other_module_lines
-        )
-
-        spacing_ok = upper_gap_ok and lower_gap_ok and title_body_gap_ok and no_overlap
-        if not upper_gap_ok:
-            if gap_prev is None:
-                spacing_reasons.append("无法取得志愿服务模块与上方模块之间的间距")
-            else:
-                spacing_reasons.append(f"志愿服务标题与上方模块间距 {gap_prev:.1f}pt 不是单倍或近似单倍行距（参照 {ref_line_gap:.1f}pt）")
-        if not lower_gap_ok:
-            spacing_reasons.append(f"志愿服务正文与下方模块间距 {gap_body_next:.1f}pt 不是单倍或近似单倍行距（参照 {ref_line_gap:.1f}pt）")
-        if not title_body_gap_ok:
-            spacing_reasons.append(f"正文与标题条之间间距 {gap_title_body:.1f}pt 与正文行间间距 {ref_line_gap:.1f}pt 不一致")
-        if not no_overlap:
-            spacing_reasons.append("志愿服务模块与其他模块重叠")
-    else:
-        spacing_reasons.append("缺少志愿服务标题、两段正文、上方模块或下方模块，无法判断模块间距")
-    if spacing_ok:
-        hits.append(Hit("+3 志愿服务模块间距", 3, True, "志愿服务模块标题与上方模块、下方模块之间保持单倍或近似单倍间距，正文与标题条之间间距与正文间距一致，且未与其他模块重叠。"))
-    else:
-        hits.append(Hit("+3 志愿服务模块间距", 3, False, "；".join(spacing_reasons)))
-
-    # +5：技能证书与获奖新增行。
-    original_skill_lines = [
-        first_line(lines, "英语能力", min_x=180),
-        first_line(lines, "工具能力", min_x=180),
-        first_line(lines, "综合表现", min_x=180),
-    ]
-    original_skill_lines = [l for l in original_skill_lines if l]
-    skill_added_ok = False
-    skill_added_reasons: list[str] = []
-    if skill_added and skill_title:
-        # 1. 新增行须位于“技能证书与获奖”模块正文区。
-        in_skill_module = skill_added.x0 >= 180 and skill_added.y0 > skill_title.y1
-        # 2. 另起一行：不能与原有技能证书条目位于同一行。
-        separate_line = not any(abs(skill_added.y0 - l.y0) <= 3 for l in original_skill_lines)
-        # 3. 字体为宋体或近似宋体。
-        font_ok = near_song_font(skill_added.font)
-        # 4. 字号为小五号或近似小五号大小。
-        size_ok = 8.0 <= skill_added.size <= 10.2
-        # 5. 位于技能证书与获奖模块原有条目之后。
-        after_original = bool(original_skill_lines) and skill_added.y0 > max(l.y0 for l in original_skill_lines)
-        # 6. 位于下一模块之前。
-        before_next = (volunteer_title is None or skill_added.y1 < volunteer_title.y0) and (plan_title is None or skill_added.y1 < plan_title.y0)
-        # 7. 不能插入到标题条内部。
-        not_in_title = skill_added.y0 > skill_title.y1 + 2
-        # 8. 不能覆盖原有条目。
-        not_cover_original = not any(rects_overlap(line_rect(skill_added), line_rect(l), pad=0) for l in original_skill_lines)
-
-        skill_added_ok = (
-            in_skill_module
-            and separate_line
-            and font_ok
-            and size_ok
-            and after_original
-            and before_next
-            and not_in_title
-            and not_cover_original
-        )
-        if not in_skill_module:
-            skill_added_reasons.append("新增文本不在技能证书与获奖模块正文区")
-        if not separate_line:
-            skill_added_reasons.append("新增文本未另起一行")
-        if not font_ok:
-            skill_added_reasons.append("新增文本字体不是宋体或近似宋体")
-        if not size_ok:
-            skill_added_reasons.append(f"新增文本字号 {skill_added.size:.1f}pt 不符合小五号或近似小五号大小")
-        if not after_original:
-            skill_added_reasons.append("新增文本未位于原有技能证书条目之后")
-        if not before_next:
-            skill_added_reasons.append("新增文本未位于下一模块之前")
-        if not not_in_title:
-            skill_added_reasons.append("新增文本插入到技能证书与获奖标题条内部")
-        if not not_cover_original:
-            skill_added_reasons.append("新增文本覆盖原有技能证书条目")
-    else:
-        if not skill_title:
-            skill_added_reasons.append("未检测到技能证书与获奖模块标题")
-        if not skill_added:
-            skill_added_reasons.append(f"未检测到新增文本‘{SKILL_ADDED}’")
-    if skill_added_ok:
-        hits.append(Hit("+5 技能证书与获奖新增行", 5, True, "指定青年马克思主义者培养工程文本位于技能证书与获奖模块中，另起一行，字体为宋体或近似宋体，字号为小五号或近似小五号，位于原有条目之后、下一模块之前，未插入标题条内部且未覆盖原有条目。"))
-    else:
-        hits.append(Hit("+5 技能证书与获奖新增行", 5, False, "；".join(skill_added_reasons)))
-
-    # +3：技能证书新增行项目符号一致。
-    skill_bullet_ok = False
-    skill_bullet_reasons: list[str] = []
-    if skill_added and original_skill_lines:
-        original_has_bullets = [bool(gold_bullets_near_line(page, l, x_min=180, x_max=l.x0)) for l in original_skill_lines]
-        added_has_bullet = bool(gold_bullets_near_line(page, skill_added, x_min=180, x_max=skill_added.x0))
-        originals_all_have = all(original_has_bullets)
-        originals_none_have = not any(original_has_bullets)
-        if originals_all_have:
-            # 原有条目使用金色圆点，新增行也须使用金色圆点。
-            skill_bullet_ok = added_has_bullet
-            if not added_has_bullet:
-                skill_bullet_reasons.append("原有技能证书条目使用金色圆点项目符号，但新增行未检测到金色圆点")
-        elif originals_none_have:
-            # 原有条目无项目符号，新增行也须无项目符号。
-            skill_bullet_ok = not added_has_bullet
-            if added_has_bullet:
-                skill_bullet_reasons.append("原有技能证书条目无项目符号，但新增行出现了金色圆点")
-        else:
-            # 原有条目项目符号不统一，无法按细则判断一致性。
-            skill_bullet_ok = False
-            skill_bullet_reasons.append("原有技能证书条目项目符号不统一，无法判断新增行是否一致")
-    else:
-        if not skill_added:
-            skill_bullet_reasons.append("未检测到新增文本，无法判断项目符号")
-        if not original_skill_lines:
-            skill_bullet_reasons.append("未检测到原有技能证书条目，无法判断项目符号")
-    if skill_bullet_ok:
-        hits.append(Hit("+3 技能证书新增行项目符号", 3, True, "新增行项目符号与原有技能证书条目保持一致。"))
-    else:
-        hits.append(Hit("+3 技能证书新增行项目符号", 3, False, "；".join(skill_bullet_reasons)))
-
-    # 扣分项 -5：实践经历下方出现超过页面50%的空白导致简历变成2页或更多页。
-    # 修正：不再用「页面高度 - 实践经历正文底部」笼统当作空白，那样会把正常排在
-    # 实践经历下方的技能证书/志愿服务/研修规划模块也算进空白。这里改为计算
-    # 实践经历正文底部以下「连续无文本、无绘图占用」的真实最大空白高度。
-    excessive_blank_or_multipage = False
-    excessive_reasons: list[str] = []
-    if page_count >= 2:
-        # 条件一：简历变成2页或更多页。
-        excessive_blank_or_multipage = True
-        excessive_reasons.append(f"PDF共 {page_count} 页，超过1页")
-    if practice_body:
-        practice_bottom = max(b.y1 for b in practice_body)
-
-        # 收集第1页上位于实践经历正文底部以下的所有「内容占用」纵向区间：
-        # 文本行 + 绘图矩形（标题条、装饰块、项目符号、分隔线等都算内容）。
-        # 页脚版权行不算模块内容，但作为页面底部内容仍可界定空白下界。
-        footer = first_line(lines, FOOTER_TEXT)
-        content_intervals: list[tuple[float, float]] = []
-        for l in lines:
-            if l.y1 > practice_bottom + 0.5:
-                content_intervals.append((max(l.y0, practice_bottom), l.y1))
-        for d in drawings(page):
-            r = drawing_rect(d)
-            if r is None:
-                continue
-            dy0, dy1 = r[1], r[3]
-            # 跳过近似整页的背景填充矩形（会覆盖全页，使空白判断失真）。
-            if (dy1 - dy0) >= height * 0.9:
-                continue
-            if dy1 > practice_bottom + 0.5:
-                content_intervals.append((max(dy0, practice_bottom), dy1))
-
-        # 空白下界：优先取页脚顶部，否则取页面底部（去掉常规下边距）。
-        region_bottom = footer.y0 if footer else height
-        # 在 [practice_bottom, region_bottom] 内，合并内容区间后求最大连续空白高度。
-        max_blank = 0.0
-        blank_span_desc = ""
-        spans = sorted(
-            (iv for iv in content_intervals if iv[0] < region_bottom),
-            key=lambda iv: iv[0],
-        )
-        cursor = practice_bottom
-        for s0, s1 in spans:
-            if s0 > cursor:
-                gap = s0 - cursor
-                if gap > max_blank:
-                    max_blank = gap
-                    blank_span_desc = f"{cursor:.1f}→{s0:.1f}pt"
-            cursor = max(cursor, s1)
-        # 末尾到空白下界之间的空白（实践经历下方内容结束后到页脚/页面底部）。
-        if region_bottom - cursor > max_blank:
-            max_blank = region_bottom - cursor
-            blank_span_desc = f"{cursor:.1f}→{region_bottom:.1f}pt"
-
-        if max_blank > height * 0.5:
-            # 条件二：实践经历下方存在超过页面50%的连续真实空白。
-            excessive_blank_or_multipage = True
-            excessive_reasons.append(
-                f"实践经历下方连续空白 {max_blank:.1f}pt（{blank_span_desc}），超过页面高度 {height:.1f}pt 的50%"
-            )
-    if excessive_blank_or_multipage:
-        hits.append(Hit("-5 实践经历下方大空白/多页", -5, True, "；".join(excessive_reasons)))
-    else:
-        hits.append(Hit("-5 实践经历下方大空白/多页", -5, False, "未检测到实践经历下方超过页面50%的连续真实空白，且简历为单页。"))
-
-    # 扣分项 -3：技能证书新增内容覆盖原有"英语能力""工具能力"或"综合表现"文本。
-    missing_originals = [name for name in ["英语能力", "工具能力", "综合表现"] if not first_line(lines, name, min_x=180)]
-    if missing_originals:
-        hits.append(Hit("-3 技能证书新增内容覆盖原文", -3, True, "原有文本缺失：" + "、".join(missing_originals)))
-    else:
-        hits.append(Hit("-3 技能证书新增内容覆盖原文", -3, False, "英语能力、工具能力、综合表现均存在，未被覆盖。"))
-
-    # 扣分项 -3：新增内容后“研修规划”模块正文被截断或超出页面底部。
-    plan_truncated_or_overflow = False
-    plan_reasons: list[str] = []
-    if not plan_title or not plan_body:
-        plan_truncated_or_overflow = True
-        plan_reasons.append("研修规划模块标题或正文缺失，判定为正文被截断")
-    else:
-        footer = first_line(lines, FOOTER_TEXT)
-        footer_top = footer.y0 if footer else height - 25
-        last_plan_bottom = max(l.y1 for l in plan_body)
-        if last_plan_bottom >= footer_top - 3 or last_plan_bottom > height - 35:
-            plan_truncated_or_overflow = True
-            plan_reasons.append("研修规划正文超出页面底部或进入页脚区域")
-    if plan_truncated_or_overflow:
-        hits.append(Hit("-3 研修规划正文截断/越界", -3, True, "；".join(plan_reasons)))
-    else:
-        hits.append(Hit("-3 研修规划正文截断/越界", -3, False, "研修规划正文未被截断，且未超出页面底部。"))
-
-    # 扣分项 -3：成绩表数字缺失。
-    missing_scores = [s for s in ["64", "71", "118", "96", "349"] if s not in compact_text]
-    if missing_scores:
-        hits.append(Hit("-3 成绩表数字缺失", -3, True, "缺失成绩文本：" + "、".join(missing_scores)))
-    else:
-        hits.append(Hit("-3 成绩表数字缺失", -3, False, "成绩表中的 64、71、118、96、349 均可检测到。"))
-
-    # 扣分项 -3：第1页底部页脚"求学申请材料 · 2026"被正文内容覆盖或完全消失。
-    footer = first_line(lines, FOOTER_TEXT)
-    footer_bad = False
-    footer_reason = ""
-    if not footer:
-        # 完全消失。
-        footer_bad = True
-        footer_reason = "页脚文本未检测到，判定为完全消失"
-    else:
-        # 被正文内容覆盖：其他行与页脚行在几何上重叠。
-        for l in lines:
-            if l is footer or normalize_text(l.text) == normalize_text(FOOTER_TEXT):
-                continue
-            if rects_overlap(line_rect(l), line_rect(footer), pad=0):
-                footer_bad = True
-                footer_reason = "检测到正文内容与页脚文本位置重叠"
-                break
-    if footer_bad:
-        hits.append(Hit("-3 页脚消失或被覆盖", -3, True, footer_reason))
-    else:
-        hits.append(Hit("-3 页脚消失或被覆盖", -3, False, "页脚文本存在且未被正文内容覆盖。"))
-
-    total = sum(h.score for h in hits if h.matched)
-    return True, hits, total, notes
-
-
-def _locate_pdf(dir_path: str) -> str | None:
-    """在给定目录里定位待评估 PDF：优先精确名称，其次任一 .pdf 文件。"""
-    if not os.path.isdir(dir_path):
-        return None
-    preferred = os.path.join(dir_path, PREFERRED_PDF_NAME)
-    if os.path.isfile(preferred):
-        return preferred
-    for name in sorted(os.listdir(dir_path)):
-        if name.lower().endswith(".pdf"):
-            candidate = os.path.join(dir_path, name)
-            if os.path.isfile(candidate):
-                return candidate
+        if not (40.0 <= m["w"] <= ARC_D * 1.15 and 40.0 <= m["h"] <= ARC_D * 1.15):
+            continue
+        cand.append(m)
+    for m in cand:
+        if _color_ok(m["color"], C_ARC, max(m["tol"], 30)):
+            return m
+    for m in cand:
+        if _has_color_inside(d, m, C_ARC, 30):
+            return m
     return None
 
 
-def evaluate(dir_path: str) -> dict[str, object]:
-    """按统一约定的入口：接收脚本所在目录路径，返回结构化评估结果。"""
-    result: dict[str, object] = {
+def _find_avatar(d):
+    for im in d.images:
+        if im["x0"] >= COL_SPLIT:
+            continue
+        if not (74.0 <= im["w"] <= 95.0 and 74.0 <= im["h"] <= 95.0):
+            continue
+        if abs(im["w"] - im["h"]) > 4.0:
+            continue
+        return im
+    return None
+
+
+def _add(results, ok, delta, rule):
+    results.append(("+%d：%s" % (delta, rule)) if ok else ("+0：%s" % rule))
+
+
+def _ded(results, hit, delta, rule):
+    results.append(("-%d：%s" % (delta, rule)) if hit else ("-0：%s" % rule))
+
+
+def _check_additions(d, results, st):
+    """一、加分项（三项指令任务 + 篇幅控制）。"""
+    # ---- 【删除被横线标注的语句】 ------------------------------------
+    p1 = d.find("参与传感数据采集", side="R")
+    p2 = d.find("和模型推理接口联调", side="R")
+    orphan = any(ln["ntext"] in (".", ",", ";", "。") for ln in d.right)
+    a01 = (not any(d.has(s) for s in _DELETED_SENTENCE)) and not orphan
+    _add(results, a01, 3, '"实践经历"首段中被横线标注的整句被完整删除，未残留孤立句号或多余空行')
+
+    # 后两条以"整句已删除"为前提，未删除者不得凭原样未动获分
+    a02 = a01 and _norm(_KEEP_PARA) in d.flat_right
+    _add(results, a02, 1, "该段删除后剩余文字措辞与用字未被改写或缩写")
+
+    a03 = False
+    if a01 and a02 and p1 and p2:
+        pair = [p1, p2]
+        a03 = (all(_fmt_ok(ln, 9.0, C_BODY, False) for ln in pair)
+               and _consecutive(d.right, pair)
+               and _near(p1["x1"] - p1["x0"], 351.0, 30.0)
+               and 10.0 <= p2["y0"] - p1["y0"] <= 19.0)
+    _add(results, a03, 1, "该段排版属性保持——约9磅、深灰 #2F3333、非加粗、行宽约351磅、缩为2行且行距约13.5磅")
+
+    # ---- 【新增"志愿服务"模块】 --------------------------------------
+    vol_title = d.exact("志愿服务", side="R")
+    vol_bar = d.bar_of_title(vol_title) if vol_title else None
+    bars = sorted(d.module_bars(), key=lambda m: m["y0"])
+    others = [b for b in bars if b is not vol_bar]
+    ref_w = _median([b["w"] for b in others]) or RIGHT_W
+    ref_gap = _median([d.gap_above(b) for b in others]) or 20.0
+    mod_titles = [ln for ln in (d.find(t, side="R") for t in _MODULE_TITLES) if ln]
+    ref_title_size = _median([ln["size"] for ln in mod_titles]) or 10.5
+    skill_items = [d.find(t, side="R") for t in ("英语能力：", "工具能力：", "综合表现：")]
+    skill_items = [ln for ln in skill_items if ln]
+    ref_item_x0 = _median([ln["x0"] for ln in skill_items])
+    ref_item_gap = _median([skill_items[i + 1]["y0"] - skill_items[i]["y0"]
+                            for i in range(len(skill_items) - 1)]) or 16.5
+    st.update(bars=bars, ref_item_x0=ref_item_x0, ref_item_gap=ref_item_gap,
+              skill_items=skill_items, p2=p2)
+
+    v1 = d.finds(_VOL1, side="R")
+    v2 = d.finds(_VOL2, side="R")
+    a07 = (len(v1) == 1 and len(v2) == 1 and v1[0] is not v2[0]
+           and _norm(_VOL2) not in v1[0]["ntext"])
+    vl = sorted([v1[0], v2[0]], key=lambda ln: ln["y0"]) if a07 else []
+
+    a04 = False
+    if vol_bar is not None and vl:
+        below = [b["y0"] for b in others if b["y0"] > vol_bar["y1"]]
+        next_top = min(below) if below else d.height
+        inside = all(vol_bar["y1"] < ln["y0"] and ln["y1"] < next_top for ln in vl)
+        overlap = any(not (b["y1"] <= vol_bar["y0"] + 0.5 or b["y0"] >= vol_bar["y1"] - 0.5)
+                      for b in others)
+        gap = d.gap_above(vol_bar)
+        a04 = (inside and not overlap
+               and vol_bar["x0"] >= COL_SPLIT - 6.0 and vol_bar["x1"] <= d.width - 12.0
+               and gap >= max(6.0, ref_gap * 0.5) and gap <= ref_gap * 3.0 + 12.0
+               and next_top - max(ln["y1"] for ln in vl) >= 3.0)
+    _add(results, a04, 5, '新增1个独立的"志愿服务"模块，置于右栏正文流的模块之间，与相邻模块间距正常、未重叠、未溢出右边界')
+
+    a05 = False
+    if vol_bar is not None:
+        tick = None
+        for tk in d.ticks():
+            if (vol_bar["y0"] - 2.0 <= tk["cy"] <= vol_bar["y1"] + 2.0
+                    and 1.0 <= tk["x0"] - vol_bar["x0"] <= 20.0):
+                tick = tk
+                break
+        a05 = (_near(vol_bar["w"], ref_w, max(ref_w * 0.06, 6.0))
+               and 14.0 <= vol_bar["h"] <= 23.0
+               and _color_ok(vol_bar["color"], C_BAR, vol_bar["tol"])
+               and tick is not None)
+    _add(results, a05, 3, '该模块标题栏与其他模块同款——深绿 #235D5B 横条约355×18磅、左端带橙色 #D4A557 竖条约4×12磅')
+
+    a06 = (vol_title is not None and vol_title["ntext"] == "志愿服务"
+           and _fmt_ok(vol_title, None, C_WHITE, True)
+           and _size_ok(vol_title["size"], ref_title_size))
+    _add(results, a06, 1, '标题文字为"志愿服务"四字，白色、加粗、字号约10.5磅，与其他模块标题一致')
+
+    _add(results, a07, 3, "模块内容为两条志愿服务经历，分成两个独立行呈现、未合并串行、文字无错漏")
+
+    a08 = bool(vl) and all(_fmt_ok(ln, 9.0, C_BODY, False) for ln in vl)
+    _add(results, a08, 1, "两行内容字号约9磅、颜色深灰 #2F3333、非加粗，与相邻模块条目一致")
+
+    a09 = False
+    if vl and ref_item_x0 is not None:
+        dots = d.dots_right()
+        a09 = (all(d.dot_for(ln, dots) is not None for ln in vl)
+               and all(_near(ln["x0"], ref_item_x0, 3.0) for ln in vl)
+               and all(ln["x0"] - RIGHT_X >= 8.0 for ln in vl))
+    _add(results, a09, 1, '两行内容带与"技能证书与获奖"条目同款的橙色圆点项目符号，文字左边界与该模块条目对齐')
+
+    a10 = len(vl) == 2 and _near(vl[1]["y0"] - vl[0]["y0"], ref_item_gap, 2.0)
+    _add(results, a10, 1, "两行内容之间的行距与其他模块条目行距一致（约16.5磅）")
+
+    a11 = bool(vl) and all(_ends_with(ln, _END_PUNCT) for ln in vl)
+    _add(results, a11, 1, "两行内容句末标点风格与文档其他条目一致，未出现无标点截断")
+
+    st.update(vol_bar=vol_bar, vl=vl, a07=a07)
+
+
+def _check_additions_tail(d, results, st):
+    """一、加分项（"技能证书与获奖"补充条目 + 篇幅控制）。"""
+    ref_item_x0 = st.get("ref_item_x0")
+    ref_item_gap = st.get("ref_item_gap") or 16.5
+    last_item = None
+    for ln in st.get("skill_items") or []:
+        if "综合表现" in ln["ntext"] and (last_item is None or ln["y0"] > last_item["y0"]):
+            last_item = ln
+
+    hits = [ln for ln in d.finds(_SKILL_NEW, side="R") if "综合表现" not in ln["ntext"]]
+    new_item = hits[0] if len(hits) == 1 else None
+    a12 = False
+    if new_item is not None and last_item is not None:
+        below = [b["y0"] for b in st.get("bars") or [] if b["y0"] > last_item["y1"]]
+        next_top = min(below) if below else d.height
+        a12 = (new_item["y0"] > last_item["y0"] and new_item["y1"] < next_top
+               and _norm(_SKILL_NEW) not in _norm(last_item["text"]))
+    _add(results, a12, 3, '"技能证书与获奖"模块末尾另起一行新增1条培养工程培训条目，未并入上一条也未覆盖既有条目')
+
+    a13 = False
+    if new_item is not None and ref_item_x0 is not None:
+        a13 = (d.dot_for(new_item, d.dots_right()) is not None
+               and _near(new_item["x0"], ref_item_x0, 2.0))
+    _add(results, a13, 1, "该新增条目带同款橙色圆点项目符号，且文字左边界与同模块其余条目严格对齐")
+
+    a14 = False
+    if new_item is not None and last_item is not None:
+        a14 = (_fmt_ok(new_item, 9.0, C_BODY, False)
+               and _near(new_item["y0"] - last_item["y0"], ref_item_gap, 2.0))
+    _add(results, a14, 1, "该新增条目字号约9磅、颜色深灰 #2F3333、非加粗，行距与同模块其余条目一致")
+
+    a15 = _ends_with(new_item, _END_PERIOD)
+    _add(results, a15, 1, "该新增条目以句号收尾，与同模块其余条目标点风格一致")
+
+    # ---- 【篇幅控制】：仅在两处内容确已新增的前提下计分 ----------------
+    added = bool(st.get("a07")) and a12
+    band = d.footer_band()
+
+    a16 = (added and d.n_pages == 1
+           and _near(d.width, A4_W, 8.0) and _near(d.height, A4_H, 8.0))
+    _add(results, a16, 5, "新增上述内容后全文仍为1页，未溢出到第2页，纸张仍为A4纵向")
+
+    a17 = False
+    if added and band is not None:
+        ftr = [ln for ln in d.right
+               if band["y0"] - 4.0 <= ln["y0"] and ln["y1"] <= band["y1"] + 4.0]
+        a17 = (bool(ftr) and max(ln["x1"] for ln in ftr) >= 500.0
+               and _band_intact(d, band))
+    _add(results, a17, 1, "页面下沿的浅色页脚色带与其中的页码文字仍位于原位置，未被正文挤出页面或覆盖")
+
+    a18 = False
+    tail = None
+    for ln in d.right:
+        if ln["y1"] <= d.height - 60.0 and (tail is None or ln["y1"] > tail["y1"]):
+            tail = ln
+    if added and band is not None and tail is not None:
+        a18 = tail["y1"] <= band["y0"] - 4.0
+    _add(results, a18, 1, "正文末句与页脚色带之间仍留有可见空白，正文未紧贴或压住页脚")
+
+
+def _check_deductions_right(d, results, st):
+    """二、减分项（右栏既有版式）。"""
+    # D01 大标题
+    title = d.find("求学申请材料", side="R", y_range=(0.0, 60.0))
+    d01 = not (_fmt_ok(title, 24.0, C_ACCENT, True) and title is not None
+               and _near(title["x0"], RIGHT_X, 8.0))
+    _ded(results, d01, 1, '右栏顶部标题"求学申请材料"不满足字号约24磅、颜色深绿 #173C3B、加粗、左端与右栏正文左对齐')
+
+    # D02 副标题
+    sub = d.find("面向能源信息与智能控制方向", side="R")
+    d02 = not (_fmt_ok(sub, 11.0, C_MUTED, False)
+               and title is not None and sub is not None
+               and sub["size"] < title["size"] * 0.7)
+    _ded(results, d02, 1, '标题下方一行"面向能源信息与智能控制方向"不满足字号约11磅、颜色灰 #6B7474、非加粗且明显小于主标题')
+
+    # D03 金色分隔线
+    d03 = not d.marks_of(C_ORANGE, wrange=(330.0, 375.0), hrange=(0.0, 5.0),
+                         yrange=(60.0, 92.0))
+    _ded(results, d03, 1, "标题区下方那条金色 #D4A557 细分隔横线不满足宽约352磅、位于标题区下沿、贯通右栏")
+
+    # D04 报考与初试情况 四组标签/取值
+    labels = [d.find(t, side="R") for t in ("报考院校：", "报考方向：", "培养类型：", "当前学历：")]
+    values = [d.find(t, side="R") for t in ("南港理工学院", "新能源控制工程", "专业型硕士", "本科在读")]
+    d04 = True
+    if all(labels) and all(values):
+        lx = sorted(set(round(ln["x0"]) for ln in labels))
+        cols = []
+        for x in lx:
+            if not cols or x - cols[-1][-1] > 4.0:
+                cols.append([x])
+            else:
+                cols[-1].append(x)
+        fmt = (all(_fmt_ok(ln, 9.2, C_ACCENT, True) for ln in labels)
+               and all(_fmt_ok(ln, 9.2, C_BODY, False) for ln in values))
+        two_cols = (len(cols) == 2 and (cols[1][0] - cols[0][0]) > 100.0
+                    and _near(cols[0][0], RIGHT_X, 8.0))
+        d04 = not (fmt and two_cols)
+    _ded(results, d04, 1, '"报考与初试情况"四组"标签+取值"不满足标签约9.2磅深绿 #173C3B 加粗、取值约9.2磅深灰 #2F3333 非加粗，或未保持左右两列各两行的对齐关系')
+
+    # D05 初试成绩表
+    heads = [d.exact(t, side="R") for t in ("思政", "外语", "专业基础", "数学", "总分")]
+    vals = [d.exact(t, side="R") for t in ("64", "71", "118", "96", "349")]
+    cells = d.marks_of(C_TBL_HEAD, wrange=(60.0, 82.0), hrange=(19.0, 29.0), pool="raw")
+    grid = [m for m in d.raw
+            if m["stroke"] and _color_ok(m["stroke"], C_TBL_LINE, _TOL_VEC)]
+    d05 = not (len(cells) == 5 and len(grid) >= 4 and all(heads) and all(vals)
+               and all(_fmt_ok(ln, 9.5, C_ACCENT, True) for ln in heads)
+               and all(_fmt_ok(ln, 9.5, C_BODY) for ln in vals))
+    _ded(results, d05, 1, "初试成绩表不满足5列表头带浅绿 #DDEBE6 底色、单元格约71×24磅、细框线 #C3D1CD 完整、表头约9.5磅深绿加粗、数值约9.5磅深灰")
+
+    # D06 教育背景行
+    row = [d.find("2022.09", side="R"), d.find("东序信息学院", side="R"),
+           d.find("计算机与自动化技术（本科）", side="R")]
+    d06 = True
+    if all(row):
+        cys = [(ln["y0"] + ln["y1"]) / 2.0 for ln in row]
+        d06 = not (_fmt_ok(row[0], 9.6, C_ACCENT, True)
+                   and _fmt_ok(row[1], 10.2, C_ACCENT, True)
+                   and _fmt_ok(row[2], 9.6, C_ACCENT, True)
+                   and max(cys) - min(cys) <= 5.0
+                   and _near(row[0]["x0"], RIGHT_X, 8.0)
+                   and 300.0 <= (row[1]["x0"] + row[1]["x1"]) / 2.0 <= 400.0
+                   and row[2]["x1"] >= 540.0)
+    _ded(results, d06, 1, '"教育背景"中"起止年月/院校名称/专业与学历"一行不满足三段同一基线、字号约9.6/10.2/9.6磅、颜色深绿 #173C3B 加粗、左中右三点分布')
+
+    # D07 课程结构段落
+    para = [d.find("课程结构以算法设计", side="R"), d.find("与工程实践为主", side="R"),
+            d.find("本化处理与版本协作", side="R")]
+    d07 = True
+    if all(para):
+        gaps = [para[i + 1]["y0"] - para[i]["y0"] for i in range(2)]
+        d07 = not (all(_fmt_ok(ln, 9.1, C_BODY, False) for ln in para)
+                   and _consecutive(d.right, para)
+                   and _near(para[0]["x1"] - para[0]["x0"], RIGHT_W, 28.0)
+                   and all(10.0 <= g <= 19.0 for g in gaps))
+    _ded(results, d07, 1, '"课程结构以算法设计…"整段不满足约9.1磅、深灰 #2F3333、非加粗、排为3行且行宽约355磅、行距约14磅')
+
+    # D08 实践经历行
+    row2 = [d.find("2025.02", side="R"), d.find("青封智能装配有限公司", side="R"),
+            d.find("智能监测开发助理", side="R")]
+    d08 = True
+    if all(row2):
+        cys = [(ln["y0"] + ln["y1"]) / 2.0 for ln in row2]
+        d08 = not (_fmt_ok(row2[0], 9.4, C_ACCENT, True)
+                   and _fmt_ok(row2[1], 10.0, C_ACCENT, True)
+                   and _fmt_ok(row2[2], 9.4, C_ACCENT, True)
+                   and max(cys) - min(cys) <= 5.0
+                   and _near(row2[0]["x0"], RIGHT_X, 8.0)
+                   and 300.0 <= (row2[1]["x0"] + row2[1]["x1"]) / 2.0 <= 400.0
+                   and row2[2]["x1"] >= 500.0)
+    _ded(results, d08, 1, '"实践经历"中"起止年月/单位名称/岗位名称"一行不满足三段同一基线、字号约9.4/10.0/9.4磅、颜色深绿 #173C3B 加粗、左中右三点分布')
+
+    # D09 课程项目 小标题行
+    proj_l = d.find("课程项目", side="R")
+    proj_r = d.find("楼宇能耗预测与调度小组项目", side="R")
+    d09 = not (_fmt_ok(proj_l, 9.4, C_ACCENT, True) and _fmt_ok(proj_r, 10.0, C_ACCENT, True))
+    _ded(results, d09, 1, '"课程项目"与"楼宇能耗预测与调度小组项目"两处小标题不满足字号约9.4/10.0磅、颜色深绿 #173C3B、加粗')
+
+    # D10 项目说明段落
+    pj = [d.find("围绕温湿度", side="R"), d.find("项目说明书与演示看板", side="R")]
+    d10 = True
+    if all(pj):
+        d10 = not (all(_fmt_ok(ln, 9.0, C_BODY, False) for ln in pj)
+                   and _consecutive(d.right, pj)
+                   and _near(pj[0]["x1"] - pj[0]["x0"], 351.0, 30.0))
+    _ded(results, d10, 1, '"围绕温湿度…"整段不满足约9磅、深灰 #2F3333、非加粗、排为2行且行宽约351磅')
+
+    # D11 课程项目行上下间距
+    d11 = True
+    prev = st.get("p2")
+    if proj_l is not None and prev is not None and pj[0] is not None:
+        g1 = proj_l["y0"] - prev["y1"]
+        g2 = pj[0]["y0"] - proj_l["y1"]
+        d11 = not (-1.0 <= g1 <= 45.0 and -1.0 <= g2 <= 45.0)
+    _ded(results, d11, 1, '"课程项目"小标题行与其上下文字之间的垂直间距未保持正常，出现紧贴、重叠或大片空洞')
+
+    # D12 技能证书与获奖 原有三条
+    items = st.get("skill_items") or []
+    d12 = True
+    if len(items) == 3:
+        items = sorted(items, key=lambda ln: ln["y0"])
+        dots = d.dots_right()
+        gaps = [items[i + 1]["y0"] - items[i]["y0"] for i in range(2)]
+        xs = [ln["x0"] for ln in items]
+        d12 = not (all(_fmt_ok(ln, 9.0, C_BODY, False) for ln in items)
+                   and all(d.dot_for(ln, dots) is not None for ln in items)
+                   and max(xs) - min(xs) <= 2.5 and min(xs) - RIGHT_X >= 8.0
+                   and all(13.5 <= g <= 20.0 for g in gaps))
+    _ded(results, d12, 1, '"技能证书与获奖"模块原有三条条目不满足约9磅深灰 #2F3333 非加粗、每条带橙色圆点、左缩进约12磅且行距约16.5磅')
+
+    # D13 研修规划段落
+    head = d.find("进入研究生阶段后", side="R")
+    d13 = True
+    if head is not None:
+        plan = sorted([ln for ln in d.right
+                       if ln["y0"] >= head["y0"] - 0.5 and ln["y1"] <= d.height - 60.0],
+                      key=lambda ln: ln["y0"])
+        if len(plan) == 5:
+            gaps = [plan[i + 1]["y0"] - plan[i]["y0"] for i in range(4)]
+            base = _median([ln["x0"] for ln in plan[1:]])
+            d13 = not (all(_fmt_ok(ln, 9.0, C_BODY, False) for ln in plan)
+                       and 10.0 <= plan[0]["x0"] - base <= 28.0
+                       and all(10.0 <= g <= 19.0 for g in gaps))
+        st["plan_last"] = plan[-1] if plan else None
+    _ded(results, d13, 1, '"研修规划"整段不满足约9磅、深灰 #2F3333、非加粗、首行缩进约18磅、排为5行且行距约14磅')
+
+    # D14 五个模块标题栏
+    d14 = False
+    for name in _MODULE_TITLES:
+        ln = d.find(name, side="R")
+        bar = d.bar_of_title(ln) if ln else None
+        ok = (_fmt_ok(ln, 10.5, C_WHITE, True) and bar is not None
+              and 14.0 <= bar["h"] <= 23.0 and _near(bar["w"], RIGHT_W, 26.0)
+              and any(bar["y0"] - 2.0 <= tk["cy"] <= bar["y1"] + 2.0
+                      and 1.0 <= tk["x0"] - bar["x0"] <= 20.0 for tk in d.ticks()))
+        if not ok:
+            d14 = True
+            break
+    _ded(results, d14, 1, "右栏五个既有模块标题栏不满足深绿 #235D5B 横条约355×18磅、标题白色加粗约10.5磅、左端橙色 #D4A557 竖条约4×12磅")
+
+    # D15 页脚文字
+    band = d.footer_band()
+    ftr = [ln for ln in d.right if ln["y0"] >= d.height - 60.0]
+    d15 = True
+    if band is not None and ftr:
+        d15 = not (all(_fmt_ok(ln, 7.6, C_MUTED, False) for ln in ftr)
+                   and max(ln["x1"] for ln in ftr) >= 500.0
+                   and all(band["y0"] - 4.0 <= ln["y0"] and ln["y1"] <= band["y1"] + 4.0
+                           for ln in ftr))
+    _ded(results, d15, 1, '页面底部"求学申请材料 · 2026"一行不满足约7.6磅、颜色灰 #6B7474、非加粗、靠右排布并位于浅色页脚色带内')
+
+
+def _check_deductions_left(d, results, st):
+    """二、减分项（左栏侧边栏既有版式）。"""
+    # D16 左侧通栏与最窄深色条
+    panel = d.marks_of(C_BAR, wrange=(163.0, 188.0), hrange=(780.0, 1200.0),
+                       xrange=(-2.0, 3.0), pool="raw")
+    strip = d.marks_of(C_STRIP, wrange=(14.0, 22.0), hrange=(780.0, 1200.0),
+                       xrange=(-2.0, 3.0), pool="raw")
+    d16 = not (panel and strip)
+    _ded(results, d16, 1, "左侧深绿 #235D5B 竖向通栏不满足宽约175磅、自页面顶端贯通至底端，或其最左侧那条约18磅宽的更深色 #163B3B 窄条缺失")
+
+    # D17 圆形头像
+    av = _find_avatar(d)
+    d17 = True
+    if av is not None:
+        cs = [d.px(av["x0"] + 2.5, av["y0"] + 2.5), d.px(av["x1"] - 2.5, av["y0"] + 2.5),
+              d.px(av["x0"] + 2.5, av["y1"] - 2.5), d.px(av["x1"] - 2.5, av["y1"] - 2.5)]
+        flat = max(max(abs(a[i] - b[i]) for i in range(3)) for a in cs for b in cs)
+        d17 = not (_size_ok(av["w"], 84.0) and flat <= 30
+                   and _near((av["x0"] + av["x1"]) / 2.0, 87.0, 10.0))
+    _ded(results, d17, 1, "左栏上部那张圆形裁切的人物头像不满足直径约84磅、正圆裁切、水平居中于左栏，或已被删除/拉伸变形")
+
+    # D18 姓名区与胶囊标签
+    name = d.find("林绯绯", side="L")
+    major = d.find("计算机与自动化技术", side="L")
+    tagline = d.find("跨学科申请", side="L")
+    pill = d.marks_of(C_ORANGE, wrange=(84.0, 102.0), hrange=(16.0, 24.0),
+                      xrange=(20.0, 60.0), pool="raw")
+    d18 = not (_fmt_ok(name, 18.0, C_WHITE, True)
+               and _fmt_ok(major, 9.5, C_SUBTITLE_L)
+               and _fmt_ok(tagline, 9.0, C_ACCENT)
+               and bool(pill))
+    _ded(results, d18, 1, '左栏"林绯绯"不满足约18磅白色加粗，或"本科 · 计算机与自动化技术"不满足约9.5磅浅绿 #D8E7E4，或"跨学科申请"及其橙色 #D4A557 胶囊底块（约93×20磅）缺失变形')
+
+    # D19 左栏四个分组标题条
+    gbars = d.marks_of(C_GROUP_BAR, wrange=(110.0, 132.0), hrange=(20.0, 28.0), pool="raw")
+    d19 = len(gbars) != 4
+    if not d19:
+        for name_t in _GROUP_TITLES:
+            ln = d.find(name_t, side="L")
+            if not _fmt_ok(ln, 10.2, C_WHITE, True):
+                d19 = True
+                break
+            if not any(m["y0"] - 4.0 <= ln["y0"] and ln["y1"] <= m["y1"] + 4.0
+                       and m["x0"] - 4.0 <= ln["x0"] and ln["x1"] <= m["x1"] + 4.0
+                       for m in gbars):
+                d19 = True
+                break
+    _ded(results, d19, 1, '左栏"基本信息""联系方式""能力概览""申请信息"四个分组标题不满足白色加粗约10.2磅并位于约120×24磅的浅绿 #3F7774 色块内')
+
+    # D20 基本信息 五行标签与取值
+    b_lab = [d.find(t, side="L") for t in ("出生年月", "政治面貌", "民族", "最高学历", "毕业院校")]
+    b_val = [d.find(t, side="L") for t in ("2001.11", "共青团员", "汉族", "本科学历", "东序信息学院")]
+    d20 = True
+    if all(b_lab) and all(b_val):
+        d20 = not (all(_fmt_ok(ln, 8.8, C_LABEL_L) for ln in b_lab)
+                   and all(_fmt_ok(ln, 8.8, C_WHITE) for ln in b_val)
+                   and all(_near(ln["x0"], 33.0, 5.0) for ln in b_lab)
+                   and all(_near(ln["x0"], 86.0, 6.0) for ln in b_val))
+    _ded(results, d20, 1, '"基本信息"五行不满足标签约8.8磅浅绿 #CFE1DE 起于左栏约33磅处、取值约8.8磅白色起于约86磅处的两列对齐')
+
+    # D21 联系方式 三行
+    ct = [d.find("校内申请系统转接", side="L"), d.find("联系邮箱", side="L"),
+          d.find("常驻城市", side="L")]
+    d21 = True
+    if all(ct):
+        ct = sorted(ct, key=lambda ln: ln["y0"])
+        gaps = [ct[i + 1]["y0"] - ct[i]["y0"] for i in range(2)]
+        d21 = not (all(_fmt_ok(ln, 8.5, C_WHITE, False) for ln in ct)
+                   and all(_near(ln["x0"], 33.0, 5.0) for ln in ct)
+                   and all(12.0 <= g <= 22.0 for g in gaps))
+    _ded(results, d21, 1, '"联系方式"三行不满足约8.5磅白色非加粗、左端对齐于约33磅处、行距约17磅')
+
+    # D22 能力概览 五条
+    caps = [d.find(t, side="L") for t in ("Python / C++ / C#", "数据处理与可视化",
+                                          "边缘计算部署", "控制系统仿真", "技术文档写作")]
+    d22 = True
+    if all(caps):
+        caps = sorted(caps, key=lambda ln: ln["y0"])
+        ldots = d.dots_left()
+        gaps = [caps[i + 1]["y0"] - caps[i]["y0"] for i in range(4)]
+        d22 = not (all(_fmt_ok(ln, 8.6, C_WHITE) for ln in caps)
+                   and len(ldots) >= 5
+                   and all(d.dot_for(ln, ldots) is not None for ln in caps)
+                   and all(14.0 <= g <= 23.0 for g in gaps))
+    _ded(results, d22, 1, '"能力概览"五条不满足约8.6磅白色、每条前带约4.4磅橙色 #D4A557 圆点、行距约18磅')
+
+    # D23 申请信息 三行
+    a_lab = [d.find(t, side="L") for t in ("报考院校", "报考专业", "报考属性")]
+    a_val = [d.find(t, side="L") for t in ("南港理工学院", "新能源控制工程", "专业型硕士")]
+    d23 = True
+    if all(a_lab) and all(a_val):
+        d23 = not (all(_fmt_ok(ln, 8.6, C_LABEL_L) for ln in a_lab)
+                   and all(_fmt_ok(ln, 8.6, C_WHITE) for ln in a_val)
+                   and all(_near(ln["x0"], 33.0, 5.0) for ln in a_lab)
+                   and all(_near(ln["x0"], 86.0, 6.0) for ln in a_val))
+    _ded(results, d23, 1, '"申请信息"三行不满足标签约8.6磅浅绿 #CFE1DE、取值约8.6磅白色的两列对齐')
+
+    # D24 左下装饰弧
+    d24 = _find_arc(d) is None
+    _ded(results, d24, 1, "左栏左下角那片浅色 #C8DDD6 装饰圆弧被删除、移位或改色")
+
+
+def _check_deductions_global(d, results, st):
+    """二、减分项（整体性破坏）。"""
+    # D25 文字内容
+    miss = [t for t in _ANCHORS_RIGHT if _norm(t) not in d.flat_right and not d.has(t)]
+    miss += [t for t in _ANCHORS_LEFT if _norm(t) not in d.flat_left and not d.has(t)]
+    _ded(results, bool(miss), 3, "除被横线标注的那一句之外，其余原有文字段落、条目与标签存在删除、改写或错字")
+
+    # D26 图形对象
+    objs = {
+        "头像": _find_avatar(d) is not None,
+        "成绩表底色": len(d.marks_of(C_TBL_HEAD, wrange=(60.0, 82.0), hrange=(19.0, 29.0),
+                                     pool="raw")) >= 5,
+        "模块标题栏": len(d.module_bars()) >= 5,
+        "右栏圆点": len(d.dots_right()) >= 3,
+        "左栏圆点": len(d.dots_left()) >= 5,
+        "装饰弧": _find_arc(d) is not None,
+        "页脚色带": d.footer_band() is not None,
+        "胶囊底块": bool(d.marks_of(C_ORANGE, wrange=(84.0, 102.0), hrange=(16.0, 24.0),
+                                    xrange=(20.0, 60.0), pool="raw")),
+        "分组标题条": len(d.marks_of(C_GROUP_BAR, wrange=(110.0, 132.0),
+                                     hrange=(20.0, 28.0), pool="raw")) >= 4,
+    }
+    _ded(results, not all(objs.values()), 3, "头像、初试成绩表框线与底色、模块标题栏色块、条目圆点、左下装饰弧形、页脚色带等既有图形对象存在删除或破坏")
+
+    # D27 模块与段落存废
+    lost = [t for t in _MODULE_TITLES if d.find(t, side="R") is None]
+    lost += [t for t in _GROUP_TITLES if d.find(t, side="L") is None]
+    for anchor in ("课程结构以算法设计", "围绕温湿度", "进入研究生阶段后", "英语能力"):
+        if d.find(anchor, side="R") is None:
+            lost.append(anchor)
+    _ded(results, bool(lost), 3, "右栏五个既有模块或左栏四个既有分组中的任一整块被删除、合并或整段搬移")
+
+    # D28 具体数值
+    nums = ["林绯绯", "2001.11", "南港理工学院", "新能源控制工程", "专业型硕士", "本科在读",
+            "东序信息学院", "2022.09", "2026.06", "2025.02", "2025.07"]
+    bad_num = [t for t in nums if not d.has(t)]
+    if not bad_num:
+        bad_num = [v for v in ("64", "71", "118", "96", "349") if d.exact(v, side="R") is None]
+    _ded(results, bool(bad_num), 1, "姓名、出生年月、初试各科分数与总分、院校与专业名称、各段起止年月等具体数值被改动")
+
+    # D29 多余新增
+    extra = False
+    if d.n_pages != 1:
+        extra = True
+    if len(d.module_bars()) > 6 or len(d.marks_of(C_GROUP_BAR, wrange=(110.0, 132.0),
+                                                 hrange=(20.0, 28.0), pool="raw")) > 4:
+        extra = True
+    if any(ln["y1"] <= 16.0 or ln["y0"] >= d.height - 8.0 for ln in d.lines):
+        extra = True
+    for anchor, limit in (("技能证书与获奖", 4), ("志愿服务", 2)):
+        title = d.exact(anchor, side="R")
+        bar = d.bar_of_title(title) if title else None
+        if bar is None:
+            continue
+        below = [b["y0"] for b in d.module_bars() if b["y0"] > bar["y1"]]
+        top = min(below) if below else d.height - 60.0
+        inner = [ln for ln in d.right if bar["y1"] <= ln["y0"] and ln["y1"] <= top]
+        if len(inner) > limit:
+            extra = True
+    _ded(results, extra, 1, "在指令未要求处新增了多余的页面、模块、分组、条目、页眉页脚或装饰元素")
+
+
+# ---------------------------------------------------------------------------
+# 汇总与对外入口
+# ---------------------------------------------------------------------------
+
+
+def _check_all(d):
+    """按 _MAX_DELTAS_ORDER 的顺序产出 47 条结果字符串。"""
+    results = []
+    st = {}
+    _check_additions(d, results, st)
+    _check_additions_tail(d, results, st)
+    _check_deductions_right(d, results, st)
+    _check_deductions_left(d, results, st)
+    _check_deductions_global(d, results, st)
+    return results
+
+
+def _evaluate_impl(dir_path, work_dir):
+    display_name, pdf_path = _resolve_pdf(dir_path, work_dir)
+    # 维度一的第一道门禁：交付物格式只接受 .pdf，不合格即判 0，不再解析版面
+    reject = _fmt_reject(pdf_path)
+    if reject:
+        return {
+            "id": SCRIPT_ID,
+            "file_name": display_name,
+            "status": "ok",
+            "error": None,
+            "dim1_pass": False,
+            # 维度一未通过：dim1_reason 必须带上错误摘要，便于直接定位原因
+            "dim1_reason": "维度一未通过：%s，完成度记 0" % reject,
+            "dim2_items": [],
+            "total_score": 0,
+            "max_score": MAX_SCORE_TOTAL,
+        }
+    d = _Doc(pdf_path)
+    try:
+        ok1, reason1 = _dim1(d)
+        if not ok1:
+            return {
+                "id": SCRIPT_ID,
+                "file_name": display_name,
+                "status": "ok",
+                "error": None,
+                "dim1_pass": False,
+                # 维度一未通过：dim1_reason 必须带上错误摘要，便于直接定位原因
+                "dim1_reason": "维度一未通过：%s，完成度记 0" % reason1,
+                "dim2_items": [],
+                "total_score": 0,
+                "max_score": MAX_SCORE_TOTAL,
+            }
+        results = _check_all(d)
+    finally:
+        d.close()
+
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(
+            f"结果条目数({len(results)})与 max_delta 序列({len(_MAX_DELTAS_ORDER)})不一致")
+
+    dim2_items = []
+    total = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        got = int(head.replace("+", "").replace("-", "").strip())
+        hit = got > 0
+        delta = max_delta if hit else 0
+        total += delta
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": delta,
+            "hit": hit,
+        })
+    total = max(total, 0)
+    return {
         "id": SCRIPT_ID,
-        "file_name": "",
+        "file_name": display_name,
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
-        "dim1_reason": "",
-        "dim2_items": [],
-        "total_score": 0,
-        "max_score": 0,
+        "dim1_pass": True,
+        "dim1_reason": reason1,
+        "dim2_items": dim2_items,
+        "total_score": total,
+        "max_score": MAX_SCORE_TOTAL,
     }
 
+
+def evaluate(dir_path):
+    """对 dir_path 下的交付文档评分，返回结果字典（不抛异常、不打印）。
+
+    - 交付物只接受 .pdf：扩展名不是 .pdf、或文件打不开（缺 %PDF- 头、加密、零页），
+      一律在维度一判不通过（dim1_pass=False、total_score=0），而不是当成没有交付物。
+      目录里没有 .pdf 但有 .docx/.pptx 等其他格式时，仍收作被评对象走这条判负路径。
+    - 定位不到交付文件时：error 只回纯文本原因（不带异常类名），
+      dim1_pass 与 dim1_reason 一律留空（空字符串，表示维度一根本没进入判定），
+      dim2_items=[]、total_score=max_score=0。
+    - 维度一未通过时：dim1_pass=False，且 dim1_reason 带出错误摘要。
+    """
+    work_dir = tempfile.mkdtemp(prefix="officeval_%s_" % SCRIPT_ID)
     try:
-        pdf_path = _locate_pdf(dir_path)
-        if not pdf_path:
-            result["status"] = "error"
-            result["error"] = f"目录中未找到待评估的 PDF 文件：{dir_path}"
-            return result
-        result["file_name"] = os.path.basename(pdf_path)
-
-        dimension1_ok, hits, total, _notes = _evaluate_pdf(pdf_path)
-
-        # 维度一
-        dim1_hit = next((h for h in hits if h.code == "维度1"), None)
-        result["dim1_pass"] = bool(dimension1_ok)
-        result["dim1_reason"] = "" if dimension1_ok else (dim1_hit.detail if dim1_hit else "维度一不通过")
-
-        # 维度二：命中与未命中项都返回
-        dim2_items: list[dict[str, object]] = []
-        max_score = 0
-        for h in hits:
-            if h.code == "维度1":
-                continue
-            max_delta = h.score  # +N 或 -N，均为该项的满额影响
-            delta = h.score if h.matched else 0
-            dim2_items.append({
-                "rule": h.code,
-                "max_delta": max_delta,
-                "delta": delta,
-                "hit": bool(h.matched),
-                "detail": "",
-            })
-            if max_delta > 0:
-                max_score += max_delta
-
-        result["dim2_items"] = dim2_items
-        result["total_score"] = total if dimension1_ok else 0
-        result["max_score"] = max_score
-        return result
-    except Exception as exc:  # 兜底：脚本自身异常 -> status=error
-        result["status"] = "error"
-        result["error"] = f"{type(exc).__name__}: {exc}"
-        result["dim1_pass"] = False
-        result["dim2_items"] = []
-        result["total_score"] = 0
-        return result
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError("目录不存在或不是目录：%s" % dir_path)
+        return _evaluate_impl(dir_path, work_dir)
+    except FileNotFoundError as exc:
+        # 找不到被评估文件：error 只回传纯文本原因，不带异常类名；维度一根本没进入
+        # 判定，dim1_pass 与 dim1_reason 一律留空（空字符串，而非 False），满分归零
+        return {
+            "id": SCRIPT_ID,
+            "file_name": "",
+            "status": "error",
+            "error": str(exc),
+            "dim1_pass": "",
+            "dim1_reason": "",
+            "dim2_items": [],
+            "total_score": 0,
+            "max_score": 0,
+        }
+    except Exception as exc:  # noqa: BLE001 — 其余异常都折叠为 error 状态
+        # 文件在但打不开/解析失败：维度一未通过，dim1_reason 带上错误摘要便于定位
+        return {
+            "id": SCRIPT_ID,
+            "file_name": "",
+            "status": "error",
+            "error": "脚本运行异常：%s: %s" % (type(exc).__name__, exc),
+            "dim1_pass": False,
+            "dim1_reason": "评测过程异常终止：%s: %s" % (type(exc).__name__, exc),
+            "dim2_items": [],
+            "total_score": 0,
+            "max_score": MAX_SCORE_TOTAL,
+        }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    # 本地调试：默认取脚本所在目录；也支持通过 argv[1] 覆盖。
-    _dir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    print(json.dumps(evaluate(_dir), ensure_ascii=False, indent=2))
+    # 本地调试入口：默认评估脚本所在目录，可用 argv[1] 覆盖目标目录。
+    _target = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_target)
+    _buf = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="")
+    _buf.write(json.dumps(_out, ensure_ascii=False, indent=2))
+    _buf.write("\n")
+    _buf.flush()
+
+
+
+
+
+
+
+
+

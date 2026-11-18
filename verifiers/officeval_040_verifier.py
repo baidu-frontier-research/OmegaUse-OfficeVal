@@ -1,1763 +1,1410 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-自动评估脚本：对 "简介素材_格式设置_水印版.docx" 进行评估
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-评估逻辑：
-    1) 维度1（可用与可修改性）为门槛项，任何一条不满足则总分 0，不再评估维度2；
-    2) 维度2 分为加分点（须满足条目内每一子项才加分）和扣分点（满足任一子项即扣分），
-       将命中的分值累加得到最终得分。
-
-对外接口：仅暴露 evaluate(dir_path: str) -> dict —— 接收脚本所在目录的路径，
-由脚本自行在该目录中定位 .docx 文件并打开，返回统一结构的字典（详见 evaluate 文档串）。
-
-说明：
-- 仅支持 .docx（Office Open XML）；不支持二进制 .doc。
-- 整套评估基于 zipfile + lxml 静态解析，不依赖 Microsoft Word COM、LibreOffice 等外部 Office。
-"""
-
-from __future__ import annotations
-
-import io
-import json
 import os
-
-SCRIPT_ID = "040"
 import re
 import sys
-import zipfile
-from dataclasses import dataclass, field
-from typing import Callable
-
-# python-docx 只用于打开/读取的便捷断言；核心解析基于底层 XML，更精确。
+import json
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import parse_xml
+from docx.oxml.ns import qn
 try:
-    from docx import Document  # type: ignore
-except Exception:  # pragma: no cover
-    Document = None
+    from docx.image.image import Image as _DocxImage  # 读取所嵌位图的像素尺寸/DPI
+except ImportError:
+    _DocxImage = None
 
-from lxml import etree
-from PIL import Image
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为“脚本所在目录的路径”，
+# 由脚本自己在该目录内定位并打开被评估的 .docx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
 
-# ---------------------------------------------------------------------------
-# 命名空间与常量
-# ---------------------------------------------------------------------------
+SCRIPT_ID = "040"
+# 维度二“加分项”max_delta 之和（= 满分）；维度一未通过 / 脚本异常时兜底
+MAX_SCORE_TOTAL = 72
 
-NS = {
-    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-    "w14": "http://schemas.microsoft.com/office/word/2010/wordml",
-    "v": "urn:schemas-microsoft-com:vml",
-    "o": "urn:schemas-microsoft-com:office:office",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
-}
+# 维度二所有评分项按“结果追加顺序”的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 results.append(...) 的顺序严格一致；共 36 项：前 22 项为
+# 加分项（累加 = MAX_SCORE_TOTAL），后 14 项为减分项（命中即扣，不计入满分）。
+_MAX_DELTAS_ORDER = [
+    3,   # 01 首行标题中文字体隶书
+    3,   # 02 首行标题二号/加粗/蓝色
+    5,   # 03 首行标题发光（橄榄色、7磅）
+    3,   # 04 首行标题阴影（向上偏移）
+    1,   # 05 首行标题居中对齐
+    3,   # 06 首行标题段后20磅
+    3,   # 07 正文楷体小四
+    3,   # 08 正文首行缩进2字符
+    1,   # 09 正文段后6磅
+    3,   # 10 正文1.1倍行距
+    3,   # 11 “专业设置如下：”拆分为独立段落
+    5,   # 12 首字下沉—悬挂
+    5,   # 13 下沉行数2行
+    3,   # 14 下沉距正文0.3厘米
+    3,   # 15 全文4处改为“智能软件工程系”
+    3,   # 16 正文3处“智能软件工程系”宋体
+    3,   # 17 正文3处四号/加粗倾斜/绿色
+    3,   # 18 正文3处着重号
+    5,   # 19 图片作水印衬于文字下方
+    5,   # 20 水印冲蚀效果
+    5,   # 21 水印缩放100%铺满整页
+    1,   # 22 水印水平垂直居中且仅1张
+    -3,  # 23 正文文字颜色被改（非深灰333333）
+    -3,  # 24 正文出现未要求的加粗/倾斜/下划线/着重号等
+    -3,  # 25 正文段前间距非0磅
+    -1,  # 26 正文段落非两端对齐
+    -1,  # 27 纸张非A4纵向或页边距被改
+    -3,  # 28 5行专业名称未独立成行/顺序被调整
+    -3,  # 29 正文数据被改写
+    -1,  # 30 机构名称/引号内固定表述被改写
+    -1,  # 31 新增未要求的内容（小标题/空段/分页符等）
+    -1,  # 32 页眉页脚出现除水印外的文字/页码/横线
+    -3,  # 33 “专业设置如下：”整行被置入下沉框
+    -3,  # 34 正文被图片/艺术字/文本框/表格承载
+    -3,  # 35 水印被拉伸变形或被替换
+    -1,  # 36 正文文字被加发光/阴影等文本效果
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+
+# ===== 命名空间 =====
+W14_NS = 'http://schemas.microsoft.com/office/word/2010/wordml'
+A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+V_NS = 'urn:schemas-microsoft-com:vml'
+O_NS = 'urn:schemas-microsoft-com:office:office'
+
+# ===== 文本锚点常量（细则中逐条点名、不得改动的文字） =====
+TITLE_TEXT = '智能软件工程系简介'
+OLD_TERM = '智能工程系'
+NEW_TERM = '智能软件工程系'
+SPLIT_LINE = '专业设置如下：'
+PREV_TAIL = '科学设置专业。'
+DROP_CHAR = '专'
+LAST_ANCHOR = '面向岗位，面向技能，面向未来，'
+MAJORS = (
+    '计算机应用技术', '软件开发技术', '道路安全与智能运维',
+    '城市轨道交通运维', '数字媒体艺术设计',
+)
+DATA_KEYS = (
+    '专、兼职教师48名', '专职教师24名', '正高级职称2名', '副高级职称6名',
+    '讲师15名', '建筑面积5200平方米', '10个专业实验实训室', '4个普通机房',
+    '校外实训基地9个',
+)
+NAME_KEYS = (
+    '南澜智信信息技术有限公司', '南澜云行科技发展有限公司', '系办智联技术服务中心',
+    '“项目实训”', '“双证融合”', '“岗位实训”', '“企业+平台”',
+    '“育人为先、重德精技、务实创新、追求卓越”',
+)
+# 交付文档应有的全文内容（{T} 为“智能工程系”/“智能软件工程系”占位）；
+# 仅用于判定“是否新增了指令未要求的文字”，按拼接后的长串做包含性比对。
+EXPECTED_PARTS = (
+    '{T}简介',
+    '{T}是学院设立较早的系部之一，本系师资队伍结构合理，教学、科研基础较扎实。'
+    '现有专、兼职教师48名。专职教师24名，有正高级职称2名，副高级职称6名，讲师15名。'
+    '校内实训中心建筑面积5200平方米，共有10个专业实验实训室和4个普通机房，'
+    '一个综合协作工作室和一个技术服务中心；另有校外实训基地9个。',
+    '{T}坚持以岗位能力为导向，结合社会、区域和行业对技术人才的需求科学设置专业。',
+    '专业设置如下：',
+    '计算机应用技术', '软件开发技术', '道路安全与智能运维',
+    '城市轨道交通运维', '数字媒体艺术设计',
+    '本系在持续办学过程中，持续优化和完善复合型技术人才培养模式。'
+    '基本形成了以职业岗位需求为导向，以提升学生的职业技能和职业素养为重点，'
+    '以学生成长为本位的人才培养理念。同时，在教学上将职业资格证书训练融入专业课程'
+    '安排之中，稳步推进与“项目实训”教学模式相衔接的“双证融合”课程体系建设。'
+    '该培养模式把课堂学习和岗位实践贯穿于教学全过程，整体提升学生的专业能力、'
+    '实践能力和协作能力。',
+    '为拓宽学生“岗位实训”和就业的渠道，持续加强校内、外实训基地建设。'
+    '在校内实训基地建设上，实施三位一体“企业+平台”的建设模式。该模式通过与'
+    '南澜智信信息技术有限公司合作成立的南澜云行科技发展有限公司、系办智联技术服务中心'
+    '和由系实训中心参照企业运行方式而建立的训练型工作室，为学生提供生产性实习和'
+    '具有职业氛围的综合实训环境。在校外实训基地的建设上，通过与相关单位建立稳定和'
+    '长期的合作关系来不断扩大基地的数量和规模。',
+    '面向岗位，面向技能，面向未来，{T}以培养学生的职业能力为核心，'
+    '按照“育人为先、重德精技、务实创新、追求卓越”的办学理念，着力培养市场上需要的、'
+    '适应性强的、具备一技之长的技术型人才，为区域产业发展培养可用之材。',
+)
+_EXPECTED_NEW = ''.join(EXPECTED_PARTS).replace('{T}', NEW_TERM)
+_EXPECTED_OLD = ''.join(EXPECTED_PARTS).replace('{T}', OLD_TERM)
+
+# ===== 字体/度量常量 =====
+LISHU_KEYS = ('隶书', 'LiSu')
+KAITI_KEYS = ('楷体', 'KaiTi', 'STKaiti')
+STRICT_SONGTI = ('宋体', 'SimSun', 'NSimSun')
+BODY_COLOR = '333333'          # 正文原有深灰
+ZH_RE = re.compile(r'[一-鿿]')
+EMU_PER_PT = 12700.0
+EMU_PER_CM = 360000.0
+PX_DPI = 96.0                  # 细则按 96DPI 折算位图的 100% 显示尺寸
+_THEME_CACHE = {}
 
 
-def q(ns: str, tag: str) -> str:
-    return f"{{{NS[ns]}}}{tag}"
-
-
-# 尺寸换算
-HALF_POINT_PER_PT = 2       # size in Word XML is half-points (sz="44" => 22pt)
-TWIPS_PER_PT = 20           # space/line values in 二十分之一磅
-EMU_PER_PT = 12700          # DrawingML EMU
-POINTS_PER_CM = 28.3464567
-
-# 中文字号对照 (磅)
-FONT_SIZE_NAME_TO_PT = {
-    "初号": 42, "小初": 36, "一号": 26, "小一": 24,
-    "二号": 22, "小二": 18, "三号": 16, "小三": 15,
-    "四号": 14, "小四": 12, "五号": 10.5, "小五": 9,
-}
-
-# 橄榄色候选：Word 主题 accent3 (Office 2007+) 为 #9BBB59；
-# 也接受经典"橄榄色"#808000 及其相近色。
-OLIVE_HEX_CANDIDATES = ["9BBB59", "808000", "6B8E23", "A2B463"]
-
-# 蓝色候选（标题颜色）
-BLUE_HEX_CANDIDATES = ["0000FF", "0070C0", "1F3864", "2F5496", "4472C4"]
-
-# 绿色候选（"智能软件工程系"文字色）
-GREEN_HEX_CANDIDATES = ["008000", "00B050", "00B04F", "008040", "339933"]
-
-
-# ---------------------------------------------------------------------------
-# XML 载入
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DocxBundle:
-    path: str
-    zf: zipfile.ZipFile
-    document: etree._Element
-    headers: dict[str, etree._Element] = field(default_factory=dict)
-    theme: etree._Element | None = None
-    rels_map: dict[str, dict[str, str]] = field(default_factory=dict)
-    accent_map: dict[str, str] = field(default_factory=dict)  # accentN -> hex
-
-    def close(self) -> None:
-        self.zf.close()
-
-
-def load_bundle(path: str) -> DocxBundle:
-    zf = zipfile.ZipFile(path)
-    document = etree.fromstring(zf.read("word/document.xml"))
-
-    bundle = DocxBundle(path=path, zf=zf, document=document)
-
-    # 头部（水印通常在页眉）
-    for name in zf.namelist():
-        if re.fullmatch(r"word/header\d+\.xml", name):
-            bundle.headers[name] = etree.fromstring(zf.read(name))
-
-    # 主题色（用于将 schemeClr accent3 解析为 sRGB）
-    if "word/theme/theme1.xml" in zf.namelist():
-        theme = etree.fromstring(zf.read("word/theme/theme1.xml"))
-        bundle.theme = theme
-        for accent_name in ("accent1", "accent2", "accent3", "accent4", "accent5", "accent6"):
-            el = theme.find(f".//{{{NS['a']}}}{accent_name}")
-            if el is not None:
-                srgb = el.find(f"{{{NS['a']}}}srgbClr")
-                if srgb is not None and "val" in srgb.attrib:
-                    bundle.accent_map[accent_name] = srgb.attrib["val"].upper()
-
-    return bundle
-
-
-# ---------------------------------------------------------------------------
-# XML 便捷访问工具
-# ---------------------------------------------------------------------------
-
-
-def get_body_paragraphs(bundle: DocxBundle) -> list[etree._Element]:
-    return bundle.document.findall(f".//{q('w','body')}/{q('w','p')}")
-
-
-def paragraph_text(p: etree._Element) -> str:
-    return "".join(t.text or "" for t in p.findall(f".//{q('w','t')}"))
-
-
-def run_font_east_asia(r: etree._Element) -> str | None:
-    rfonts = r.find(f"{q('w','rPr')}/{q('w','rFonts')}")
-    if rfonts is None:
+def _hex_rgb(val):
+    """把 w:color/@w:val 之类的十六进制颜色转成 (r,g,b)；auto/空/非法返回 None。"""
+    if not val:
         return None
-    return rfonts.get(q("w", "eastAsia")) or rfonts.get(q("w", "ascii"))
+    v = str(val).strip().lstrip('#').upper()
+    if v in ('AUTO', 'NONE'):
+        return None
+    if len(v) != 6 or re.search(r'[^0-9A-F]', v):
+        return None
+    return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
 
 
-def run_size_pt(r: etree._Element) -> float | None:
-    sz = r.find(f"{q('w','rPr')}/{q('w','sz')}")
-    if sz is None or "val" not in sz.attrib.get(q("w", "val"), "") and q("w", "val") not in sz.attrib:
-        # 兼容不同属性写法
-        val = sz.attrib.get(q("w", "val")) if sz is not None else None
-        if val is None:
-            return None
-        return float(val) / HALF_POINT_PER_PT
-    return float(sz.attrib[q("w", "val")]) / HALF_POINT_PER_PT
-
-
-def run_bool(r: etree._Element, tag: str) -> bool:
-    el = r.find(f"{q('w','rPr')}/{q('w', tag)}")
-    if el is None:
+def _is_blue(val):
+    """蓝色系（0000FF / 0070C0 等）。"""
+    rgb = _hex_rgb(val)
+    if rgb is None:
         return False
-    val = el.get(q("w", "val"))
-    if val is None:
-        return True
-    return val not in ("0", "false", "off")
+    r, g, b = rgb
+    return b >= 110 and b > r + 40 and b > g + 20
 
 
-def run_color_hex(r: etree._Element) -> str | None:
-    c = r.find(f"{q('w','rPr')}/{q('w','color')}")
-    if c is None:
-        return None
-    return (c.get(q("w", "val")) or "").upper() or None
-
-
-def run_em(r: etree._Element) -> str | None:
-    em = r.find(f"{q('w','rPr')}/{q('w','em')}")
-    return None if em is None else em.get(q("w", "val"))
-
-
-def para_alignment(p: etree._Element) -> str | None:
-    jc = p.find(f"{q('w','pPr')}/{q('w','jc')}")
-    return None if jc is None else jc.get(q("w", "val"))
-
-
-def para_spacing(p: etree._Element) -> dict[str, str]:
-    sp = p.find(f"{q('w','pPr')}/{q('w','spacing')}")
-    return {} if sp is None else {re.sub(r".*}", "", k): v for k, v in sp.attrib.items()}
-
-
-def para_indent(p: etree._Element) -> dict[str, str]:
-    ind = p.find(f"{q('w','pPr')}/{q('w','ind')}")
-    return {} if ind is None else {re.sub(r".*}", "", k): v for k, v in ind.attrib.items()}
-
-
-def para_framepr(p: etree._Element) -> dict[str, str] | None:
-    fr = p.find(f"{q('w','pPr')}/{q('w','framePr')}")
-    if fr is None:
-        return None
-    return {re.sub(r".*}", "", k): v for k, v in fr.attrib.items()}
-
-
-def resolve_glow_color(rpr: etree._Element, accent_map: dict[str, str]) -> str | None:
-    glow = rpr.find(f"{q('w14','glow')}")
-    if glow is None:
-        return None
-    srgb = glow.find(f"{q('w14','srgbClr')}")
-    if srgb is not None:
-        return (srgb.get("val") or "").upper()
-    scheme = glow.find(f"{q('w14','schemeClr')}")
-    if scheme is not None:
-        val = scheme.get("val")
-        return accent_map.get(val)
-    return None
-
-
-def hex_distance(a: str, b: str) -> float:
-    """两个十六进制颜色的欧氏距离。"""
-    ai = [int(a[i:i + 2], 16) for i in (0, 2, 4)]
-    bi = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
-    return sum((x - y) ** 2 for x, y in zip(ai, bi)) ** 0.5
-
-
-def is_near(color: str | None, candidates: list[str], threshold: float = 80.0) -> bool:
-    if not color:
+def _is_green(val):
+    """绿色系（00B050 / 008000 / 9BBB59 等）。"""
+    rgb = _hex_rgb(val)
+    if rgb is None:
         return False
-    color = color.upper()
-    return any(hex_distance(color, c) <= threshold for c in candidates)
+    r, g, b = rgb
+    return g >= 100 and g > r + 20 and g > b + 20
 
 
-# ---------------------------------------------------------------------------
-# Office 属性生效解析（run rPr > 段落 pPr/rPr > 段落样式链）
-# 这样即使属性通过"样式"设置而非直接在 run 上，也能被检测到（贴合 Word/WPS 渲染）。
-# ---------------------------------------------------------------------------
+def _is_olive(val):
+    """橄榄色系（9BBB59 / 6B8E23 / 808000 等：红绿相近且明显高于蓝）。"""
+    rgb = _hex_rgb(val)
+    if rgb is None:
+        return False
+    r, g, b = rgb
+    return g >= 90 and g > b + 40 and r > b + 20 and abs(r - g) <= 100
+
+def _load_theme_fonts(doc):
+    """读取 word/theme/theme1.xml 的字体方案，返回
+       {'majorAscii','majorEastAsia','minorAscii','minorEastAsia'}；
+       东亚字体优先取 <a:ea>，为空时回落 <a:font script="Hans">（与 Word 一致）。"""
+    fonts = {'majorAscii': None, 'majorEastAsia': None,
+             'minorAscii': None, 'minorEastAsia': None}
+    root = None
+    try:
+        for part in doc.part.package.iter_parts():
+            if str(part.partname).lower().endswith('theme1.xml'):
+                root = getattr(part, 'element', None)
+                if root is None:
+                    root = parse_xml(part.blob)
+                break
+    except Exception:
+        root = None
+    if root is None:
+        return fonts
+    for tag, key in (('majorFont', 'major'), ('minorFont', 'minor')):
+        node = root.find('.//{%s}%s' % (A_NS, tag))
+        if node is None:
+            continue
+        latin = node.find('{%s}latin' % A_NS)
+        if latin is not None and latin.get('typeface'):
+            fonts[key + 'Ascii'] = latin.get('typeface')
+        ea = node.find('{%s}ea' % A_NS)
+        face = ea.get('typeface') if ea is not None else None
+        if not face:
+            for f in node.findall('{%s}font' % A_NS):
+                if f.get('script') == 'Hans' and f.get('typeface'):
+                    face = f.get('typeface')
+                    break
+        if face:
+            fonts[key + 'EastAsia'] = face
+    return fonts
 
 
-def _styles_map(bundle: "DocxBundle") -> dict[str, etree._Element]:
-    if not hasattr(bundle, "_styles_cache"):
-        cache: dict[str, etree._Element] = {}
-        if "word/styles.xml" in bundle.zf.namelist():
-            root = etree.fromstring(bundle.zf.read("word/styles.xml"))
-            for st in root.findall(q("w", "style")):
-                sid = st.get(q("w", "styleId"))
-                if sid:
-                    cache[sid] = st
-        bundle._styles_cache = cache  # type: ignore[attr-defined]
-    return bundle._styles_cache  # type: ignore[attr-defined]
+def _theme_fonts(doc):
+    key = id(doc)
+    if key not in _THEME_CACHE:
+        _THEME_CACHE[key] = _load_theme_fonts(doc)
+    return _THEME_CACHE[key]
 
 
-def _pstyle_id(p: etree._Element) -> str | None:
-    ps = p.find(f"{q('w','pPr')}/{q('w','pStyle')}")
-    return ps.get(q("w", "val")) if ps is not None else None
+def _resolve_theme(doc, theme_ref, slot):
+    """把 w:eastAsiaTheme / w:asciiTheme 等主题字体引用解析为真实字体名。"""
+    if not theme_ref:
+        return None
+    ref = str(theme_ref)
+    kind = 'major' if ref.startswith('major') else 'minor'
+    return _theme_fonts(doc).get(kind + ('EastAsia' if slot == 'ea' else 'Ascii'))
+
+def _style_chain_rprs(doc, para_el):
+    """返回段落样式链（w:pStyle → styles.xml，沿 basedOn 上溯）上的 w:rPr 列表。"""
+    out = []
+    styles_el = doc.styles.element
+    style_id = None
+    pPr = para_el.find(qn('w:pPr')) if para_el is not None else None
+    if pPr is not None:
+        pStyle = pPr.find(qn('w:pStyle'))
+        if pStyle is not None:
+            style_id = pStyle.get(qn('w:val'))
+
+    def _style_by_id(sid):
+        for st in styles_el.findall(qn('w:style')):
+            if st.get(qn('w:styleId')) == sid:
+                return st
+        return None
+
+    seen = set()
+    while style_id and style_id not in seen:
+        seen.add(style_id)
+        st = _style_by_id(style_id)
+        if st is None:
+            break
+        rpr = st.find(qn('w:rPr'))
+        if rpr is not None:
+            out.append(rpr)
+        base = st.find(qn('w:basedOn'))
+        style_id = base.get(qn('w:val')) if base is not None else None
+    return out
 
 
-def _style_chain(styles: dict[str, etree._Element], style_id: str | None) -> list[etree._Element]:
-    chain: list[etree._Element] = []
-    cur = style_id
-    seen: set[str] = set()
-    while cur and cur not in seen and cur in styles:
-        seen.add(cur)
-        chain.append(styles[cur])
-        based = styles[cur].find(q("w", "basedOn"))
-        cur = based.get(q("w", "val")) if based is not None else None
+def _doc_default_rpr(doc):
+    """docDefaults/rPrDefault/rPr。"""
+    dd = doc.styles.element.find(qn('w:docDefaults'))
+    if dd is None:
+        return None
+    rpd = dd.find(qn('w:rPrDefault'))
+    if rpd is None:
+        return None
+    return rpd.find(qn('w:rPr'))
+
+
+def _rpr_chain(doc, run):
+    """run 实际生效属性的查找链：run 级 → 段落样式链 → docDefaults。"""
+    chain = []
+    rPr = run._element.rPr
+    if rPr is not None:
+        chain.append(rPr)
+    para_el = getattr(getattr(run, '_parent', None), '_p', None)
+    chain.extend(_style_chain_rprs(doc, para_el))
+    dflt = _doc_default_rpr(doc)
+    if dflt is not None:
+        chain.append(dflt)
     return chain
 
-
-def _run_prop_sources(r: etree._Element, p: etree._Element, bundle) -> list[etree._Element]:
-    """按 Word 生效优先级（高→低）返回可查询的 rPr 元素列表。"""
-    sources: list[etree._Element] = []
-    r_rpr = r.find(q("w", "rPr"))
-    if r_rpr is not None:
-        sources.append(r_rpr)
-    p_rpr = p.find(f"{q('w','pPr')}/{q('w','rPr')}")
-    if p_rpr is not None:
-        sources.append(p_rpr)
-    for st in _style_chain(_styles_map(bundle), _pstyle_id(p)):
-        st_rpr = st.find(q("w", "rPr"))
-        if st_rpr is not None:
-            sources.append(st_rpr)
-    return sources
-
-
-def _p_prop_sources(p: etree._Element, bundle) -> list[etree._Element]:
-    sources: list[etree._Element] = []
-    p_pr = p.find(q("w", "pPr"))
-    if p_pr is not None:
-        sources.append(p_pr)
-    for st in _style_chain(_styles_map(bundle), _pstyle_id(p)):
-        st_ppr = st.find(q("w", "pPr"))
-        if st_ppr is not None:
-            sources.append(st_ppr)
-    return sources
-
-
-def effective_font_eastasia(r, p, bundle) -> str | None:
-    for src in _run_prop_sources(r, p, bundle):
-        rfonts = src.find(q("w", "rFonts"))
-        if rfonts is not None:
-            v = rfonts.get(q("w", "eastAsia")) or rfonts.get(q("w", "ascii"))
-            if v:
-                return v
+def _resolve_effective_eastasia(doc, run):
+    """按 Word 的字体继承链，解析 run 中文字符实际生效的东亚字体（打开办公软件看到的）：
+       run 直接设定(w:eastAsia / w:eastAsiaTheme) → 段落样式(含 basedOn 链) → docDefaults。
+       任一层拿到即返回；都没有则返回 None。"""
+    for rpr in _rpr_chain(doc, run):
+        rf = rpr.find(qn('w:rFonts'))
+        if rf is None:
+            continue
+        ea = rf.get(qn('w:eastAsia'))
+        if ea:
+            return ea
+        themed = _resolve_theme(doc, rf.get(qn('w:eastAsiaTheme')), 'ea')
+        if themed:
+            return themed
     return None
 
 
-def effective_size_pt(r, p, bundle) -> float | None:
-    for src in _run_prop_sources(r, p, bundle):
-        sz = src.find(q("w", "sz"))
-        if sz is not None:
-            v = sz.get(q("w", "val"))
-            if v:
-                return float(v) / 2.0  # w:sz 单位为半磅
+def _resolve_effective_ascii(doc, run):
+    """按 Word 的字体继承链，解析 run 对西文/数字实际生效的字体：
+       run 直接设定(w:ascii → 回落 w:hAnsi / 主题引用) → 段落样式链 → docDefaults。"""
+    for rpr in _rpr_chain(doc, run):
+        rf = rpr.find(qn('w:rFonts'))
+        if rf is None:
+            continue
+        v = rf.get(qn('w:ascii')) or rf.get(qn('w:hAnsi'))
+        if v:
+            return v
+        themed = _resolve_theme(
+            doc, rf.get(qn('w:asciiTheme')) or rf.get(qn('w:hAnsiTheme')), 'ascii')
+        if themed:
+            return themed
     return None
 
 
-def effective_bold(r, p, bundle) -> bool:
-    # Word 的加粗为 toggle：<w:b/> 表示开；<w:b w:val="0"/> 表示关。取最高优先级来源。
-    for src in _run_prop_sources(r, p, bundle):
-        b = src.find(q("w", "b"))
-        if b is not None:
-            v = b.get(q("w", "val"))
-            return (v is None) or (v not in ("0", "false", "off"))
+def _resolve_effective_size_pt(doc, run):
+    """解析 run 实际生效的字号（磅）：w:sz 为半磅值。"""
+    for rpr in _rpr_chain(doc, run):
+        sz = rpr.find(qn('w:sz'))
+        if sz is not None and sz.get(qn('w:val')):
+            try:
+                return int(sz.get(qn('w:val'))) / 2.0
+            except ValueError:
+                return None
+    return None
+
+
+def _resolve_effective_color(doc, run):
+    """解析 run 实际生效的字体颜色，返回大写十六进制、'AUTO' 或 None（未设定）。"""
+    for rpr in _rpr_chain(doc, run):
+        col = rpr.find(qn('w:color'))
+        if col is None:
+            continue
+        val = col.get(qn('w:val'))
+        if val:
+            return str(val).upper()
+    return None
+
+def _toggle_on(el):
+    """开关型属性（w:b/w:i/w:em/w:u...）是否为“开”：无 val 视为开，val=0/false 为关。"""
+    if el is None:
+        return False
+    val = el.get(qn('w:val'))
+    if val is None:
+        return True
+    return str(val).lower() not in ('0', 'false', 'off', 'none')
+
+
+def _resolve_effective_toggle(doc, run, tag):
+    """解析 run 的开关型属性（如 'w:b'/'w:i'）：沿继承链取第一个显式声明。"""
+    for rpr in _rpr_chain(doc, run):
+        el = rpr.find(qn(tag))
+        if el is not None:
+            return _toggle_on(el)
     return False
 
 
-def effective_italic(r, p, bundle) -> bool:
-    """倾斜同样是 toggle：<w:i/> 开；<w:i w:val="0"/> 关。"""
-    for src in _run_prop_sources(r, p, bundle):
-        it = src.find(q("w", "i"))
-        if it is not None:
-            v = it.get(q("w", "val"))
-            return (v is None) or (v not in ("0", "false", "off"))
-    return False
+def _run_rpr(run):
+    return run._element.rPr
 
 
-def effective_em(r, p, bundle) -> str | None:
-    """w:em 表示着重号，取值：none / dot / comma / circle / underDot。
-    Office 中"字体→着重号"选择任一非 none 即为"添加着重号"。"""
-    for src in _run_prop_sources(r, p, bundle):
-        em = src.find(q("w", "em"))
-        if em is not None:
-            return em.get(q("w", "val"))
-    return None
+def _w14_children(run, names):
+    """run 直接 rPr 下是否存在指定的 Word 2010 文本效果子元素（如 glow/shadow）。"""
+    rPr = _run_rpr(run)
+    if rPr is None:
+        return []
+    return [rPr.find('{%s}%s' % (W14_NS, n)) for n in names
+            if rPr.find('{%s}%s' % (W14_NS, n)) is not None]
 
 
-def effective_color(r, p, bundle) -> tuple[str | None, str | None]:
-    for src in _run_prop_sources(r, p, bundle):
-        c = src.find(q("w", "color"))
-        if c is not None:
-            hex_v = c.get(q("w", "val"))
-            theme_v = c.get(q("w", "themeColor"))
-            if hex_v or theme_v:
-                return (hex_v.upper() if hex_v else None), theme_v
-    return None, None
-
-
-def effective_alignment(p, bundle) -> str | None:
-    for src in _p_prop_sources(p, bundle):
-        jc = src.find(q("w", "jc"))
-        if jc is not None:
-            v = jc.get(q("w", "val"))
-            if v:
-                return v
-    return None
-
-
-def effective_space_after(p, bundle) -> tuple[float | None, bool]:
-    """返回 (段后磅数, afterAutospacing 是否开启)。autospacing 开启时 Office 忽略数值。"""
-    after_pt: float | None = None
-    auto_on = False
-    for src in _p_prop_sources(p, bundle):
-        sp = src.find(q("w", "spacing"))
-        if sp is None:
-            continue
-        if after_pt is None:
-            a = sp.get(q("w", "after"))
-            if a is not None:
-                after_pt = float(a) / 20.0  # twips → pt
-        auto = sp.get(q("w", "afterAutospacing"))
-        if auto in ("1", "true", "on"):
-            auto_on = True
-        if after_pt is not None:
-            break
-    return after_pt, auto_on
-
-
-def effective_line_spacing(p, bundle) -> tuple[float | None, str | None]:
-    """返回 (行距倍数, lineRule)。倍数依据 lineRule：
-       - auto  : line / 240
-       - atLeast/exact : 视为磅数比例（不返回倍数，multiplier=None）
-    """
-    for src in _p_prop_sources(p, bundle):
-        sp = src.find(q("w", "spacing"))
-        if sp is None:
-            continue
-        line = sp.get(q("w", "line"))
-        rule = sp.get(q("w", "lineRule")) or "auto"
-        if line is not None:
-            if rule == "auto":
-                return float(line) / 240.0, rule
-            return None, rule
-    return None, None
-
-
-def effective_first_line_indent(p, bundle) -> tuple[str | None, int | None, int | None]:
-    """返回 (firstLineChars, firstLine_twips, hanging_twips)。
-    办公软件"首行缩进 N 字符" 对应 firstLineChars=N*100；
-    也可用绝对量 firstLine (twips)。若 hanging 存在，则为悬挂缩进而非首行缩进。
-    """
-    for src in _p_prop_sources(p, bundle):
-        ind = src.find(q("w", "ind"))
-        if ind is None:
-            continue
-        fl_chars = ind.get(q("w", "firstLineChars"))
-        fl = ind.get(q("w", "firstLine"))
-        hanging = ind.get(q("w", "hanging"))
-        return (
-            fl_chars,
-            int(fl) if fl is not None else None,
-            int(hanging) if hanging is not None else None,
-        )
-    return None, None, None
-
-
-def _theme_hex(bundle, theme_name: str | None) -> str | None:
-    if not theme_name or not bundle.accent_map:
+def _int_attr(el, name):
+    """读取属性并转 int（w: 前缀走 qn，其余按原名）；缺失/非法返回 None。"""
+    if el is None:
         return None
-    return bundle.accent_map.get(theme_name)
-
-
-def _is_office_blue(hex_val: str | None, theme_val: str | None, bundle) -> bool:
-    """按 Word/WPS 实际显示判断是否为蓝色：B 通道主导且明显高于 R、G。
-    覆盖标准色"蓝色"#0000FF、"深蓝"#002060、"浅蓝"#00B0F0 等常见蓝色系。"""
-    if hex_val is None and theme_val:
-        hex_val = _theme_hex(bundle, theme_val)
-    if not hex_val or hex_val.upper() == "AUTO":
-        return False
+    raw = el.get(qn(name)) if name.startswith('w:') else el.get(name)
+    if raw is None:
+        return None
     try:
-        r = int(hex_val[0:2], 16); g = int(hex_val[2:4], 16); b = int(hex_val[4:6], 16)
-    except Exception:
-        return False
-    return b >= 100 and b >= r + 30 and b >= g + 30
-
-
-# ---------------------------------------------------------------------------
-# 评估结果收集
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RuleResult:
-    rule_id: str
-    score: int
-    passed: bool
-    detail: str
-
-
-@dataclass
-class Report:
-    dim1_passed: bool = True
-    dim1_reasons: list[str] = field(default_factory=list)
-    rules: list[RuleResult] = field(default_factory=list)
-
-    def add_dim1_fail(self, reason: str) -> None:
-        self.dim1_passed = False
-        self.dim1_reasons.append(reason)
-
-    def add(self, rid: str, score: int, passed: bool, detail: str) -> None:
-        self.rules.append(RuleResult(rid, score, passed, detail))
-
-    def final_score(self) -> int:
-        if not self.dim1_passed:
-            return 0
-        return sum(r.score for r in self.rules if r.passed)
-
-    def render(self) -> str:
-        # 维度 1 未通过：仅输出维度一失败原因 + 总分 0
-        if not self.dim1_passed:
-            lines = ["维度一：未通过"]
-            for r in self.dim1_reasons:
-                lines.append(f"  - {r}")
-            lines.append(f"总分：0")
-            return "\n".join(lines)
-
-        # 维度 1 通过：按用户指定格式输出
-        lines = ["维度一：通过", "维度二：评分结果"]
-        for r in self.rules:
-            if not r.passed:
-                continue  # 只显示命中项
-            sign = "+" if r.score >= 0 else ""
-            lines.append(f"{sign}{r.score}：{r.rule_id}")
-        lines.append(f"总分：{self.final_score()}")
-        return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# 维度 1 检查
-# ---------------------------------------------------------------------------
-
-
-def check_dimension1(bundle: DocxBundle, report: Report) -> None:
-    # 1.1 .docx 格式，正常打开：能到这里说明能打开
-    if not bundle.path.lower().endswith(".docx"):
-        report.add_dim1_fail("文件不是 .docx 扩展名")
-    try:
-        if Document is not None:
-            Document(bundle.path)
-    except Exception as e:
-        report.add_dim1_fail(f"python-docx 无法打开文档：{e}")
-
-    # 原 1.2 (标题/正文可编辑文本)、1.3 (连续空白页/乱码/图片遮挡)、
-    # 1.4 (水印为图片水印且正文未被转成图片) 三项已按用户要求删除。
-
-
-# ---------------------------------------------------------------------------
-# 维度 2 检查
-# ---------------------------------------------------------------------------
-
-
-def find_title_run(bundle: DocxBundle) -> tuple[etree._Element | None, etree._Element | None]:
-    """返回 (标题段落, 标题 run)。"""
-    for p in get_body_paragraphs(bundle):
-        for r in p.findall(f"{q('w','r')}"):
-            for t in r.findall(f"{q('w','t')}"):
-                if t.text and "智能软件工程系简介" in t.text:
-                    return p, r
-    return None, None
-
-
-def rule_title_basic_format(bundle: DocxBundle) -> tuple[bool, str]:
-    """+1: 文档标题段落："智能软件工程系简介"位于文档首行，采用隶书、二号、加粗、蓝色，
-    居中对齐，段后间距20磅。
-
-    每一条细则的检测思路（贴合 Word/WPS 实际显示）：
-      · 位于文档首行     -> 正文首段的可见文本 == 标题
-      · 采用隶书         -> run/pPr/样式链上 rFonts eastAsia 生效值为"隶书"
-      · 二号             -> w:sz 生效值 = 44 半磅 = 22pt
-      · 加粗             -> w:b toggle 生效为 True
-      · 蓝色             -> w:color 生效值判定为蓝色系（含 themeColor 解析）
-      · 居中对齐         -> w:jc 生效值 = center
-      · 段后间距 20 磅   -> w:spacing/@after = 400 twips 且未启用 afterAutospacing
-    """
-    body = get_body_paragraphs(bundle)
-    if not body:
-        return False, "文档无正文段落"
-
-    title_text = "智能软件工程系简介"
-
-    # 1) "位于文档首行"：第一段（跳过纯空段）文本必须严格等于标题
-    first_nonempty_idx = next(
-        (i for i, p in enumerate(body) if paragraph_text(p).strip()), None
-    )
-    checks: list[tuple[str, bool]] = []
-    if first_nonempty_idx is None:
-        return False, "文档无可见文本"
-    first_para = body[first_nonempty_idx]
-    first_text = paragraph_text(first_para).strip()
-    checks.append((
-        f"'{title_text}' 位于文档首行  实际首行='{first_text}'",
-        first_text == title_text,
-    ))
-
-    # 定位承载标题文本的 run（用于字符级属性判定）
-    title_para = first_para
-    title_runs = [
-        r for r in title_para.findall(q("w", "r"))
-        if title_text in "".join((t.text or "") for t in r.findall(q("w", "t")))
-    ]
-    if not title_runs:
-        # 兜底：任何包含"智能软件工程系简介"文字片段的 run 集合
-        title_runs = [
-            r for r in title_para.findall(q("w", "r"))
-            if "".join((t.text or "") for t in r.findall(q("w", "t"))).strip()
-        ]
-    if not title_runs:
-        return False, "标题段落无可用 run"
-    r0 = title_runs[0]
-
-    # 2) 字体：采用隶书
-    font = effective_font_eastasia(r0, title_para, bundle)
-    checks.append((f"采用隶书  实际={font}", font == "隶书"))
-
-    # 3) 字号：二号 (= 22pt)
-    size_pt = effective_size_pt(r0, title_para, bundle)
-    checks.append((
-        f"二号(22磅)  实际={size_pt}pt",
-        size_pt is not None and abs(size_pt - 22.0) < 1e-6,
-    ))
-
-    # 4) 加粗
-    bold = effective_bold(r0, title_para, bundle)
-    checks.append(("加粗", bold))
-
-    # 5) 蓝色
-    hex_val, theme_val = effective_color(r0, title_para, bundle)
-    is_blue = _is_office_blue(hex_val, theme_val, bundle)
-    checks.append((
-        f"蓝色  实际=#{hex_val} themeColor={theme_val}",
-        is_blue,
-    ))
-
-    # 6) 居中对齐
-    align = effective_alignment(title_para, bundle)
-    checks.append((f"居中对齐  实际={align}", align == "center"))
-
-    # 7) 段后间距 20 磅（Word 中 w:spacing/@after 单位为 二十分之一磅；20 磅 = 400）
-    after_pt, auto_on = effective_space_after(title_para, bundle)
-    space_ok = (
-        after_pt is not None
-        and abs(after_pt - 20.0) < 1e-6
-        and not auto_on
-    )
-    checks.append((
-        f"段后间距 20 磅  实际={after_pt}pt afterAutospacing={auto_on}",
-        space_ok,
-    ))
-
-    passed = all(ok for _, ok in checks)
-    return passed, "\n".join(f"{'✓' if ok else '✗'} {msg}" for msg, ok in checks)
-
-
-def rule_title_glow_shadow(bundle: DocxBundle) -> tuple[bool, str]:
-    """+3: 文档标题段落："智能软件工程系简介"设置发光效果，发光颜色为橄榄色或接近橄榄色，
-    发光大小约7磅，使用强调文字颜色3或接近效果。"智能软件工程系简介"设置向上偏移
-    阴影效果，标题文字仍清晰可读。
-
-    每一条细则的检测思路（对齐 Word/WPS "开始→字体→文字效果和版式" 的行为）：
-      · 设置发光效果             -> 标题 run 存在 w14:glow
-      · 发光颜色为橄榄色或接近橄榄色 -> glow 颜色解析后与橄榄色系(#9BBB59/#808000)接近
-      · 发光大小约 7 磅          -> w14:glow/@w14:rad ÷ 12700 ≈ 7pt (约 ±2 磅)
-      · 使用强调文字颜色 3 或接近效果 -> glow 使用 schemeClr accent3；或颜色接近主题 accent3
-      · 设置向上偏移阴影效果      -> 标题 run 存在 w14:shadow，dir=16200000 (Office"向上偏移"预设)
-                                     或方向落在向上区间(225°~315°)以匹配"或接近"
-      · 标题文字仍清晰可读        -> 标题字体颜色存在、非白、且与发光颜色不同（不被吞没）
-    """
-    _, title_run = find_title_run(bundle)
-    if title_run is None:
-        return False, "未找到标题 run"
-    rpr = title_run.find(q("w", "rPr"))
-    if rpr is None:
-        return False, "标题 run 缺 rPr"
-
-    checks: list[tuple[str, bool]] = []
-
-    # ---- 发光相关 4 点 ----
-    glow = rpr.find(q("w14", "glow"))
-    # 1) 设置发光效果
-    checks.append(("设置发光效果  存在 w14:glow", glow is not None))
-
-    # 2) 发光颜色为橄榄色或接近橄榄色
-    glow_color_hex: str | None = None
-    scheme_val: str | None = None
-    if glow is not None:
-        srgb = glow.find(q("w14", "srgbClr"))
-        scheme = glow.find(q("w14", "schemeClr"))
-        if srgb is not None:
-            glow_color_hex = (srgb.get(q("w14", "val")) or srgb.get("val") or "").upper() or None
-        if scheme is not None:
-            scheme_val = scheme.get(q("w14", "val")) or scheme.get("val")
-            if not glow_color_hex and scheme_val:
-                glow_color_hex = bundle.accent_map.get(scheme_val)
-    olive_ok = is_near(glow_color_hex, OLIVE_HEX_CANDIDATES, threshold=90.0)
-    checks.append((
-        f"发光颜色为橄榄色或接近橄榄色  实际颜色=#{glow_color_hex}",
-        olive_ok,
-    ))
-
-    # 3) 发光大小约 7 磅
-    rad_pt: float | None = None
-    if glow is not None:
-        rad_emu_str = glow.get(q("w14", "rad")) or glow.get("rad")
-        if rad_emu_str is not None:
-            rad_pt = int(rad_emu_str) / EMU_PER_PT
-    checks.append((
-        f"发光大小约 7 磅  实际={rad_pt}pt" if rad_pt is not None else "发光大小约 7 磅  未设置 rad",
-        rad_pt is not None and abs(rad_pt - 7.0) <= 2.0,
-    ))
-
-    # 4) 使用强调文字颜色 3 或接近效果
-    accent3_hex = bundle.accent_map.get("accent3")
-    uses_accent3_scheme = scheme_val == "accent3"
-    close_to_accent3 = (
-        accent3_hex is not None
-        and glow_color_hex is not None
-        and hex_distance(glow_color_hex.upper(), accent3_hex.upper()) <= 90.0
-    )
-    accent3_ok = uses_accent3_scheme or close_to_accent3
-    checks.append((
-        f"使用强调文字颜色 3 或接近效果  schemeClr=accent3? {uses_accent3_scheme}; "
-        f"主题 accent3=#{accent3_hex}",
-        accent3_ok,
-    ))
-
-    # ---- 阴影相关 1 点 ----
-    shadow = rpr.find(q("w14", "shadow"))
-    # 5) 设置向上偏移阴影效果
-    dir_val: int | None = None
-    if shadow is not None:
-        dir_str = shadow.get(q("w14", "dir")) or shadow.get("dir")
-        if dir_str is not None:
-            dir_val = int(dir_str)
-    # Office "向上偏移" 预设精确值：dir=16200000 (=270°)；允许"或接近"：225°~315°
-    shadow_up_ok = (
-        shadow is not None
-        and dir_val is not None
-        and 13500000 <= dir_val <= 18900000
-    )
-    checks.append((
-        f"设置向上偏移阴影效果  存在 w14:shadow={shadow is not None} dir={dir_val}",
-        shadow_up_ok,
-    ))
-
-    # ---- 可读性 1 点 ----
-    # 6) 标题文字仍清晰可读：颜色已设定、非白色、且与发光颜色区分
-    text_color = run_color_hex(title_run)
-    readable = (
-        text_color is not None
-        and text_color.upper() != "FFFFFF"
-        and (glow_color_hex is None or text_color.upper() != glow_color_hex.upper())
-    )
-    checks.append((
-        f"标题文字仍清晰可读  文字颜色=#{text_color} 发光颜色=#{glow_color_hex}",
-        readable,
-    ))
-
-    passed = all(ok for _, ok in checks)
-    return passed, "\n".join(f"{'✓' if ok else '✗'} {msg}" for msg, ok in checks)
-
-
-def locate_special_dropcap(
-    body: "list[etree._Element]",
-) -> tuple[int | None, int | None]:
-    """定位"专业设置如下："段的首字下沉结构。
-
-    返回 (first_char_idx, others_idx)，两者均为 body 中的下标：
-      · 结构 A（framePr 挂在原段，首字与其余文字同段）：
-            first_char_idx = None
-            others_idx     = 该段（含完整"专业设置如下："文字）
-      · 结构 B（Office 将首字拆到独立段，其余文字放到下一段，仅"首字段"挂 framePr）：
-            first_char_idx = 挂 framePr 的"首字段"下标
-            others_idx     = 紧邻的"其余文字段"下标
-      · 未找到"专业设置如下"结构时两者均为 None。
-
-    先按 framePr + dropCap 属性识别 Office 的首字下沉容器；仅当"首字段(1字)+其余
-    文字段"拼接后仍以"专业设置如下"起始时才视为结构 B，否则退回按文本前缀匹配的
-    结构 A（此时可能只是普通段落，framePr 不存在）。
-    """
-    # 1) 优先按 framePr / dropCap 定位 Office 首字下沉容器
-    for i, p in enumerate(body):
-        fr = p.find(f"{q('w','pPr')}/{q('w','framePr')}")
-        if fr is None or fr.get(q("w", "dropCap")) not in ("margin", "drop"):
-            continue
-        p_text = paragraph_text(p).strip()
-        # 结构 B：首字段独占单字，与下一段拼接后仍以"专业设置如下"开头
-        if len(p_text) == 1 and i + 1 < len(body):
-            next_text = paragraph_text(body[i + 1]).strip()
-            if (p_text + next_text).startswith("专业设置如下"):
-                return i, i + 1
-        # 结构 A：framePr 与"专业设置如下"文字挂在同一段
-        if p_text.startswith("专业设置如下"):
-            return None, i
-    # 2) framePr 不存在或位置异常时，按文本前缀兜底找出内容段
-    for i, p in enumerate(body):
-        if paragraph_text(p).strip().startswith("专业设置如下"):
-            return None, i
-    return None, None
-
-
-def rule_body_para_format(bundle: DocxBundle) -> tuple[bool, str]:
-    """+1: 正文段落格式：除标题、"专业设置如下："、"计算机应用技术"内容段落外，
-    其余正文采用首行缩进2字符，段后间距6磅，1.1倍行距。
-
-    每一条细则的检测思路（对齐 Word/WPS 段落格式面板的行为）：
-      · 首行缩进 2 字符  -> 每个正文段 w:ind/@w:firstLineChars == "200"
-                            （Office UI "首行缩进 2 字符" 精确对应 200，即 2×100）
-                            并且不存在悬挂缩进（hanging 应为 0/缺省）
-      · 段后间距 6 磅    -> w:spacing/@w:after == 120 twips (=6pt) 且未启用 afterAutospacing
-      · 1.1 倍行距       -> w:spacing/@w:line == 264 且 @w:lineRule == "auto"
-                            （多倍行距 1.1 → 240*1.1 = 264）
-
-    段落例外（整段跳过，不参与判定）：
-      · 标题段（首个非空段）
-      · "专业设置如下："内容段：使用 locate_special_dropcap 定位；若 Office 将首字
-        拆为独立段（结构 B），首字段与其余文字段共同构成该"内容段"，两段一起跳过；
-        若首字与其余文字同段（结构 A），跳过该段。
-      · 文本包含"计算机应用技术"的段落
-      · 空段
-    """
-    body = get_body_paragraphs(bundle)
-    if len(body) < 2:
-        return False, "正文段落不足"
-
-    # 定位标题段：正文首个非空段
-    title_idx = next(
-        (i for i, p in enumerate(body) if paragraph_text(p).strip()), 0
-    )
-
-    # "专业设置如下："内容段：结构 A 一段、结构 B 两段，一并从段落格式判定中排除
-    first_char_idx, others_idx = locate_special_dropcap(body)
-    special_para_indices: set[int] = {
-        idx for idx in (first_char_idx, others_idx) if idx is not None
-    }
-
-    failures: list[str] = []
-    stats = dict(indent_ok=0, after_ok=0, line_ok=0, total=0)
-
-    for i, p in enumerate(body):
-        if i == title_idx:
-            continue
-        if i in special_para_indices:
-            continue
-        text = paragraph_text(p).strip()
-        if not text:
-            continue  # 空段不参与判定
-        if "计算机应用技术" in text:
-            continue
-        stats["total"] += 1
-
-        # 首行缩进 2 字符：firstLineChars == "200"，且无 hanging
-        fl_chars, fl_twips, hanging = effective_first_line_indent(p, bundle)
-        indent_ok = (fl_chars == "200") and (not hanging or hanging == 0)
-        if indent_ok:
-            stats["indent_ok"] += 1
-        else:
-            failures.append(
-                f"段{i}('{text[:10]}...')首行缩进异常：firstLineChars={fl_chars} "
-                f"firstLine={fl_twips} hanging={hanging}"
-            )
-
-        # 段后间距 6 磅：after==120twips 且 afterAutospacing 关闭
-        after_pt, auto_on = effective_space_after(p, bundle)
-        after_ok = (after_pt is not None) and abs(after_pt - 6.0) < 1e-6 and (not auto_on)
-        if after_ok:
-            stats["after_ok"] += 1
-        else:
-            failures.append(
-                f"段{i}('{text[:10]}...')段后异常：after={after_pt}pt afterAutospacing={auto_on}"
-            )
-
-        # 1.1 倍行距：line==264 且 lineRule=="auto"
-        multiplier, rule = effective_line_spacing(p, bundle)
-        line_ok = (rule == "auto") and (multiplier is not None) and abs(multiplier - 1.1) < 1e-6
-        if line_ok:
-            stats["line_ok"] += 1
-        else:
-            failures.append(
-                f"段{i}('{text[:10]}...')行距异常：倍数={multiplier} lineRule={rule}"
-            )
-
-    total = stats["total"]
-    detail_lines = [
-        f"共评估 {total} 个正文段落（排除标题段、\"专业设置如下：\"内容段、\"计算机应用技术\"段及空段）",
-        f"首行缩进2字符 {stats['indent_ok']}/{total}  "
-        f"段后6磅 {stats['after_ok']}/{total}  1.1倍行距 {stats['line_ok']}/{total}",
-    ]
-    # 细则要求段落格式整体符合，故每个非例外段落的每一项都必须通过。
-    passed = (
-        total > 0
-        and stats["indent_ok"] == total and stats["after_ok"] == total
-        and stats["line_ok"] == total
-    )
-    if not passed and failures:
-        detail_lines.append("失败明细：")
-        for msg in failures[:8]:
-            detail_lines.append(f"  - {msg}")
-        if len(failures) > 8:
-            detail_lines.append(f"  ...（共 {len(failures)} 条）")
-    return passed, "\n".join(detail_lines)
-
-
-def rule_body_font_format(bundle: DocxBundle) -> tuple[bool, str]:
-    """+1: 正文字体格式：除标题、"专业设置如下："内容段落特殊首字和被替换文字
-    "智能软件工程系"特殊格式外，正文采用楷体、小四号。
-
-    每一条细则的检测思路（对齐 Word/WPS 段落格式面板的行为）：
-      · 楷体             -> 每个非例外 run 的 rFonts eastAsia 生效值 == "楷体"
-      · 小四号           -> 每个非例外 run 的 w:sz 生效值 == 24 半磅 (= 12pt)
-
-    Run 级例外：
-      · 标题段整段跳过
-      · "专业设置如下："内容段的"特殊首字"：使用 locate_special_dropcap 定位。
-          - 结构 A（framePr 在同段）：跳过该段第一个可见 run 的首字 run
-          - 结构 B（首字被拆为独立段）：整段（=特殊首字）跳过；其余文字段照常参与
-      · run 文本 == "智能软件工程系" 的 run（保留其特殊格式，不参与 run 属性判定）
-    """
-    body = get_body_paragraphs(bundle)
-    if len(body) < 2:
-        return False, "正文段落不足"
-
-    # 定位标题段：正文首个非空段
-    title_idx = next(
-        (i for i, p in enumerate(body) if paragraph_text(p).strip()), 0
-    )
-
-    # 使用与 rule_drop_cap 一致的首字下沉定位逻辑
-    first_char_idx, others_idx = locate_special_dropcap(body)
-    # 结构 A：首字与其余文字同段 → 该段第一个可见 run 是特殊首字，需按 run 排除
-    dropcap_first_run_para_idx: int | None = others_idx if first_char_idx is None else None
-    # 结构 B：首字独占一段 → 整段（长度为 1 的字符）就是特殊首字，需按段排除
-    isolated_first_char_para_idx: int | None = first_char_idx
-
-    failures: list[str] = []
-    stats = dict(font_ok=0, size_ok=0, total=0)
-
-    for i, p in enumerate(body):
-        if i == title_idx:
-            continue
-        if i == isolated_first_char_para_idx:
-            continue  # 结构 B 的"首字段" = 特殊首字本身
-        text = paragraph_text(p).strip()
-        if not text:
-            continue  # 空段不参与判定
-        stats["total"] += 1
-
-        # 排除：run 文本 == "智能软件工程系"；结构 A 下再排除该段首字下沉的首字 run。
-        runs = p.findall(f"{q('w','r')}")
-        para_font_ok = True
-        para_size_ok = True
-        first_visible_run_seen = False
-        for r in runs:
-            txt = "".join((t.text or "") for t in r.findall(f"{q('w','t')}"))
-            if not txt:
-                continue
-            # 例外 1：被替换文字"智能软件工程系"
-            if txt == "智能软件工程系":
-                continue
-            # 例外 2：结构 A 首字下沉段的"特殊首字"（该段第一个可见 run）
-            if i == dropcap_first_run_para_idx and not first_visible_run_seen:
-                first_visible_run_seen = True
-                continue
-            first_visible_run_seen = True
-            font = effective_font_eastasia(r, p, bundle)
-            size = effective_size_pt(r, p, bundle)
-            if font != "楷体":
-                para_font_ok = False
-                failures.append(f"段{i}('{text[:10]}...')run 字体非楷体：'{txt[:10]}' font={font}")
-            if size is None or abs(size - 12.0) > 1e-6:
-                para_size_ok = False
-                failures.append(f"段{i}('{text[:10]}...')run 字号非小四：'{txt[:10]}' size={size}")
-        if para_font_ok:
-            stats["font_ok"] += 1
-        if para_size_ok:
-            stats["size_ok"] += 1
-
-    total = stats["total"]
-    detail_lines = [
-        f"共评估 {total} 个正文段落（排除标题段、结构 B 首字段、空段）",
-        f"楷体 {stats['font_ok']}/{total}  小四 {stats['size_ok']}/{total}",
-    ]
-    # 细则要求"正文字体格式"整体符合，故每个非例外段落的每一项都必须通过。
-    passed = (
-        total > 0
-        and stats["font_ok"] == total and stats["size_ok"] == total
-    )
-    if not passed and failures:
-        detail_lines.append("失败明细：")
-        for msg in failures[:8]:
-            detail_lines.append(f"  - {msg}")
-        if len(failures) > 8:
-            detail_lines.append(f"  ...（共 {len(failures)} 条）")
-    return passed, "\n".join(detail_lines)
-
-
-def rule_drop_cap(bundle: DocxBundle) -> tuple[bool, str]:
-    """+5: 第三段"专业设置如下："所在段落：段首文字设置首字下沉，首字下沉方式为悬挂，
-    下沉2行，距正文0.3厘米。首字下沉后段落其余文字仍保持正文楷体小四号、1.1倍行距，
-    未造成文字重叠或段落断裂。
-
-    判定按 rubric 逐项验证，不再要求非 rubric 的硬性 XML 结构（如 wrap/vAnchor/
-    hAnchor 齐备或"首字必须独占一段"）——这些是 Office UI 保存首字下沉的常见形态
-    之一，但并非唯一形态。Word/WPS 里 framePr 也可能与整段挂在一起。
-
-    验证项（对齐 rubric 原文的 7 点）：
-      1) 目标位于第三段（按"用户可见段"计数：结构 B 中"首字段+其余文字段"合并计 1 段）
-      2) 段首文字设置首字下沉
-      3) 悬挂        → w:framePr/@w:dropCap == "margin"
-      4) 下沉 2 行   → w:framePr/@w:lines == "2"
-      5) 距正文 0.3 厘米 → w:framePr/@w:hSpace == 170 twips (= 0.30 cm)
-      6-8) 其余文字仍保持正文楷体 / 小四 / 1.1 倍行距
-      9) 未造成文字重叠或段落断裂
-    """
-    body = get_body_paragraphs(bundle)
-    first_char_idx, others_idx = locate_special_dropcap(body)
-    if others_idx is None:
-        return False, "未找到 '专业设置如下：' 段落"
-
-    target: etree._Element = body[others_idx]
-    target_idx: int = others_idx
-
-    # 计算"用户可见段"顺序：跳过空段；结构 B 的首字段与其余文字段合并为一段
-    visible_para_start: list[int] = []
-    i = 0
-    while i < len(body):
-        text_i = paragraph_text(body[i]).strip()
-        if not text_i:
-            i += 1
-            continue
-        # 结构 B：当前是"首字段"且下一段是"其余文字段"，两段视为同一"用户可见段"
-        if i == first_char_idx and others_idx == i + 1:
-            visible_para_start.append(i)
-            i += 2
-            continue
-        visible_para_start.append(i)
-        i += 1
-
-    # 目标用户可见段的位置（1-based）
-    target_start_body_idx = first_char_idx if first_char_idx is not None else others_idx
-    try:
-        target_visible_pos = visible_para_start.index(target_start_body_idx) + 1
+        return int(round(float(str(raw).rstrip('f'))))
     except ValueError:
-        target_visible_pos = -1
-
-    checks: list[tuple[str, bool]] = []
-
-    # 1) 目标位于第三段
-    checks.append((
-        f"目标位于第三段  实际位置={target_visible_pos}",
-        target_visible_pos == 3,
-    ))
-
-    # 定位承载 framePr 的段落：结构 A 挂在 target 上，结构 B 挂在其前的"首字段"上
-    fr: etree._Element | None = None
-    fr_para: etree._Element | None = None
-    if first_char_idx is not None:
-        fr_para = body[first_char_idx]
-    if fr_para is None:
-        fr_para = target
-    fr = fr_para.find(f"{q('w','pPr')}/{q('w','framePr')}") if fr_para is not None else None
-    # 若 framePr 不在预期位置，兜底再看 target 前一段（少数分拆场景）
-    if (fr is None or fr.get(q("w", "dropCap")) not in ("margin", "drop")) and target_idx - 1 >= 0:
-        prev = body[target_idx - 1]
-        pf = prev.find(f"{q('w','pPr')}/{q('w','framePr')}")
-        if pf is not None and pf.get(q("w", "dropCap")) in ("margin", "drop"):
-            fr = pf
-            fr_para = prev
-
-    # 2) 段首文字设置首字下沉
-    dropcap_attr = fr.get(q("w", "dropCap")) if fr is not None else None
-    checks.append((
-        f"段首文字设置首字下沉  framePr={fr is not None} dropCap={dropcap_attr}",
-        fr is not None and dropcap_attr in ("margin", "drop"),
-    ))
-
-    # 3) 首字下沉方式为悬挂 (dropCap=margin)
-    checks.append((
-        f"首字下沉方式为悬挂  实际 dropCap={dropcap_attr}",
-        dropcap_attr == "margin",
-    ))
-
-    # 4) 下沉 2 行
-    lines_val = fr.get(q("w", "lines")) if fr is not None else None
-    checks.append((
-        f"下沉 2 行  实际 lines={lines_val}",
-        lines_val == "2",
-    ))
-
-    # 5) 距正文 0.3 厘米
-    hspace_str = fr.get(q("w", "hSpace")) if fr is not None else None
-    hspace_twips: int | None = int(hspace_str) if hspace_str is not None else None
-    hspace_ok = hspace_twips == 170
-    hspace_cm = (hspace_twips / 20.0 / POINTS_PER_CM) if hspace_twips is not None else None
-    checks.append((
-        f"距正文 0.3 厘米  实际 hSpace={hspace_twips}twips"
-        f"({hspace_cm:.2f}cm)" if hspace_cm is not None else "距正文 0.3 厘米  hSpace 未设置",
-        hspace_ok,
-    ))
-
-    # 6~8) 其余文字保持楷体 / 小四 / 1.1 倍行距
-    # "其余文字段"即 target（结构 A 中即整段；结构 B 中即其余文字所在段）
-    others_para: etree._Element = target
-    other_runs: list[etree._Element] = [
-        r for r in others_para.findall(f"{q('w','r')}")
-        if "".join((t.text or "") for t in r.findall(f"{q('w','t')}"))
-    ]
-    # 结构 A：first_char_idx is None，target 段本身还包含"特殊首字"这一 run，
-    # 参照 rubric"其余文字"应剔除首字 run 后再判定。
-    if first_char_idx is None and other_runs:
-        other_runs = other_runs[1:]
-
-    font_ok = bool(other_runs) and all(
-        effective_font_eastasia(r, others_para, bundle) == "楷体" for r in other_runs
-    )
-    checks.append(("其余文字仍保持正文楷体", font_ok))
-
-    size_ok = bool(other_runs) and all(
-        (effective_size_pt(r, others_para, bundle) is not None
-         and abs(effective_size_pt(r, others_para, bundle) - 12.0) < 1e-6)
-        for r in other_runs
-    )
-    checks.append(("其余文字仍保持小四号", size_ok))
-
-    multiplier, rule = effective_line_spacing(others_para, bundle)
-    line_ok = (rule == "auto") and (multiplier is not None) and abs(multiplier - 1.1) < 1e-6
-    checks.append((
-        f"其余文字仍保持 1.1 倍行距  实际倍数={multiplier} lineRule={rule}",
-        line_ok,
-    ))
-
-    # 9) 未造成文字重叠或段落断裂 —— 轻量启发式，不做非 rubric 的结构硬约束：
-    #    · hSpace > 0：首字与正文有间距，避免像素重叠
-    #    · 其余文字长度不少于下沉行数：Word 下沉高度约等于 lines 行，其余文字过短
-    #      时下沉框底部会与后续段拼接出空白/断裂
-    #    · 紧邻的下一段不得再挂 dropCap framePr（避免与当前浮动框冲突）
-    lines_num = int(lines_val) if lines_val and lines_val.isdigit() else 0
-    remainder_len = len(paragraph_text(others_para))
-    next_i = target_idx + 1
-    next_frame_conflict = False
-    if 0 < next_i < len(body):
-        next_fr = body[next_i].find(f"{q('w','pPr')}/{q('w','framePr')}")
-        next_frame_conflict = (
-            next_fr is not None and next_fr.get(q("w", "dropCap")) is not None
-        )
-    no_overlap_break = (
-        (hspace_twips is not None and hspace_twips > 0)
-        and (lines_num == 0 or remainder_len >= lines_num)
-        and (not next_frame_conflict)
-    )
-    checks.append((
-        f"未造成文字重叠或段落断裂  hSpace>0={hspace_twips not in (None, 0)}, "
-        f"其余字符≥下沉行数({remainder_len}≥{lines_num})={lines_num == 0 or remainder_len >= lines_num}, "
-        f"后段无 framePr 冲突={not next_frame_conflict}",
-        no_overlap_break,
-    ))
-
-    passed = all(ok for _, ok in checks)
-    return passed, "\n".join(f"{'✓' if ok else '✗'} {msg}" for msg, ok in checks)
+        return None
 
 
-def rule_no_wrong_name(bundle: DocxBundle) -> tuple[bool, str]:
-    """+1: 文档中没有出现"智能工程系"文本。
-
-    检测思路（对齐 Word/WPS "开始→查找 (Ctrl+F)"的行为）：
-      Office 的"查找"只匹配文档可见文本（正文、页眉页脚、脚注/尾注、文本框
-      等所有 w:t 节点），不匹配图像里的像素文字。此处严格判定：任何 w:t
-      文本片段之间跨节点拼接后不出现子串"智能工程系"。
-      注："智能软件工程系"包含"软件"作为中缀，本身不含子串"智能工程系"，
-      因此无需人为剔除即可分辨。
-    """
-    needle = "智能工程系"
-
-    # 收集文档所有 XML 部件中的 w:t 文本，模拟 Office 全文查找覆盖范围。
-    parts: list[str] = ["word/document.xml"]
-    for name in bundle.zf.namelist():
-        if re.fullmatch(
-            r"word/(header\d+|footer\d+|footnotes|endnotes|comments)\.xml",
-            name,
-        ):
-            parts.append(name)
-
-    hits: list[str] = []
-    for name in parts:
-        try:
-            root = etree.fromstring(bundle.zf.read(name))
-        except Exception:
-            continue
-        # 逐段落拼接 w:t —— 对齐 Word 查找"跨 run 匹配"的行为；跨段落不算连续。
-        for p in root.iter(q("w", "p")):
-            joined = "".join((t.text or "") for t in p.iter(q("w", "t")))
-            if needle in joined:
-                hits.append(f"{name}: '{joined[:60]}'")
-
-    triggered = bool(hits)
-    if triggered:
-        detail = "仍出现'智能工程系'文本：" + "; ".join(hits[:5])
-        if len(hits) > 5:
-            detail += f"; ...（共 {len(hits)} 处）"
-    else:
-        detail = "未在任何 w:t 文本中检出子串'智能工程系'"
-    return (not triggered), detail
+def _pPr(para):
+    return para._element.find(qn('w:pPr'))
 
 
-def _paragraph_char_run_map(
-    p: "etree._Element",
-) -> tuple[str, list["etree._Element"]]:
-    """把段落的可见文本按字符位置映射回 run。
+def _frame_pr(para):
+    pPr = _pPr(para)
+    return pPr.find(qn('w:framePr')) if pPr is not None else None
 
-    只拼接 w:r/w:t 文本节点（不含 tab/br 等结构化字符），因此段落文本索引与
-    每个字符所属的 run 严格对齐。返回 (text, char_to_run)，长度一致：
-    char_to_run[i] 即 text[i] 所属的 w:r 元素。
-    """
-    text_parts: list[str] = []
-    char_to_run: list[etree._Element] = []
-    for r in p.findall(q("w", "r")):
-        run_text = "".join((t.text or "") for t in r.findall(q("w", "t")))
-        if not run_text:
-            continue
-        text_parts.append(run_text)
-        char_to_run.extend([r] * len(run_text))
-    return "".join(text_parts), char_to_run
-
-
-def rule_special_run_format(bundle: DocxBundle) -> tuple[bool, str]:
-    """+1: 正文中的"智能软件工程系"：采用宋体、四号、加粗、倾斜、绿色，并添加着重号。
-
-    每一条细则的检测思路（对齐 Word/WPS "开始→字体"面板的行为）：
-      · 宋体         -> run 的 rFonts eastAsia 生效值 == "宋体"
-      · 四号         -> w:sz 生效值 == 28 半磅 (=14pt，Office 中"四号"精确对应值)
-      · 加粗         -> w:b toggle 生效为真
-      · 倾斜         -> w:i toggle 生效为真
-      · 绿色         -> w:color 生效值判定为绿色（G 通道显著高于 R、B），
-                        并支持通过 themeColor 解析主题色（对齐 Office UI 里
-                        "标准色→绿色"与"主题颜色"两条路径）
-      · 添加着重号   -> w:em 生效值存在且不为 "none"（Office UI "着重号"下拉的
-                        任一非"(无)"选项：dot/comma/circle/underDot）
-
-    "正文中的"智能软件工程系"":按段落可见文本拼接后定位所有出现位置，再映射
-    回覆盖该子串的 run 集合；每一处出现被覆盖的每个 run 都必须同时满足上述 6 项。
-    """
-    target_text = "智能软件工程系"
-    body = get_body_paragraphs(bundle)
-
-    # 收集所有"出现"，每个"出现"记录 (段落, 覆盖它的 run 集合[保序去重])
-    occurrences: list[tuple[etree._Element, list[etree._Element]]] = []
-    for p in body:
-        para_text, char_to_run = _paragraph_char_run_map(p)
-        if not para_text:
-            continue
-        start = 0
-        while True:
-            pos = para_text.find(target_text, start)
-            if pos < 0:
+def _para_prop(doc, para, tag, attr):
+    """解析段落级属性（w:spacing/@w:after、w:ind/@w:firstLineChars、w:jc/@w:val 等）：
+       段落直接设定 → 段落样式链 → docDefaults/pPrDefault；返回字符串或 None。"""
+    pPr = _pPr(para)
+    if pPr is not None:
+        el = pPr.find(qn(tag))
+        if el is not None and el.get(qn(attr)) is not None:
+            return el.get(qn(attr))
+    styles_el = doc.styles.element
+    style_id = None
+    if pPr is not None:
+        pStyle = pPr.find(qn('w:pStyle'))
+        if pStyle is not None:
+            style_id = pStyle.get(qn('w:val'))
+    seen = set()
+    while style_id and style_id not in seen:
+        seen.add(style_id)
+        st = None
+        for s in styles_el.findall(qn('w:style')):
+            if s.get(qn('w:styleId')) == style_id:
+                st = s
                 break
-            covered: list[etree._Element] = []
-            seen: set[int] = set()
-            for i in range(pos, pos + len(target_text)):
-                r = char_to_run[i]
-                rid = id(r)
-                if rid not in seen:
-                    seen.add(rid)
-                    covered.append(r)
-            occurrences.append((p, covered))
-            start = pos + len(target_text)
-
-    if not occurrences:
-        return False, "正文中未找到 '智能软件工程系'"
-
-    total = len(occurrences)
-    stats = dict(font=0, size=0, bold=0, italic=0, color=0, em=0)
-    failures: list[str] = []
-
-    for idx, (p, runs) in enumerate(occurrences, 1):
-        # 每一处出现：所覆盖的每个 run 都必须满足全部 6 项属性
-        per_ok = dict(font=True, size=True, bold=True, italic=True, color=True, em=True)
-        for r in runs:
-            # 1) 宋体
-            font = effective_font_eastasia(r, p, bundle)
-            if font != "宋体":
-                per_ok["font"] = False
-                failures.append(f"第{idx}处 有 run 字体非宋体：{font}")
-
-            # 2) 四号 (=14pt，严格)
-            size = effective_size_pt(r, p, bundle)
-            if size is None or abs(size - 14.0) > 1e-6:
-                per_ok["size"] = False
-                failures.append(f"第{idx}处 有 run 字号非四号：{size}pt")
-
-            # 3) 加粗
-            if not effective_bold(r, p, bundle):
-                per_ok["bold"] = False
-                failures.append(f"第{idx}处 有 run 未加粗")
-
-            # 4) 倾斜
-            if not effective_italic(r, p, bundle):
-                per_ok["italic"] = False
-                failures.append(f"第{idx}处 有 run 未倾斜")
-
-            # 5) 绿色：G 通道明显高于 R、B（覆盖 Office"标准色→绿色"#00B050、
-            #    "深绿"#006100、经典"绿色"#008000 等），并支持 themeColor 解析
-            hex_val, theme_val = effective_color(r, p, bundle)
-            color_hex = hex_val if hex_val and hex_val.upper() != "AUTO" else _theme_hex(bundle, theme_val)
-            color_ok = False
-            if color_hex:
-                try:
-                    rr = int(color_hex[0:2], 16)
-                    gg = int(color_hex[2:4], 16)
-                    bb = int(color_hex[4:6], 16)
-                    color_ok = gg >= 100 and gg >= rr + 30 and gg >= bb + 30
-                except Exception:
-                    color_ok = False
-            if not color_ok:
-                per_ok["color"] = False
-                failures.append(f"第{idx}处 有 run 非绿色：#{hex_val} themeColor={theme_val}")
-
-            # 6) 添加着重号：w:em 存在且非 "none"
-            em_val = effective_em(r, p, bundle)
-            if not (em_val is not None and em_val != "none"):
-                per_ok["em"] = False
-                failures.append(f"第{idx}处 有 run 未添加着重号：w:em={em_val}")
-
-        for k, v in per_ok.items():
-            if v:
-                stats[k] += 1
-
-    detail_lines = [
-        f"正文中共发现 {total} 处 '智能软件工程系'（按段落文本拼接后定位，可跨 run）：",
-        f"  宋体 {stats['font']}/{total}, 四号 {stats['size']}/{total}, "
-        f"加粗 {stats['bold']}/{total}, 倾斜 {stats['italic']}/{total}, "
-        f"绿色 {stats['color']}/{total}, 着重号 {stats['em']}/{total}",
-    ]
-    passed = all(v == total for v in stats.values())
-    if not passed and failures:
-        detail_lines.append("失败明细：")
-        for msg in failures[:8]:
-            detail_lines.append(f"  - {msg}")
-        if len(failures) > 8:
-            detail_lines.append(f"  ...（共 {len(failures)} 条）")
-    return passed, "\n".join(detail_lines)
-
-
-def find_watermark_imagedata(bundle: DocxBundle) -> tuple[etree._Element | None, str | None, str | None]:
-    """在页眉中查找水印 v:shape，返回 (shape, image_target, header_name)。"""
-    for hname, hxml in bundle.headers.items():
-        # 传统 VML 水印：<v:shape><v:imagedata r:id="..."/>
-        for shape in hxml.findall(f".//{q('v','shape')}"):
-            imagedata = shape.find(f"{q('v','imagedata')}")
-            if imagedata is None:
-                continue
-            rid = imagedata.get(q("r", "id"))
-            # 解析 rId -> target
-            rels_name = f"word/_rels/{os.path.basename(hname)}.rels"
-            target = None
-            if rels_name in bundle.zf.namelist():
-                rels = etree.fromstring(bundle.zf.read(rels_name))
-                for rel in rels.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
-                    if rel.get("Id") == rid:
-                        target = rel.get("Target")
-                        break
-            return shape, target, hname
-        # DrawingML 水印
-        for drawing in hxml.findall(f".//{q('w','drawing')}"):
-            blip = drawing.find(f".//{{{NS['a']}}}blip")
-            if blip is not None:
-                return drawing, None, hname
-    return None, None, None
-
-
-def rule_watermark_scale(bundle: DocxBundle) -> tuple[bool, str]:
-    """+5: 文档水印背景：校园横幅图片被设置为整篇简介文档的水印背景，
-    显示在正文后方，缩放比例为100%或接近100%。
-
-    每一条细则的检测思路（对齐 Word/WPS "设计→水印→自定义水印→图片水印" 面板的行为）：
-      · 校园横幅图片            -> 水印引用的图片存在、可解析为图像，且长宽比呈"横幅"
-                                    形态（宽/高 ≥ 1.6，Office 中"横幅"素材的典型比例）
-      · 被设置为整篇简介文档的水印背景 -> 水印在页眉里(w:hdr)，通过节属性(sectPr)
-                                    被文档的每个 section 引用（Word 图片水印的实现方式）
-      · 显示在正文后方          -> VML 水印 z-index < 0，或 DrawingML behindDoc="1"
-                                    （对应 Office UI 中"衬于文字下方"）
-      · 缩放比例为100%或接近100% -> Office"图片水印"对话框里"缩放"下拉的值。
-                                    从 XML 反算：display_size / native_size × 100%
-                                    (native = 像素 ÷ DPI × 72pt/inch)；接受 85%~115%
-    """
-    shape, target, hname = find_watermark_imagedata(bundle)
-    if shape is None:
-        return False, "未在页眉中找到水印图片对象"
-
-    checks: list[tuple[str, bool]] = []
-
-    # 解析显示尺寸 (VML style 或 DrawingML wp:extent)
-    style = shape.get("style") or ""
-    m_w = re.search(r"width:([\d.]+)pt", style)
-    m_h = re.search(r"height:([\d.]+)pt", style)
-    display_w_pt: float | None = float(m_w.group(1)) if m_w else None
-    display_h_pt: float | None = float(m_h.group(1)) if m_h else None
-    # DrawingML 兜底：<wp:extent cx="EMU" cy="EMU"/>
-    if display_w_pt is None:
-        extent = shape.find(f".//{q('wp','extent')}")
-        if extent is not None:
-            cx = extent.get("cx"); cy = extent.get("cy")
-            if cx and cy:
-                display_w_pt = int(cx) / EMU_PER_PT
-                display_h_pt = int(cy) / EMU_PER_PT
-
-    # 打开图片，读取像素与 DPI
-    orig_w = orig_h = None
-    orig_dpi_x = orig_dpi_y = None
-    orig_ratio: float | None = None
-    if target:
-        for name in (f"word/{target.lstrip('/')}", f"word/{target}"):
-            name = name.replace("word/word/", "word/")
-            if name in bundle.zf.namelist():
-                with bundle.zf.open(name) as f:
-                    img = Image.open(io.BytesIO(f.read()))
-                    orig_w, orig_h = img.size
-                    orig_dpi_x, orig_dpi_y = img.info.get("dpi", (96, 96))
-                orig_ratio = orig_w / orig_h if orig_w and orig_h else None
-                break
-
-    # 1) 校园横幅图片：水印引用的图片可解析，且长宽比呈横幅形态
-    banner_ok = (
-        target is not None
-        and orig_w is not None and orig_h is not None
-        and orig_ratio is not None
-        and orig_ratio >= 1.6  # Office 中"横幅/banner"类图片的典型宽高比
-    )
-    checks.append((
-        f"校园横幅图片  目标={target} 尺寸={orig_w}x{orig_h}px 长宽比={orig_ratio}",
-        banner_ok,
-    ))
-
-    # 2) 被设置为整篇简介文档的水印背景：水印在页眉，且所有节都引用该页眉
-    #    Word "图片水印" 就是在页眉插入 v:shape/v:imagedata，通过 sectPr→headerReference 生效。
-    in_header = hname is not None and re.fullmatch(r"word/header\d+\.xml", hname) is not None
-
-    header_rid = None
-    if hname is not None:
-        # 通过反查 document.xml.rels 找到指向该页眉的 rId
-        if "word/_rels/document.xml.rels" in bundle.zf.namelist():
-            doc_rels = etree.fromstring(bundle.zf.read("word/_rels/document.xml.rels"))
-            for rel in doc_rels.findall(
-                ".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
-            ):
-                if rel.get("Target") in (os.path.basename(hname), f"/{hname}", hname.replace("word/", "")):
-                    header_rid = rel.get("Id")
-                    break
-
-    sect_prs = bundle.document.findall(f".//{q('w','sectPr')}")
-    if not sect_prs:
-        sect_prs = []
-    all_sections_ref = False
-    if sect_prs and header_rid:
-        all_sections_ref = all(
-            any(
-                hr.get(q("r", "id")) == header_rid
-                for hr in sp.findall(f"{q('w','headerReference')}")
-            )
-            for sp in sect_prs
-        )
-    else:
-        # 兼容单节且未显式引用的情形：Word 在保存图片水印时会自动写入 headerReference；
-        # 若只有一个 section 且页眉是唯一 header，视为覆盖整篇。
-        header_files = [n for n in bundle.zf.namelist() if re.fullmatch(r"word/header\d+\.xml", n)]
-        all_sections_ref = len(sect_prs) <= 1 and len(header_files) == 1 and in_header
-
-    background_ok = in_header and all_sections_ref
-    checks.append((
-        f"被设置为整篇简介文档的水印背景  水印在页眉={in_header} 每节引用该页眉={all_sections_ref}",
-        background_ok,
-    ))
-
-    # 3) 显示在正文后方：VML z-index<0，或 DrawingML behindDoc="1"
-    behind_doc = False
-    z_match = re.search(r"z-index:\s*(-?\d+)", style)
-    if z_match:
-        behind_doc = int(z_match.group(1)) < 0
-    if not behind_doc:
-        anchor = shape.find(f".//{q('wp','anchor')}") if shape is not None else None
-        if anchor is not None:
-            behind_doc = anchor.get("behindDoc") in ("1", "true")
-    checks.append((
-        f"显示在正文后方  z-index={z_match.group(1) if z_match else None} behindDoc/负z-index生效={behind_doc}",
-        behind_doc,
-    ))
-
-    # 4) 缩放比例为 100% 或接近 100%
-    #    对齐 Office UI "设置图片格式→大小→缩放" 显示的数值，即：
-    #        缩放% = 显示尺寸(pt) / 原生尺寸(pt) × 100
-    #        原生尺寸(pt) = 像素 / DPI × 72
-    #    该值就是用户在办公软件里肉眼看到的百分比（本文档 Office 显示 41%）。
-    #    "接近 100%" 保守取 ±15%。
-    scale_note = "无法计算缩放比例"
-    scale_ok = False
-    if display_w_pt and orig_w and orig_h and orig_dpi_x and orig_dpi_y:
-        native_w_pt = orig_w / float(orig_dpi_x) * 72.0
-        native_h_pt = orig_h / float(orig_dpi_y) * 72.0
-        scale_w = display_w_pt / native_w_pt * 100
-        scale_h = (display_h_pt / native_h_pt * 100) if display_h_pt else scale_w
-        scale_ok = 85.0 <= scale_w <= 115.0 and 85.0 <= scale_h <= 115.0
-        scale_note = (
-            f"原图 {orig_w}x{orig_h}px @ {orig_dpi_x}dpi -> 原生 "
-            f"{native_w_pt:.1f}x{native_h_pt:.1f}pt；显示 {display_w_pt:.1f}x{display_h_pt}pt；"
-            f"Office 缩放≈{scale_w:.1f}%(宽)/{scale_h:.1f}%(高)"
-        )
-    checks.append((f"缩放比例为100%或接近100%  {scale_note}", scale_ok))
-
-    passed = all(ok for _, ok in checks)
-    return passed, "\n".join(f"{'✓' if ok else '✗'} {msg}" for msg, ok in checks)
-
-
-def rule_watermark_washout(bundle: DocxBundle) -> tuple[bool, str]:
-    """+3: 文档水印效果：水印图片应用"冲蚀"或明显淡化效果，
-    正文文字在水印上方仍清晰可读。
-
-    对齐 Office/WPS "图片水印"对话框里"冲蚀"复选框的实际效果：
-      · Word 勾选"冲蚀"后，会在 VML <v:imagedata> 上写入
-            o:gain="19661f"       (=0.4，亮度提升)
-            o:blacklevel="22938f" (=0.35，黑阶抬升)
-        这两个属性是 Office 内部把"冲蚀"落到 XML 的**唯一渠道**。
-        如果这两个属性缺失，Office 在打开时不会应用冲蚀滤镜，
-        用户在 UI 上就看不到冲蚀效果（即便图片本身颜色较浅）。
-      · WPS 保存"图片水印→冲蚀"输出等价的 gain/blacklevel。
-
-    因此本项**只**认这两个 Office 属性作为"应用了冲蚀"的证据；
-    图片文件本身预先偏亮偏灰不等于 Office 应用了冲蚀效果。
-    """
-    shape, _target, _ = find_watermark_imagedata(bundle)
-    if shape is None:
-        return False, "未找到水印图片"
-
-    checks: list[tuple[str, bool]] = []
-
-    # ---------- 点 1：水印图片应用"冲蚀"或明显淡化效果 ----------
-    imagedata = shape.find(f"{q('v','imagedata')}")
-    gain = blacklevel = chromakey = None
-    if imagedata is not None:
-        gain = imagedata.get(f"{{{NS['o']}}}gain") or imagedata.get("gain")
-        blacklevel = imagedata.get(f"{{{NS['o']}}}blacklevel") or imagedata.get("blacklevel")
-        chromakey = imagedata.get(f"{{{NS['o']}}}chromakey") or imagedata.get("chromakey")
-
-    # Office 冲蚀的判定：至少有 gain 或 blacklevel（Word "冲蚀"预设）
-    washout_applied = gain is not None or blacklevel is not None
-    msg = (
-        f"水印图片应用'冲蚀'或明显淡化效果  "
-        f"Office 冲蚀属性 o:gain={gain} o:blacklevel={blacklevel} o:chromakey={chromakey}"
-    )
-    checks.append((msg, washout_applied))
-
-    # ---------- 点 2：正文文字在水印上方仍清晰可读 ----------
-    body = get_body_paragraphs(bundle)
-    has_text = False
-    fg_ok = False
-    sample_color: str | None = None
-    for p in body:
-        text = paragraph_text(p).strip()
-        if not text:
-            continue
-        has_text = True
-        for r in p.findall(f"{q('w','r')}"):
-            if "".join((t.text or "") for t in r.findall(f"{q('w','t')}")):
-                color = (run_color_hex(r) or "000000").upper()
-                sample_color = color
-                try:
-                    rr = int(color[0:2], 16); gg = int(color[2:4], 16); bb = int(color[4:6], 16)
-                    fg_ok = not (rr >= 240 and gg >= 240 and bb >= 240)
-                except Exception:
-                    fg_ok = color not in ("FFFFFF",)
-                break
-        if fg_ok:
+        if st is None:
             break
-    readable = has_text and fg_ok
-    checks.append((
-        f"正文文字在水印上方仍清晰可读  正文有文字={has_text} 首个正文run颜色=#{sample_color} 前景非白={fg_ok}",
-        readable,
-    ))
+        spr = st.find(qn('w:pPr'))
+        if spr is not None:
+            el = spr.find(qn(tag))
+            if el is not None and el.get(qn(attr)) is not None:
+                return el.get(qn(attr))
+        base = st.find(qn('w:basedOn'))
+        style_id = base.get(qn('w:val')) if base is not None else None
+    dd = styles_el.find(qn('w:docDefaults'))
+    if dd is not None:
+        ppd = dd.find(qn('w:pPrDefault'))
+        spr = ppd.find(qn('w:pPr')) if ppd is not None else None
+        if spr is not None:
+            el = spr.find(qn(tag))
+            if el is not None and el.get(qn(attr)) is not None:
+                return el.get(qn(attr))
+    return None
 
-    passed = all(ok for _, ok in checks)
-    return passed, "\n".join(f"{'✓' if ok else '✗'} {msg}" for msg, ok in checks)
+
+def _para_prop_int(doc, para, tag, attr, default=None):
+    raw = _para_prop(doc, para, tag, attr)
+    if raw is None:
+        return default
+    try:
+        return int(round(float(raw)))
+    except ValueError:
+        return default
+
+def _run_spans(para):
+    """返回 [(起, 止, 序号, run)]，与 para.text 的字符下标对齐。"""
+    spans = []
+    pos = 0
+    for i, r in enumerate(para.runs):
+        t = r.text or ''
+        spans.append((pos, pos + len(t), i, r))
+        pos += len(t)
+    return spans
 
 
-def rule_watermark_range(bundle: DocxBundle) -> tuple[bool, str]:
-    """+1: 文档水印范围：水印出现在页面背景区域，
-    不作为正文中的普通插入图片占用段落位置，不挤压正文排版。
+def _runs_covering(para, sub):
+    """返回段落中每一处 sub 出现位置所覆盖的 run 列表（按出现顺序）。"""
+    groups = []
+    text = para.text or ''
+    spans = _run_spans(para)
+    for m in re.finditer(re.escape(sub), text):
+        grp = [r for (s, e, _i, r) in spans if s < m.end() and e > m.start()]
+        if grp:
+            groups.append(grp)
+    return groups
 
-    对齐 Office/WPS 中"图片水印"的行为：
-      · 页面背景区域 —— Word/WPS 的图片水印固定放在页眉(w:hdr)里；
-                        VML 通过 v:shape 的 position:absolute + mso-position-*-relative
-                        绝对定位到页面/页边距，脱离正文流。
-      · 不作为正文中的普通插入图片占用段落位置
-                     —— 正文 (w:body) 直接子层的段落 run 中不包含指向同一水印图
-                        的 <w:pict>/<w:drawing>（若有也不得是 inline 而必须是 anchor 且
-                        behindDoc="1"）。
-      · 不挤压正文排版
-                     —— VML: <w10:wrap type="none"/> 或不存在 wrap（文字不环绕）；
-                        DrawingML: <wp:anchor behindDoc="1"> + <wp:wrapNone/>。
-    """
-    shape, target, hname = find_watermark_imagedata(bundle)
-    if shape is None:
-        return False, "未找到水印"
 
-    checks: list[tuple[str, bool]] = []
+def _term_run_ids(para, sub=NEW_TERM):
+    """返回覆盖 sub 的 run 在段落内的序号集合（lxml 代理对象的 id 不稳定，故用序号）。"""
+    idx = set()
+    text = para.text or ''
+    for m in re.finditer(re.escape(sub), text):
+        for (s, e, i, _r) in _run_spans(para):
+            if s < m.end() and e > m.start():
+                idx.add(i)
+    return idx
 
-    # ---------- 点 1：水印出现在页面背景区域 ----------
-    #   a) 位于页眉 xml（Office 图片水印的固定载体）
-    #   b) VML style 中 position:absolute，且 mso-position-*-relative 绑到 page/margin
-    in_header = hname is not None and re.fullmatch(r"word/header\d+\.xml", hname) is not None
-    style = shape.get("style") or ""
-    style_l = style.lower().replace(" ", "")
-    is_absolute = "position:absolute" in style_l
-    hrel = re.search(r"mso-position-horizontal-relative:([a-z\-]+)", style_l)
-    vrel = re.search(r"mso-position-vertical-relative:([a-z\-]+)", style_l)
-    hrel_v = hrel.group(1) if hrel else None
-    vrel_v = vrel.group(1) if vrel else None
-    # Office 保存图片水印时把水平/垂直相对参考写成 page 或 margin
-    rel_ok = (
-        (hrel_v in ("page", "margin", "left-margin", "right-margin") or hrel_v is None)
-        and (vrel_v in ("page", "margin", "top-margin", "bottom-margin") or vrel_v is None)
-    )
-    bg_ok = in_header and (is_absolute or rel_ok)
-    checks.append((
-        f"水印出现在页面背景区域  页眉={hname} position:absolute={is_absolute} "
-        f"mso-position-horizontal-relative={hrel_v} mso-position-vertical-relative={vrel_v}",
-        bg_ok,
-    ))
 
-    # ---------- 点 2：不作为正文中的普通插入图片占用段落位置 ----------
-    #    正文 w:body 里不得存在与水印图相同 rId 目标、且是"inline"或"anchor 但非 behindDoc"
-    #    的图片 —— 那样才会像普通插图一样占据段落位置。
-    body = bundle.document.find(f".//{q('w','body')}")
-    body_pics: list[etree._Element] = []
-    if body is not None:
-        body_pics = body.findall(f".//{q('w','pict')}") + body.findall(f".//{q('w','drawing')}")
-    # 过滤掉 body 内声明为背景层的图片（behindDoc="1" 或 z-index<0），
-    # 只保留"占段落位置"的普通插入图片
-    occupying_paragraph = 0
-    for pic in body_pics:
-        # DrawingML: <w:drawing><wp:inline .../></w:drawing> 一律占位
-        if pic.find(f".//{q('wp','inline')}") is not None:
-            occupying_paragraph += 1
+def _visible_border(el):
+    """w:pBdr 是否有可见边框（任一侧 val 非 none/nil）。"""
+    if el is None:
+        return False
+    for side in ('top', 'bottom', 'left', 'right', 'between'):
+        b = el.find(qn('w:' + side))
+        if b is None:
             continue
-        # DrawingML anchor：不是 behindDoc 且没有 wrapNone —— 会挤压正文
-        anchor = pic.find(f".//{q('wp','anchor')}")
-        if anchor is not None:
-            behind = anchor.get("behindDoc") in ("1", "true")
-            wrap_none = anchor.find(f"{q('wp','wrapNone')}") is not None
-            if not behind and not wrap_none:
-                occupying_paragraph += 1
+        val = b.get(qn('w:val'))
+        if val and str(val).lower() not in ('none', 'nil'):
+            return True
+    return False
+
+
+def _open_word_document(file_path):
+    """打开 .docx 文档（python-docx 仅支持 OOXML/.docx）."""
+    return Document(file_path)
+
+def _len_to_emu(raw):
+    """把 VML style 里的长度（595.3pt / 21cm / 8.27in / 1916px）折成 EMU。"""
+    if not raw:
+        return None
+    m = re.match(r'^\s*(-?[\d.]+)\s*(pt|cm|mm|in|px|pc)?\s*$', str(raw))
+    if not m:
+        return None
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return None
+    unit = (m.group(2) or 'pt').lower()
+    factor = {
+        'pt': EMU_PER_PT, 'pc': EMU_PER_PT * 12.0, 'cm': EMU_PER_CM,
+        'mm': EMU_PER_CM / 10.0, 'in': 914400.0, 'px': 914400.0 / PX_DPI,
+    }.get(unit, EMU_PER_PT)
+    return int(round(num * factor))
+
+
+def _vml_style(shape):
+    """把 v:shape/@style 解析成小写键的 dict。"""
+    out = {}
+    for seg in (shape.get('style') or '').split(';'):
+        if ':' not in seg:
             continue
-        # VML pict：z-index 非负 或 wrap 非 none => 占位
-        s = pic.find(f".//{q('v','shape')}")
-        if s is not None:
-            s_style = (s.get("style") or "").lower()
-            z_m = re.search(r"z-index:\s*(-?\d+)", s_style)
-            z = int(z_m.group(1)) if z_m else 0
-            wrap = pic.find(f".//{{{NS.get('w10','urn:schemas-microsoft-com:office:word')}}}wrap")
-            wrap_ok = wrap is not None and (wrap.get("type") == "none")
-            if z >= 0 and not wrap_ok:
-                occupying_paragraph += 1
-    not_inline_in_body = occupying_paragraph == 0
-    checks.append((
-        f"不作为正文中的普通插入图片占用段落位置  "
-        f"body 内 pict/drawing 总数={len(body_pics)} 其中占段落位置的={occupying_paragraph}",
-        not_inline_in_body,
-    ))
-
-    # ---------- 点 3：不挤压正文排版 ----------
-    #    水印 shape 上：VML <w10:wrap type="none"/> 或不存在 wrap；DrawingML wp:wrapNone
-    w10_ns = NS.get("w10", "urn:schemas-microsoft-com:office:word")
-    w10_wrap = shape.find(f".//{{{w10_ns}}}wrap")
-    wrap_type = w10_wrap.get("type") if w10_wrap is not None else None
-    dml_wrap_none = shape.find(f".//{q('wp','wrapNone')}") is not None
-    # "无环绕" 意味着不挤压排版：type="none" / 缺省 / DrawingML wrapNone
-    no_squeeze = (
-        (w10_wrap is None and not dml_wrap_none)  # VML 无 wrap 元素默认不影响正文
-        or wrap_type == "none"
-        or dml_wrap_none
-    )
-    checks.append((
-        f"不挤压正文排版  w10:wrap type={wrap_type} wp:wrapNone={dml_wrap_none}",
-        no_squeeze,
-    ))
-
-    passed = all(ok for _, ok in checks)
-    return passed, "\n".join(f"{'✓' if ok else '✗'} {msg}" for msg, ok in checks)
+        k, _, v = seg.partition(':')
+        out[k.strip().lower()] = v.strip()
+    return out
 
 
-# ---- 扣分点 -----------------------------------------------------------------
-# （原 -5 漏字/错字 与 -3 水印裁切/变形/覆盖 两条按用户要求删除）
+def _image_px(part, rid):
+    """按关系 id 取所嵌位图的像素尺寸 (px_w, px_h)；取不到返回 (None, None)。"""
+    try:
+        img_part = part.related_parts[rid]
+    except Exception:
+        return (None, None)
+    img = getattr(img_part, 'image', None)
+    if img is None and _DocxImage is not None:
+        try:
+            img = _DocxImage.from_blob(img_part.blob)
+        except Exception:
+            img = None
+    if img is None:
+        return (None, None)
+    return (getattr(img, 'px_width', None), getattr(img, 'px_height', None))
 
 
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
+def _hf_parts(doc):
+    """返回文档的全部页眉/页脚部件。"""
+    parts = []
+    try:
+        for part in doc.part.package.iter_parts():
+            name = str(part.partname).lower()
+            if re.search(r'/(header|footer)\d*\.xml$', name):
+                parts.append(part)
+    except Exception:
+        pass
+    return parts
+
+R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
 
-def evaluate(dir_path: str) -> dict[str, object]:
-    """统一入口：接收脚本所在目录的路径，脚本自行在该目录内定位 .docx 并评估。
+def _collect_watermarks(doc):
+    """收集页眉/页脚中的水印对象（新式 DrawingML 与旧式 VML 两种落地方式都认）。
+       每项：kind/behind/wash/cx/cy/hcenter/vcenter/px_w/px_h/is_text。"""
+    out = []
+    for part in _hf_parts(doc):
+        root = getattr(part, 'element', None)
+        if root is None:
+            try:
+                root = parse_xml(part.blob)
+            except Exception:
+                continue
+        # ① 新式：w:drawing/wp:anchor（衬于文字下方 = behindDoc="1"）
+        nodes = list(root.findall('.//{%s}anchor' % WP_NS))
+        nodes += list(root.findall('.//{%s}inline' % WP_NS))
+        for nd in nodes:
+            blip = nd.find('.//{%s}blip' % A_NS)
+            if blip is None:
+                continue
+            ext = nd.find('{%s}extent' % WP_NS)
+            lum = nd.find('.//{%s}lum' % A_NS)
+            bright = _int_attr(lum, 'bright') if lum is not None else None
+            contrast = _int_attr(lum, 'contrast') if lum is not None else None
+            aligns = [(a.getparent().tag, (a.text or '').strip().lower())
+                      for a in nd.findall('.//{%s}align' % WP_NS)]
+            px_w, px_h = _image_px(part, blip.get('{%s}embed' % R_NS))
+            out.append({
+                'kind': 'dml',
+                'behind': str(nd.get('behindDoc') or '').lower() in ('1', 'true'),
+                'wash': (bright is not None and contrast is not None
+                         and bright >= 50000 and contrast <= -50000),
+                'cx': _int_attr(ext, 'cx'), 'cy': _int_attr(ext, 'cy'),
+                'hcenter': any(t.endswith('positionH') and v == 'center' for t, v in aligns),
+                'vcenter': any(t.endswith('positionV') and v == 'center' for t, v in aligns),
+                'px_w': px_w, 'px_h': px_h, 'is_text': False,
+            })
+        # ② 旧式：w:pict/v:shape（衬于文字下方 = z-index 为负）
+        for sp in root.findall('.//{%s}shape' % V_NS):
+            style = _vml_style(sp)
+            imagedata = sp.find('{%s}imagedata' % V_NS)
+            is_text = sp.find('{%s}textpath' % V_NS) is not None
+            if imagedata is None and not is_text:
+                continue
+            rid = imagedata.get('{%s}id' % R_NS) if imagedata is not None else None
+            gain = None
+            black = None
+            if imagedata is not None:
+                gain = imagedata.get('gain') or imagedata.get('{%s}gain' % O_NS)
+                black = (imagedata.get('blacklevel')
+                         or imagedata.get('{%s}blacklevel' % O_NS))
+            px_w, px_h = _image_px(part, rid) if rid else (None, None)
+            zi = (style.get('z-index') or '').strip()
+            out.append({
+                'kind': 'vml',
+                'behind': zi.startswith('-'),
+                'wash': bool(gain or black),
+                'cx': _len_to_emu(style.get('width')),
+                'cy': _len_to_emu(style.get('height')),
+                'hcenter': style.get('mso-position-horizontal', '').lower() == 'center',
+                'vcenter': style.get('mso-position-vertical', '').lower() == 'center',
+                'px_w': px_w, 'px_h': px_h, 'is_text': is_text,
+            })
+    return out
 
-    返回结构（详见《脚本接口差异与统一建议》§2.2）：
-        {
-            "id": "040",
-            "file_name": <被评估文档名>,
-            "status": "ok" | "error",
-            "error": None | <错误信息>,
-            "dim1_pass": bool,
-            "dim1_reason": "" | <未通过原因>,
-            "dim2_items": [ {rule, max_delta, delta, hit, detail}, ... ],
-            "total_score": int,
-            "max_score": int,
-        }
-    """
-    # 加分项元数据：rule_id 使用打分细则的原文；max_delta 为该项满分。
-    plus_rules: list[tuple[str, int, Callable[[DocxBundle], tuple[bool, str]]]] = [
-        ("文档标题段落：\"智能软件工程系简介\"位于文档首行，采用隶书、二号、加粗、蓝色、居中，段后间距为20磅。", 1, rule_title_basic_format),
-        ("文档标题段落：\"智能软件工程系简介\"设置发光效果，颜色为橄榄色或接近橄榄色，大小约7磅，使用强调文字颜色3或接近效果；设置向上偏移阴影效果；标题文字仍清晰可读。", 3, rule_title_glow_shadow),
-        ("正文段落格式：除标题、\"专业设置如下：\"、\"计算机应用技术\"内容段落外，其余正文首行缩进2字符、段后6磅、1.1倍行距。", 1, rule_body_para_format),
-        ("正文字体格式：除标题、\"专业设置如下：\"内容段落特殊首字和被替换文字\"智能软件工程系\"特殊格式外，正文采用楷体、小四号。", 1, rule_body_font_format),
-        ("第三段\"专业设置如下：\"所在段落：段首文字设置首字下沉，方式为悬挂，下沉2行，距正文0.3厘米；其余文字仍保持正文楷体、小四号、1.1倍行距；未造成文字重叠或段落断裂。", 5, rule_drop_cap),
-        ("文档中没有出现\"智能工程系\"文本。", 1, rule_no_wrong_name),
-        ("正文中的\"智能软件工程系\"：采用宋体、四号、加粗、倾斜、绿色，并添加着重号。", 1, rule_special_run_format),
-        ("文档水印背景：校园横幅图片被设置为整篇简介文档的水印背景，显示在正文后方，缩放比例为100%或接近100%。", 5, rule_watermark_scale),
-        ("文档水印效果：水印图片应用\"冲蚀\"或明显淡化效果，正文文字在水印上方仍清晰可读。", 3, rule_watermark_washout),
-        ("文档水印范围：水印出现在页面背景区域，不作为正文中的普通插入图片占用段落位置，不挤压正文排版。", 1, rule_watermark_range),
-    ]
+class _FileMissingError(Exception):
+    """目录不存在或目录中没有 .docx：连交付文件都没有，不进入维度一判定，
+    此时 dim1_pass / dim1_reason 留空、max_score 归 0。"""
 
-    dim2_items: list[dict[str, object]] = []
-    result: dict[str, object] = {
-        "id": "040",
+
+def evaluate(dir_path):
+    """按 §2.2 约定，返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为“脚本所在目录的路径”，脚本自己在该目录里定位并打开被评估的
+    .docx（忽略以 ~$ 开头的 Word 临时锁文件）。脚本自身崩溃（含目录不存在、
+    未发现文档等）由本函数捕获并返回 status='error'。"""
+    result = {
+        "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
         "dim1_pass": True,
         "dim1_reason": "",
-        "dim2_items": dim2_items,
+        "dim2_items": [],
         "total_score": 0,
-        "max_score": sum(s for _, s, _ in plus_rules),
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        # 在目录中定位 .docx（排除 Office 临时锁文件 ~$*.docx）
-        if not os.path.isdir(dir_path):
-            raise FileNotFoundError(f"目录不存在：{dir_path}")
-        docx_files = [
+        if not dir_path or not os.path.isdir(dir_path):
+            raise _FileMissingError(f"目录不存在：{dir_path}")
+        cands = sorted(
             f for f in os.listdir(dir_path)
-            if f.lower().endswith(".docx") and not f.startswith("~$")
-        ]
-        if not docx_files:
-            raise FileNotFoundError(f"目录中未找到 .docx 文件：{dir_path}")
-        file_name = docx_files[0]
-        result["file_name"] = file_name
-        file_path = os.path.join(dir_path, file_name)
-
-        report = Report()
-        bundle = load_bundle(file_path)
-        try:
-            check_dimension1(bundle, report)
-            if not report.dim1_passed:
-                result["dim1_pass"] = False
-                result["dim1_reason"] = "；".join(report.dim1_reasons)
-                result["total_score"] = 0
-                return result
-
-            total = 0
-            for rid, max_delta, fn in plus_rules:
-                passed, detail = fn(bundle)
-                delta = max_delta if passed else 0
-                total += delta
-                # detail 字段按需求置空；上方仍保留 fn(bundle) 的完整计算，
-                # 以保证评分逻辑与结构不变。
-                _ = detail
-                dim2_items.append({
-                    "rule": rid,
-                    "max_delta": max_delta,
-                    "delta": delta,
-                    "hit": passed,
-                    "detail": "",
-                })
-            result["total_score"] = total
-            # 扣分项已按用户要求全部移除
-        finally:
-            bundle.close()
-    except Exception as e:
+            if f.lower().endswith('.docx') and not f.startswith('~$')
+        )
+        if not cands:
+            raise _FileMissingError(f"目录中未找到 .docx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
+    except _FileMissingError as exc:
+        # 找不到交付文件：dim1_pass / dim1_reason 留空，满分也归 0
+        result["file_name"] = ""
         result["status"] = "error"
-        result["error"] = f"{type(e).__name__}: {e}"
-        dim2_items.clear()
+        result["error"] = str(exc)
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
         result["total_score"] = 0
+        result["max_score"] = 0
+        return result
+    except Exception as exc:
+        # 文件存在但打不开/解析失败：维度一判为 false，dim1_reason 给出错误摘要
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["dim1_pass"] = False
+        result["dim1_reason"] = f"文档无法正常打开或解析：{type(exc).__name__}: {exc}"
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        return result
+
+def _evaluate_impl(file_path, result):
+    """维度一 + 维度二的评估主体；内部构造 results 列表（加分项 "+N：…"、
+    减分项 "-N：…"，未命中一律写 "+0：…"/"-0：…"），末尾按 _MAX_DELTAS_ORDER
+    反解成结构化 dim2_items 填入 result。"""
+    doc = _open_word_document(file_path)
+    results = []
+
+    body_el = doc.element.body
+    all_paras = list(doc.paragraphs)
+    paras = [p for p in all_paras if (p.text or '').strip()]
+    para_texts = [(p.text or '').strip() for p in paras]
+    title_para = paras[0] if paras else None
+    body_paras = paras[1:]
+    flat_all = re.sub(r'\s+', '', ''.join((p.text or '') for p in all_paras))
+
+    # ---- 首字下沉框定位（多条细则复用） ----
+    drop_para, drop_idx, drop_fp = None, -1, None
+    for i, p in enumerate(body_paras):
+        fp = _frame_pr(p)
+        if fp is not None and fp.get(qn('w:dropCap')):
+            drop_para, drop_idx, drop_fp = p, i, fp
+            break
+    drop_text = (drop_para.text or '').strip() if drop_para is not None else ''
+    drop_lines = _int_attr(drop_fp, 'w:lines') if drop_fp is not None else None
+    drop_next = ((body_paras[drop_idx + 1].text or '').strip()
+                 if 0 <= drop_idx < len(body_paras) - 1 else '')
+    # 下沉框自身的行距/段后由下沉版式决定，且下沉首字必然放大：这些段落在
+    # “正文段后6磅/1.1倍行距/小四”等项里按办公软件口径排除。
+    drop_only = {drop_idx} if drop_idx >= 0 else set()
+    # 环绕在下沉字右侧的行（下沉行数范围内）由下沉版式接管其首行缩进，
+    # 故“首行缩进2字符”一项排除下沉框及其后 lines 行。
+    drop_wrapped = set(drop_only)
+    if drop_idx >= 0:
+        for k in range(1, (drop_lines or 2) + 1):
+            drop_wrapped.add(drop_idx + k)
+
+    def _normal_runs(para):
+        """段落内“普通正文 run”：含中文、且不属于 3 处替换文字的 run。"""
+        tids = _term_run_ids(para)
+        return [r for i, r in enumerate(para.runs)
+                if ZH_RE.search(r.text or '') and i not in tids]
+
+    # ========== 维度1：可用与可修改性 ==========
+    # 严格对齐细则：本维度只判定“交付文件为 1 个可正常打开的 Word 文档（.docx）”这一点。
+    # 与办公软件对齐：能被 OPC/WordprocessingML 解析器成功打开即视为可正常打开；
+    #   打开失败（文件损坏、需修复、格式非法）由 evaluate 兜底为 status="error"、
+    #   dim1_pass=False、总分 0。走到这里说明文档已成功打开。
+    result["dim1_pass"] = True
+    result["dim1_reason"] = "交付文件为可正常打开的 Word 文档（.docx）"
+
+    # ========== 维度2：完成度评分 ==========
+
+    # +3：首行标题“智能软件工程系简介”中文字体为隶书
+    # 严格对齐细则，仅踩细则写出的点：
+    #   ① 判定对象为首行标题段落中承载中文的所有 run
+    #   ② 中文字体（东亚字体）为隶书
+    # 与办公软件对齐：沿 w:rFonts/@w:eastAsia（含主题字体引用）→ 段落样式链 →
+    #   docDefaults 解析实际生效的中文字体，即打开 Word/WPS 看到的效果。
+    title_runs = [r for r in title_para.runs if ZH_RE.search(r.text or '')] if title_para else []
+    lishu_ok = bool(title_runs) and all(
+        (_resolve_effective_eastasia(doc, r) or '') and
+        any(k in (_resolve_effective_eastasia(doc, r) or '') for k in LISHU_KEYS)
+        for r in title_runs)
+    if lishu_ok:
+        results.append(f"+3：首行标题中文字体为隶书（{_resolve_effective_eastasia(doc, title_runs[0])}）")
+    else:
+        results.append("+0：首行标题中文字体为隶书")
+
+    # +3：首行标题字号为二号（22磅 / sz=44）、设置加粗、字体颜色为蓝色
+    # 严格对齐细则三点：① 字号二号（22磅，容差21.5-22.5）② 加粗 ③ 蓝色系
+    # 与办公软件对齐：w:sz（半磅）、w:b、w:color/@w:val。
+    t_sizes = [_resolve_effective_size_pt(doc, r) for r in title_runs]
+    size2_ok = bool(t_sizes) and all(s is not None and 21.5 <= s <= 22.5 for s in t_sizes)
+    bold_ok = bool(title_runs) and all(_resolve_effective_toggle(doc, r, 'w:b') for r in title_runs)
+    blue_ok = bool(title_runs) and all(_is_blue(_resolve_effective_color(doc, r)) for r in title_runs)
+    if size2_ok and bold_ok and blue_ok:
+        results.append(
+            f"+3：首行标题二号/加粗/蓝色（{t_sizes[0]}磅、加粗、"
+            f"{_resolve_effective_color(doc, title_runs[0])}）")
+    else:
+        results.append("+0：首行标题二号/加粗/蓝色")
+
+    # +5：首行标题添加“发光”文本效果，发光颜色为橄榄色（强调文字颜色3）、半径7磅
+    # 严格对齐细则三点：① 有发光效果 ② 颜色为橄榄色/强调文字颜色3
+    #   ③ 发光半径7磅（w14:glow/@w14:rad = 88900 EMU，容差 6.5-7.5磅）
+    # 与办公软件对齐：Word 2010 文本效果命名空间 w14 下的 w14:glow 及其子颜色节点
+    #   （srgbClr 直接给色值、schemeClr accent3 即“强调文字颜色3”）。
+    glow_ok = False
+    glow_detail = ''
+    for r in (title_runs or []):
+        rPr = _run_rpr(r)
+        glow = rPr.find('{%s}glow' % W14_NS) if rPr is not None else None
+        if glow is None:
+            glow_ok = False
+            break
+        rad = _int_attr(glow, '{%s}rad' % W14_NS)
+        rad_ok = rad is not None and 82550 <= rad <= 95250
+        srgb = glow.find('{%s}srgbClr' % W14_NS)
+        scheme = glow.find('{%s}schemeClr' % W14_NS)
+        cval = srgb.get('{%s}val' % W14_NS) if srgb is not None else None
+        sval = scheme.get('{%s}val' % W14_NS) if scheme is not None else None
+        color_ok = _is_olive(cval) or (sval or '').lower() in ('accent3',)
+        glow_ok = bool(rad_ok and color_ok)
+        glow_detail = f"rad={rad}、色={cval or sval}"
+        if not glow_ok:
+            break
+    if glow_ok:
+        results.append(f"+5：首行标题发光效果（橄榄色/强调文字颜色3、7磅；{glow_detail}）")
+    else:
+        results.append("+0：首行标题发光效果（橄榄色/强调文字颜色3、7磅）")
+
+    # +3：首行标题添加“阴影”文本效果且方向为向上偏移（阴影角度270°、w14:dir=16200000）
+    # 严格对齐细则两点：① 有阴影效果 ② 方向为向上偏移（dir≈16200000，即270°；
+    #   偏移距离约3磅、dist>0），向下/向左右等其他方向不得分。
+    # 与办公软件对齐：w14:shadow/@w14:dir（1/60000 度）与 @w14:dist（EMU）。
+    shadow_ok = False
+    shadow_detail = ''
+    for r in (title_runs or []):
+        rPr = _run_rpr(r)
+        sh = rPr.find('{%s}shadow' % W14_NS) if rPr is not None else None
+        if sh is None:
+            shadow_ok = False
+            break
+        d = _int_attr(sh, '{%s}dir' % W14_NS)
+        dist = _int_attr(sh, '{%s}dist' % W14_NS)
+        shadow_ok = (d is not None and 15900000 <= d <= 16500000
+                     and dist is not None and dist > 0)
+        shadow_detail = f"dir={d}、dist={dist}"
+        if not shadow_ok:
+            break
+    if shadow_ok:
+        results.append(f"+3：首行标题阴影效果为向上偏移（{shadow_detail}）")
+    else:
+        results.append("+0：首行标题阴影效果为向上偏移")
+
+    # +1：首行标题段落为居中对齐
+    # 与办公软件对齐：段落 w:jc/@w:val = center（含样式链继承）。
+    t_jc = _para_prop(doc, title_para, 'w:jc', 'w:val') if title_para is not None else None
+    if t_jc == 'center' or (title_para is not None
+                            and title_para.alignment == WD_ALIGN_PARAGRAPH.CENTER):
+        results.append("+1：首行标题段落居中对齐（w:jc=center）")
+    else:
+        results.append("+0：首行标题段落居中对齐")
+
+    # +3：首行标题段落段后间距为20磅（w:after=400）
+    # 与办公软件对齐：w:spacing/@w:after 为 twips（20磅 = 400 twips，容差 390-410）。
+    t_after = _para_prop_int(doc, title_para, 'w:spacing', 'w:after') if title_para is not None else None
+    if t_after is not None and 390 <= t_after <= 410:
+        results.append(f"+3：首行标题段后间距20磅（w:after={t_after}）")
+    else:
+        results.append("+0：首行标题段后间距20磅")
+
+    # +3：正文所有段落（第二段至末段，含5行专业名称）中文字体为楷体、字号为小四
+    # 严格对齐细则两点：① 中文字体楷体 ② 字号小四（12磅，容差11.5-12.5）
+    # 判定范围按办公软件口径：正文所有段落中承载中文的 run，排除 3 处
+    #   “智能软件工程系”（细则另有宋体四号要求）；下沉首字必然被放大，故其
+    #   字号不纳入本项（字体仍需为楷体）。
+    kai_bad, size4_bad = [], []
+    for i, p in enumerate(body_paras):
+        for r in _normal_runs(p):
+            ea = _resolve_effective_eastasia(doc, r) or ''
+            if not any(k in ea for k in KAITI_KEYS):
+                kai_bad.append(f"第{i + 2}段“{(r.text or '')[:6]}”={ea or '未设定'}")
+            if i in drop_only:
+                continue
+            sz = _resolve_effective_size_pt(doc, r)
+            if sz is None or not (11.5 <= sz <= 12.5):
+                size4_bad.append(f"第{i + 2}段={sz}磅")
+    if body_paras and not kai_bad and not size4_bad:
+        results.append(f"+3：正文所有段落楷体小四（共{len(body_paras)}段）")
+    else:
+        results.append("+0：正文所有段落楷体小四")
+
+    # +3：正文所有段落设置首行缩进2字符（firstLineChars=200，非空格或制表符模拟）
+    # 严格对齐细则三点：① 首行缩进 ② 2字符 ③ 非空格/制表符模拟
+    # 与办公软件对齐：w:ind/@w:firstLineChars（1/100 字符，Word“2字符”的原生存储）
+    #   或 @w:firstLine（twips）÷ 段落字号折算 2 字符；并检查段首无空格/Tab 充数。
+    ind_bad = []
+    for i, p in enumerate(body_paras):
+        if i in drop_wrapped:
+            continue        # 下沉框及其环绕行的首行缩进由下沉版式接管
+        chars = _para_prop_int(doc, p, 'w:ind', 'w:firstLineChars')
+        first = _para_prop_int(doc, p, 'w:ind', 'w:firstLine')
+        ok = chars is not None and 180 <= chars <= 220
+        if not ok and first:
+            runs = _normal_runs(p)
+            base = None
+            for r in runs:
+                base = _resolve_effective_size_pt(doc, r)
+                if base:
+                    break
+            base = base or 12.0
+            ok = 1.8 <= (first / 20.0) / base <= 2.2
+        raw = p.text or ''
+        if raw[:2] in ('  ', '　　', '\t\t') or raw.startswith('\t'):
+            ok = False      # 用空格/制表符模拟缩进不算
+        if not ok:
+            ind_bad.append(f"第{i + 2}段(firstLineChars={chars}, firstLine={first})")
+    if body_paras and not ind_bad:
+        results.append("+3：正文所有段落首行缩进2字符（firstLineChars=200）")
+    else:
+        results.append("+0：正文所有段落首行缩进2字符")
+
+    # +1：正文所有段落段后间距为6磅（w:after=120）
+    # 与办公软件对齐：w:spacing/@w:after（twips，6磅=120）；下沉框段落的段后由
+    #   下沉版式决定，不纳入判定。
+    after_bad = []
+    for i, p in enumerate(body_paras):
+        if i in drop_only:
+            continue
+        after = _para_prop_int(doc, p, 'w:spacing', 'w:after')
+        if after is None or not (110 <= after <= 130):
+            after_bad.append(f"第{i + 2}段={after}")
+    if body_paras and not after_bad:
+        results.append("+1：正文所有段落段后间距6磅（w:after=120）")
+    else:
+        results.append("+0：正文所有段落段后间距6磅")
+
+    # +3：正文所有段落行距为1.1倍行距（w:line=264 且 lineRule=auto）
+    # 与办公软件对齐：w:spacing/@w:line=264（240×1.1）且 @w:lineRule=auto；
+    #   下沉框段落的行距为下沉版式专用（lineRule=exact），不纳入判定。
+    line_bad = []
+    for i, p in enumerate(body_paras):
+        if i in drop_only:
+            continue
+        line = _para_prop_int(doc, p, 'w:spacing', 'w:line')
+        rule = _para_prop(doc, p, 'w:spacing', 'w:lineRule')
+        if line is None or not (258 <= line <= 270) or rule != 'auto':
+            line_bad.append(f"第{i + 2}段(line={line}, rule={rule})")
+    if body_paras and not line_bad:
+        results.append("+3：正文所有段落1.1倍行距（w:line=264、lineRule=auto）")
+    else:
+        results.append("+0：正文所有段落1.1倍行距")
+
+    # +3：“专业设置如下：”已从“…科学设置专业。”所在段落中拆分为独立段落，
+    #      且“…科学设置专业。”仍完整留在上一段落末尾，文字无丢失、无重复
+    # 与办公软件对齐：办公软件里看到的是两个独立段落；若已做悬挂首字下沉，
+    #   该行会被 Word 拆成“专”（下沉框段）+“业设置如下：”（环绕段）两段，
+    #   两种落地形态都算“已独立成段”。
+    split_idx = -1
+    for i, t in enumerate(para_texts):
+        if t == SPLIT_LINE:
+            split_idx = i
+            break
+        if t == DROP_CHAR and i + 1 < len(para_texts) and para_texts[i + 1] == SPLIT_LINE[1:]:
+            split_idx = i
+            break
+    prev_ok = split_idx > 0 and para_texts[split_idx - 1].endswith(PREV_TAIL)
+    once_ok = flat_all.count(SPLIT_LINE) == 1 and flat_all.count(PREV_TAIL) == 1
+    if split_idx > 0 and prev_ok and once_ok:
+        results.append("+3：“专业设置如下：”已独立成段且“…科学设置专业。”完整留在上一段末尾")
+    else:
+        results.append("+0：“专业设置如下：”已独立成段且“…科学设置专业。”完整留在上一段末尾")
+
+    # +5：“专业设置如下：”的首字“专”设置“首字下沉”，下沉方式为“悬挂”
+    # 严格对齐细则三点：① 有首字下沉 ② 方式为悬挂（framePr dropCap="margin"，
+    #   即单字置于版心左侧页边距一侧）③ 仅该单字放大下沉、后续“业设置如下：”
+    #   以小四楷体环绕其右侧正常显示。
+    # 与办公软件对齐：w:pPr/w:framePr/@w:dropCap=margin，下沉框段落只含 1 个字符，
+    #   紧随其后的段落承接该行余下文字。
+    hang_ok = (drop_fp is not None
+               and drop_fp.get(qn('w:dropCap')) == 'margin'
+               and drop_text == DROP_CHAR
+               and drop_next.startswith(SPLIT_LINE[1:]))
+    if hang_ok:
+        results.append("+5：首字“专”首字下沉且方式为悬挂（dropCap=margin，仅单字下沉）")
+    else:
+        results.append("+0：首字“专”首字下沉且方式为悬挂")
+
+    # +5：首字下沉的下沉行数为2行（下沉字高度约等于两行正文高度，字号约36-40磅）
+    # 与办公软件对齐：w:framePr/@w:lines=2，且下沉首字 run 的 w:sz 被放大到
+    #   约 36-40磅（sz≈72-80），即版面上实际占两行高。
+    drop_size = None
+    if drop_para is not None:
+        sizes = [_resolve_effective_size_pt(doc, r) for r in drop_para.runs
+                 if ZH_RE.search(r.text or '')]
+        sizes = [s for s in sizes if s]
+        drop_size = max(sizes) if sizes else None
+    if drop_lines == 2 and drop_size is not None and 35.0 <= drop_size <= 41.0:
+        results.append(f"+5：首字下沉行数为2行（w:lines=2、下沉字{drop_size}磅）")
+    else:
+        results.append("+0：首字下沉行数为2行")
+
+    # +3：首字下沉的“距正文”距离为0.3厘米（约170 twips，hSpace=170）
+    # 与办公软件对齐：w:framePr/@w:hSpace（twips；0.3厘米≈170，容差150-190）。
+    hspace = _int_attr(drop_fp, 'w:hSpace') if drop_fp is not None else None
+    if hspace is not None and 150 <= hspace <= 190:
+        results.append(f"+3：首字下沉距正文0.3厘米（hSpace={hspace}）")
+    else:
+        results.append("+0：首字下沉距正文0.3厘米")
+
+    # +3：全文4处“智能工程系”（首行标题内、第二段段首、第三段段首、末段
+    #      “面向岗位，面向技能，面向未来，”之后）均已改为“智能软件工程系”，
+    #      无遗漏、无重复插入，且未误改“道路安全与智能运维”等其他含“智能”的文字
+    # 与办公软件对齐：按可见文本判定（全文去空白后统计出现次数与位置锚点）。
+    cnt_new = flat_all.count(NEW_TERM)
+    cnt_old = flat_all.count(OLD_TERM)
+    title_ok = bool(para_texts) and para_texts[0] == TITLE_TEXT
+    head_ok = sum(1 for t in para_texts[1:] if t.startswith(NEW_TERM)) >= 2
+    tail_ok = (LAST_ANCHOR + NEW_TERM) in flat_all
+    other_ok = MAJORS[2] in flat_all      # “道路安全与智能运维”未被误改
+    if cnt_new == 4 and cnt_old == 0 and title_ok and head_ok and tail_ok and other_ok:
+        results.append("+3：全文4处均已改为“智能软件工程系”（标题/第二段首/第三段首/末段中部）")
+    else:
+        results.append("+0：全文4处均已改为“智能软件工程系”")
+
+    # 3 处正文替换文字的 run 分组（下面 3 条细则复用）
+    term_groups = []
+    for p in body_paras:
+        term_groups.extend(_runs_covering(p, NEW_TERM))
+
+    # +3：正文3处“智能软件工程系”中文字体为宋体
+    # 与办公软件对齐：沿 w:rFonts/@w:eastAsia 或主题引用（minorEastAsia→theme1.xml
+    #   中 Hans 字体）解析实际生效的中文字体。
+    song_ok = len(term_groups) == 3
+    song_detail = ''
+    for grp in term_groups:
+        for r in grp:
+            ea = _resolve_effective_eastasia(doc, r) or ''
+            song_detail = ea or '未设定'
+            if not any(k in ea for k in STRICT_SONGTI):
+                song_ok = False
+    if song_ok:
+        results.append(f"+3：正文3处“智能软件工程系”中文字体为宋体（{song_detail}）")
+    else:
+        results.append("+0：正文3处“智能软件工程系”中文字体为宋体")
+
+    # +3：上述3处字号为四号（14磅 / sz=28）、同时设置加粗与倾斜、字体颜色为绿色
+    # 与办公软件对齐：w:sz、w:b、w:i、w:color/@w:val（绿色系，含 9BBB59 强调色3）。
+    fmt_ok = len(term_groups) == 3
+    fmt_detail = ''
+    for grp in term_groups:
+        for r in grp:
+            sz = _resolve_effective_size_pt(doc, r)
+            b = _resolve_effective_toggle(doc, r, 'w:b')
+            it = _resolve_effective_toggle(doc, r, 'w:i')
+            col = _resolve_effective_color(doc, r)
+            fmt_detail = f"{sz}磅、加粗={b}、倾斜={it}、{col}"
+            if not (sz is not None and 13.5 <= sz <= 14.5 and b and it and _is_green(col)):
+                fmt_ok = False
+    if fmt_ok:
+        results.append(f"+3：正文3处“智能软件工程系”四号/加粗倾斜/绿色（{fmt_detail}）")
+    else:
+        results.append("+0：正文3处“智能软件工程系”四号/加粗倾斜/绿色")
+
+    # +3：上述3处添加着重号（每字下方一个小圆点，w:em="dot"），而非下划线或删除线
+    # 与办公软件对齐：w:rPr/w:em/@w:val=dot（“着重号”），w:u/w:strike 不算。
+    em_ok = len(term_groups) == 3
+    for grp in term_groups:
+        for r in grp:
+            rPr = _run_rpr(r)
+            em = rPr.find(qn('w:em')) if rPr is not None else None
+            if em is None or (em.get(qn('w:val')) or '') != 'dot':
+                em_ok = False
+    if em_ok:
+        results.append("+3：正文3处“智能软件工程系”添加着重号（w:em=dot）")
+    else:
+        results.append("+0：正文3处“智能软件工程系”添加着重号")
+
+    # ---- 水印相关（下面 4 条加分项 + 1 条减分项复用） ----
+    wms = _collect_watermarks(doc)
+    pic_wms = [w for w in wms if not w['is_text']]
+    txt_wms = [w for w in wms if w['is_text']]
+    wm = None
+    for w in pic_wms:
+        if w['behind']:
+            wm = w
+            break
+    if wm is None and pic_wms:
+        wm = pic_wms[0]
+
+    # +5：给定图片以水印形式置于文档背景（插入页眉并设为衬于文字下方），
+    #      正文全部文字显示在图片之上且可正常选中编辑
+    # 与办公软件对齐：图片位于页眉部件中，且新式 wp:anchor/@behindDoc=1 或
+    #   旧式 v:shape 的 z-index 为负 —— 即 Word 的“衬于文字下方”。
+    if wm is not None and wm['behind']:
+        results.append(f"+5：图片以水印形式衬于文字下方置于页眉背景（{wm['kind']}）")
+    else:
+        results.append("+0：图片以水印形式衬于文字下方置于页眉背景")
+
+    # +5：水印图片应用“冲蚀”效果（亮度+70%、对比度-70%）
+    # 与办公软件对齐：新式 a:blip/a:lum@bright≈70000 且 @contrast≈-70000；
+    #   旧式 v:imagedata 的 gain/blacklevel 冲蚀参数。把冲蚀预先烘进位图像素
+    #   （文档内无冲蚀参数）不算，因为办公软件里图片格式仍显示为未冲蚀。
+    if wm is not None and wm['wash']:
+        results.append("+5：水印图片应用“冲蚀”效果（亮度+70%、对比度-70%）")
+    else:
+        results.append("+0：水印图片应用“冲蚀”效果")
+
+    # +5：水印缩放比例为100%（按所嵌位图像素尺寸1:1呈现，96DPI折算显示宽度≥30厘米、
+    #      高度≥21厘米，纵向铺满整页版面）；被等比缩小到只覆盖页面中部一条横带不达标
+    # 与办公软件对齐：显示尺寸取 wp:extent（EMU）或 v:shape style 的 width/height；
+    #   位图 100% 尺寸 = 像素数 ÷ 96 × 914400 EMU。
+    scale_ok = False
+    scale_detail = ''
+    if wm is not None and wm['cx'] and wm['cy'] and wm['px_w'] and wm['px_h']:
+        nat_cx = wm['px_w'] / PX_DPI * 914400.0
+        nat_cy = wm['px_h'] / PX_DPI * 914400.0
+        ratio_w = wm['cx'] / nat_cx
+        ratio_h = wm['cy'] / nat_cy
+        scale_detail = (f"{wm['cx'] / EMU_PER_CM:.1f}×{wm['cy'] / EMU_PER_CM:.1f}厘米、"
+                        f"缩放{ratio_w * 100:.0f}%")
+        scale_ok = (0.95 <= ratio_w <= 1.05 and 0.95 <= ratio_h <= 1.05
+                    and wm['cx'] >= 30 * EMU_PER_CM and wm['cy'] >= 21 * EMU_PER_CM)
+    if scale_ok:
+        results.append(f"+5：水印缩放比例100%且纵向铺满整页（{scale_detail}）")
+    else:
+        results.append("+0：水印缩放比例100%且纵向铺满整页")
+
+    # +1：水印图片在页面上水平居中且垂直居中放置，且全文仅插入1次、未重复叠放多张图片
+    # 与办公软件对齐：新式 wp:positionH/positionV 的 wp:align=center；
+    #   旧式 mso-position-horizontal/vertical:center；并统计页眉页脚中图片水印总数。
+    if wm is not None and wm['hcenter'] and wm['vcenter'] and len(pic_wms) == 1:
+        results.append("+1：水印水平垂直居中且全文仅插入1张")
+    else:
+        results.append("+0：水印水平垂直居中且全文仅插入1张")
+
+    # ---- 以下为减分项：命中即扣（对应细则中的 -N 条目） ----
+
+    # -3：除首行标题及3处“智能软件工程系”外，正文各段落文字颜色不为深灰色（333333）
+    # 与办公软件对齐：沿继承链解析 w:color/@w:val；未设定或 auto 即渲染为黑色，同样计入。
+    color_bad = []
+    for i, p in enumerate(body_paras):
+        for r in _normal_runs(p):
+            col = _resolve_effective_color(doc, r)
+            if (col or '') != BODY_COLOR:
+                color_bad.append(f"第{i + 2}段={col or '未设定'}")
+    if color_bad:
+        results.append(f"-3：正文文字颜色被改为非深灰333333（{color_bad[0]}，共{len(color_bad)}处）")
+    else:
+        results.append("-0：正文各段落文字颜色保持深灰333333")
+
+    # -3：除3处“智能软件工程系”外，正文中出现未要求的加粗、倾斜、下划线、着重号、
+    #      删除线、突出显示或字符底纹
+    # 与办公软件对齐：w:b/w:i（开关型，val=0 为关不算）、w:u（val 非 none）、
+    #   w:em、w:strike/w:dstrike、w:highlight（非 none）、w:shd（底纹填充非 auto）。
+    deco_bad = []
+    for i, p in enumerate(body_paras):
+        for r in _normal_runs(p):
+            rPr = _run_rpr(r)
+            if rPr is None:
+                continue
+            hits = []
+            if _toggle_on(rPr.find(qn('w:b'))):
+                hits.append('加粗')
+            if _toggle_on(rPr.find(qn('w:i'))):
+                hits.append('倾斜')
+            u = rPr.find(qn('w:u'))
+            if u is not None and (u.get(qn('w:val')) or 'single') != 'none':
+                hits.append('下划线')
+            em = rPr.find(qn('w:em'))
+            if em is not None and (em.get(qn('w:val')) or 'dot') != 'none':
+                hits.append('着重号')
+            if _toggle_on(rPr.find(qn('w:strike'))) or _toggle_on(rPr.find(qn('w:dstrike'))):
+                hits.append('删除线')
+            hl = rPr.find(qn('w:highlight'))
+            if hl is not None and (hl.get(qn('w:val')) or 'none') != 'none':
+                hits.append('突出显示')
+            shd = rPr.find(qn('w:shd'))
+            if shd is not None:
+                fill = (shd.get(qn('w:fill')) or 'auto').upper()
+                val = (shd.get(qn('w:val')) or 'clear').lower()
+                if fill not in ('AUTO', 'FFFFFF') or val not in ('clear', 'nil'):
+                    hits.append('字符底纹')
+            if hits:
+                deco_bad.append(f"第{i + 2}段{'/'.join(hits)}")
+    if deco_bad:
+        results.append(f"-3：正文出现未要求的字符格式（{deco_bad[0]}，共{len(deco_bad)}处）")
+    else:
+        results.append("-0：正文未出现未要求的加粗/倾斜/下划线/着重号/删除线/突出显示/底纹")
+
+    # -3：正文各段落段前间距不为0磅
+    # 与办公软件对齐：w:spacing/@w:before（twips），未设定按 0 处理。
+    before_bad = []
+    for i, p in enumerate(body_paras):
+        before = _para_prop_int(doc, p, 'w:spacing', 'w:before', 0) or 0
+        if before != 0:
+            before_bad.append(f"第{i + 2}段={before / 20.0:.1f}磅")
+    if before_bad:
+        results.append(f"-3：正文段前间距非0磅（{before_bad[0]}，共{len(before_bad)}段）")
+    else:
+        results.append("-0：正文各段落段前间距为0磅")
+
+    # -1：除首行标题居中外，其余各段落（含5行专业名称）对齐方式不为两端对齐
+    # 与办公软件对齐：w:jc/@w:val=both（含样式链继承）。
+    jc_bad = []
+    for i, p in enumerate(body_paras):
+        jc = _para_prop(doc, p, 'w:jc', 'w:val')
+        if jc != 'both':
+            jc_bad.append(f"第{i + 2}段={jc or '未设定(左对齐)'}")
+    if jc_bad:
+        results.append(f"-1：正文段落对齐方式非两端对齐（{jc_bad[0]}，共{len(jc_bad)}段）")
+    else:
+        results.append("-0：除标题居中外其余段落均为两端对齐")
+
+    # -1：页面纸张不为A4纵向（11906×16838 twips），或页边距不为上下2.54厘米、
+    #      左右约3.17厘米
+    # 与办公软件对齐：w:sectPr/w:pgSz（@w:w/@w:h/@w:orient）与 w:pgMar；
+    #   未写 w:pgMar 视为未改动页面设置，不计扣分。
+    page_bad = []
+    sectPrs = body_el.findall(qn('w:sectPr'))
+    sect = sectPrs[-1] if sectPrs else None
+    pgSz = sect.find(qn('w:pgSz')) if sect is not None else None
+    if pgSz is None:
+        page_bad.append('未设置纸张')
+    else:
+        w = _int_attr(pgSz, 'w:w')
+        h = _int_attr(pgSz, 'w:h')
+        orient = pgSz.get(qn('w:orient'))
+        if not (w and h and abs(w - 11906) <= 60 and abs(h - 16838) <= 60):
+            page_bad.append(f'纸张={w}×{h}')
+        if orient == 'landscape':
+            page_bad.append('横向')
+    pgMar = sect.find(qn('w:pgMar')) if sect is not None else None
+    if pgMar is not None:
+        top = _int_attr(pgMar, 'w:top')
+        bottom = _int_attr(pgMar, 'w:bottom')
+        left = _int_attr(pgMar, 'w:left')
+        right = _int_attr(pgMar, 'w:right')
+        for name, got, want, tol in (('上', top, 1440, 40), ('下', bottom, 1440, 40),
+                                     ('左', left, 1797, 60), ('右', right, 1797, 60)):
+            if got is None or abs(got - want) > tol:
+                page_bad.append(f'{name}边距={got}')
+    if page_bad:
+        results.append(f"-1：页面设置被改（{'、'.join(page_bad)}）")
+    else:
+        results.append("-0：页面为A4纵向且页边距为上下2.54厘米、左右约3.17厘米")
+
+    # -3：“计算机应用技术”“软件开发技术”“道路安全与智能运维”“城市轨道交通运维”
+    #      “数字媒体艺术设计”未各占独立一行、先后顺序被调整，或被合并进相邻段落
+    # 与办公软件对齐：5 个专业名称须各自单独成段（段落文本恰好等于该名称）、
+    #   且按给定先后顺序连续排列。
+    major_idx = []
+    for m in MAJORS:
+        major_idx.append(para_texts.index(m) if m in para_texts else -1)
+    majors_ok = (all(i >= 0 for i in major_idx)
+                 and major_idx == sorted(major_idx)
+                 and major_idx[-1] - major_idx[0] == len(MAJORS) - 1)
+    if majors_ok:
+        results.append("-0：5行专业名称各占独立一行且先后顺序未变")
+    else:
+        results.append(f"-3：5行专业名称未各占独立一行或顺序被调整（段落序号{major_idx}）")
+
+    # -3：正文数据被改写（教师/职称/面积/实训室/机房/实训基地等数字）
+    # 与办公软件对齐：按可见文本逐条核对细则点名的数据串是否原样存在。
+    data_bad = [k for k in DATA_KEYS if k not in flat_all]
+    if data_bad:
+        results.append(f"-3：正文数据被改写（缺失{'、'.join(data_bad)}）")
+    else:
+        results.append("-0：正文各项数据未被改写")
+
+    # -1：机构名称被改写删除，或中文引号内的固定表述被改写、引号被替换为英文引号
+    # 与办公软件对齐：按可见文本核对机构名与带中文引号的固定表述是否原样存在。
+    name_bad = [k for k in NAME_KEYS if k not in flat_all]
+    if name_bad:
+        results.append(f"-1：机构名称或中文引号内表述被改写（缺失{'、'.join(name_bad)}）")
+    else:
+        results.append("-0：机构名称与中文引号内固定表述均未被改写")
+
+    # -1：文档中新增指令未要求的内容，如“专业介绍”“办学理念”等小标题、自动编号、
+    #      项目符号、分隔线、总结语、空白段落、空行、分页符、分节符，或末段之后
+    #      产生多余空白页
+    # 与办公软件对齐：空段落（既无文字也无图片的 w:p）、w:numPr（自动编号/项目符号）、
+    #   w:br@type=page 与 pageBreakBefore（分页符）、段落内 w:sectPr（分节符）、
+    #   w:pBdr（分隔线），以及出现了应有内容之外的新文字段落。
+    extra = []
+    for p in all_paras:
+        if (p.text or '').strip():
+            continue
+        if p._element.findall('.//' + qn('w:drawing')) or p._element.findall('.//' + qn('w:pict')):
+            continue
+        extra.append('空段落/空行')
+        break
+    if body_el.findall('.//' + qn('w:numPr')):
+        extra.append('自动编号/项目符号')
+    if any((br.get(qn('w:type')) or '') == 'page' for br in body_el.findall('.//' + qn('w:br'))):
+        extra.append('分页符')
+    for p in all_paras:
+        pPr = _pPr(p)
+        if pPr is None:
+            continue
+        if pPr.find(qn('w:sectPr')) is not None:
+            extra.append('分节符')
+            break
+    for p in all_paras:
+        pPr = _pPr(p)
+        if pPr is not None and _visible_border(pPr.find(qn('w:pBdr'))):
+            extra.append('段落分隔线/边框')
+            break
+    for t in para_texts:
+        flat = re.sub(r'\s+', '', t)
+        if flat and flat not in _EXPECTED_NEW and flat not in _EXPECTED_OLD:
+            extra.append(f'新增文字“{flat[:12]}”')
+            break
+    if extra:
+        results.append(f"-1：新增了指令未要求的内容（{'、'.join(extra)}）")
+    else:
+        results.append("-0：未新增小标题/编号/空段/分页符等指令未要求的内容")
+
+    # -1：页眉或页脚中出现除水印图片以外的文字、页码、横线或边框
+    # 与办公软件对齐：遍历页眉/页脚部件，检查是否有可见 w:t 文字、PAGE 域（页码），
+    #   或段落 w:pBdr 可见边框（页眉横线）。
+    hf_bad = []
+    for part in _hf_parts(doc):
+        root = getattr(part, 'element', None)
+        if root is None:
+            continue
+        for t in root.findall('.//' + qn('w:t')):
+            if (t.text or '').strip():
+                hf_bad.append(f"文字“{(t.text or '').strip()[:8]}”")
+                break
+        for it in root.findall('.//' + qn('w:instrText')):
+            if 'PAGE' in (it.text or '').upper():
+                hf_bad.append('页码域')
+                break
+        for pPr in root.findall('.//' + qn('w:pPr')):
+            if _visible_border(pPr.find(qn('w:pBdr'))):
+                hf_bad.append('页眉横线/边框')
+                break
+    if hf_bad:
+        results.append(f"-1：页眉页脚出现除水印图片以外的内容（{'、'.join(hf_bad[:3])}）")
+    else:
+        results.append("-0：页眉页脚除水印图片外无文字/页码/横线/边框")
+
+    # -3：将“专业设置如下：”整行文字置入首字下沉框内，导致该行以超大字号单独占据版面
+    # 与办公软件对齐：带 w:framePr@dropCap 的段落内只应保留 1 个下沉字符，
+    #   其余文字须留在紧随其后的正文段落中。
+    drop_flat = re.sub(r'\s+', '', drop_text)
+    if drop_fp is not None and len(drop_flat) > 1:
+        results.append("-3：整行文字被置入首字下沉框（框内文字“%s”）" % drop_flat[:10])
+    else:
+        results.append("-0：首字下沉框内未置入整行文字")
+
+    # -3：正文文字被转为图片、艺术字、文本框或表格承载，导致文字不可编辑
+    # 与办公软件对齐：正文中出现 w:tbl（表格）、w:txbxContent（文本框）或
+    #   v:textpath（艺术字）且其中含中文字符，即判定正文被改用其他载体承载。
+    carrier = []
+    for tbl in body_el.findall('.//' + qn('w:tbl')):
+        if ZH_RE.search(''.join(t.text or '' for t in tbl.findall('.//' + qn('w:t')))):
+            carrier.append('表格')
+            break
+    for tbx in body_el.findall('.//' + qn('w:txbxContent')):
+        if ZH_RE.search(''.join(t.text or '' for t in tbx.findall('.//' + qn('w:t')))):
+            carrier.append('文本框')
+            break
+    for tp in body_el.findall('.//{%s}textpath' % V_NS):
+        if ZH_RE.search(tp.get('string') or ''):
+            carrier.append('艺术字')
+            break
+    if carrier:
+        results.append(f"-3：正文文字被其他载体承载（{'、'.join(carrier)}）")
+    else:
+        results.append("-0：正文文字未被图片/艺术字/文本框/表格承载")
+
+    # -3：水印图片被拉伸变形（长宽比与图片自身长宽比不一致），或被替换为其他图片、文字水印
+    # 与办公软件对齐：比较显示尺寸长宽比（wp:extent 或 v:shape@style 的 width/height）
+    #   与位图像素长宽比，偏差超过 5% 判为变形；出现 v:textpath 判为文字水印。
+    wm_bad = []
+    for wm in wms:
+        if wm['is_text']:
+            wm_bad.append('被替换为文字水印')
+            continue
+        if wm['cx'] and wm['cy'] and wm['px_w'] and wm['px_h']:
+            shown = float(wm['cx']) / float(wm['cy'])
+            native = float(wm['px_w']) / float(wm['px_h'])
+            if native > 0 and abs(shown - native) / native > 0.05:
+                wm_bad.append(f'长宽比失真（显示{shown:.3f} vs 图片{native:.3f}）')
+    if wm_bad:
+        results.append(f"-3：水印被拉伸变形或被替换（{'；'.join(wm_bad[:2])}）")
+    else:
+        results.append("-0：水印保持图片自身长宽比且未被替换")
+
+    # -1：正文文字被添加发光、阴影、映像、三维等首行标题以外的文本效果
+    # 与办公软件对齐：正文段落 run 的 w:rPr 下不应出现 w14:glow / w14:shadow /
+    #   w14:reflection / w14:scene3d / w14:props3d / w14:textOutline；
+    #   w14:textFill 仅为文字填充色，不属于发光/阴影类效果，不计入。
+    EFFECT_TAGS = ('glow', 'shadow', 'reflection', 'scene3d', 'props3d', 'textOutline')
+    eff_bad = []
+    for idx, para in enumerate(all_paras):
+        if title_para is not None and para._element is title_para._element:
+            continue
+        for run in para.runs:
+            rpr = _run_rpr(run)
+            if rpr is None:
+                continue
+            for name in EFFECT_TAGS:
+                if rpr.find('{%s}%s' % (W14_NS, name)) is not None:
+                    eff_bad.append(f'第{idx + 1}段“{name}”')
+                    break
+            if eff_bad:
+                break
+        if eff_bad:
+            break
+    if eff_bad:
+        results.append(f"-1：正文文字被添加标题以外的文本效果（{'、'.join(eff_bad[:2])}）")
+    else:
+        results.append("-0：正文文字未被添加发光/阴影/映像/三维等文本效果")
+
+    # ---------------------------------------------------------------- 汇总
+    # 按接口统一约定：results 按 _MAX_DELTAS_ORDER 的顺序逐条位置对齐反解析。
+    # 加分项 "+N：…" 命中记 N 分、"+0：…" 未命中记 0 分；
+    # 减分项 "-N：…" 表示扣分触发（delta 取负值），"-0：…" 表示未触发。
+    if len(results) != len(_MAX_DELTAS_ORDER):
+        raise RuntimeError(f"dim2 项数不一致：results={len(results)} vs order={len(_MAX_DELTAS_ORDER)}")
+    dim2_items = []
+    total_score = 0
+    for raw, max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta != 0
+        dim2_items.append({"rule": rule, "max_delta": max_delta,
+                           "delta": max_delta if hit else 0, "hit": hit})
+        total_score += (max_delta if hit else 0)
+    if not result["dim1_pass"]:
+        total_score = 0
+    result["dim2_items"] = dim2_items
+    result["total_score"] = max(0, total_score)
+    result["max_score"] = MAX_SCORE_TOTAL
     return result
 
 
 if __name__ == "__main__":
-    # 仅用于本地调试：入参为脚本所在目录（缺省则取本脚本所在目录）
-    target = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
-    _payload = json.dumps(evaluate(target), ensure_ascii=False, indent=2)
-    # 直接写 UTF-8 字节，避免 Windows 终端 cp1252 打印中文时抛 UnicodeEncodeError；
-    # 不修改 sys.stdout（遵循接口规约 §2.3）。
-    _ = sys.stdout.buffer.write(_payload.encode("utf-8"))
-    _ = sys.stdout.buffer.write(b"\n")
+    if len(sys.argv) >= 2:
+        _dir = sys.argv[1]
+    else:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+    _out = evaluate(_dir)
+    print(json.dumps(_out, ensure_ascii=False, indent=2))

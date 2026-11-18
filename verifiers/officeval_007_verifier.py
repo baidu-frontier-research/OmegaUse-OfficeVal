@@ -1,4914 +1,1429 @@
-"""
-Word文档自动评估脚本
-根据评分细则评估文档格式
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportPrivateUsage=false, reportUnknownLambdaType=false, reportGeneralTypeIssues=false
 
-对外统一入口：
-    evaluate(dir_path: str) -> dict
-
-- dir_path 为脚本所在目录路径；脚本自行在该目录内定位并打开被评估的 .docx 文档。
-- 返回结构化字典（含维度一通过与否、维度二逐项得分、总分），详见接口约定 §2.2。
-"""
-import json
 import os
 import re
 import sys
-
+import json
+import math
+import shutil
+import tempfile
 from docx import Document
-from docx.shared import Pt, Cm
+from docx.text.paragraph import Paragraph
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+try:
+    _VERIFIER_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _VERIFIER_DIR not in sys.path:
+        sys.path.insert(0, _VERIFIER_DIR)
+    import pymupdf_compat as fitz  # 已移除 PyMuPDF(AGPL)，改用 pdfplumber+pypdfium2 兼容层
+except ImportError:
+    fitz = None
+from docx.oxml.ns import qn
 
+# 说明：按接口统一约定，本模块不修改全局 sys.stdout，也不 print 主结果。
+# 主结果统一由 evaluate(dir_path) -> dict 返回；入参为"脚本所在目录的路径"，
+# 由脚本自己在该目录内定位并打开被评估的 .docx。本文件仅在 __main__ 下作为
+# 本地调试入口，才把 dict 序列化为 JSON 打印。
+#
+# 评测对象：按"齐鲁启明继续教育学院论文模板"的格式要求，修改
+#           "幼儿园自然探究活动课程设计"中的目录。
+# 维度二含 20 项加分项（指令下达的任务）与 26 项减分项（指令未涉及、
+#           一经改动即为破坏的项），减分项的 max_delta 为负值。
 
-# 脚本编号（与文件名 officeval_007_verifier.py 对齐）
 SCRIPT_ID = "007"
+# 维度二全部"加分项"max_delta 之和；用于维度一未通过 / 脚本异常时兜底。
+# 减分项不计入 max_score（未触发即为 0，触发则从 total_score 中扣减）。
+MAX_SCORE_TOTAL = 56
+
+# 维度二所有评分项按"结果追加顺序"的 max_delta 列表；末端把 results 里的
+# "+N：..." / "-N：..." 字符串反解为结构化 dim2_items 时用。顺序须与
+# _evaluate_impl 中 results.append(...) 的顺序严格一致；共 46 项。
+_MAX_DELTAS_ORDER = [
+    # ===== 加分项（20 项，累加 = MAX_SCORE_TOTAL = 56）=====
+    5,   # 01 目录由目录域/目录样式承载
+    5,   # 02 正文各级标题已设大纲级别
+    5,   # 03 三级层级完整收录（条目 ≥45）
+    5,   # 04 点线前导符 + 右对齐制表位落在版心右边界
+    5,   # 05 条目文字与正文标题一致
+    3,   # 06 目录标题"目  录"格式
+    3,   # 07 一级条目：黑体小四/左对齐/1.5倍/不加粗
+    3,   # 08 二级条目：宋体小四/左对齐/1.5倍/无缩进
+    1,   # 09 三级条目：宋体小四/左对齐/1.5倍/缩进1字符
+    3,   # 10 层级缩进递进且同级一致
+    1,   # 11 无"参考文献""附  录"条目
+    1,   # 12 收录"总结""致谢"
+    3,   # 13 无手工省略号/句点串填充
+    3,   # 14 每条行末有阿拉伯数字页码
+    3,   # 15 页码与实际所在页一致、只增不减
+    3,   # 16 条目单行显示
+    1,   # 17 条目段前段后为0或全表统一
+    1,   # 18 仅收录标题级文字
+    1,   # 19 目录位置与独立起页
+    1,   # 20 "三"章条目为完整标题
+    # ===== 减分项（26 项，max_delta 为负）=====
+    -5,  # 21 封面校徽图形/图片元素
+    -5,  # 22 正文段落完整性（无整段删除/重复/错序）
+    -5,  # 23 分节结构与分段页码编排
+    -3,  # 24 A4 纸张与页边距
+    -3,  # 25 前置部分大写罗马数字页码
+    -3,  # 26 正文阿拉伯数字页码从 1 起编
+    -3,  # 27 页眉/页脚存在与格式
+    -1,  # 28 "学校代码："行
+    -1,  # 29 封面"成人高等教育毕业论文（设计）"
+    -1,  # 30 封面题目两行
+    -1,  # 31 "启明学院毕业论文作者声明"
+    -1,  # 32 作者声明两段正文
+    -1,  # 33 作者签名/指导教师签名两行
+    -1,  # 34 "摘  要"标题
+    -1,  # 35 摘要正文
+    -1,  # 36 关键词行
+    -1,  # 37 "Abstract"标题
+    -1,  # 38 Abstract 正文
+    -1,  # 39 "Keywords:"行
+    -3,  # 40 正文四个章标题
+    -1,  # 41 "总结""致谢"标题
+    -3,  # 42 正文二级标题
+    -1,  # 43 正文叙述段落字号/行距
+    -1,  # 44 "•"项目符号
+    -3,  # 45 批注/修订/高亮/底纹/彩色字体
+    -1,  # 46 致谢正文
+]
+assert sum(d for d in _MAX_DELTAS_ORDER if d > 0) == MAX_SCORE_TOTAL
+
+# ======================= 一、格式继承链解析 =======================
+# 与办公软件对齐：Word/WPS 里"看到的"格式是 直接设定 → 段落样式(沿 basedOn 上溯)
+# → docDefaults 三层继承的结果。本套目录既可能把格式写在段落上（手工目录），
+# 也可能写在 toc 1/toc 2/toc 3 样式上（自动目录域），因此所有判定一律走继承链，
+# 不直接读 python-docx 的 run.font.* / paragraph_format.*（后者只看直接设定）。
+
+def _style_by_id(doc, style_id):
+    for st in doc.styles.element.findall(qn('w:style')):
+        if st.get(qn('w:styleId')) == style_id:
+            return st
+    return None
 
 
-def _open_word_document(file_path: str):
-    """打开 .docx 文件 (python-docx 仅支持 OOXML/.docx)."""
+def _para_style_id(para):
+    if para is None:
+        return None
+    pPr = para._element.find(qn('w:pPr'))
+    if pPr is None:
+        return None
+    pStyle = pPr.find(qn('w:pStyle'))
+    return pStyle.get(qn('w:val')) if pStyle is not None else None
+
+
+def _style_chain(doc, style_id):
+    """样式自身 + basedOn 上溯链。"""
+    out = []
+    seen = set()
+    while style_id and style_id not in seen:
+        seen.add(style_id)
+        st = _style_by_id(doc, style_id)
+        if st is None:
+            break
+        out.append(st)
+        base = st.find(qn('w:basedOn'))
+        style_id = base.get(qn('w:val')) if base is not None else None
+    return out
+
+
+def _doc_defaults(doc, kind):
+    """kind='rPr' 或 'pPr'，取 docDefaults 里的默认属性容器。"""
+    dd = doc.styles.element.find(qn('w:docDefaults'))
+    if dd is None:
+        return None
+    wrap = dd.find(qn('w:rPrDefault') if kind == 'rPr' else qn('w:pPrDefault'))
+    if wrap is None:
+        return None
+    return wrap.find(qn('w:' + kind))
+
+
+def _rpr_chain(doc, run):
+    """run 的字符属性继承链：run 直接设定 → 段落样式链 → docDefaults。"""
+    chain = []
+    if run is not None and run._element.rPr is not None:
+        chain.append(run._element.rPr)
+    sid = _para_style_id(run._parent) if run is not None else None
+    for st in _style_chain(doc, sid):
+        rpr = st.find(qn('w:rPr'))
+        if rpr is not None:
+            chain.append(rpr)
+    dd = _doc_defaults(doc, 'rPr')
+    if dd is not None:
+        chain.append(dd)
+    return chain
+
+
+def _ppr_chain(doc, para):
+    """段落属性继承链：段落直接设定 → 段落样式链 → docDefaults。"""
+    chain = []
+    pPr = para._element.find(qn('w:pPr'))
+    if pPr is not None:
+        chain.append(pPr)
+    for st in _style_chain(doc, _para_style_id(para)):
+        p = st.find(qn('w:pPr'))
+        if p is not None:
+            chain.append(p)
+    dd = _doc_defaults(doc, 'pPr')
+    if dd is not None:
+        chain.append(dd)
+    return chain
+
+
+def _chain_attr(chain, tag, attr):
+    """沿继承链取第一个显式给出该属性的值（逐属性继承，与 Word 一致）。"""
+    for el in chain:
+        node = el.find(qn(tag))
+        if node is not None:
+            v = node.get(qn(attr))
+            if v is not None:
+                return v
+    return None
+
+
+def _chain_node(chain, tag):
+    for el in chain:
+        node = el.find(qn(tag))
+        if node is not None:
+            return node
+    return None
+
+# ---------- 字符级（run）有效属性 ----------
+# 注：东亚字体若只由主题（eastAsiaTheme=minorEastAsia）给出，视为"未显式指定"，
+#     按 Word 中文默认字体（宋体）处理——即 _is_songti(None) 为真、_is_heiti(None) 为假。
+
+def _eff_eastasia(doc, run):
+    return _chain_attr(_rpr_chain(doc, run), 'w:rFonts', 'w:eastAsia')
+
+
+def _eff_ascii(doc, run):
+    chain = _rpr_chain(doc, run)
+    return (_chain_attr(chain, 'w:rFonts', 'w:ascii')
+            or _chain_attr(chain, 'w:rFonts', 'w:hAnsi'))
+
+
+def _eff_size_pt(doc, run):
+    v = _chain_attr(_rpr_chain(doc, run), 'w:sz', 'w:val')
+    try:
+        return float(v) / 2.0 if v is not None else None
+    except ValueError:
+        return None
+
+
+def _eff_bold(doc, run):
+    for el in _rpr_chain(doc, run):
+        b = el.find(qn('w:b'))
+        if b is not None:
+            return (b.get(qn('w:val')) or 'true') not in ('0', 'false', 'off')
+    return False
+
+
+def _eff_color(doc, run):
+    """返回 (w:val, w:themeColor)。"""
+    chain = _rpr_chain(doc, run)
+    node = _chain_node(chain, 'w:color')
+    if node is None:
+        return (None, None)
+    return (node.get(qn('w:val')), node.get(qn('w:themeColor')))
+
+
+def _is_songti(name):
+    if not name:
+        return True   # 未显式指定 → Word 中文默认宋体
+    return any(k in name for k in ('宋体', 'SimSun', 'NSimSun', 'Song'))
+
+
+def _is_heiti(name):
+    if not name:
+        return False
+    return any(k in name for k in ('黑体', 'SimHei', 'Hei'))
+
+
+# ---------- 段落级有效属性 ----------
+
+def _eff_jc(doc, para):
+    """返回 'left'/'center'/'right'/'both'/None（None = 未指定，Word 按左/两端）。"""
+    return _chain_attr(_ppr_chain(doc, para), 'w:jc', 'w:val')
+
+
+def _eff_outline(doc, para):
+    v = _chain_attr(_ppr_chain(doc, para), 'w:outlineLvl', 'w:val')
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def _eff_spacing(doc, para, attr):
+    """取 w:spacing 上某属性（before/after/beforeLines/afterLines/line/lineRule）。"""
+    for el in _ppr_chain(doc, para):
+        sp = el.find(qn('w:spacing'))
+        if sp is not None:
+            v = sp.get(qn('w:' + attr))
+            if v is not None:
+                return v
+    return None
+
+
+def _eff_line_multiple(doc, para):
+    """行距倍数；固定值/最小值行距返回 None。"""
+    line = _eff_spacing(doc, para, 'line')
+    if line is None:
+        return None
+    rule = _eff_spacing(doc, para, 'lineRule')
+    if rule not in (None, 'auto'):
+        return None
+    try:
+        return int(line) / 240.0
+    except ValueError:
+        return None
+
+
+def _eff_ind(doc, para, attr):
+    """取 w:ind 上某属性（left/leftChars/firstLine/firstLineChars/hanging…）的整数值。"""
+    for el in _ppr_chain(doc, para):
+        ind = el.find(qn('w:ind'))
+        if ind is not None:
+            v = ind.get(qn('w:' + attr))
+            if v is not None:
+                try:
+                    return int(v)
+                except ValueError:
+                    return None
+    return None
+
+
+def _eff_tabs(doc, para):
+    """返回 [(val, pos_twips, leader), ...]；沿继承链取第一个定义 w:tabs 的层级。"""
+    node = _chain_node(_ppr_chain(doc, para), 'w:tabs')
+    if node is None:
+        return []
+    out = []
+    for t in node.findall(qn('w:tab')):
+        try:
+            pos = int(t.get(qn('w:pos')))
+        except (TypeError, ValueError):
+            pos = None
+        out.append((t.get(qn('w:val')), pos, t.get(qn('w:leader'))))
+    return out
+
+# ======================= 二、文本与层级判定 =======================
+
+_WS_RE = re.compile(r'[\s　\xa0]+')
+_LEADER_CHARS = '….．·‧・'          # … . ． · ‧ ・
+_LVL2_RE = re.compile(r'^[（(][一二三四五六七八九十]+[)）]')
+_LVL3_RE = re.compile(r'^\d+[\.．、]')
+_LVL1_RE = re.compile(r'^[一二三四五六七八九十]+[\.．、]')
+_TAIL_PAGE_RE = re.compile(r'[\t' + _LEADER_CHARS + r'\s]*(\d{1,3})\s*$')
+_TAIL_ONLY_RE = re.compile(r'[\t' + _LEADER_CHARS + r'\s]+$')
+_L1_KEYWORDS = ('总结', '致谢', '结论', '结束语', '参考文献', '附录', '摘要', '引言')
+
+
+def _nows(s):
+    """去掉所有空白（含全角空格/NBSP），用于文本等价比较。"""
+    return _WS_RE.sub('', s or '')
+
+
+def _collapse(s):
+    return _WS_RE.sub(' ', (s or '').strip())
+
+
+def _entry_page(text):
+    """目录条目行末的阿拉伯数字页码；无则 None。"""
+    m = _TAIL_PAGE_RE.search((text or '').strip())
+    return int(m.group(1)) if m else None
+
+
+def _entry_body(text):
+    """剥掉行末页码与点线/省略号填充后的条目正文。"""
+    t = (text or '').strip()
+    t = _TAIL_PAGE_RE.sub('', t)
+    t = _TAIL_ONLY_RE.sub('', t)
+    return t.strip()
+
+
+def _strip_numbering(text):
+    """去掉层级序号（"一."/"（一）"/"1."），只留标题核心文字。"""
+    t = _nows(text)
+    for pat in (_LVL2_RE, _LVL3_RE, _LVL1_RE):
+        t2 = pat.sub('', t, count=1)
+        if t2 != t:
+            return t2
+    return t
+
+
+def _entry_level(text, style_name):
+    """目录条目层级：1/2/3。优先按 toc N 样式，其次按序号写法。"""
+    sn = _nows(style_name).lower()
+    m = re.match(r'^toc(\d+)$', sn)
+    if m:
+        lvl = int(m.group(1))
+        return lvl if lvl in (1, 2, 3) else 3
+    t = _nows(_entry_body(text))
+    if _LVL2_RE.match(t):
+        return 2
+    if _LVL3_RE.match(t):
+        return 3
+    if _LVL1_RE.match(t):
+        return 1
+    if any(k == t or t.endswith(k) for k in _L1_KEYWORDS):
+        return 1
+    return 1
+
+
+def _visual_units(text):
+    """文本视觉宽度（以"全角字符宽"为单位）：中日韩全角=1，半角≈0.5，Tab 忽略。"""
+    w = 0.0
+    for ch in text or '':
+        if ch == '\t':
+            continue
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF or 0x3000 <= o <= 0x303F or 0xFF00 <= o <= 0xFFEF:
+            w += 1.0
+        else:
+            w += 0.5
+    return w
+
+
+def _has_drawing(element):
+    if element.find('.//' + qn('w:drawing')) is not None:
+        return True
+    return element.find('.//' + qn('w:pict')) is not None
+
+
+def _para_text_with_fields(para):
+    """段落可见文本；自动目录域的域结果文本 python-docx 已能取到，此处仅做兜底拼接。"""
+    txt = para.text
+    if txt.strip():
+        return txt
+    parts = []
+    for t in para._element.iter(qn('w:t')):
+        parts.append(t.text or '')
+    return ''.join(parts)
+
+# ======================= 三、文档打开与目录定位 =======================
+
+def _all_paragraphs(doc):
+    """文档全部段落（含表格单元格内段落），按 XML 文档序返回。
+    doc.paragraphs 只给出顶层段落，会漏掉排在表格里的标题。"""
+    return [Paragraph(el, doc) for el in doc.element.body.iter(qn('w:p'))]
+
+
+def _open_word_document(file_path):
+    """打开 .docx 文档（python-docx 仅支持 OOXML/.docx）."""
     return Document(file_path)
 
 
-class DocxEvaluator:
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.doc = None
-        self.results = []  # 存储每个检查点的结果
-        self.score = 0
-        self.dimension1_passed = False
-
-    def evaluate(self) -> tuple[int, list[str]]:
-        """
-        执行完整评估
-        返回: (总分, 检查结果列表)
-        """
-        print(f"开始评估文件: {self.file_path}\n")
-
-        # 维度1：可用与可修改性
-        dim1_result = self.check_dimension1()
-
-        # 打印维度1结果
-        print("\n" + "="*60)
-        print("维度1检查结果:")
-        print("="*60)
-        for result in self.results:
-            status = "✓ 通过" if result['passed'] else "✗ 不通过"
-            print(f"{status}: {result['description']}")
-        print("="*60)
-
-        if not dim1_result:
-            print("\n维度1未通过，得分为0分")
-            return 0, self.results
-
-        self.dimension1_passed = True
-        print("\n维度1通过，开始检查维度2...\n")
-
-        # 维度2：完成度评分细则
-        self.check_dimension2()
-
-        # 打印结果
-        self.print_results()
-
-        return self.score, self.results
-
-    def add_result(self, description: str, passed: bool, score_change: int = 0):
-        """记录检查结果"""
-        self.results.append({
-            'description': description,
-            'passed': passed,
-            'score_change': score_change
-        })
-        if not self.dimension1_passed:
-            return
-        if passed:
-            self.score += score_change
-
-    def print_results(self):
-        """打印评估结果"""
-        print("=" * 80)
-        print("评估结果:")
-        print("=" * 80)
-        for result in self.results:
-            score_change = result['score_change']
-            passed = result['passed']
-            description = result['description']
-
-            if score_change == 0:
-                if passed:
-                    print(f"{description}")
-            elif passed:
-                sign = "+" if score_change > 0 else ""
-                print(f"{sign}{score_change}分：{description}")
-
-        print("=" * 80)
-        print(f"最终得分: {self.score}分")
-        print("=" * 80)
-
-    # ==================== 维度1 ====================
-
-    def check_dimension1(self) -> bool:
-        """检查维度1：可用与可修改性"""
-        dimension1_passed = True
-
-        # 1. 检查文件扩展名
-        if not self.check_file_extension():
-            dimension1_passed = False
-
-        # 2. 检查文件可正常打开
-        if not self.check_file_openable():
-            dimension1_passed = False
-
-        return dimension1_passed
-
-    def check_file_extension(self) -> bool:
-        """检查文件扩展名"""
-        ext = os.path.splitext(self.file_path)[1].lower()
-        passed = ext == '.docx'
-        self.add_result("文件扩展名为.docx", passed)
-        return passed
-
-    def check_file_openable(self) -> bool:
-        """检查文件可正常打开"""
-        try:
-            self.doc = _open_word_document(self.file_path)
-            print(f"文件成功打开，段落数: {len(self.doc.paragraphs)}")
-            passed = True
-        except Exception as e:
-            print(f"文件打开失败: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-            passed = False
-        self.add_result("文件可正常打开", passed)
-        return passed
-
-    def check_toc_editable(self) -> bool:
-        """检查目录内容可编辑（不是整张图片）"""
-        if not self.doc:
-            return False
-
-        # 检查是否有目录段落且包含文本（去除空格后检查）
-        toc_found = False
-        toc_has_text = False
-
-        for para in self.doc.paragraphs:
-            text = para.text.strip()
-            # 去除空格后检查
-            text_no_space = text.replace(' ', '')
-            if '目录' in text_no_space:
-                toc_found = True
-                # 检查段落是否包含文本内容（可编辑）
-                if para.runs and any(run.text.strip() for run in para.runs):
-                    toc_has_text = True
-                    break
-
-        # 如果找到目录，还需要检查目录区域是否全是图片
-        if toc_found:
-            # 检查目录附近的段落是否有文本
-            for i, para in enumerate(self.doc.paragraphs):
-                text_no_space = para.text.replace(' ', '')
-                if '目录' in text_no_space:
-                    # 检查前后几个段落
-                    for j in range(max(0, i-2), min(len(self.doc.paragraphs), i+20)):
-                        p = self.doc.paragraphs[j]
-                        if p.runs and any(run.text.strip() for run in p.runs):
-                            toc_has_text = True
-                            break
-                    break
-
-        passed = toc_found and toc_has_text
-        print(f"目录检查: 找到目录={toc_found}, 有可编辑文本={toc_has_text}")
-        self.add_result("目录页内容可编辑，不是一张图片", passed)
-        return passed
-
-    def check_blank_pages(self) -> bool:
-        """检查无连续2页及以上空白页"""
-        if not self.doc:
-            return False
-
-        # 通过检查段落数量和文本内容来判断
-        consecutive_blank = 0
-        page_approximate_chars = 1000  # 粗略估计一页的字符数
-        blank_count = 0
-
-        # 简化检查：统计空白段落过多的情况
-        empty_paras = sum(1 for p in self.doc.paragraphs if not p.text.strip())
-        total_paras = len(self.doc.paragraphs)
-        empty_ratio = empty_paras / total_paras if total_paras > 0 else 0
-
-        # 如果空白段落占比过高，可能有连续空白页
-        passed = empty_ratio < 0.8  # 假设80%空白段落可能有问题
-        self.add_result("无连续2页及以上空白页", passed)
-        return passed
-
-    def check_garbled_text(self) -> bool:
-        """检查无超过1/3面积乱码"""
-        if not self.doc:
-            return False
-
-        # 检查是否有异常字符
-        total_chars = 0
-        garbled_chars = 0
-
-        for para in self.doc.paragraphs:
-            text = para.text
-            total_chars += len(text)
-            # 检查不可打印字符和异常字符
-            for char in text:
-                if ord(char) > 65535 or ord(char) < 32 and char not in '\n\r\t':
-                    garbled_chars += 1
-
-        garbled_ratio = garbled_chars / total_chars if total_chars > 0 else 0
-        passed = garbled_ratio < 0.33
-        self.add_result("无超过1/3面积乱码", passed)
-        return passed
-
-    def check_text_overlap(self) -> bool:
-        """检查无超过1/3面积文字重叠"""
-        # Word文档中文字重叠需要检查格式设置
-        # 通过检查是否有异常的行距或位置设置来判断
-        if not self.doc:
-            return False
-
-        overlap_detected = False
-        for para in self.doc.paragraphs:
-            # 检查是否有异常的段落格式
-            if para.paragraph_format:
-                line_spacing = para.paragraph_format.line_spacing
-                # 如果行距设置异常（如负值或过小），可能导致文字重叠
-                if line_spacing and line_spacing < 0.5:
-                    overlap_detected = True
-                    break
-
-        passed = not overlap_detected
-        self.add_result("无超过1/3面积文字重叠", passed)
-        return passed
-
-    # ==================== 维度2 ====================
-
-    def check_dimension2(self):
-        """检查维度2：完成度评分细则"""
-
-        # +5：目录是自动生成目录
-        self.check_auto_toc()
-
-        # +3：目录页除"目录"两字外目录页中所有条目左对齐
-        self.check_toc_left_align()
-
-        # +1：目录页"目录"两字字体为黑体三号，居中
-        self.check_toc_title_font()
-
-        # +1：目录页"目录"两字中间空两个字符
-        self.check_toc_title_spacing()
-
-        # +1：目录页"目录"两字段落格式为两倍行距，段前1行，段后1行
-        self.check_toc_title_paragraph()
-
-        # +3：目录中包含三级标题
-        self.check_toc_three_levels()
-
-        # +3：目录中的一级标题文字为小四号、黑体
-        self.check_toc_level1_font()
-
-        # +3：目录中的一级标题段落格式为1.5倍行距、左对齐
-        self.check_toc_level1_paragraph()
-
-        # +3：目录中的二级标题文字为小四号、宋体
-        self.check_toc_level2_font()
-
-        # +3：目录中的二级标题段落格式为1.5倍行距、左对齐
-        self.check_toc_level2_paragraph()
-
-        # +3：目录中的三级标题文字为小四号、宋体
-        self.check_toc_level3_font()
-
-        # +3：目录中的三级标题段落格式为1.5倍行距、左对齐，标题后空一个字符
-        self.check_toc_level3_paragraph()
-
-        # +3：目录中的标题层级严格按照"一"、"（一）"、"1"
-        self.check_toc_level_format()
-
-        # +1：目录页的页码使用阿拉伯数字
-        self.check_toc_page_number()
-
-        # -3：目录页不在英文摘要页后面
-        self.check_toc_after_english_abstract()
-
-        # -1：封面页的图片大小不满足5.34×15.34
-        self.check_cover_image_size()
-
-        # -1：封面页的图片格式不满足嵌入型布局、两端对齐
-        self.check_cover_image_layout()
-
-        # -1：封面页"学校代码：12786"文本字体格式不满足宋体四号
-        self.check_cover_school_code_font()
-
-        # -1：封面页"学校代码：12786"文本段落格式不满足右对齐、单倍行距
-        self.check_cover_school_code_paragraph()
-
-        # -1：封面页"成人高等教育毕业论文（设计）"文本段落格式不满足居中对齐、单倍行距
-        self.check_cover_graduate_paper_paragraph()
-
-        # -1：封面页"成人高等教育毕业论文（设计）"文本字体格式不满足宋体，字号为32
-        self.check_cover_graduate_paper_font()
-
-        # -1：封面页标题字体不满足华文新魏小一
-        self.check_cover_title_font()
-
-        # -1：封面页标题段落格式不满足居中对齐、单倍行距
-        self.check_cover_title_paragraph()
-
-
-        # -1：封面页的表格内第二列字体段落格式不满足居中对齐、单倍行距
-        self.check_cover_table_second_col_paragraph()
-
-        # -1："启明学院毕业论文作者声明"文本所在页的标题及内容字体不满足宋体三号
-        self.check_declaration_font()
-
-        # -1："启明学院毕业论文作者声明"文本所在页的标题段落格式不满足居中对齐、1.5倍行距
-        self.check_declaration_title_paragraph()
-
-        # -1："启明学院毕业论文作者声明"文本所在页的内容段落格式不满足居中对齐、1.5倍行距
-        self.check_declaration_content_paragraph()
-
-        # -1：摘要页标题的字体格式不满足黑体三号
-        self.check_abstract_title_font()
-
-        # -1：摘要页标题的段落格式不满足段前一行、段后一行，两倍行距，居中对齐
-        self.check_abstract_title_paragraph()
-
-        # -1：摘要页的内容段落格式不满足首行缩进两字符、两端对齐、1.5倍行距
-        self.check_abstract_content_paragraph()
-
-        # -1：摘要页的关键词及冒号后内容字体格式不满足黑体四号
-        self.check_abstract_keywords_font()
-
-        # -1：摘要页的关键词及其冒号后内容段落格式不满足单倍行距、左对齐
-        self.check_abstract_keywords_paragraph()
-
-        # -1：英文摘要页的标题字体格式不满足Times New Roman三号
-        self.check_english_abstract_title_font()
-
-        # -1：英文摘要页的标题段落格式不满足段前一行、段后一行，两倍行距，居中对齐
-        self.check_english_abstract_title_paragraph()
-
-        # -1：英文摘要页的内容段落格式不满足首行缩进两字符、两端对齐、1.5倍行距
-        self.check_english_abstract_content_paragraph()
-
-        # -1：英文摘要页的关键词及其冒号后内容段落格式不满足首行缩进两字符、左对齐、1.5倍行距
-        self.check_english_abstract_keywords_paragraph()
-
-        # -1：英文摘要页的关键词及冒号后内容字体格式不满足Times New Roman四号
-        self.check_english_abstract_keywords_font()
-
-        # -3：从目录页开始出现任意一页没有页眉
-        self.check_header_present()
-
-        # -1：页眉字体格式不是宋体五号
-        self.check_header_font()
-
-        # -1：页眉段落格式不满足页眉下无横线、居中对齐、单倍行距
-        self.check_header_paragraph()
-
-        # -1：页眉上边距不满足1.50厘米
-        self.check_header_top_margin()
-
-        # -1：页脚下边距不满足1.75厘米
-        self.check_footer_bottom_margin()
-
-        # -3：文章不满足：从摘要页开始编写页码，摘要页到目录页页码格式为大写罗马数字
-        self.check_page_number_roman()
-
-        # -3：文章不满足：从正文内容页重新编写页码从1开始，页码格式为阿拉伯数字
-        self.check_page_number_restart()
-
-        # -3：文章一级标题字体格式不满足黑体三号
-        self.check_level1_font()
-
-        # -3：文章一级标题段落格式不满足居中对齐、段前一行、段后一行、两倍行距
-        self.check_level1_paragraph()
-
-        # -3：文章二级标题字体格式不满足黑体四号
-        self.check_level2_font()
-
-        # -3：文章二级标题段落格式不满足左对齐、段前0.5行、段后0.5行、1.5倍行距
-        self.check_level2_paragraph()
-
-        # -3：文章三级标题字体格式不满足黑体小四号
-        self.check_level3_font()
-
-        # -3：文章三级标题段落格式不满足左对齐、段前0.5行、段后0.5行、1.5倍行距
-        self.check_level3_paragraph()
-
-    # ==================== 得分点检查 ====================
-
-    def check_auto_toc(self):
-        """+5：目录是自动生成目录
-
-        细则依据：办公软件（Word/WPS）判定"自动目录"的两个硬指标必须
-        同时满足——目录外层由 TOC 域驱动，且目录条目由 PAGEREF 域承载
-        页码。若只有 TOC 外层字段而条目已被替换为静态文本（无 PAGEREF
-        字段），按 F9 无法更新、Ctrl+点击不可跳转——办公软件视觉上看
-        像目录，但功能上不是自动目录。因此加分需同时满足：
-          1) 文档任一段落存在 <w:instrText> 且内容含 "TOC" 指令
-             （目录外层字段容器）
-          2) 文档任一段落存在 <w:instrText> 且内容含 "PAGEREF" 指令
-             （至少一个条目由 PAGEREF 字段生成页码）
-        两条件同时成立才判为自动目录并加 +5 分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-
-        has_toc_field = False
-        has_pageref_field = False
-
-        for para in self.doc.paragraphs:
-            for instr in para._element.findall(f'.//{W_NS}instrText'):
-                text = instr.text or ''
-                text_upper = text.upper()
-                if 'TOC' in text_upper:
-                    has_toc_field = True
-                if 'PAGEREF' in text_upper:
-                    has_pageref_field = True
-            if has_toc_field and has_pageref_field:
-                break
-
-        passed = has_toc_field and has_pageref_field
-        self.add_result("目录是自动生成目录", passed, 5)
-
-    def check_toc_left_align(self):
-        """+3：目录页除"目录"两字外目录页中所有条目左对齐
-
-        细则依据：目录页内除"目录"标题以外的所有条目，其段落对齐方式必须为
-        左对齐。Word 文件属性上，段落对齐由 w:pPr/w:jc 决定：值为 "left" 或
-        "start" 视为左对齐；未设置 w:jc（None）时，Word 默认即为左对齐。
-        因此本检查只判定"每个目录条目段落的对齐是否为左对齐"这一项。
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目段落。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_left = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                found_any = True
-
-                # 直接读取 w:pPr/w:jc 判断对齐（Word 文件属性）
-                jc_val = None
-                pPr = p_el.find(f'{W_NS}pPr')
-                if pPr is not None:
-                    jc = pPr.find(f'{W_NS}jc')
-                    if jc is not None:
-                        jc_val = jc.get(f'{W_NS}val')
-
-                # 左对齐：显式 left/start，或未设置（None，Word 默认左对齐）
-                is_left = jc_val in (None, 'left', 'start')
-                if not is_left:
-                    all_left = False
-
-        passed = found_any and all_left
-        self.add_result("目录页除'目录'两字外所有条目左对齐", passed, 3)
-
-    def check_toc_title_font(self):
-        """+1：目录页'目录'两字字体为黑体三号，居中
-
-        细则依据：目录页中"目录"两字需同时满足三点——
-          1) 字体为黑体（Word 文件属性 w:rFonts 的 eastAsia/ascii/hAnsi 任一为"黑体"/SimHei）
-          2) 字号为三号（Word 文件属性 w:sz 的半磅值 = 32，即 16 磅）
-          3) 段落对齐为居中（Word 文件属性 w:pPr/w:jc = "center"）
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        passed = False
-
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '')
-            if text_ns != '目录':
-                continue
-
-            # 1) 字体：黑体
-            font_ok = False
-            # 2) 字号：三号 = 16 磅
-            size_ok = False
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-                rpr = run._element.rPr
-                font_name = ''
-                if rpr is not None and rpr.rFonts is not None:
-                    for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                        v = rpr.rFonts.get(f'{W_NS}{attr}')
-                        if v:
-                            font_name = v
-                            break
-                if not font_name:
-                    font_name = run.font.name or ''
-                if '黑体' in str(font_name) or 'SimHei' in str(font_name):
-                    font_ok = True
-                if run.font.size is not None and abs(run.font.size.pt - 16) < 0.5:
-                    size_ok = True
-
-            # 3) 对齐：居中（读 w:pPr/w:jc）
-            align_ok = False
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is not None and jc.get(f'{W_NS}val') == 'center':
-                    align_ok = True
-
-            passed = font_ok and size_ok and align_ok
+def _has_toc_field(doc):
+    """文档中是否存在自动目录域（w:instrText / w:fldSimple 的 TOC 指令）。"""
+    for el in doc.element.body.iter(qn('w:instrText')):
+        if 'TOC' in (el.text or '').upper():
+            return True
+    for el in doc.element.body.iter(qn('w:fldSimple')):
+        if 'TOC' in (el.get(qn('w:instr')) or '').upper():
+            return True
+    return False
+
+
+def _style_name(para):
+    try:
+        return para.style.name or ''
+    except Exception:
+        return ''
+
+
+def _is_toc_entry_para(para):
+    """判定某段落是否为一条目录条目（手工目录与自动目录域通用）。"""
+    if _nows(_style_name(para)).lower().startswith('toc'):
+        return True
+    t = (para.text or '').strip()
+    if not t:
+        return False
+    if len(t) > 80:
+        return False
+    if '\t' in para.text:
+        return True
+    if re.search(r'\d\s*$', t):
+        return True
+    if re.search('[' + _LEADER_CHARS + ']{3,}', t):
+        return True
+    return False
+
+
+def _locate_toc(doc, paras):
+    """返回 (目录标题段索引, [条目段索引...], 正文起始段索引)。"""
+    title_idx = None
+    for i, p in enumerate(paras):
+        if _nows(p.text) == '目录':
+            title_idx = i
             break
-
-        self.add_result("目录页'目录'两字字体为黑体三号，居中", passed, 1)
-
-    def check_toc_title_spacing(self):
-        """+1：目录页'目录'两字中间空两个字符
-
-        细则依据：目录页的"目录"标题，"目"与"录"两字之间需空两个字符。
-        Word 文件属性上体现为段落文本内容中，"目"与"录"之间恰好存在两个
-        空白字符（半角空格 U+0020 或全角空格 U+3000，两者混合亦可）。
-        """
-        if not self.doc:
-            return
-
-        passed = False
-        for para in self.doc.paragraphs:
-            text = para.text.strip()
-            # 定位目录标题段落：去掉所有空白后正好是"目录"
-            if text.replace(' ', '').replace('　', '').replace('\t', '') != '目录':
-                continue
-
-            # "目" 和 "录" 之间的字符
-            m = re.match(r'^目([\s　]*)录$', text)
-            if m and len(m.group(1)) == 2:
-                passed = True
-            break
-
-        self.add_result("目录页'目录'两字中间空两个字符", passed, 1)
-
-    def check_toc_title_paragraph(self):
-        """+1：目录页'目录'两字段落格式为两倍行距，段前1行，段后1行
-
-        细则依据：三项需同时满足，全部读 Word 文件属性 w:pPr/w:spacing：
-          1) 两倍行距：w:line="480" 且 w:lineRule="auto"（240=单倍，480=两倍）
-          2) 段前1行：w:beforeLines="100"（单位为 1/100 行，100=1行）
-          3) 段后1行：w:afterLines="100"
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        passed = False
-
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns != '目录':
-                continue
-
-            pPr = para._element.find(f'{W_NS}pPr')
-            spacing = pPr.find(f'{W_NS}spacing') if pPr is not None else None
-
-            line_ok = False
-            before_ok = False
-            after_ok = False
-            if spacing is not None:
-                # 1) 两倍行距
-                line = spacing.get(f'{W_NS}line')
-                line_rule = spacing.get(f'{W_NS}lineRule')
-                if line == '480' and line_rule == 'auto':
-                    line_ok = True
-
-                # 2) 段前 1 行
-                before_lines = spacing.get(f'{W_NS}beforeLines')
-                if before_lines == '100':
-                    before_ok = True
-
-                # 3) 段后 1 行
-                after_lines = spacing.get(f'{W_NS}afterLines')
-                if after_lines == '100':
-                    after_ok = True
-
-            passed = line_ok and before_ok and after_ok
-            break
-
-        self.add_result("目录页'目录'两字段落格式为两倍行距，段前1行，段后1行", passed, 1)
-
-    def check_toc_three_levels(self):
-        """+3：目录中包含三级标题
-
-        细则依据（宽松路线：办公软件视觉判定）：目录中的三级条目通常以
-        阿拉伯数字加分隔符起始（如 "1. xxx"、"1、xxx"、"1．xxx"、
-        "1 xxx"），而一级为"一/二/三…、xxx"、二级为"（一）/（二）…
-        xxx"。
-
-        本检查直接遍历底层 XML 的全部 w:p 段落。WPS/Word 生成的目录可能
-        包在 w:sdt/w:sdtContent 内容控件内，python-docx 的 doc.paragraphs
-        不会枚举这些段落；同时该类目录也可能没有传统 TOC 字段的
-        fldChar end 结束标记。因此以"目录"标题后的、含 w:tab 的目录条目
-        段落作为判断范围，避免把正文里的三级标题误当作目录条目。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        passed = False
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            level3_pattern = re.compile(r'^\d+\s*[\.．、\s]')
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if level3_pattern.match(head):
-                    passed = True
-                    break
-
-        self.add_result("目录中包含三级标题", passed, 3)
-
-    def check_toc_level1_font(self):
-        """+3：目录中的一级标题文字为小四号、黑体
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目；其中以
-        中文数字 + 分隔符起始的条目视为一级目录标题。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-        L1_PAT = re.compile(r'^[一二三四五六七八九十百]+\s*[、\.．]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        def _run_text(r_el):
-            return ''.join(t.text or '' for t in r_el.findall(f'.//{W_NS}t'))
-
-        def _run_font(r_el):
-            rpr = r_el.find(f'{W_NS}rPr')
-            if rpr is None:
-                return ''
-            rfonts = rpr.find(f'{W_NS}rFonts')
-            if rfonts is None:
-                return ''
-            for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                value = rfonts.get(f'{W_NS}{attr}')
-                if value:
-                    return value
-            return ''
-
-        def _run_size_pt(r_el):
-            rpr = r_el.find(f'{W_NS}rPr')
-            if rpr is None:
-                return None
-            sz = rpr.find(f'{W_NS}sz')
-            if sz is None:
-                return None
-            value = sz.get(f'{W_NS}val')
-            try:
-                return int(value) / 2
-            except (TypeError, ValueError):
-                return None
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not L1_PAT.match(head):
-                    continue
-
-                found_any = True
-                for r_el in p_el.findall(f'{W_NS}r'):
-                    rt = _run_text(r_el).strip()
-                    if not rt or rt.isdigit():
-                        continue
-                    font_ok = '黑体' in _run_font(r_el) or 'SimHei' in _run_font(r_el)
-                    size_pt = _run_size_pt(r_el)
-                    size_ok = size_pt is not None and abs(size_pt - 12) < 0.5
-                    if not (font_ok and size_ok):
-                        all_ok = False
-                        break
-                if not all_ok:
-                    break
-
-        passed = found_any and all_ok
-        self.add_result("目录中的一级标题文字为小四号、黑体", passed, 3)
-    def check_toc_level1_paragraph(self):
-        """+3：目录中的一级标题段落格式为1.5倍行距、左对齐
-
-        细则依据（宽松路线：与 check_toc_level1_font 保持一致）：本文档
-        目录条目未绑定内建 TOC 1 样式，无法以 pStyle 定位一级条目。改按
-        办公软件视觉习惯：目录条目起始为"中文数字（一/二/三…/十/百）
-        + '、' 或 '.' / '．'"的段落即视为一级条目。对这些条目段落需
-        同时满足：
-          1) 1.5 倍行距：w:pPr/w:spacing 的 w:line="360" 且 w:lineRule="auto"
-             （240=单倍，360=1.5倍，480=两倍）
-          2) 左对齐：w:pPr/w:jc 的 val 为 "left"/"start"，或未设置（Word 默认左对齐）
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-        L1_PAT = re.compile(r'^[一二三四五六七八九十百]+\s*[、\.．]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not L1_PAT.match(head):
-                    continue
-
-                found_any = True
-
-                pPr = p_el.find(f'{W_NS}pPr')
-
-                # 1) 1.5 倍行距
-                line_ok = False
-                spacing = pPr.find(f'{W_NS}spacing') if pPr is not None else None
-                if spacing is not None:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line == '360' and line_rule == 'auto':
-                        line_ok = True
-
-                # 2) 左对齐
-                jc = pPr.find(f'{W_NS}jc') if pPr is not None else None
-                jc_val = jc.get(f'{W_NS}val') if jc is not None else None
-                align_ok = jc_val in (None, 'left', 'start')
-
-                if not (line_ok and align_ok):
-                    all_ok = False
-                    break
-
-        passed = found_any and all_ok
-        self.add_result("目录中的一级标题段落格式为1.5倍行距、左对齐", passed, 3)
-
-    def check_toc_level2_font(self):
-        """+3：目录中的二级标题文字为小四号、宋体
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目；其中以
-        "（中文数字）"或"(中文数字)"起始的条目视为二级目录标题。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-        L2_PAT = re.compile(r'^[（(][一二三四五六七八九十百]+[）)]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        def _run_text(r_el):
-            return ''.join(t.text or '' for t in r_el.findall(f'.//{W_NS}t'))
-
-        def _run_font(r_el):
-            rpr = r_el.find(f'{W_NS}rPr')
-            if rpr is None:
-                return ''
-            rfonts = rpr.find(f'{W_NS}rFonts')
-            if rfonts is None:
-                return ''
-            for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                value = rfonts.get(f'{W_NS}{attr}')
-                if value:
-                    return value
-            return ''
-
-        def _run_size_pt(r_el):
-            rpr = r_el.find(f'{W_NS}rPr')
-            if rpr is None:
-                return None
-            sz = rpr.find(f'{W_NS}sz')
-            if sz is None:
-                return None
-            value = sz.get(f'{W_NS}val')
-            try:
-                return int(value) / 2
-            except (TypeError, ValueError):
-                return None
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not L2_PAT.match(head):
-                    continue
-
-                found_any = True
-                for r_el in p_el.findall(f'{W_NS}r'):
-                    rt = _run_text(r_el).strip()
-                    if not rt or rt.isdigit():
-                        continue
-                    font_name = _run_font(r_el)
-                    font_ok = '宋体' in font_name or 'SimSun' in font_name
-                    size_pt = _run_size_pt(r_el)
-                    size_ok = size_pt is not None and abs(size_pt - 12) < 0.5
-                    if not (font_ok and size_ok):
-                        all_ok = False
-                        break
-                if not all_ok:
-                    break
-
-        passed = found_any and all_ok
-        self.add_result("目录中的二级标题文字为小四号、宋体", passed, 3)
-    def check_toc_level2_paragraph(self):
-        """+3：目录中的二级标题段落格式为1.5倍行距、左对齐
-
-        细则依据（宽松路线：与 check_toc_level1_paragraph 保持一致）：本
-        文档目录条目未绑定内建 TOC 2 样式，无法以 pStyle 定位二级条目。
-        改按办公软件视觉习惯：目录条目起始为"（中文数字）"（如
-        "（一）/（二）…"）的段落即视为二级条目。对这些条目段落需
-        同时满足：
-          1) 1.5 倍行距：w:pPr/w:spacing 的 w:line="360" 且 w:lineRule="auto"
-             （240=单倍，360=1.5倍，480=两倍）
-          2) 左对齐：w:pPr/w:jc 的 val 为 "left"/"start"，或未设置（Word 默认左对齐）
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-        L2_PAT = re.compile(r'^[（(][一二三四五六七八九十百]+[）)]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not L2_PAT.match(head):
-                    continue
-
-                found_any = True
-
-                pPr = p_el.find(f'{W_NS}pPr')
-
-                # 1) 1.5 倍行距
-                line_ok = False
-                spacing = pPr.find(f'{W_NS}spacing') if pPr is not None else None
-                if spacing is not None:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line == '360' and line_rule == 'auto':
-                        line_ok = True
-
-                # 2) 左对齐
-                jc = pPr.find(f'{W_NS}jc') if pPr is not None else None
-                jc_val = jc.get(f'{W_NS}val') if jc is not None else None
-                align_ok = jc_val in (None, 'left', 'start')
-
-                if not (line_ok and align_ok):
-                    all_ok = False
-                    break
-
-        passed = found_any and all_ok
-        self.add_result("目录中的二级标题段落格式为1.5倍行距、左对齐", passed, 3)
-
-    def check_toc_level3_font(self):
-        """+3：目录中的三级标题文字为小四号、宋体
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目；其中以
-        "阿拉伯数字 + 分隔符（. / 、 / ． / 空格）"起始的条目视为
-        三级目录标题。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-        L3_PAT = re.compile(r'^\d+\s*[\.．、\s]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        def _run_text(r_el):
-            return ''.join(t.text or '' for t in r_el.findall(f'.//{W_NS}t'))
-
-        def _run_font(r_el):
-            rpr = r_el.find(f'{W_NS}rPr')
-            if rpr is None:
-                return ''
-            rfonts = rpr.find(f'{W_NS}rFonts')
-            if rfonts is None:
-                return ''
-            for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                value = rfonts.get(f'{W_NS}{attr}')
-                if value:
-                    return value
-            return ''
-
-        def _run_size_pt(r_el):
-            rpr = r_el.find(f'{W_NS}rPr')
-            if rpr is None:
-                return None
-            sz = rpr.find(f'{W_NS}sz')
-            if sz is None:
-                return None
-            value = sz.get(f'{W_NS}val')
-            try:
-                return int(value) / 2
-            except (TypeError, ValueError):
-                return None
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not L3_PAT.match(head):
-                    continue
-
-                found_any = True
-                for r_el in p_el.findall(f'{W_NS}r'):
-                    rt = _run_text(r_el).strip()
-                    if not rt or rt.isdigit():
-                        continue
-                    font_name = _run_font(r_el)
-                    font_ok = '宋体' in font_name or 'SimSun' in font_name
-                    size_pt = _run_size_pt(r_el)
-                    size_ok = size_pt is not None and abs(size_pt - 12) < 0.5
-                    if not (font_ok and size_ok):
-                        all_ok = False
-                        break
-                if not all_ok:
-                    break
-
-        passed = found_any and all_ok
-        self.add_result("目录中的三级标题文字为小四号、宋体", passed, 3)
-    def check_toc_level3_paragraph(self):
-        """+3：目录中的三级标题段落格式为1.5倍行距、左对齐，标题后空一个字符
-
-        细则依据（宽松路线：与 check_toc_level1/2_paragraph 保持一致）：
-        本文档目录条目未绑定内建 TOC 3 样式，无法以 pStyle 定位三级
-        条目。改按办公软件视觉习惯：目录条目起始为"阿拉伯数字 + 分隔符
-        （. / 、 / ． / ' '（空格））"的段落即视为三级条目。对这些
-        条目段落需同时满足：
-          1) 1.5 倍行距：w:pPr/w:spacing 的 w:line="360" 且 w:lineRule="auto"
-             （240=单倍，360=1.5倍，480=两倍）
-          2) 左对齐：w:pPr/w:jc 的 val 为 "left"/"start"，或未设置（Word 默认左对齐）
-          3) 标题后空一个字符：Word 自动目录中标题正文与页码之间由制表符
-             分隔；本项要求标题正文与该制表符之间恰好存在 1 个空白字符
-             （半角空格 U+0020 或全角空格 U+3000）。
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目；第 3 项
-        通过按文档顺序拼接段内各 run 的 <w:t> 与 <w:tab/> 序列，取首个
-        <w:tab/> 之前累计的标题文本来判断结尾是否恰好 1 个空白字符
-        （因为 _paragraph_text 拼接后的字符串本身不保留 <w:tab/> 的
-        位置信息）。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-        L3_PAT = re.compile(r'^\d+\s*[\.．、\s]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        def _title_text_before_tab(p_el):
-            """按文档顺序拼接首个 <w:tab/> 之前的所有 <w:t> 文本。"""
-            title = ''
-            for r_el in p_el.findall(f'{W_NS}r'):
-                for sub in r_el:
-                    tag = sub.tag.replace(W_NS, '')
-                    if tag == 'tab':
-                        return title
-                    if tag == 't':
-                        title += sub.text or ''
-            return title
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not L3_PAT.match(head):
-                    continue
-
-                found_any = True
-
-                pPr = p_el.find(f'{W_NS}pPr')
-
-                # 1) 1.5 倍行距
-                line_ok = False
-                spacing = pPr.find(f'{W_NS}spacing') if pPr is not None else None
-                if spacing is not None:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line == '360' and line_rule == 'auto':
-                        line_ok = True
-
-                # 2) 左对齐
-                jc = pPr.find(f'{W_NS}jc') if pPr is not None else None
-                jc_val = jc.get(f'{W_NS}val') if jc is not None else None
-                align_ok = jc_val in (None, 'left', 'start')
-
-                # 3) 标题后空一个字符：首个 w:tab 之前的标题文本需以恰好
-                #    1 个空白字符（半角/全角空格）结尾
-                title_text = _title_text_before_tab(p_el)
-                space_after_ok = bool(re.search(r'[^\s　][ 　]$', title_text))
-
-                if not (line_ok and align_ok and space_after_ok):
-                    all_ok = False
-                    break
-
-        passed = found_any and all_ok
-        self.add_result("目录中的三级标题段落格式为1.5倍行距、左对齐，标题后空一个字符", passed, 3)
-
-    def check_toc_level_format(self):
-        """+3：目录中的标题层级严格按照"一"、"（一）"、"1" """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-
-        L1_PAT = re.compile(r'^[一二三四五六七八九十百]+\s*[、\.．]')
-        L2_PAT = re.compile(r'^[（(][一二三四五六七八九十百]+[）)]')
-        L3_PAT = re.compile(r'^\d+\s*[\.．、\s]')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        passed = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                head = re.sub(r'\s*\d+\s*$', '', text).lstrip().lstrip('　')
-                if not head:
-                    continue
-
-                found_any = True
-                if L1_PAT.match(head) or L2_PAT.match(head) or L3_PAT.match(head):
-                    continue
-
-                passed = False
-                break
-
-        self.add_result("目录中的标题层级严格按照'一'、'（一）'、'1'", found_any and passed, 3)
-
-    def check_toc_page_number(self):
-        """+1：目录条目中的页码使用阿拉伯数字
-
-        目录可能位于 w:sdt/w:sdtContent 内容控件内，不能依赖
-        python-docx 的 doc.paragraphs 或传统 TOC 字段结束标记。直接从
-        底层 XML 中扫描"目录"标题后的、含 w:tab 的目录条目，并检查
-        条目文本末尾的页码是否为阿拉伯数字。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        paragraphs = self.doc.element.body.findall(f'.//{W_NS}p')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_title_idx = None
-        for i, p_el in enumerate(paragraphs):
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_title_idx = i
-                break
-
-        found_any = False
-        all_ok = True
-        found_toc_entry = False
-
-        if toc_title_idx is not None:
-            for p_el in paragraphs[toc_title_idx + 1:]:
-                text = _paragraph_text(p_el).strip()
-                has_tab = bool(p_el.findall(f'.//{W_NS}tab'))
-
-                if not text:
-                    continue
-
-                if not has_tab:
-                    if found_toc_entry:
-                        break
-                    continue
-
-                found_toc_entry = True
-                found_any = True
-
-                page_num_match = re.search(r'(\d+)\s*$', text)
-                if not page_num_match:
-                    all_ok = False
-                    break
-
-                page_num = page_num_match.group(1)
-                if not re.fullmatch(r'\d+', page_num):
-                    all_ok = False
-                    break
-
-        self.add_result("目录条目中的页码使用阿拉伯数字", found_any and all_ok, 1)
-
-    def check_toc_after_english_abstract(self):
-        """-3：目录页不在英文摘要页后面
-
-        细则依据（扣分项）：当"目录页"在文档流中出现在"英文摘要页"之前
-        （即目录不在英文摘要后面）时扣 3 分。基于 Word 文件属性判定：
-          - 目录页位置：以文档中首个 TOC 指令域（w:instrText 含 "TOC"）
-            所在段落索引为准；这是 Word 自动目录在文件属性上的唯一标识。
-          - 英文摘要页位置：以段落文本为 "Abstract"（忽略大小写与空白）
-            的首个段落索引为准。
-        当 TOC 索引 < Abstract 索引 时，判定"目录页不在英文摘要页后面"成立，
-        触发扣分。若文档不含英文摘要或不含自动目录，则不触发扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        toc_idx = -1
-        abstract_idx = -1
-
-        for i, para in enumerate(self.doc.paragraphs):
-            # 目录位置：首个 TOC 指令域
-            if toc_idx == -1:
-                for instr in para._element.findall(f'.//{W_NS}instrText'):
-                    if instr.text and 'TOC' in instr.text:
-                        toc_idx = i
-                        break
-
-            # 英文摘要位置：首个文本为 Abstract 的段落
-            if abstract_idx == -1:
-                text_ns = para.text.strip().replace(' ', '')
-                if text_ns.lower() == 'abstract':
-                    abstract_idx = i
-
-            if toc_idx != -1 and abstract_idx != -1:
-                break
-
-        # 扣分成立：目录与英文摘要都存在，且目录在英文摘要之前
-        passed = toc_idx != -1 and abstract_idx != -1 and toc_idx < abstract_idx
-        self.add_result("目录页不在英文摘要页后面", passed, -3)
-
-    def check_cover_image_size(self):
-        """-1：封面页的图片大小不满足5.34×15.34
-
-        细则依据（扣分项）：封面页图片的尺寸需满足 5.34cm × 15.34cm。
-        Word 文件属性上，内嵌/浮动图片的尺寸存储于 wp:extent 元素的
-        cx / cy 属性中，单位为 EMU（1cm = 360000 EMU）。
-          - 5.34 cm = 1,922,400 EMU
-          - 15.34 cm = 5,522,400 EMU
-        本项判定：封面页范围内（从文档开始至首个"摘要/Abstract/目录"标题段落
-        之前）的所有图片，其 (cx, cy) 换算为 cm 后是否构成 {5.34, 15.34} 集合
-        （不区分宽高顺序）。任一图片尺寸不满足即触发扣分。
-        """
-        if not self.doc:
-            return
-
-        WP_NS = '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}'
-        EMU_PER_CM = 360000.0
-
-        # 圈定封面页范围：文档开始 → 首个 摘要/Abstract/目录 标题段落之前
-        cover_end = len(self.doc.paragraphs)
-        for i, para in enumerate(self.doc.paragraphs):
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns in ('摘要', '目录') or text_ns.lower() == 'abstract':
-                cover_end = i
-                break
-
-        # 收集封面页范围内所有图片的尺寸
-        found_any = False
-        any_mismatch = False
-        for para in self.doc.paragraphs[:cover_end]:
-            for extent in para._element.findall(f'.//{WP_NS}extent'):
-                cx = extent.get('cx')
-                cy = extent.get('cy')
-                if cx is None or cy is None:
-                    continue
-                found_any = True
-                w_cm = int(cx) / EMU_PER_CM
-                h_cm = int(cy) / EMU_PER_CM
-                # 允许 5.34 与 15.34 顺序互换；容差 0.05cm 覆盖 Word 显示的舍入
-                dims = sorted([w_cm, h_cm])
-                if not (abs(dims[0] - 5.34) < 0.05 and abs(dims[1] - 15.34) < 0.05):
-                    any_mismatch = True
-                    break
-            if any_mismatch:
-                break
-
-        # 扣分成立：存在图片且至少一张尺寸不满足；或封面页范围内未发现任何图片
-        passed = (found_any and any_mismatch) or (not found_any)
-        self.add_result("封面页的图片大小不满足5.34×15.34", passed, -1)
-
-    def check_cover_image_layout(self):
-        """-1：封面页的图片格式不满足嵌入型布局、两端对齐"""
-        if not self.doc:
-            return
-
-        found_image = False
-        layout_ok = True
-        for para in self.doc.paragraphs:
-            for run in para.runs:
-                has_inline = bool(run._element.xpath('.//wp:inline'))
-                has_anchor = bool(run._element.xpath('.//wp:anchor'))
-                if has_inline or has_anchor:
-                    found_image = True
-                    inline_ok = has_inline and not has_anchor
-                    align_ok = para.paragraph_format.alignment in (WD_ALIGN_PARAGRAPH.JUSTIFY, None)
-                    if not inline_ok or not align_ok:
-                        layout_ok = False
-
-        if not found_image:
-            layout_ok = False
-
-        # 扣分项：只有封面图片格式不满足要求时才扣分。
-        should_deduct = not layout_ok
-        self.add_result("封面页的图片格式不满足嵌入型布局、两端对齐", should_deduct, -1)
-
-    def check_cover_school_code_font(self):
-        """-1：封面页"学校代码：12786"文本字体格式不满足宋体四号
-
-        细则依据：定位段落文本包含"学校代码"与"12786"的封面段落，对该
-        段落中每个非空 run，需同时满足：
-          1) 字体为宋体（w:rPr/w:rFonts 的 eastAsia/ascii/hAnsi/cs 任一为"宋体"/SimSun）
-          2) 字号为四号（w:rPr/w:sz 的半磅值 = 28，即 14 磅）
-        只要任一 run 不满足，即"不满足宋体四号"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '学校代码' not in para.text or '12786' not in para.text:
-                continue
-            found = True
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-
-                # 1) 字体：宋体
-                rpr = run._element.rPr
-                font_name = ''
-                if rpr is not None and rpr.rFonts is not None:
-                    for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                        v = rpr.rFonts.get(f'{W_NS}{attr}')
-                        if v:
-                            font_name = v
-                            break
-                if not font_name:
-                    font_name = run.font.name or ''
-                font_ok = '宋体' in str(font_name) or 'SimSun' in str(font_name)
-
-                # 2) 字号：四号 = 14 磅
-                size_ok = run.font.size is not None and abs(run.font.size.pt - 14) < 0.5
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：目标段落存在且不满足宋体四号时触发
-        passed = found and violated
-        self.add_result("封面页'学校代码：12786'文本字体格式不满足宋体四号", passed, -1)
-
-    def check_cover_school_code_paragraph(self):
-        """-1：封面页"学校代码：12786"文本段落格式不满足右对齐、单倍行距
-
-        细则依据：定位段落文本同时包含"学校代码"与"12786"的封面段落，
-        其段落格式需同时满足：
-          1) 右对齐：Word 文件属性 w:pPr/w:jc 的 val = "right"
-          2) 单倍行距：Word 文件属性 w:pPr/w:spacing 的 w:line="240" 且
-             w:lineRule="auto"；或未设置 w:spacing/w:line（Word 默认即
-             为单倍行距）
-        只要任一项不满足，即"不满足右对齐、单倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '学校代码' not in para.text or '12786' not in para.text:
-                continue
-            found = True
-
-            pPr = para._element.find(f'{W_NS}pPr')
-
-            # 1) 右对齐：w:pPr/w:jc val="right"
-            align_ok = False
-            if pPr is not None:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is not None and jc.get(f'{W_NS}val') == 'right':
-                    align_ok = True
-
-            # 2) 单倍行距：w:line="240" 且 w:lineRule="auto"，
-            #    或未设置 w:spacing/w:line（Word 默认单倍行距）
-            line_ok = False
-            if pPr is None:
-                line_ok = True
-            else:
-                spacing = pPr.find(f'{W_NS}spacing')
-                if spacing is None:
-                    line_ok = True
-                else:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line is None:
-                        line_ok = True
-                    elif line == '240' and line_rule == 'auto':
-                        line_ok = True
-
-            if not (align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：目标段落存在且不满足右对齐+单倍行距时触发
-        passed = found and violated
-        self.add_result("封面页'学校代码：12786'文本段落格式不满足右对齐、单倍行距", passed, -1)
-
-    def check_cover_graduate_paper_paragraph(self):
-        """-1：封面页"成人高等教育毕业论文（设计）"文本段落格式不满足居中对齐、单倍行距
-
-        细则依据：定位段落文本同时包含"成人高等教育毕业论文"与"设计"的
-        封面段落，其段落格式需同时满足：
-          1) 居中对齐：Word 文件属性 w:pPr/w:jc 的 val = "center"
-          2) 单倍行距：Word 文件属性 w:pPr/w:spacing 的 w:line="240" 且
-             w:lineRule="auto"；或未设置 w:spacing/w:line（Word 默认即
-             为单倍行距）
-        只要任一项不满足，即"不满足居中对齐、单倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '成人高等教育毕业论文' not in para.text or '设计' not in para.text:
-                continue
-            found = True
-
-            pPr = para._element.find(f'{W_NS}pPr')
-
-            # 1) 居中对齐：w:pPr/w:jc val="center"
-            align_ok = False
-            if pPr is not None:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is not None and jc.get(f'{W_NS}val') == 'center':
-                    align_ok = True
-
-            # 2) 单倍行距：w:line="240" 且 w:lineRule="auto"，
-            #    或未设置 w:spacing/w:line（Word 默认单倍行距）
-            line_ok = False
-            if pPr is None:
-                line_ok = True
-            else:
-                spacing = pPr.find(f'{W_NS}spacing')
-                if spacing is None:
-                    line_ok = True
-                else:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line is None:
-                        line_ok = True
-                    elif line == '240' and line_rule == 'auto':
-                        line_ok = True
-
-            if not (align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：目标段落存在且不满足居中对齐+单倍行距时触发
-        passed = found and violated
-        self.add_result("封面页'成人高等教育毕业论文（设计）'文本段落格式不满足居中对齐、单倍行距", passed, -1)
-
-    def check_cover_graduate_paper_font(self):
-        """-1：封面页"成人高等教育毕业论文（设计）"文本字体格式不满足宋体，字号为32
-
-        细则依据：定位段落文本同时包含"成人高等教育毕业论文"与"设计"的
-        封面段落，对该段落中每个非空 run，需同时满足：
-          1) 字体为宋体（Word 文件属性 w:rPr/w:rFonts 的 eastAsia/ascii/
-             hAnsi/cs 任一为"宋体"/SimSun）
-          2) 字号为 32（Word 文件属性 w:rPr/w:sz 的半磅值 = 64，即 32 磅）
-        只要任一 run 不满足，即"不满足宋体，字号为32"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '成人高等教育毕业论文' not in para.text or '设计' not in para.text:
-                continue
-            found = True
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-
-                # 1) 字体：宋体
-                rpr = run._element.rPr
-                font_name = ''
-                if rpr is not None and rpr.rFonts is not None:
-                    for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                        v = rpr.rFonts.get(f'{W_NS}{attr}')
-                        if v:
-                            font_name = v
-                            break
-                if not font_name:
-                    font_name = run.font.name or ''
-                font_ok = '宋体' in str(font_name) or 'SimSun' in str(font_name)
-
-                # 2) 字号：32 磅
-                size_ok = run.font.size is not None and abs(run.font.size.pt - 32) < 0.5
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：目标段落存在且不满足宋体+字号32时触发
-        passed = found and violated
-        self.add_result("封面页'成人高等教育毕业论文（设计）'文本字体格式不满足宋体，字号为32", passed, -1)
-
-    def check_cover_title_font(self):
-        """-1：封面页标题“幼儿园自然探究活动融入一日生活的课程设计与应用”字体不满足华文新魏小一
-
-        细则依据：封面页标题（论文题目）需同时满足：
-          1) 字体为华文新魏（Word 文件属性 w:rPr/w:rFonts 的 eastAsia/ascii/
-             hAnsi/cs 任一为"华文新魏"/STXinwei）
-          2) 字号为小一（Word 文件属性 w:rPr/w:sz 的半磅值 = 48，即 24 磅）
-
-        本文档标题分为两段："幼儿园自然探究活动融入一日生活的"和
-        "课程设计与应用"。按标题文本精确定位这两段，只检查标题 run，
-        避免把后续作者声明等非标题段落误当作封面标题候选。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        title_text = '幼儿园自然探究活动融入一日生活的课程设计与应用'
-
-        title_paragraphs = []
-        paragraphs = list(self.doc.paragraphs)
-        for i in range(len(paragraphs)):
-            first = paragraphs[i].text.strip().replace(' ', '').replace('　', '')
-            if not first:
-                continue
-            combined = first
-            matched = [paragraphs[i]]
-            for j in range(i + 1, min(i + 4, len(paragraphs))):
-                nxt = paragraphs[j].text.strip().replace(' ', '').replace('　', '')
-                if not nxt:
-                    continue
-                combined += nxt
-                matched.append(paragraphs[j])
-                if len(combined) >= len(title_text):
-                    break
-            if combined == title_text:
-                title_paragraphs = matched
-                break
-
-        violated = not bool(title_paragraphs)
-
-        if title_paragraphs:
-            for para in title_paragraphs:
-                for run in para.runs:
-                    if not run.text.strip():
-                        continue
-
-                    # 1) 字体：华文新魏
-                    rpr = run._element.rPr
-                    font_name = ''
-                    if rpr is not None and rpr.rFonts is not None:
-                        for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                            v = rpr.rFonts.get(f'{W_NS}{attr}')
-                            if v:
-                                font_name = v
-                                break
-                    if not font_name:
-                        font_name = run.font.name or ''
-                    font_ok = '华文新魏' in str(font_name) or 'STXinwei' in str(font_name)
-
-                    # 2) 字号：小一 = 24 磅
-                    size_ok = run.font.size is not None and abs(run.font.size.pt - 24) < 0.5
-
-                    if not (font_ok and size_ok):
-                        violated = True
-                        break
-                if violated:
-                    break
-
-        self.add_result("封面页标题“幼儿园自然探究活动融入一日生活的课程设计与应用”字体不满足华文新魏小一", violated, -1)
-
-    def check_cover_title_paragraph(self):
-        """-1：封面页标题"幼儿园自然探究活动融入一日生活的课程设计与应用"段落格式不满足居中对齐、单倍行距
-
-        细则依据：封面页标题（论文题目）所在段落，需同时满足：
-          1) 居中对齐：Word 文件属性 w:pPr/w:jc 的 val = "center"
-          2) 单倍行距：Word 文件属性 w:pPr/w:spacing 的 w:line="240" 且
-             w:lineRule="auto"；或未设置 w:spacing/w:line（Word 默认即
-             为单倍行距）
-
-        本文档标题分为两段："幼儿园自然探究活动融入一日生活的"和
-        "课程设计与应用"。按标题文本精确定位这两段，只检查标题段落，
-        避免把后续作者声明等非标题段落误当作封面标题候选。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        title_text = '幼儿园自然探究活动融入一日生活的课程设计与应用'
-
-        title_paragraphs = []
-        paragraphs = list(self.doc.paragraphs)
-        for i in range(len(paragraphs)):
-            first = paragraphs[i].text.strip().replace(' ', '').replace('　', '')
-            if not first:
-                continue
-            combined = first
-            matched = [paragraphs[i]]
-            for j in range(i + 1, min(i + 4, len(paragraphs))):
-                nxt = paragraphs[j].text.strip().replace(' ', '').replace('　', '')
-                if not nxt:
-                    continue
-                combined += nxt
-                matched.append(paragraphs[j])
-                if len(combined) >= len(title_text):
-                    break
-            if combined == title_text:
-                title_paragraphs = matched
-                break
-
-        violated = not bool(title_paragraphs)
-
-        for para in title_paragraphs:
-            pPr = para._element.find(f'{W_NS}pPr')
-
-            # 1) 居中对齐：w:pPr/w:jc val="center"
-            align_ok = False
-            if pPr is not None:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is not None and jc.get(f'{W_NS}val') == 'center':
-                    align_ok = True
-
-            # 2) 单倍行距：w:line="240" 且 w:lineRule="auto"，
-            #    或未设置 w:spacing/w:line（Word 默认单倍行距）
-            line_ok = False
-            if pPr is None:
-                line_ok = True
-            else:
-                spacing = pPr.find(f'{W_NS}spacing')
-                if spacing is None:
-                    line_ok = True
-                else:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line is None:
-                        line_ok = True
-                    elif line == '240' and line_rule == 'auto':
-                        line_ok = True
-
-            if not (align_ok and line_ok):
-                violated = True
-                break
-
-        self.add_result("封面页标题\"幼儿园自然探究活动融入一日生活的课程设计与应用\"段落格式不满足居中对齐、单倍行距", violated, -1)
-
-    def check_cover_table_second_col_paragraph(self):
-        """-1：封面页的表格内第二列字体段落格式不满足居中对齐、单倍行距
-
-        细则依据：封面页表格中每一行第二列单元格内的每个段落，需同时满足：
-          1) 居中对齐：Word 文件属性 w:pPr/w:jc 的 val = "center"
-          2) 单倍行距：Word 文件属性 w:pPr/w:spacing 的 w:line="240" 且
-             w:lineRule="auto"；或未设置 w:spacing/w:line（Word 默认即
-             为单倍行距）
-        任一段落不满足上述任一项，即"不满足居中对齐、单倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for table in self.doc.tables:
-            for row in table.rows:
-                if len(row.cells) < 2:
-                    continue
-                second_cell = row.cells[1]
-                for para in second_cell.paragraphs:
-                    if not para.text.strip():
-                        continue
-                    found = True
-
-                    pPr = para._element.find(f'{W_NS}pPr')
-
-                    # 1) 居中对齐：w:pPr/w:jc val="center"
-                    align_ok = False
-                    if pPr is not None:
-                        jc = pPr.find(f'{W_NS}jc')
-                        if jc is not None and jc.get(f'{W_NS}val') == 'center':
-                            align_ok = True
-
-                    # 2) 单倍行距：w:line="240" 且 w:lineRule="auto"，
-                    #    或未设置 w:spacing/w:line（Word 默认单倍行距）
-                    line_ok = False
-                    if pPr is None:
-                        line_ok = True
-                    else:
-                        spacing = pPr.find(f'{W_NS}spacing')
-                        if spacing is None:
-                            line_ok = True
-                        else:
-                            line = spacing.get(f'{W_NS}line')
-                            line_rule = spacing.get(f'{W_NS}lineRule')
-                            if line is None:
-                                line_ok = True
-                            elif line == '240' and line_rule == 'auto':
-                                line_ok = True
-
-                    if not (align_ok and line_ok):
-                        violated = True
-                        break
-                if violated:
-                    break
-            if violated:
-                break
-
-        # 扣分项：第二列段落存在且不满足居中对齐+单倍行距时触发
-        passed = found and violated
-        self.add_result("封面页的表格内第二列字体段落格式不满足居中对齐、单倍行距", passed, -1)
-
-    def check_declaration_font(self):
-        """-1："启明学院毕业论文作者声明"文本所在页的标题及内容字体不满足宋体三号
-
-        细则依据：定位"启明学院毕业论文作者声明"标题段落，其所在页的标题
-        与其后内容段落（直至"签名"/"日期"段落之前）中每个非空 run，需同时
-        满足：
-          1) 字体为宋体（Word 文件属性 w:rPr/w:rFonts 的 eastAsia/ascii/
-             hAnsi/cs 任一为"宋体"/SimSun）
-          2) 字号为三号（Word 文件属性 w:rPr/w:sz 的半磅值 = 32，即 16 磅）
-        任一 run 不满足上述任一项，即"不满足宋体三号"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        in_declaration = False
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text = para.text
-            if '启明学院毕业论文作者声明' in text:
-                in_declaration = True
-            if not in_declaration:
-                continue
-
-            # 遇到"签名"或"日期"段落，声明标题与内容区结束
-            if in_declaration and ('签名' in text or '日期' in text) \
-                    and '启明学院毕业论文作者声明' not in text:
-                break
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-                found = True
-
-                # 1) 字体：宋体
-                rpr = run._element.rPr
-                font_name = ''
-                if rpr is not None and rpr.rFonts is not None:
-                    for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                        v = rpr.rFonts.get(f'{W_NS}{attr}')
-                        if v:
-                            font_name = v
-                            break
-                if not font_name:
-                    font_name = run.font.name or ''
-                font_ok = '宋体' in str(font_name) or 'SimSun' in str(font_name)
-
-                # 2) 字号：三号 = 16 磅
-                size_ok = run.font.size is not None and abs(run.font.size.pt - 16) < 0.5
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：声明标题/内容存在且不满足宋体三号时触发
-        passed = found and violated
-        self.add_result("'启明学院毕业论文作者声明'文本所在页的标题及内容字体不满足宋体三号", passed, -1)
-
-    def check_declaration_title_paragraph(self):
-        """-1："启明学院毕业论文作者声明"文本所在页的标题段落格式不满足居中对齐、1.5倍行距
-
-        细则依据：定位段落文本包含"启明学院毕业论文作者声明"的标题段落，
-        其段落格式需同时满足：
-          1) 居中对齐：Word 文件属性 w:pPr/w:jc 的 val = "center"
-          2) 1.5 倍行距：Word 文件属性 w:pPr/w:spacing 的 w:line="360" 且
-             w:lineRule="auto"（240=单倍，360=1.5倍，480=两倍）
-        只要任一项不满足，即"不满足居中对齐、1.5倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '启明学院毕业论文作者声明' not in para.text:
-                continue
-            found = True
-
-            pPr = para._element.find(f'{W_NS}pPr')
-
-            # 1) 居中对齐：w:pPr/w:jc val="center"
-            align_ok = False
-            if pPr is not None:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is not None and jc.get(f'{W_NS}val') == 'center':
-                    align_ok = True
-
-            # 2) 1.5 倍行距：w:pPr/w:spacing w:line="360" 且 w:lineRule="auto"
-            line_ok = False
-            if pPr is not None:
-                spacing = pPr.find(f'{W_NS}spacing')
-                if spacing is not None:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line == '360' and line_rule == 'auto':
-                        line_ok = True
-
-            if not (align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：声明标题存在且不满足居中对齐+1.5倍行距时触发
-        passed = found and violated
-        self.add_result("'启明学院毕业论文作者声明'文本所在页的标题段落格式不满足居中对齐、1.5倍行距", passed, -1)
-
-    def check_declaration_content_paragraph(self):
-        """-1："启明学院毕业论文作者声明"文本所在页的内容段落格式不满足左对齐、1.5倍行距
-
-        细则依据：定位"启明学院毕业论文作者声明"标题段落，其后至"签名"/
-        "日期"段落之前的所有非空文本段落视为声明内容。这些段落需同时满足：
-          1) 左对齐：Word 文件属性 w:pPr/w:jc 的 val 为 "left"/"start"，
-             或未设置 w:jc（Word 默认即为左对齐）
-          2) 1.5 倍行距：Word 文件属性 w:pPr/w:spacing 的 w:line="360" 且
-             w:lineRule="auto"（240=单倍，360=1.5倍，480=两倍）
-        只要任一段落不满足上述任一项，即"不满足左对齐、1.5倍行距"，
-        触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        in_declaration = False
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text = para.text
-            if '启明学院毕业论文作者声明' in text:
-                in_declaration = True
-                continue
-            if not in_declaration:
-                continue
-
-            # 遇到"签名"或"日期"段落，声明内容区结束
-            if '签名' in text or '日期' in text:
-                break
-
-            if not text.strip():
-                continue
-            found = True
-
-            pPr = para._element.find(f'{W_NS}pPr')
-
-            # 1) 左对齐：w:pPr/w:jc val 为 left/start，或未设置
-            align_ok = False
-            if pPr is None:
-                align_ok = True
-            else:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is None:
-                    align_ok = True
-                else:
-                    jc_val = jc.get(f'{W_NS}val')
-                    if jc_val in (None, 'left', 'start'):
-                        align_ok = True
-
-            # 2) 1.5 倍行距：w:pPr/w:spacing w:line="360" 且 w:lineRule="auto"
-            line_ok = False
-            if pPr is not None:
-                spacing = pPr.find(f'{W_NS}spacing')
-                if spacing is not None:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line == '360' and line_rule == 'auto':
-                        line_ok = True
-
-            if not (align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：声明内容存在且不满足左对齐+1.5倍行距时触发
-        passed = found and violated
-        self.add_result("'启明学院毕业论文作者声明'文本所在页的内容段落格式不满足左对齐、1.5倍行距", passed, -1)
-
-    def check_abstract_title_font(self):
-        """-1：摘要页标题的字体格式不满足黑体三号
-
-        细则依据：定位段落文本为"摘要"（忽略空白后完全匹配）的标题段落，
-        对该段落中每个非空 run，需同时满足：
-          1) 字体为黑体（Word 文件属性 w:rPr/w:rFonts 的 eastAsia/ascii/
-             hAnsi/cs 任一为"黑体"/SimHei）
-          2) 字号为三号（Word 文件属性 w:rPr/w:sz 的半磅值 = 32，即 16 磅）
-        只要任一 run 不满足上述任一项，即"不满足黑体三号"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns != '摘要':
-                continue
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-                found = True
-
-                # 1) 字体：黑体
-                rpr = run._element.rPr
-                font_name = ''
-                if rpr is not None and rpr.rFonts is not None:
-                    for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                        v = rpr.rFonts.get(f'{W_NS}{attr}')
-                        if v:
-                            font_name = v
-                            break
-                if not font_name:
-                    font_name = run.font.name or ''
-                font_ok = '黑体' in str(font_name) or 'SimHei' in str(font_name)
-
-                # 2) 字号：三号 = 16 磅
-                size_ok = run.font.size is not None and abs(run.font.size.pt - 16) < 0.5
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated or found:
-                break
-
-        # 扣分项：摘要标题存在且不满足黑体三号时触发
-        passed = found and violated
-        self.add_result("摘要页标题的字体格式不满足黑体三号", passed, -1)
-
-    def check_abstract_title_paragraph(self):
-        """-1：摘要页标题的段落格式不满足段前一行、段后一行，两倍行距，居中对齐
-
-        细则依据：定位段落文本为"摘要"（忽略空白后完全匹配）的标题段落，
-        其段落格式需同时满足（全部读 Word 文件属性 w:pPr）：
-          1) 段前 1 行：w:pPr/w:spacing 的 w:beforeLines="100"
-             （单位为 1/100 行，100=1 行）
-          2) 段后 1 行：w:pPr/w:spacing 的 w:afterLines="100"
-          3) 两倍行距：w:pPr/w:spacing 的 w:line="480" 且 w:lineRule="auto"
-             （240=单倍，360=1.5倍，480=两倍）
-          4) 居中对齐：w:pPr/w:jc 的 val = "center"
-        只要任一项不满足，即"不满足段前一行、段后一行，两倍行距，居中对齐"，
-        触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns != '摘要':
-                continue
-            found = True
-
-            pPr = para._element.find(f'{W_NS}pPr')
-            spacing = pPr.find(f'{W_NS}spacing') if pPr is not None else None
-
-            # 1) 段前 1 行
-            before_ok = False
-            # 2) 段后 1 行
-            after_ok = False
-            # 3) 两倍行距
-            line_ok = False
-            if spacing is not None:
-                if spacing.get(f'{W_NS}beforeLines') == '100':
-                    before_ok = True
-                if spacing.get(f'{W_NS}afterLines') == '100':
-                    after_ok = True
-                line = spacing.get(f'{W_NS}line')
-                line_rule = spacing.get(f'{W_NS}lineRule')
-                if line == '480' and line_rule == 'auto':
-                    line_ok = True
-
-            # 4) 居中对齐
-            align_ok = False
-            if pPr is not None:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is not None and jc.get(f'{W_NS}val') == 'center':
-                    align_ok = True
-
-            if not (before_ok and after_ok and line_ok and align_ok):
-                violated = True
-            break
-
-        # 扣分项：摘要标题存在且不满足任一子项时触发
-        passed = found and violated
-        self.add_result("摘要页标题的段落格式不满足段前一行、段后一行，两倍行距，居中对齐", passed, -1)
-
-    def check_abstract_content_paragraph(self):
-        """-1：摘要页的内容段落格式不满足首行缩进两字符、两端对齐、1.5倍行距
-
-        细则依据：定位"摘要"标题段落之后至"关键词"/"目录"段落之前的所有
-        非空文本段落视为摘要内容。这些段落需同时满足（全部读 Word 文件
-        属性 w:pPr）：
-          1) 首行缩进两字符：w:pPr/w:ind 的 w:firstLineChars="200"
-             （单位为 1/100 字符，200=2 字符）
-          2) 两端对齐：w:pPr/w:jc 的 val = "both"（等价别名 "justify" 一并接受）；
-             或未设置 w:jc（Word/WPS 正文默认即为两端对齐）
-          3) 1.5 倍行距：w:pPr/w:spacing 的 w:line="360" 且 w:lineRule="auto"
-             （240=单倍，360=1.5倍，480=两倍）
-        只要任一段落不满足上述任一项，即"不满足首行缩进两字符、两端对齐、
-        1.5倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        in_abstract = False
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text = para.text
-            text_ns = text.strip().replace(' ', '').replace('　', '')
-
-            if text_ns == '摘要':
-                in_abstract = True
-                continue
-            if not in_abstract:
-                continue
-
-            # 遇到"关键词"或"目录"段落，摘要内容区结束
-            if '关键词' in text or text_ns == '目录':
-                break
-
-            if not text.strip():
-                continue
-            found = True
-
-            pPr = para._element.find(f'{W_NS}pPr')
-
-            # 1) 首行缩进两字符：w:pPr/w:ind w:firstLineChars="200"
-            indent_ok = False
-            if pPr is not None:
-                ind = pPr.find(f'{W_NS}ind')
-                if ind is not None and ind.get(f'{W_NS}firstLineChars') == '200':
-                    indent_ok = True
-
-            # 2) 两端对齐：w:pPr/w:jc val="both"（或等价别名 "justify"）；
-            #    未设置 w:jc 时，Word/WPS 正文默认按两端对齐渲染，视为满足
-            align_ok = False
-            if pPr is None:
-                align_ok = True
-            else:
-                jc = pPr.find(f'{W_NS}jc')
-                if jc is None:
-                    align_ok = True
-                elif jc.get(f'{W_NS}val') in ('both', 'justify'):
-                    align_ok = True
-
-            # 3) 1.5 倍行距：w:pPr/w:spacing w:line="360" 且 w:lineRule="auto"
-            line_ok = False
-            if pPr is not None:
-                spacing = pPr.find(f'{W_NS}spacing')
-                if spacing is not None:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line == '360' and line_rule == 'auto':
-                        line_ok = True
-
-            if not (indent_ok and align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：摘要内容存在且不满足任一子项时触发
-        passed = found and violated
-        self.add_result("摘要页的内容段落格式不满足首行缩进两字符、两端对齐、1.5倍行距", passed, -1)
-
-    def check_abstract_keywords_font(self):
-        """-1：摘要页的关键词及冒号后内容字体格式不满足黑体四号
-
-        细则依据：定位段落文本包含"关键词"的摘要页段落，对该段落中每个
-        非空 run，需同时满足：
-          1) 字体为黑体（Word 文件属性 w:rPr/w:rFonts 的 eastAsia/ascii/
-             hAnsi/cs 任一为"黑体"/SimHei）
-          2) 字号为四号（Word 文件属性 w:rPr/w:sz 的半磅值 = 28，即 14 磅）
-        只要任一 run 不满足上述任一项，即"不满足黑体四号"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '关键词' not in para.text:
-                continue
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-                found = True
-
-                # 1) 字体：黑体
-                rpr = run._element.rPr
-                font_name = ''
-                if rpr is not None and rpr.rFonts is not None:
-                    for attr in ('eastAsia', 'ascii', 'hAnsi', 'cs'):
-                        v = rpr.rFonts.get(f'{W_NS}{attr}')
-                        if v:
-                            font_name = v
-                            break
-                if not font_name:
-                    font_name = run.font.name or ''
-                font_ok = '黑体' in str(font_name) or 'SimHei' in str(font_name)
-
-                # 2) 字号：四号 = 14 磅
-                size_ok = run.font.size is not None and abs(run.font.size.pt - 14) < 0.5
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：关键词段落存在且不满足黑体四号时触发
-        passed = found and violated
-        self.add_result("摘要页的关键词及冒号后内容字体格式不满足黑体四号", passed, -1)
-
-    def check_abstract_keywords_paragraph(self):
-        """-1：摘要页的关键词及其冒号后内容段落格式不满足单倍行距、左对齐
-
-        细则依据（只判定"单倍行距"和"左对齐"两点，不加任何额外约束）：
-        定位段落文本包含"关键词"的摘要页段落，判定其在办公软件（Word/WPS）
-        中实际生效的段落属性——即沿"段落直接属性 → w:pStyle 样式链 →
-        w:docDefaults"逐级回退取到的最终值。
-          1) 单倍行距：effective w:spacing 满足 w:line="240" 且
-             w:lineRule="auto"；或整条链上均未设置 w:line
-             （Word 默认即为单倍行距）
-          2) 左对齐：effective w:jc 的 val 为 "left"/"start"；或整条链上
-             均未设置 w:jc（Word 默认即为左对齐）
-        只要任一项不满足，即"不满足单倍行距、左对齐"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective(para, child_tag):
-            """沿"段落直接 pPr → pStyle 链 → docDefaults/pPrDefault/pPr"
-            回退查找指定 pPr 子元素（如 w:jc、w:spacing），返回首个存在者。
-            """
-            # 1) 段落直接属性
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                el = pPr.find(f'{W_NS}{child_tag}')
-                if el is not None:
-                    return el
-            # 2) 段落所引用样式 → basedOn 链
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(f'{W_NS}{child_tag}')
-                    if el is not None:
-                        return el
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            # 3) docDefaults/pPrDefault/pPr
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(f'{W_NS}{child_tag}')
-                        if el is not None:
-                            return el
-            return None
-
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if '关键词' not in para.text:
-                continue
-            found = True
-
-            # 1) 单倍行距：effective w:spacing 的 w:line="240" 且
-            #    w:lineRule="auto"；或全链未设置 w:line（Word 默认单倍）
-            spacing = _find_effective(para, 'spacing')
-            if spacing is None:
-                line_ok = True
-            else:
-                line = spacing.get(f'{W_NS}line')
-                line_rule = spacing.get(f'{W_NS}lineRule')
-                if line is None:
-                    line_ok = True
-                elif line == '240' and line_rule == 'auto':
-                    line_ok = True
-                else:
-                    line_ok = False
-
-            # 2) 左对齐：effective w:jc val 为 left/start；或全链未设置
-            jc = _find_effective(para, 'jc')
-            if jc is None:
-                align_ok = True
-            else:
-                jc_val = jc.get(f'{W_NS}val')
-                align_ok = jc_val in (None, 'left', 'start')
-
-            if not (line_ok and align_ok):
-                violated = True
-                break
-
-        # 扣分项：关键词段落存在且不满足单倍行距+左对齐时触发
-        passed = found and violated
-        self.add_result("摘要页的关键词及其冒号后内容段落格式不满足单倍行距、左对齐", passed, -1)
-
-    def check_english_abstract_title_font(self):
-        """-1：英文摘要页的标题字体格式不满足Times New Roman三号
-
-        细则依据（只判定"Times New Roman"和"三号"两点，不加任何额外约束）：
-        定位段落文本为"Abstract"（忽略空白与大小写后完全匹配）的英文
-        摘要标题段落，对该段落中每个非空 run，判定其在办公软件（Word/WPS）
-        中实际生效的字体属性——沿"run 直接 rPr → 段落 pPr/rPr →
-        w:pStyle 样式链（含 basedOn）→ w:docDefaults/rPrDefault/rPr"
-        逐级回退取值：
-          1) 字体为 Times New Roman：effective w:rFonts 的 w:ascii 值
-             为 "Times New Roman"（英文标题使用 ascii 字体槽渲染）
-          2) 字号为三号：effective w:sz 的半磅值 = 32（即 16 磅）
-        只要任一 run 不满足上述任一项，即"不满足 Times New Roman 三号"，
-        触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _effective_rpr_value(run, para, getter):
-            """沿"run 直接 rPr → 段落 pPr/rPr → 段落 pStyle 链的 rPr →
-            docDefaults/rPrDefault/rPr"回退，返回 getter(rPr) 的首个非空值。
-            """
-            # 1) run 直接 rPr
-            r_rpr = run._element.find(f'{W_NS}rPr')
-            if r_rpr is not None:
-                v = getter(r_rpr)
-                if v is not None:
-                    return v
-            # 2) 段落 pPr/rPr（段落级 run 属性）
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                p_rpr = pPr.find(f'{W_NS}rPr')
-                if p_rpr is not None:
-                    v = getter(p_rpr)
-                    if v is not None:
-                        return v
-            # 3) pStyle → basedOn 链上的 rPr
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_rpr = style.find(f'{W_NS}rPr')
-                if s_rpr is not None:
-                    v = getter(s_rpr)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            # 4) docDefaults/rPrDefault/rPr
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                rPrDefault = doc_defaults.find(f'{W_NS}rPrDefault')
-                if rPrDefault is not None:
-                    d_rpr = rPrDefault.find(f'{W_NS}rPr')
-                    if d_rpr is not None:
-                        v = getter(d_rpr)
-                        if v is not None:
-                            return v
-            return None
-
-        def _get_ascii_font(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            if rFonts is None:
-                return None
-            return rFonts.get(f'{W_NS}ascii')
-
-        def _get_sz(rpr):
-            sz = rpr.find(f'{W_NS}sz')
-            if sz is None:
-                return None
-            return sz.get(f'{W_NS}val')
-
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns.lower() != 'abstract':
-                continue
-            found = True
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-
-                # 1) 字体：Times New Roman（ascii 字体槽）
-                ascii_font = _effective_rpr_value(run, para, _get_ascii_font) or ''
-                font_ok = ascii_font == 'Times New Roman'
-
-                # 2) 字号：三号 = 半磅 32（16 磅）
-                sz_val = _effective_rpr_value(run, para, _get_sz)
-                size_ok = sz_val == '32'
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：英文摘要标题存在且不满足 Times New Roman 三号时触发
-        passed = found and violated
-        self.add_result("英文摘要页的标题字体格式不满足Times New Roman三号", passed, -1)
-
-    def check_english_abstract_title_paragraph(self):
-        """-1：英文摘要页的标题段落格式不满足段前一行、段后一行，两倍行距，居中对齐
-
-        细则依据（只判定"段前 1 行、段后 1 行、两倍行距、居中对齐"四点，
-        不加任何额外约束）：定位段落文本为"Abstract"（忽略空白与大小写后
-        完全匹配）的英文摘要标题段落，判定其在办公软件（Word/WPS）中实际
-        生效的段落属性——沿"段落直接 pPr → w:pStyle 样式链（含 basedOn）→
-        w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 段前 1 行：effective w:spacing 的 w:beforeLines="100"
-             （单位为 1/100 行）
-          2) 段后 1 行：effective w:spacing 的 w:afterLines="100"
-          3) 两倍行距：effective w:spacing 的 w:line="480" 且
-             w:lineRule="auto"（240=单倍，360=1.5倍，480=两倍）
-          4) 居中对齐：effective w:jc 的 val = "center"
-        只要任一项不满足，即"不满足段前一行、段后一行，两倍行距，居中对齐"，
-        触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective(para, child_tag):
-            """沿"段落直接 pPr → pStyle 链 → docDefaults/pPrDefault/pPr"
-            回退查找指定 pPr 子元素，返回首个存在者。
-            """
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                el = pPr.find(f'{W_NS}{child_tag}')
-                if el is not None:
-                    return el
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(f'{W_NS}{child_tag}')
-                    if el is not None:
-                        return el
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(f'{W_NS}{child_tag}')
-                        if el is not None:
-                            return el
-            return None
-
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns.lower() != 'abstract':
-                continue
-            found = True
-
-            spacing = _find_effective(para, 'spacing')
-            jc = _find_effective(para, 'jc')
-
-            # 1) 段前 1 行
-            before_ok = spacing is not None and spacing.get(f'{W_NS}beforeLines') == '100'
-            # 2) 段后 1 行
-            after_ok = spacing is not None and spacing.get(f'{W_NS}afterLines') == '100'
-            # 3) 两倍行距
-            line_ok = (
-                spacing is not None
-                and spacing.get(f'{W_NS}line') == '480'
-                and spacing.get(f'{W_NS}lineRule') == 'auto'
-            )
-            # 4) 居中对齐
-            align_ok = jc is not None and jc.get(f'{W_NS}val') == 'center'
-
-            if not (before_ok and after_ok and line_ok and align_ok):
-                violated = True
-            break
-
-        # 扣分项：英文摘要标题存在且不满足任一子项时触发
-        passed = found and violated
-        self.add_result("英文摘要页的标题段落格式不满足段前一行、段后一行，两倍行距，居中对齐", passed, -1)
-
-    def check_english_abstract_content_paragraph(self):
-        """-1：英文摘要页的内容段落格式不满足首行缩进两字符、两端对齐、1.5倍行距
-
-        细则依据（只判定"首行缩进两字符、两端对齐、1.5 倍行距"三点，
-        不加任何额外约束）：定位英文摘要"Abstract"标题段落之后至
-        "Keywords"/"Key words"/"目录"段落之前的所有非空文本段落视为英文
-        摘要内容。判定其在办公软件（Word/WPS）中实际生效的段落属性——
-        沿"段落直接 pPr → w:pStyle 样式链（含 basedOn）→
-        w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 首行缩进两字符：effective w:ind 的 w:firstLineChars="200"
-             （单位为 1/100 字符，200=2 字符）
-          2) 两端对齐：effective w:jc 的 val = "both"（等价别名 "justify"
-             一并接受）
-          3) 1.5 倍行距：effective w:spacing 的 w:line="360" 且
-             w:lineRule="auto"（240=单倍，360=1.5倍，480=两倍）
-        只要任一段落不满足上述任一项，即"不满足首行缩进两字符、两端对齐、
-        1.5倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective(para, child_tag):
-            """沿"段落直接 pPr → pStyle 链 → docDefaults/pPrDefault/pPr"
-            回退查找指定 pPr 子元素，返回首个存在者。
-            """
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                el = pPr.find(f'{W_NS}{child_tag}')
-                if el is not None:
-                    return el
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(f'{W_NS}{child_tag}')
-                    if el is not None:
-                        return el
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(f'{W_NS}{child_tag}')
-                        if el is not None:
-                            return el
-            return None
-
-        in_abstract = False
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            text = para.text
-            text_ns = text.strip().replace(' ', '').replace('　', '')
-
-            if text_ns.lower() == 'abstract':
-                in_abstract = True
-                continue
-            if not in_abstract:
-                continue
-
-            # 遇到 Keywords / Key words / 目录 段落，英文摘要内容区结束
-            if 'Keywords' in text or 'Key words' in text or text_ns == '目录':
-                break
-
-            if not text.strip():
-                continue
-            found = True
-
-            # 1) 首行缩进两字符：effective w:ind/@w:firstLineChars == "200"
-            ind = _find_effective(para, 'ind')
-            indent_ok = ind is not None and ind.get(f'{W_NS}firstLineChars') == '200'
-
-            # 2) 两端对齐：effective w:jc/@w:val ∈ {"both", "justify"}
-            jc = _find_effective(para, 'jc')
-            align_ok = jc is not None and jc.get(f'{W_NS}val') in ('both', 'justify')
-
-            # 3) 1.5 倍行距：effective w:spacing/@w:line=="360" 且
-            #    @w:lineRule=="auto"
-            spacing = _find_effective(para, 'spacing')
-            line_ok = (
-                spacing is not None
-                and spacing.get(f'{W_NS}line') == '360'
-                and spacing.get(f'{W_NS}lineRule') == 'auto'
-            )
-
-            if not (indent_ok and align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：英文摘要内容存在且不满足任一子项时触发
-        passed = found and violated
-        self.add_result("英文摘要页的内容段落格式不满足首行缩进两字符、两端对齐、1.5倍行距", passed, -1)
-
-    def check_english_abstract_keywords_paragraph(self):
-        """-1：英文摘要页的关键词及其冒号后内容段落格式不满足首行缩进两字符、左对齐、1.5倍行距
-
-        细则依据（只判定"首行缩进两字符、左对齐、1.5 倍行距"三点，不加
-        任何额外约束）：定位段落文本包含"Keywords"或"Key words"的英文
-        摘要段落，判定其在办公软件（Word/WPS）中实际生效的段落属性——
-        沿"段落直接 pPr → w:pStyle 样式链（含 basedOn）→
-        w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 首行缩进两字符：effective w:ind 的 w:firstLineChars="200"
-             （单位为 1/100 字符，200=2 字符）
-          2) 左对齐：effective w:jc 的 val 为 "left"/"start"；或整条链上
-             均未设置 w:jc（Word 默认即为左对齐）
-          3) 1.5 倍行距：effective w:spacing 的 w:line="360" 且
-             w:lineRule="auto"（240=单倍，360=1.5倍，480=两倍）
-        只要任一项不满足，即"不满足首行缩进两字符、左对齐、1.5倍行距"，
-        触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective(para, child_tag):
-            """沿"段落直接 pPr → pStyle 链 → docDefaults/pPrDefault/pPr"
-            回退查找指定 pPr 子元素，返回首个存在者。
-            """
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                el = pPr.find(f'{W_NS}{child_tag}')
-                if el is not None:
-                    return el
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(f'{W_NS}{child_tag}')
-                    if el is not None:
-                        return el
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(f'{W_NS}{child_tag}')
-                        if el is not None:
-                            return el
-            return None
-
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if 'Keywords' not in para.text and 'Key words' not in para.text:
-                continue
-            found = True
-
-            # 1) 首行缩进两字符：effective w:ind/@w:firstLineChars == "200"
-            ind = _find_effective(para, 'ind')
-            indent_ok = ind is not None and ind.get(f'{W_NS}firstLineChars') == '200'
-
-            # 2) 左对齐：effective w:jc/@w:val ∈ {"left", "start"}；
-            #    或整条链未设置 w:jc（Word 默认左对齐）
-            jc = _find_effective(para, 'jc')
-            if jc is None:
-                align_ok = True
-            else:
-                jc_val = jc.get(f'{W_NS}val')
-                align_ok = jc_val in (None, 'left', 'start')
-
-            # 3) 1.5 倍行距：effective w:spacing/@w:line=="360" 且
-            #    @w:lineRule=="auto"
-            spacing = _find_effective(para, 'spacing')
-            line_ok = (
-                spacing is not None
-                and spacing.get(f'{W_NS}line') == '360'
-                and spacing.get(f'{W_NS}lineRule') == 'auto'
-            )
-
-            if not (indent_ok and align_ok and line_ok):
-                violated = True
-                break
-
-        # 扣分项：英文摘要 Keywords 段落存在且不满足任一子项时触发
-        passed = found and violated
-        self.add_result("英文摘要页的关键词及其冒号后内容段落格式不满足首行缩进两字符、左对齐、1.5倍行距", passed, -1)
-
-    def check_english_abstract_keywords_font(self):
-        """-1：英文摘要页的关键词及冒号后内容字体格式不满足Times New Roman四号
-
-        细则依据（只判定"Times New Roman"和"四号"两点，不加任何额外
-        约束）：定位段落文本包含"Keywords"或"Key words"的英文摘要段落，
-        对该段落中每个非空 run，判定其在办公软件（Word/WPS）中实际生效
-        的字体属性——沿"run 直接 rPr → 段落 pPr/rPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/rPrDefault/rPr"逐级回退取值：
-          1) 字体为 Times New Roman：effective w:rFonts 的 w:ascii 值
-             为 "Times New Roman"（英文使用 ascii 字体槽渲染）
-          2) 字号为四号：effective w:sz 的半磅值 = 28（即 14 磅）
-        只要任一 run 不满足上述任一项，即"不满足 Times New Roman 四号"，
-        触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _effective_rpr_value(run, para, getter):
-            """沿"run 直接 rPr → 段落 pPr/rPr → pStyle 链 rPr →
-            docDefaults/rPrDefault/rPr"回退，返回 getter(rPr) 的首个非空值。
-            """
-            r_rpr = run._element.find(f'{W_NS}rPr')
-            if r_rpr is not None:
-                v = getter(r_rpr)
-                if v is not None:
-                    return v
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None:
-                p_rpr = pPr.find(f'{W_NS}rPr')
-                if p_rpr is not None:
-                    v = getter(p_rpr)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_rpr = style.find(f'{W_NS}rPr')
-                if s_rpr is not None:
-                    v = getter(s_rpr)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                rPrDefault = doc_defaults.find(f'{W_NS}rPrDefault')
-                if rPrDefault is not None:
-                    d_rpr = rPrDefault.find(f'{W_NS}rPr')
-                    if d_rpr is not None:
-                        v = getter(d_rpr)
-                        if v is not None:
-                            return v
-            return None
-
-        def _get_ascii_font(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            if rFonts is None:
-                return None
-            return rFonts.get(f'{W_NS}ascii')
-
-        def _get_sz(rpr):
-            sz = rpr.find(f'{W_NS}sz')
-            if sz is None:
-                return None
-            return sz.get(f'{W_NS}val')
-
-        found = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            if 'Keywords' not in para.text and 'Key words' not in para.text:
-                continue
-
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-                found = True
-
-                # 1) 字体：Times New Roman（ascii 字体槽）
-                ascii_font = _effective_rpr_value(run, para, _get_ascii_font) or ''
-                font_ok = ascii_font == 'Times New Roman'
-
-                # 2) 字号：四号 = 半磅 28（14 磅）
-                sz_val = _effective_rpr_value(run, para, _get_sz)
-                size_ok = sz_val == '28'
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：英文摘要 Keywords 段落存在且不满足 Times New Roman 四号时触发
-        passed = found and violated
-        self.add_result("英文摘要页的关键词及冒号后内容字体格式不满足Times New Roman四号", passed, -1)
-
-    def check_header_present(self):
-        """-3：目录页后出现任意一页没有页眉
-
-        细则依据（只判定"目录页后是否存在没有页眉的页面"这一点，不加
-        任何额外约束）：
-
-        注意：不能使用 python-docx 的 doc.sections 高层接口——该文档中
-        doc.sections 的条目数量与底层 XML 中实际的 <w:sectPr> 元素数量
-        不一致（python-docx 在特定结构下会去重/合并分节标记，导致索引
-        整体错位），会造成"目录后紧邻的、实际声明了内容页眉的分节"被
-        跳过误判。因此直接遍历 self.doc.element.body 中所有 <w:sectPr>
-        （包含 w:p/w:pPr 内嵌的分节标记及 body 末尾的最后一个），按其
-        文档顺序索引定位目录段落所在的 sectPr，再逐一检查其后每个
-        sectPr 在办公软件（Word/WPS）中实际会显示的页眉：
-          1) 默认页眉（default）：分节必然会使用；从当前 sectPr 起向前
-             回溯，取最近一个显式声明 headerReference type="default" 的
-             sectPr，解析其引用的 header 部件内容。
-          2) 首页页眉（first）：仅当该 sectPr 存在 w:titlePg 时才生效，
-             同样向前回溯取最近一个显式声明 type="first" 的 sectPr。
-          3) 偶数页页眉（even）：仅当 word/settings.xml 声明了
-             w:evenAndOddHeaders 时才生效，同样向前回溯取最近一个显式
-             声明 type="even" 的 sectPr。
-        页眉"内容非空"的判定：header 部件的 XML 树中存在任一非空
-        w:t 文本节点，或存在 w:drawing/w:pict/w:tbl 元素之一。
-        任一"该分节会使用到"的页眉类型内容为空，即"存在页面没有页眉"，
-        触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        R_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
-        body = self.doc.element.body
-
-        # 1) 按文档顺序取出所有 sectPr（分节边界标记）
-        all_sectprs = body.findall(f'.//{W_NS}sectPr')
-
-        # 2) 定位"目录"段落所属的 sectPr 序号（0 起）
-        paragraphs = body.findall(f'.//{W_NS}p')
-
-        def _paragraph_text(p_el):
-            return ''.join(t.text or '' for t in p_el.findall(f'.//{W_NS}t'))
-
-        toc_sectpr_idx = None
-        sectpr_seen = 0
-        for p_el in paragraphs:
-            text_ns = _paragraph_text(p_el).strip().replace(' ', '').replace('　', '')
-            pPr = p_el.find(f'{W_NS}pPr')
-            has_sectpr = pPr is not None and pPr.find(f'{W_NS}sectPr') is not None
-            if text_ns == '目录' and toc_sectpr_idx is None:
-                toc_sectpr_idx = sectpr_seen
-            if has_sectpr:
-                sectpr_seen += 1
-
-        # 3) settings 中是否声明 evenAndOddHeaders（偶数页页眉是否启用）
-        settings_el = self.doc.settings.element
-        even_and_odd = settings_el.find(f'{W_NS}evenAndOddHeaders') is not None
-
-        # 4) 解析 r:id 对应的部件
-        def _resolve_part(rid):
-            try:
-                return self.doc.part.rels[rid].target_part
-            except KeyError:
-                return None
-
-        # 5) 从 sectpr_idx 向前回溯，取最近一个显式声明该 kind 的 headerReference
-        def _effective_header_part(sectpr_idx, kind):
-            idx = sectpr_idx
-            while idx >= 0:
-                sectPr = all_sectprs[idx]
-                ref = None
-                for r in sectPr.findall(f'{W_NS}headerReference'):
-                    if r.get(f'{W_NS}type') == kind:
-                        ref = r
-                        break
-                if ref is not None:
-                    rid = ref.get(f'{R_NS}id')
-                    return _resolve_part(rid)
-                idx -= 1
-            return None
-
-        # 6) 判定 header 部件是否含内容
-        def _has_header_content(part):
-            if part is None:
-                return False
-            el = part.element
-            for t in el.iter(f'{W_NS}t'):
-                if t.text and t.text.strip():
-                    return True
-            for tag in ('drawing', 'pict', 'tbl'):
-                if el.find(f'.//{W_NS}{tag}') is not None:
-                    return True
-            return False
-
-        # 7) 逐个"目录后"sectPr 检查
-        violated = False
-        start_idx = (toc_sectpr_idx + 1) if toc_sectpr_idx is not None else 0
-        for i in range(start_idx, len(all_sectprs)):
-            sectPr = all_sectprs[i]
-            title_pg = sectPr.find(f'{W_NS}titlePg') is not None
-
-            # 默认页眉：始终检查
-            if not _has_header_content(_effective_header_part(i, 'default')):
-                violated = True
-                break
-            # 首页页眉：仅 titlePg 生效时
-            if title_pg:
-                if not _has_header_content(_effective_header_part(i, 'first')):
-                    violated = True
-                    break
-            # 偶数页页眉：仅 settings 声明 evenAndOddHeaders 时
-            if even_and_odd:
-                if not _has_header_content(_effective_header_part(i, 'even')):
-                    violated = True
-                    break
-
-        # 扣分项：目录页后存在没有页眉的页面
-        self.add_result("目录页后出现任意一页没有页眉", violated, -3)
-
-    def check_header_font(self):
-        """-1：页眉字体格式不是宋体五号
-
-        细则依据（只判定"宋体"和"五号"两点，不加任何额外约束）：对文档
-        中所有分节实际会渲染到页面上的页眉——default 页眉始终生效；
-        first 页眉仅当分节 sectPr 存在 w:titlePg 时生效；even 页眉仅当
-        word/settings.xml 存在 w:evenAndOddHeaders 时生效——沿分节
-        is_linked_to_previous 链回溯到显式声明该 headerReference 的
-        header 部件，遍历其中所有非空 run，判定其在办公软件（Word/WPS）
-        中实际生效的字体属性——沿"run 直接 rPr → 段落 pPr/rPr → w:pStyle
-        样式链（含 basedOn）→ w:docDefaults/rPrDefault/rPr"逐级回退取值：
-          1) 字体为宋体：run.text 中的中文字符（CJK 统一表意区）按
-             effective w:rFonts/@w:eastAsia 判定；非 CJK 字符按
-             effective w:rFonts/@w:ascii 判定；被判定的槽位值需为
-             "宋体" 或 "SimSun"
-          2) 字号为五号：effective w:sz 的半磅值 = 21（即 10.5 磅）
-        只要任一非空 run 不满足上述任一项，即"不是宋体五号"，触发 -1
-        扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _effective_rpr_value(run_el, para_el, getter):
-            """沿"run 直接 rPr → 段落 pPr/rPr → pStyle 链 rPr →
-            docDefaults/rPrDefault/rPr"回退。
-            """
-            r_rpr = run_el.find(f'{W_NS}rPr')
-            if r_rpr is not None:
-                v = getter(r_rpr)
-                if v is not None:
-                    return v
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                p_rpr = pPr.find(f'{W_NS}rPr')
-                if p_rpr is not None:
-                    v = getter(p_rpr)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_rpr = style.find(f'{W_NS}rPr')
-                if s_rpr is not None:
-                    v = getter(s_rpr)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                rPrDefault = doc_defaults.find(f'{W_NS}rPrDefault')
-                if rPrDefault is not None:
-                    d_rpr = rPrDefault.find(f'{W_NS}rPr')
-                    if d_rpr is not None:
-                        v = getter(d_rpr)
-                        if v is not None:
-                            return v
-            return None
-
-        def _get_east_asia(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}eastAsia') if rFonts is not None else None
-
-        def _get_ascii(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}ascii') if rFonts is not None else None
-
-        def _get_sz(rpr):
-            sz = rpr.find(f'{W_NS}sz')
-            return sz.get(f'{W_NS}val') if sz is not None else None
-
-        def _is_song(name):
-            return name in ('宋体', 'SimSun')
-
-        def _is_cjk(ch):
-            cp = ord(ch)
-            return (
-                0x4E00 <= cp <= 0x9FFF   # CJK 统一表意
-                or 0x3400 <= cp <= 0x4DBF  # 扩展 A
-                or 0xF900 <= cp <= 0xFAFF  # 兼容
-                or 0x3000 <= cp <= 0x303F  # CJK 符号和标点
-                or 0xFF00 <= cp <= 0xFFEF  # 全角
-            )
-
-        # 定位所有实际生效的 header 部件根元素
-        settings_el = self.doc.settings.element
-        even_and_odd = settings_el.find(f'{W_NS}evenAndOddHeaders') is not None
-        sections = self.doc.sections
-
-        def _effective_header_element(idx, kind):
-            while idx >= 0:
-                sec = sections[idx]
-                if kind == 'default':
-                    h = sec.header
-                elif kind == 'first':
-                    h = sec.first_page_header
-                else:
-                    h = sec.even_page_header
-                if not h.is_linked_to_previous:
-                    try:
-                        return h.part.element
-                    except AttributeError:
-                        return None
-                idx -= 1
-            return None
-
-        header_roots = []
-        seen = set()
-        for i, section in enumerate(sections):
-            sectPr = section._sectPr
-            title_pg = (
-                sectPr is not None
-                and sectPr.find(f'{W_NS}titlePg') is not None
-            )
-            kinds = ['default']
-            if title_pg:
-                kinds.append('first')
-            if even_and_odd:
-                kinds.append('even')
-            for k in kinds:
-                el = _effective_header_element(i, k)
-                if el is not None and id(el) not in seen:
-                    seen.add(id(el))
-                    header_roots.append(el)
-
-        found = False
-        violated = False
-
-        for root in header_roots:
-            for para_el in root.iter(f'{W_NS}p'):
-                for run_el in para_el.findall(f'{W_NS}r'):
-                    text = ''.join(
-                        (t.text or '') for t in run_el.findall(f'{W_NS}t')
-                    )
-                    if not text.strip():
-                        continue
-                    found = True
-
-                    # 1) 字体：按 run 中字符类别选择字体槽位
-                    has_cjk = any(_is_cjk(c) for c in text)
-                    has_ascii = any(not _is_cjk(c) and not c.isspace() for c in text)
-                    font_ok = True
-                    if has_cjk:
-                        ea = _effective_rpr_value(run_el, para_el, _get_east_asia) or ''
-                        if not _is_song(ea):
-                            font_ok = False
-                    if font_ok and has_ascii:
-                        asc = _effective_rpr_value(run_el, para_el, _get_ascii) or ''
-                        if not _is_song(asc):
-                            font_ok = False
-
-                    # 2) 字号：五号 = 半磅 21（10.5 磅）
-                    sz_val = _effective_rpr_value(run_el, para_el, _get_sz)
-                    size_ok = sz_val == '21'
-
-                    if not (font_ok and size_ok):
-                        violated = True
-                        break
-                if violated:
-                    break
-            if violated:
-                break
-
-        # 扣分项：存在生效页眉且任一非空 run 不满足宋体五号
-        passed = found and violated
-        self.add_result("页眉字体格式不是宋体五号", passed, -1)
-
-    def check_header_paragraph(self):
-        """-1：页眉段落格式不满足页眉下无横线、居中对齐、单倍行距
-
-        细则依据（只判定"页眉下无横线、居中对齐、单倍行距"三点，不加
-        任何额外约束）：对文档中所有实际会渲染到页面上的页眉——default
-        页眉始终生效；first 页眉仅当分节 sectPr 存在 w:titlePg 时生效；
-        even 页眉仅当 word/settings.xml 存在 w:evenAndOddHeaders 时生效
-        ——沿分节 is_linked_to_previous 链回溯到显式声明该 headerReference
-        的 header 部件，遍历其中所有段落，判定其在办公软件（Word/WPS）
-        中实际生效的段落属性——沿"段落直接 pPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 页眉下无横线：effective w:pBdr/w:bottom 缺失，或其
-             w:val ∈ {"nil", "none"}，或其 w:sz == "0"
-          2) 居中对齐：effective w:jc 的 val = "center"
-          3) 单倍行距：effective w:spacing 的 w:line="240" 且
-             w:lineRule="auto"；或整条链上均未设置 w:line
-             （Word 默认即为单倍行距）
-        只要任一段落不满足上述任一项，即"不满足页眉下无横线、居中对齐、
-        单倍行距"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective(para_el, child_tag):
-            """沿"段落直接 pPr → pStyle 链 → docDefaults/pPrDefault/pPr"
-            回退查找指定 pPr 子元素，返回首个存在者。
-            """
-            pPr = para_el.find(f'{W_NS}pPr')
-            if pPr is not None:
-                el = pPr.find(f'{W_NS}{child_tag}')
-                if el is not None:
-                    return el
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(f'{W_NS}{child_tag}')
-                    if el is not None:
-                        return el
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(f'{W_NS}{child_tag}')
-                        if el is not None:
-                            return el
-            return None
-
-        # 收集所有实际生效的 header 部件根元素
-        settings_el = self.doc.settings.element
-        even_and_odd = settings_el.find(f'{W_NS}evenAndOddHeaders') is not None
-        sections = self.doc.sections
-
-        def _effective_header_element(idx, kind):
-            while idx >= 0:
-                sec = sections[idx]
-                if kind == 'default':
-                    h = sec.header
-                elif kind == 'first':
-                    h = sec.first_page_header
-                else:
-                    h = sec.even_page_header
-                if not h.is_linked_to_previous:
-                    try:
-                        return h.part.element
-                    except AttributeError:
-                        return None
-                idx -= 1
-            return None
-
-        def _header_has_visible_content(hdr_el):
-            """header 部件是否在办公软件中会呈现可见内容——存在任一非空
-            w:t 文本，或存在 w:drawing / w:pict / w:tbl 元素。
-            """
-            if hdr_el is None:
-                return False
-            for t in hdr_el.iter(f'{W_NS}t'):
-                if t.text and t.text.strip():
-                    return True
-            for tag in ('drawing', 'pict', 'tbl'):
-                if hdr_el.find(f'.//{W_NS}{tag}') is not None:
-                    return True
-            return False
-
-        header_roots = []
-        seen = set()
-        for i, section in enumerate(sections):
-            sectPr = section._sectPr
-            title_pg = (
-                sectPr is not None
-                and sectPr.find(f'{W_NS}titlePg') is not None
-            )
-            kinds = ['default']
-            if title_pg:
-                kinds.append('first')
-            if even_and_odd:
-                kinds.append('even')
-            for k in kinds:
-                el = _effective_header_element(i, k)
-                if el is not None and id(el) not in seen:
-                    seen.add(id(el))
-                    # 只判定"页面上实际显示的页眉段落"，跳过空 header
-                    if _header_has_visible_content(el):
-                        header_roots.append(el)
-
-        found = False
-        violated = False
-
-        for root in header_roots:
-            for para_el in root.iter(f'{W_NS}p'):
-                found = True
-
-                # 1) 页眉下无横线：effective w:pBdr/w:bottom 视为无线的情况
-                pBdr = _find_effective(para_el, 'pBdr')
-                if pBdr is None:
-                    no_line_ok = True
-                else:
-                    bottom = pBdr.find(f'{W_NS}bottom')
-                    if bottom is None:
-                        no_line_ok = True
-                    else:
-                        val = bottom.get(f'{W_NS}val')
-                        sz = bottom.get(f'{W_NS}sz')
-                        no_line_ok = val in ('nil', 'none') or sz == '0'
-
-                # 2) 居中对齐：effective w:jc/@w:val == "center"
-                jc = _find_effective(para_el, 'jc')
-                align_ok = jc is not None and jc.get(f'{W_NS}val') == 'center'
-
-                # 3) 单倍行距：effective w:spacing 满足单倍行距
-                spacing = _find_effective(para_el, 'spacing')
-                if spacing is None:
-                    line_ok = True
-                else:
-                    line = spacing.get(f'{W_NS}line')
-                    line_rule = spacing.get(f'{W_NS}lineRule')
-                    if line is None:
-                        line_ok = True
-                    elif line == '240' and line_rule == 'auto':
-                        line_ok = True
-                    else:
-                        line_ok = False
-
-                if not (no_line_ok and align_ok and line_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：存在生效页眉段落且任一段落不满足任一子项时触发
-        passed = found and violated
-        self.add_result("页眉段落格式不满足页眉下无横线、居中对齐、单倍行距", passed, -1)
-
-    def check_header_top_margin(self):
-        """-1：页眉上边距不满足1.50厘米
-
-        细则依据（只判定"页眉上边距 = 1.50 厘米"这一点，不加任何额外
-        约束）：对文档每个分节，读取其在办公软件（Word/WPS）"页面设置 →
-        页边距 → 页眉"处所显示的值——对应 OOXML 的 w:sectPr/w:pgMar 的
-        w:header 属性（单位 twip，1440 twip = 1 英寸 = 2.54 厘米）。
-        将该 twip 值按办公软件默认的两位小数厘米显示进行舍入，需等于
-        1.50 厘米。若任一分节的 pgMar/@w:header 缺失，或其厘米显示值
-        不等于 1.50，即"不满足 1.50 厘米"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        violated = False
-
-        for section in self.doc.sections:
-            sectPr = section._sectPr
-            pgMar = sectPr.find(f'{W_NS}pgMar') if sectPr is not None else None
-            twips_attr = pgMar.get(f'{W_NS}header') if pgMar is not None else None
-            if twips_attr is None:
-                violated = True
-                break
-            try:
-                twips = int(twips_attr)
-            except (TypeError, ValueError):
-                violated = True
-                break
-            # 与办公软件"厘米（两位小数）"显示保持一致的舍入判定
-            cm_display = round(twips / 1440.0 * 2.54, 2)
-            if cm_display != 1.50:
-                violated = True
-                break
-
-        self.add_result("页眉上边距不满足1.50厘米", violated, -1)
-
-    def check_footer_bottom_margin(self):
-        """-1：页脚下边距不满足1.75厘米
-
-        细则依据（只判定"页脚下边距 = 1.75 厘米"这一点，不加任何额外
-        约束）：对文档每个分节，读取其在办公软件（Word/WPS）"页面设置 →
-        页边距 → 页脚"处所显示的值——对应 OOXML 的 w:sectPr/w:pgMar 的
-        w:footer 属性（单位 twip，1440 twip = 1 英寸 = 2.54 厘米）。
-        将该 twip 值按办公软件默认的两位小数厘米显示进行舍入，需等于
-        1.75 厘米。若任一分节的 pgMar/@w:footer 缺失，或其厘米显示值
-        不等于 1.75，即"不满足 1.75 厘米"，触发 -1 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        violated = False
-
-        for section in self.doc.sections:
-            sectPr = section._sectPr
-            pgMar = sectPr.find(f'{W_NS}pgMar') if sectPr is not None else None
-            twips_attr = pgMar.get(f'{W_NS}footer') if pgMar is not None else None
-            if twips_attr is None:
-                violated = True
-                break
-            try:
-                twips = int(twips_attr)
-            except (TypeError, ValueError):
-                violated = True
-                break
-            # 与办公软件"厘米（两位小数）"显示保持一致的舍入判定
-            cm_display = round(twips / 1440.0 * 2.54, 2)
-            if cm_display != 1.75:
-                violated = True
-                break
-
-        self.add_result("页脚下边距不满足1.75厘米", violated, -1)
-
-    def check_page_number_roman(self):
-        """-3：文章不满足：从摘要页开始编写页码，摘要页到目录页页码格式为大写罗马数字
-
-        细则依据（只判定"从摘要页开始编写页码"与"摘要页到目录页页码格式
-        为大写罗马数字"两点，不加任何额外约束）：
-
-        1) 从摘要页开始编写页码——摘要页所在分节及其后的每一分节，其在
-           办公软件（Word/WPS）中实际渲染的页脚必须含"PAGE"域（对应
-           OOXML 的 w:instrText 中包含 "PAGE" 关键字）；而摘要页所在
-           分节之前的每一分节，其实际渲染页脚不得含 PAGE 域。
-           "实际渲染的页脚"沿分节 is_linked_to_previous 链回溯到显式
-           声明该 footerReference 的 footer 部件——default 始终生效；
-           first 仅当分节 sectPr 存在 w:titlePg 时生效；even 仅当
-           word/settings.xml 存在 w:evenAndOddHeaders 时生效。
-
-        2) 摘要页到目录页页码格式为大写罗马数字——摘要页所在分节到
-           目录页所在分节（含端点）的每一分节，其
-           w:sectPr/w:pgNumType/@w:fmt == "upperRoman"。
-
-        以上任一点不成立，即触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-
-        # 1) 定位摘要页和目录页所在分节序号（0 起）
-        abstract_sec_idx = None
-        toc_sec_idx = None
-        section_idx = 0
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if abstract_sec_idx is None and text_ns == '摘要':
-                abstract_sec_idx = section_idx
-            if toc_sec_idx is None and text_ns == '目录':
-                toc_sec_idx = section_idx
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None and pPr.find(f'{W_NS}sectPr') is not None:
-                section_idx += 1
-            if abstract_sec_idx is not None and toc_sec_idx is not None:
-                break
-
-        # 无法定位摘要/目录时不触发扣分（保持保守）
-        if abstract_sec_idx is None or toc_sec_idx is None:
-            self.add_result("从摘要页开始编写页码，摘要页到目录页页码格式不为大写罗马数字", False, -3)
-            return
-
-        settings_el = self.doc.settings.element
-        even_and_odd = settings_el.find(f'{W_NS}evenAndOddHeaders') is not None
-        sections = self.doc.sections
-
-        def _effective_footer_element(idx, kind):
-            while idx >= 0:
-                sec = sections[idx]
-                if kind == 'default':
-                    f = sec.footer
-                elif kind == 'first':
-                    f = sec.first_page_footer
-                else:
-                    f = sec.even_page_footer
-                if not f.is_linked_to_previous:
-                    try:
-                        return f.part.element
-                    except AttributeError:
-                        return None
-                idx -= 1
-            return None
-
-        def _footer_kinds(section):
-            sectPr = section._sectPr
-            title_pg = (
-                sectPr is not None
-                and sectPr.find(f'{W_NS}titlePg') is not None
-            )
-            kinds = ['default']
-            if title_pg:
-                kinds.append('first')
-            if even_and_odd:
-                kinds.append('even')
-            return kinds
-
-        def _footer_has_page_field(ftr_el):
-            if ftr_el is None:
-                return False
-            for it in ftr_el.iter(f'{W_NS}instrText'):
-                if it.text and 'PAGE' in it.text.upper():
-                    return True
-            return False
-
-        violated = False
-
-        # 2) 摘要页之前：所有会渲染的页脚都不得含 PAGE 域
-        for i in range(0, abstract_sec_idx):
-            for k in _footer_kinds(sections[i]):
-                if _footer_has_page_field(_effective_footer_element(i, k)):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 3) 摘要页及之后：所有会渲染的页脚都必须含 PAGE 域
-        if not violated:
-            for i in range(abstract_sec_idx, len(sections)):
-                for k in _footer_kinds(sections[i]):
-                    if not _footer_has_page_field(_effective_footer_element(i, k)):
-                        violated = True
-                        break
-                if violated:
-                    break
-
-        # 4) 摘要页到目录页（含端点）：pgNumType/@fmt == "upperRoman"
-        if not violated:
-            lo, hi = sorted((abstract_sec_idx, toc_sec_idx))
-            for i in range(lo, hi + 1):
-                sectPr = sections[i]._sectPr
-                pgNum = sectPr.find(f'{W_NS}pgNumType') if sectPr is not None else None
-                fmt = pgNum.get(f'{W_NS}fmt') if pgNum is not None else None
-                if fmt != 'upperRoman':
-                    violated = True
-                    break
-
-        self.add_result("从摘要页开始编写页码，摘要页到目录页页码格式不为大写罗马数字", violated, -3)
-
-    def check_page_number_restart(self):
-        """-3：文章不满足：从正文内容页重新编写页码从1开始，页码格式为阿拉伯数字
-
-        细则依据（只判定"从正文内容页重新编写页码从 1 开始"与"页码格式
-        为阿拉伯数字"两点，不加任何额外约束）：
-
-        "正文内容页"定位为紧接目录页之后的第一个分节——即目录段落所在
-        分节的下一个分节；办公软件（Word/WPS）以此分节为界重启页码。
-        对该分节判定其 w:sectPr/w:pgNumType：
-          1) 重新编写页码从 1 开始：@w:start == "1"（w:pgNumType 显式
-             存在 @w:start=1 才表示"重新起编"；缺失时页码沿用上一节，
-             办公软件不视为重起）
-          2) 页码格式为阿拉伯数字：@w:fmt == "decimal"；或 pgNumType
-             不存在 @w:fmt（阿拉伯数字为 OOXML 默认，办公软件默认按
-             阿拉伯数字显示）
-        任一点不成立，即触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-
-        # 1) 定位目录段落所在分节序号，正文内容页 = 目录分节 + 1
-        toc_sec_idx = None
-        section_idx = 0
-        for para in self.doc.paragraphs:
-            text_ns = para.text.strip().replace(' ', '').replace('　', '')
-            if text_ns == '目录':
-                toc_sec_idx = section_idx
-                break
-            pPr = para._element.find(f'{W_NS}pPr')
-            if pPr is not None and pPr.find(f'{W_NS}sectPr') is not None:
-                section_idx += 1
-
-        sections = self.doc.sections
-        body_sec_idx = (toc_sec_idx + 1) if toc_sec_idx is not None else None
-
-        # 找不到目录分节或正文分节不存在时不触发扣分（保持保守）
-        if body_sec_idx is None or body_sec_idx >= len(sections):
-            self.add_result("正文内容页未重新编写页码从1开始，或页码格式不是阿拉伯数字", False, -3)
-            return
-
-        sectPr = sections[body_sec_idx]._sectPr
-        pgNum = sectPr.find(f'{W_NS}pgNumType') if sectPr is not None else None
-        start = pgNum.get(f'{W_NS}start') if pgNum is not None else None
-        fmt = pgNum.get(f'{W_NS}fmt') if pgNum is not None else None
-
-        # 1) 重新编写页码从 1 开始：需显式 @w:start == "1"
-        restart_ok = start == '1'
-        # 2) 阿拉伯数字：@w:fmt == "decimal" 或未设置（默认即阿拉伯数字）
-        fmt_ok = fmt in (None, 'decimal')
-
-        violated = not (restart_ok and fmt_ok)
-        self.add_result("正文内容页未重新编写页码从1开始，或页码格式不是阿拉伯数字", violated, -3)
-
-    def check_level1_font(self):
-        """-3：文章一级标题字体格式不满足黑体三号
-
-        细则依据（只判定"黑体"和"三号"两点，不加任何额外约束）：
-        "文章一级标题" 指正文区（自动目录字段 fldChar end 之后）中所有
-        办公软件（Word/WPS）识别为大纲级别 1 的段落——即段落 effective
-        w:outlineLvl 的 val = "0"（沿"段落 pPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值）。
-        对每个此类段落遍历所有非空 run，判定其在办公软件中实际生效的
-        字体属性——沿"run 直接 rPr → 段落 pPr/rPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/rPrDefault/rPr"逐级回退取值：
-          1) 字体为黑体：run 文本中的中文字符（CJK）按 effective
-             w:rFonts/@w:eastAsia 判定；非中文字符按 effective
-             w:rFonts/@w:ascii 判定；被判定槽位值需为 "黑体" 或 "SimHei"
-          2) 字号为三号：effective w:sz 的半磅值 = 32（即 16 磅）
-        只要存在一级标题且任一 run 不满足以上任一项，触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective_ppr_child(para_el, child_tag):
-            """段落属性沿 pPr → pStyle 链 → docDefaults/pPrDefault 回退。"""
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                v = pPr.find(child_tag)
-                if v is not None:
-                    return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    v = s_pPr.find(child_tag)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        v = d_pPr.find(child_tag)
-                        if v is not None:
-                            return v
-            return None
-
-        def _effective_rpr_value(run_el, para_el, getter):
-            """run 属性沿 run rPr → 段落 pPr/rPr → pStyle 链 rPr →
-            docDefaults/rPrDefault/rPr 回退。
-            """
-            r_rpr = run_el.find(f'{W_NS}rPr')
-            if r_rpr is not None:
-                v = getter(r_rpr)
-                if v is not None:
-                    return v
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                p_rpr = pPr.find(f'{W_NS}rPr')
-                if p_rpr is not None:
-                    v = getter(p_rpr)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_rpr = style.find(f'{W_NS}rPr')
-                if s_rpr is not None:
-                    v = getter(s_rpr)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                rPrDefault = doc_defaults.find(f'{W_NS}rPrDefault')
-                if rPrDefault is not None:
-                    d_rpr = rPrDefault.find(f'{W_NS}rPr')
-                    if d_rpr is not None:
-                        v = getter(d_rpr)
-                        if v is not None:
-                            return v
-            return None
-
-        def _get_east_asia(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}eastAsia') if rFonts is not None else None
-
-        def _get_ascii(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}ascii') if rFonts is not None else None
-
-        def _get_sz(rpr):
-            sz = rpr.find(f'{W_NS}sz')
-            return sz.get(f'{W_NS}val') if sz is not None else None
-
-        def _is_hei(name):
-            return name in ('黑体', 'SimHei')
-
-        def _is_cjk(ch):
-            cp = ord(ch)
-            return (
-                0x4E00 <= cp <= 0x9FFF
-                or 0x3400 <= cp <= 0x4DBF
-                or 0xF900 <= cp <= 0xFAFF
-                or 0x3000 <= cp <= 0x303F
-                or 0xFF00 <= cp <= 0xFFEF
-            )
-
-        # 定位正文起点：自动目录字段 fldChar end 之后
-        in_body = False
-        found_level1 = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            para_el = para._element
-            if not in_body:
-                if '<w:fldChar w:fldCharType="end"' in para_el.xml:
-                    in_body = True
-                continue
-
-            # 判定 effective outlineLvl == "0"
-            ol_el = _find_effective_ppr_child(para_el, f'{W_NS}outlineLvl')
-            if ol_el is None:
-                continue
-            if ol_el.get(f'{W_NS}val') != '0':
-                continue
-
-            found_level1 = True
-
-            for run_el in para_el.findall(f'{W_NS}r'):
-                text = ''.join(
-                    (t.text or '') for t in run_el.findall(f'{W_NS}t')
-                )
-                if not text.strip():
-                    continue
-
-                # 1) 字体：按 run 中字符类别选择字体槽位
-                has_cjk = any(_is_cjk(c) for c in text)
-                has_non_cjk = any(
-                    (not _is_cjk(c)) and (not c.isspace()) for c in text
-                )
-                font_ok = True
-                if has_cjk:
-                    ea = _effective_rpr_value(run_el, para_el, _get_east_asia) or ''
-                    if not _is_hei(ea):
-                        font_ok = False
-                if font_ok and has_non_cjk:
-                    asc = _effective_rpr_value(run_el, para_el, _get_ascii) or ''
-                    if not _is_hei(asc):
-                        font_ok = False
-
-                # 2) 字号：三号 = 半磅 32（16 磅）
-                sz_val = _effective_rpr_value(run_el, para_el, _get_sz)
-                size_ok = sz_val == '32'
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：存在一级标题且任一 run 不满足黑体三号
-        passed = found_level1 and violated
-        self.add_result("文章一级标题字体格式不满足黑体三号", passed, -3)
-
-    def check_level1_paragraph(self):
-        """-3：文章一级标题段落格式不满足居中对齐、段前一行、段后一行、两倍行距
-
-        细则依据（只判定"居中对齐、段前一行、段后一行、两倍行距"四点，
-        不加任何额外约束）："文章一级标题" 指正文区（自动目录字段
-        fldChar end 之后）中所有办公软件（Word/WPS）识别为大纲级别 1
-        的段落——即段落 effective w:outlineLvl 的 val = "0"（沿"段落
-        pPr → w:pStyle 样式链（含 basedOn）→ w:docDefaults/pPrDefault/
-        pPr"逐级回退取值）。对每个此类段落判定其在办公软件中实际生效
-        的段落属性——对每个属性（w:jc 的 val，w:spacing 的 beforeLines
-        / afterLines / line / lineRule）单独沿"段落 pPr → w:pStyle 样式
-        链（含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 居中对齐：effective w:jc/@w:val == "center"
-          2) 段前一行：effective w:spacing/@w:beforeLines == "100"
-             （办公软件"段前 1 行"存储为 beforeLines=100，单位 1/100 行）
-          3) 段后一行：effective w:spacing/@w:afterLines == "100"
-          4) 两倍行距：effective w:spacing/@w:line == "480" 且
-             effective w:spacing/@w:lineRule 属于 {"auto", 缺失}
-             （OOXML lineRule 默认为 auto；两倍行距 = 480/240）
-        只要存在一级标题且任一点不满足，触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective_ppr_child(para_el, child_tag):
-            """段落属性沿 pPr → pStyle 链 → docDefaults/pPrDefault 回退，
-            返回第一个出现的子元素（整元素）。
-            """
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                v = pPr.find(child_tag)
-                if v is not None:
-                    return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    v = s_pPr.find(child_tag)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        v = d_pPr.find(child_tag)
-                        if v is not None:
-                            return v
-            return None
-
-        def _find_effective_ppr_attr(para_el, child_tag, attr_qname):
-            """段落属性按 attribute 粒度回退（OOXML 中 w:spacing 各属性
-            单独继承）：沿"段落 pPr → w:pStyle 样式链（含 basedOn）→
-            docDefaults/pPrDefault/pPr"逐级回退，返回首次出现该属性
-            的值。
-            """
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                el = pPr.find(child_tag)
-                if el is not None:
-                    v = el.get(attr_qname)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(child_tag)
-                    if el is not None:
-                        v = el.get(attr_qname)
-                        if v is not None:
-                            return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(child_tag)
-                        if el is not None:
-                            v = el.get(attr_qname)
-                            if v is not None:
-                                return v
-            return None
-
-        # 定位正文起点：自动目录字段 fldChar end 之后
-        in_body = False
-        found_level1 = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            para_el = para._element
-            if not in_body:
-                if '<w:fldChar w:fldCharType="end"' in para_el.xml:
-                    in_body = True
-                continue
-
-            # 判定 effective outlineLvl == "0"
-            ol_el = _find_effective_ppr_child(para_el, f'{W_NS}outlineLvl')
-            if ol_el is None:
-                continue
-            if ol_el.get(f'{W_NS}val') != '0':
-                continue
-
-            found_level1 = True
-
-            # 1) 居中对齐
-            jc_val = _find_effective_ppr_attr(para_el, f'{W_NS}jc', f'{W_NS}val')
-            align_ok = jc_val == 'center'
-
-            # 2) 段前一行：beforeLines == "100"
-            before_lines = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}beforeLines'
-            )
-            before_ok = before_lines == '100'
-
-            # 3) 段后一行：afterLines == "100"
-            after_lines = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}afterLines'
-            )
-            after_ok = after_lines == '100'
-
-            # 4) 两倍行距：line == "480" 且 lineRule ∈ {"auto", 缺失}
-            line_val = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}line'
-            )
-            line_rule = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}lineRule'
-            )
-            spacing_ok = line_val == '480' and line_rule in (None, 'auto')
-
-            if not (align_ok and before_ok and after_ok and spacing_ok):
-                violated = True
-                break
-
-        # 扣分项：存在一级标题且任一点不满足
-        passed = found_level1 and violated
-        self.add_result(
-            "文章一级标题段落格式不满足居中对齐、段前一行、段后一行、两倍行距",
-            passed, -3,
-        )
-
-    def check_level2_font(self):
-        """-3：文章二级标题字体格式不满足黑体四号
-
-        细则依据（只判定"黑体"和"四号"两点，不加任何额外约束）：
-        "文章二级标题" 指正文区（自动目录字段 fldChar end 之后）中所有
-        办公软件（Word/WPS）识别为大纲级别 2 的段落——即段落 effective
-        w:outlineLvl 的 val = "1"（沿"段落 pPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值）。
-        对每个此类段落遍历所有非空 run，判定其在办公软件中实际生效的
-        字体属性——沿"run 直接 rPr → 段落 pPr/rPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/rPrDefault/rPr"逐级回退取值：
-          1) 字体为黑体：run 文本中的中文字符（CJK）按 effective
-             w:rFonts/@w:eastAsia 判定；非中文字符按 effective
-             w:rFonts/@w:ascii 判定；被判定槽位值需为 "黑体" 或 "SimHei"
-          2) 字号为四号：effective w:sz 的半磅值 = 28（即 14 磅）
-        只要存在二级标题且任一 run 不满足以上任一项，触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective_ppr_child(para_el, child_tag):
-            """段落属性沿 pPr → pStyle 链 → docDefaults/pPrDefault 回退。"""
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                v = pPr.find(child_tag)
-                if v is not None:
-                    return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    v = s_pPr.find(child_tag)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        v = d_pPr.find(child_tag)
-                        if v is not None:
-                            return v
-            return None
-
-        def _effective_rpr_value(run_el, para_el, getter):
-            """run 属性沿 run rPr → 段落 pPr/rPr → pStyle 链 rPr →
-            docDefaults/rPrDefault/rPr 回退。
-            """
-            r_rpr = run_el.find(f'{W_NS}rPr')
-            if r_rpr is not None:
-                v = getter(r_rpr)
-                if v is not None:
-                    return v
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                p_rpr = pPr.find(f'{W_NS}rPr')
-                if p_rpr is not None:
-                    v = getter(p_rpr)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_rpr = style.find(f'{W_NS}rPr')
-                if s_rpr is not None:
-                    v = getter(s_rpr)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                rPrDefault = doc_defaults.find(f'{W_NS}rPrDefault')
-                if rPrDefault is not None:
-                    d_rpr = rPrDefault.find(f'{W_NS}rPr')
-                    if d_rpr is not None:
-                        v = getter(d_rpr)
-                        if v is not None:
-                            return v
-            return None
-
-        def _get_east_asia(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}eastAsia') if rFonts is not None else None
-
-        def _get_ascii(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}ascii') if rFonts is not None else None
-
-        def _get_sz(rpr):
-            sz = rpr.find(f'{W_NS}sz')
-            return sz.get(f'{W_NS}val') if sz is not None else None
-
-        def _is_hei(name):
-            return name in ('黑体', 'SimHei')
-
-        def _is_cjk(ch):
-            cp = ord(ch)
-            return (
-                0x4E00 <= cp <= 0x9FFF
-                or 0x3400 <= cp <= 0x4DBF
-                or 0xF900 <= cp <= 0xFAFF
-                or 0x3000 <= cp <= 0x303F
-                or 0xFF00 <= cp <= 0xFFEF
-            )
-
-        # 定位正文起点：自动目录字段 fldChar end 之后
-        in_body = False
-        found_level2 = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            para_el = para._element
-            if not in_body:
-                if '<w:fldChar w:fldCharType="end"' in para_el.xml:
-                    in_body = True
-                continue
-
-            # 判定 effective outlineLvl == "1"
-            ol_el = _find_effective_ppr_child(para_el, f'{W_NS}outlineLvl')
-            if ol_el is None:
-                continue
-            if ol_el.get(f'{W_NS}val') != '1':
-                continue
-
-            found_level2 = True
-
-            for run_el in para_el.findall(f'{W_NS}r'):
-                text = ''.join(
-                    (t.text or '') for t in run_el.findall(f'{W_NS}t')
-                )
-                if not text.strip():
-                    continue
-
-                # 1) 字体：按 run 中字符类别选择字体槽位
-                has_cjk = any(_is_cjk(c) for c in text)
-                has_non_cjk = any(
-                    (not _is_cjk(c)) and (not c.isspace()) for c in text
-                )
-                font_ok = True
-                if has_cjk:
-                    ea = _effective_rpr_value(run_el, para_el, _get_east_asia) or ''
-                    if not _is_hei(ea):
-                        font_ok = False
-                if font_ok and has_non_cjk:
-                    asc = _effective_rpr_value(run_el, para_el, _get_ascii) or ''
-                    if not _is_hei(asc):
-                        font_ok = False
-
-                # 2) 字号：四号 = 半磅 28（14 磅）
-                sz_val = _effective_rpr_value(run_el, para_el, _get_sz)
-                size_ok = sz_val == '28'
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：存在二级标题且任一 run 不满足黑体四号
-        passed = found_level2 and violated
-        self.add_result("文章二级标题字体格式不满足黑体四号", passed, -3)
-
-    def check_level2_paragraph(self):
-        """-3：文章二级标题段落格式不满足左对齐、段前0.5行、段后0.5行、1.5倍行距
-
-        细则依据（只判定"左对齐、段前0.5行、段后0.5行、1.5倍行距"四点，
-        不加任何额外约束）："文章二级标题" 指正文区（自动目录字段
-        fldChar end 之后）中所有办公软件（Word/WPS）识别为大纲级别 2
-        的段落——即段落 effective w:outlineLvl 的 val = "1"（沿"段落
-        pPr → w:pStyle 样式链（含 basedOn）→ w:docDefaults/pPrDefault/
-        pPr"逐级回退取值）。对每个此类段落判定其在办公软件中实际生效
-        的段落属性——每个属性（w:jc 的 val，w:spacing 的 beforeLines /
-        afterLines / line / lineRule）单独沿"段落 pPr → w:pStyle 样式
-        链（含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 左对齐：effective w:jc/@w:val == "left"
-          2) 段前0.5行：effective w:spacing/@w:beforeLines == "50"
-             （办公软件"段前 0.5 行"存储为 beforeLines=50，单位 1/100 行）
-          3) 段后0.5行：effective w:spacing/@w:afterLines == "50"
-          4) 1.5倍行距：effective w:spacing/@w:line == "360" 且
-             effective w:spacing/@w:lineRule 属于 {"auto", 缺失}
-             （OOXML lineRule 默认为 auto；1.5 倍 = 360/240）
-        只要存在二级标题且任一点不满足，触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective_ppr_child(para_el, child_tag):
-            """段落属性沿 pPr → pStyle 链 → docDefaults/pPrDefault 回退。"""
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                v = pPr.find(child_tag)
-                if v is not None:
-                    return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    v = s_pPr.find(child_tag)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        v = d_pPr.find(child_tag)
-                        if v is not None:
-                            return v
-            return None
-
-        def _find_effective_ppr_attr(para_el, child_tag, attr_qname):
-            """段落属性按 attribute 粒度回退（OOXML 中 w:spacing 各属性
-            单独继承）。
-            """
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                el = pPr.find(child_tag)
-                if el is not None:
-                    v = el.get(attr_qname)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(child_tag)
-                    if el is not None:
-                        v = el.get(attr_qname)
-                        if v is not None:
-                            return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(child_tag)
-                        if el is not None:
-                            v = el.get(attr_qname)
-                            if v is not None:
-                                return v
-            return None
-
-        # 定位正文起点：自动目录字段 fldChar end 之后
-        in_body = False
-        found_level2 = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            para_el = para._element
-            if not in_body:
-                if '<w:fldChar w:fldCharType="end"' in para_el.xml:
-                    in_body = True
-                continue
-
-            # 判定 effective outlineLvl == "1"
-            ol_el = _find_effective_ppr_child(para_el, f'{W_NS}outlineLvl')
-            if ol_el is None:
-                continue
-            if ol_el.get(f'{W_NS}val') != '1':
-                continue
-
-            found_level2 = True
-
-            # 1) 左对齐
-            jc_val = _find_effective_ppr_attr(para_el, f'{W_NS}jc', f'{W_NS}val')
-            align_ok = jc_val == 'left'
-
-            # 2) 段前 0.5 行：beforeLines == "50"
-            before_lines = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}beforeLines'
-            )
-            before_ok = before_lines == '50'
-
-            # 3) 段后 0.5 行：afterLines == "50"
-            after_lines = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}afterLines'
-            )
-            after_ok = after_lines == '50'
-
-            # 4) 1.5 倍行距：line == "360" 且 lineRule ∈ {"auto", 缺失}
-            line_val = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}line'
-            )
-            line_rule = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}lineRule'
-            )
-            spacing_ok = line_val == '360' and line_rule in (None, 'auto')
-
-            if not (align_ok and before_ok and after_ok and spacing_ok):
-                violated = True
-                break
-
-        # 扣分项：存在二级标题且任一点不满足
-        passed = found_level2 and violated
-        self.add_result(
-            "文章二级标题段落格式不满足左对齐、段前0.5行、段后0.5行、1.5倍行距",
-            passed, -3,
-        )
-
-    def check_level3_font(self):
-        """-3：文章三级标题字体格式不满足黑体小四号
-
-        细则依据（只判定"黑体"和"小四号"两点，不加任何额外约束）：
-        "文章三级标题" 指正文区（自动目录字段 fldChar end 之后）中所有
-        办公软件（Word/WPS）识别为大纲级别 3 的段落——即段落 effective
-        w:outlineLvl 的 val = "2"（沿"段落 pPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值）。
-        对每个此类段落遍历所有非空 run，判定其在办公软件中实际生效的
-        字体属性——沿"run 直接 rPr → 段落 pPr/rPr → w:pStyle 样式链
-        （含 basedOn）→ w:docDefaults/rPrDefault/rPr"逐级回退取值：
-          1) 字体为黑体：run 文本中的中文字符（CJK）按 effective
-             w:rFonts/@w:eastAsia 判定；非中文字符按 effective
-             w:rFonts/@w:ascii 判定；被判定槽位值需为 "黑体" 或 "SimHei"
-          2) 字号为小四号：effective w:sz 的半磅值 = 24（即 12 磅）
-        只要存在三级标题且任一 run 不满足以上任一项，触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective_ppr_child(para_el, child_tag):
-            """段落属性沿 pPr → pStyle 链 → docDefaults/pPrDefault 回退。"""
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                v = pPr.find(child_tag)
-                if v is not None:
-                    return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    v = s_pPr.find(child_tag)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        v = d_pPr.find(child_tag)
-                        if v is not None:
-                            return v
-            return None
-
-        def _effective_rpr_value(run_el, para_el, getter):
-            """run 属性沿 run rPr → 段落 pPr/rPr → pStyle 链 rPr →
-            docDefaults/rPrDefault/rPr 回退。
-            """
-            r_rpr = run_el.find(f'{W_NS}rPr')
-            if r_rpr is not None:
-                v = getter(r_rpr)
-                if v is not None:
-                    return v
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                p_rpr = pPr.find(f'{W_NS}rPr')
-                if p_rpr is not None:
-                    v = getter(p_rpr)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_rpr = style.find(f'{W_NS}rPr')
-                if s_rpr is not None:
-                    v = getter(s_rpr)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                rPrDefault = doc_defaults.find(f'{W_NS}rPrDefault')
-                if rPrDefault is not None:
-                    d_rpr = rPrDefault.find(f'{W_NS}rPr')
-                    if d_rpr is not None:
-                        v = getter(d_rpr)
-                        if v is not None:
-                            return v
-            return None
-
-        def _get_east_asia(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}eastAsia') if rFonts is not None else None
-
-        def _get_ascii(rpr):
-            rFonts = rpr.find(f'{W_NS}rFonts')
-            return rFonts.get(f'{W_NS}ascii') if rFonts is not None else None
-
-        def _get_sz(rpr):
-            sz = rpr.find(f'{W_NS}sz')
-            return sz.get(f'{W_NS}val') if sz is not None else None
-
-        def _is_hei(name):
-            return name in ('黑体', 'SimHei')
-
-        def _is_cjk(ch):
-            cp = ord(ch)
-            return (
-                0x4E00 <= cp <= 0x9FFF
-                or 0x3400 <= cp <= 0x4DBF
-                or 0xF900 <= cp <= 0xFAFF
-                or 0x3000 <= cp <= 0x303F
-                or 0xFF00 <= cp <= 0xFFEF
-            )
-
-        # 定位正文起点：自动目录字段 fldChar end 之后
-        in_body = False
-        found_level3 = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            para_el = para._element
-            if not in_body:
-                if '<w:fldChar w:fldCharType="end"' in para_el.xml:
-                    in_body = True
-                continue
-
-            # 判定 effective outlineLvl == "2"
-            ol_el = _find_effective_ppr_child(para_el, f'{W_NS}outlineLvl')
-            if ol_el is None:
-                continue
-            if ol_el.get(f'{W_NS}val') != '2':
-                continue
-
-            found_level3 = True
-
-            for run_el in para_el.findall(f'{W_NS}r'):
-                text = ''.join(
-                    (t.text or '') for t in run_el.findall(f'{W_NS}t')
-                )
-                if not text.strip():
-                    continue
-
-                # 1) 字体：按 run 中字符类别选择字体槽位
-                has_cjk = any(_is_cjk(c) for c in text)
-                has_non_cjk = any(
-                    (not _is_cjk(c)) and (not c.isspace()) for c in text
-                )
-                font_ok = True
-                if has_cjk:
-                    ea = _effective_rpr_value(run_el, para_el, _get_east_asia) or ''
-                    if not _is_hei(ea):
-                        font_ok = False
-                if font_ok and has_non_cjk:
-                    asc = _effective_rpr_value(run_el, para_el, _get_ascii) or ''
-                    if not _is_hei(asc):
-                        font_ok = False
-
-                # 2) 字号：小四号 = 半磅 24（12 磅）
-                sz_val = _effective_rpr_value(run_el, para_el, _get_sz)
-                size_ok = sz_val == '24'
-
-                if not (font_ok and size_ok):
-                    violated = True
-                    break
-            if violated:
-                break
-
-        # 扣分项：存在三级标题且任一 run 不满足黑体小四号
-        passed = found_level3 and violated
-        self.add_result("文章三级标题字体格式不满足黑体小四号", passed, -3)
-
-    def check_level3_paragraph(self):
-        """-3：文章三级标题段落格式不满足左对齐、段前0.5行、段后0.5行、1.5倍行距
-
-        细则依据（只判定"左对齐、段前0.5行、段后0.5行、1.5倍行距"四点，
-        不加任何额外约束）："文章三级标题" 指正文区（自动目录字段
-        fldChar end 之后）中所有办公软件（Word/WPS）识别为大纲级别 3
-        的段落——即段落 effective w:outlineLvl 的 val = "2"（沿"段落
-        pPr → w:pStyle 样式链（含 basedOn）→ w:docDefaults/pPrDefault/
-        pPr"逐级回退取值）。对每个此类段落判定其在办公软件中实际生效
-        的段落属性——每个属性（w:jc 的 val，w:spacing 的 beforeLines /
-        afterLines / line / lineRule）单独沿"段落 pPr → w:pStyle 样式
-        链（含 basedOn）→ w:docDefaults/pPrDefault/pPr"逐级回退取值：
-          1) 左对齐：effective w:jc/@w:val == "left"
-          2) 段前0.5行：effective w:spacing/@w:beforeLines == "50"
-             （办公软件"段前 0.5 行"存储为 beforeLines=50，单位 1/100 行）
-          3) 段后0.5行：effective w:spacing/@w:afterLines == "50"
-          4) 1.5倍行距：effective w:spacing/@w:line == "360" 且
-             effective w:spacing/@w:lineRule 属于 {"auto", 缺失}
-             （OOXML lineRule 默认为 auto；1.5 倍 = 360/240）
-        只要存在三级标题且任一点不满足，触发 -3 扣分。
-        """
-        if not self.doc:
-            return
-
-        W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        styles_el = self.doc.styles.element
-
-        def _style_by_id(style_id):
-            if not style_id:
-                return None
-            for s in styles_el.findall(f'{W_NS}style'):
-                if s.get(f'{W_NS}styleId') == style_id:
-                    return s
-            return None
-
-        def _find_effective_ppr_child(para_el, child_tag):
-            """段落属性沿 pPr → pStyle 链 → docDefaults/pPrDefault 回退。"""
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                v = pPr.find(child_tag)
-                if v is not None:
-                    return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    v = s_pPr.find(child_tag)
-                    if v is not None:
-                        return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        v = d_pPr.find(child_tag)
-                        if v is not None:
-                            return v
-            return None
-
-        def _find_effective_ppr_attr(para_el, child_tag, attr_qname):
-            """段落属性按 attribute 粒度回退（OOXML 中 w:spacing 各属性
-            单独继承）。
-            """
-            pPr = para_el.find(f'{W_NS}pPr') if para_el is not None else None
-            if pPr is not None:
-                el = pPr.find(child_tag)
-                if el is not None:
-                    v = el.get(attr_qname)
-                    if v is not None:
-                        return v
-            style_id = None
-            if pPr is not None:
-                pStyle = pPr.find(f'{W_NS}pStyle')
-                if pStyle is not None:
-                    style_id = pStyle.get(f'{W_NS}val')
-            visited = set()
-            while style_id and style_id not in visited:
-                visited.add(style_id)
-                style = _style_by_id(style_id)
-                if style is None:
-                    break
-                s_pPr = style.find(f'{W_NS}pPr')
-                if s_pPr is not None:
-                    el = s_pPr.find(child_tag)
-                    if el is not None:
-                        v = el.get(attr_qname)
-                        if v is not None:
-                            return v
-                based_on = style.find(f'{W_NS}basedOn')
-                style_id = based_on.get(f'{W_NS}val') if based_on is not None else None
-            doc_defaults = styles_el.find(f'{W_NS}docDefaults')
-            if doc_defaults is not None:
-                pPrDefault = doc_defaults.find(f'{W_NS}pPrDefault')
-                if pPrDefault is not None:
-                    d_pPr = pPrDefault.find(f'{W_NS}pPr')
-                    if d_pPr is not None:
-                        el = d_pPr.find(child_tag)
-                        if el is not None:
-                            v = el.get(attr_qname)
-                            if v is not None:
-                                return v
-            return None
-
-        # 定位正文起点：自动目录字段 fldChar end 之后
-        in_body = False
-        found_level3 = False
-        violated = False
-
-        for para in self.doc.paragraphs:
-            para_el = para._element
-            if not in_body:
-                if '<w:fldChar w:fldCharType="end"' in para_el.xml:
-                    in_body = True
-                continue
-
-            # 判定 effective outlineLvl == "2"
-            ol_el = _find_effective_ppr_child(para_el, f'{W_NS}outlineLvl')
-            if ol_el is None:
-                continue
-            if ol_el.get(f'{W_NS}val') != '2':
-                continue
-
-            found_level3 = True
-
-            # 1) 左对齐
-            jc_val = _find_effective_ppr_attr(para_el, f'{W_NS}jc', f'{W_NS}val')
-            align_ok = jc_val == 'left'
-
-            # 2) 段前 0.5 行：beforeLines == "50"
-            before_lines = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}beforeLines'
-            )
-            before_ok = before_lines == '50'
-
-            # 3) 段后 0.5 行：afterLines == "50"
-            after_lines = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}afterLines'
-            )
-            after_ok = after_lines == '50'
-
-            # 4) 1.5 倍行距：line == "360" 且 lineRule ∈ {"auto", 缺失}
-            line_val = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}line'
-            )
-            line_rule = _find_effective_ppr_attr(
-                para_el, f'{W_NS}spacing', f'{W_NS}lineRule'
-            )
-            spacing_ok = line_val == '360' and line_rule in (None, 'auto')
-
-            if not (align_ok and before_ok and after_ok and spacing_ok):
-                violated = True
-                break
-
-        # 扣分项：存在三级标题且任一点不满足
-        passed = found_level3 and violated
-        self.add_result(
-            "文章三级标题段落格式不满足左对齐、段前0.5行、段后0.5行、1.5倍行距",
-            passed, -3,
-        )
-
-
-def _locate_docx(dir_path: str) -> str:
-    """在 dir_path 目录内定位被评估的 Word 文档 (.docx)。
-
-    约定：一个评估目录内应恰有一个待评估文档；若存在多个，选择目录中
-    首个（按 os.listdir 顺序）的 .docx 文件。跳过 Office 临时文件
-    （以 "~$" 开头的锁文件）。
-    """
-    if not os.path.isdir(dir_path):
-        raise FileNotFoundError(f"目录不存在: {dir_path}")
-    candidates = []
-    for name in os.listdir(dir_path):
-        if name.startswith('~$'):
+    if title_idx is None:
+        return (None, [], 0)
+    entries = []
+    i = title_idx + 1
+    while i < len(paras):
+        p = paras[i]
+        if not (p.text or '').strip():
+            i += 1
             continue
-        if name.lower().endswith('.docx'):
-            candidates.append(name)
-    if not candidates:
-        raise FileNotFoundError(f"目录 {dir_path} 中未找到 .docx 文档")
-    return os.path.join(dir_path, candidates[0])
+        if _is_toc_entry_para(p):
+            entries.append(i)
+            i += 1
+            continue
+        break
+    body_start = (entries[-1] + 1) if entries else (title_idx + 1)
+    return (title_idx, entries, body_start)
 
 
-def evaluate(dir_path: str) -> dict:
-    """统一评估入口。
+def _para_section_index(doc, paras):
+    """段落索引 → 所属节序号（按 body 中 sectPr 出现次序划分）。"""
+    mapping = {}
+    sect = 0
+    idx = 0
+    p_tag = qn('w:p')
+    for child in doc.element.body.iterchildren():
+        if child.tag == p_tag:
+            mapping[idx] = sect
+            idx += 1
+            if child.find(qn('w:pPr')) is not None and \
+                    child.find(qn('w:pPr')).find(qn('w:sectPr')) is not None:
+                sect += 1
+        elif child.tag == qn('w:sectPr'):
+            sect += 1
+    return mapping
 
-    参数：
-        dir_path: 脚本所在目录路径；脚本自行在该目录内定位并打开被评估
-                  的 .docx 文档。
 
-    返回：结构化字典，字段定义详见接口约定 §2.2。
-    """
+def _render_to_pdf(file_path, tmp_dir):
+    """把 .docx 渲染为 PDF，用于获取真实分页结果；仅走本机 Word COM 自动化。"""
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    out_pdf = os.path.join(tmp_dir, base_name + '.pdf')
+    try:
+        import win32com.client  # pywin32
+    except ImportError as exc:
+        raise RuntimeError('未安装 pywin32, 无法调用 Word 渲染 PDF: ' + str(exc))
+    word = None
+    doc = None
+    try:
+        word = win32com.client.DispatchEx('Word.Application')
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(os.path.abspath(file_path), ReadOnly=True)
+        doc.ExportAsFixedFormat(
+            OutputFileName=os.path.abspath(out_pdf),
+            ExportFormat=17,  # wdExportFormatPDF
+        )
+    except Exception as exc:
+        raise RuntimeError('Word PDF 渲染失败: ' + str(exc))
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+    if not os.path.isfile(out_pdf):
+        raise RuntimeError('Word PDF 渲染未生成目标文件')
+    return out_pdf
+
+def _build_pdf_probe(file_path):
+    """渲染为 PDF 后返回 (locate, displayed)：
+       locate(snippet) -> 该文本在正文范围内首次出现的物理页序号（0-based）或 None；
+       displayed[phys] -> 该物理页页脚上显示的阿拉伯页码（无法解析则 None）。
+       渲染或 PyMuPDF 不可用时返回 (None, None)，调用方退回静态判定。"""
+    if fitz is None:
+        return (None, None)
+    tmp_dir = tempfile.mkdtemp(prefix='officeval_007_pdf_')
+    try:
+        pdf_path = _render_to_pdf(file_path, tmp_dir)
+        pdf_doc = fitz.open(pdf_path)
+        page_texts = [page.get_text() for page in pdf_doc]
+        pdf_doc.close()
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return (None, None)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # PyMuPDF 抽取文本时会在中/英/数字交界插入换行或空格，去空白后再匹配。
+    norm = [_nows(t) for t in page_texts]
+
+    # 页脚显示页码：取每页最后一个独立成行的阿拉伯数字
+    displayed = []
+    for txt in page_texts:
+        num = None
+        for line in reversed([ln.strip() for ln in (txt or '').splitlines()]):
+            if re.fullmatch(r'\d{1,3}', line):
+                num = int(line)
+                break
+        displayed.append(num)
+
+    # 目录页自身列全了所有条目文字，若从第0页起搜索，每条都会先命中目录页而非
+    # 正文标题。正文以"页脚首次出现阿拉伯页码"的物理页为界（前置部分为罗马数字
+    # 或无页码），以此作搜索下界，正向游标与兜底全扫都不得越过该界回到目录页。
+    body_first = next((p for p, v in enumerate(displayed) if v is not None), 0)
+    state = {'cursor': body_first}
+
+    def locate(snippet):
+        ns = _nows(snippet)
+        if not ns:
+            return None
+        for p in range(state['cursor'], len(norm)):
+            if ns in norm[p]:
+                state['cursor'] = p
+                return p
+        for p in range(body_first, len(norm)):
+            if ns in norm[p]:
+                return p
+        return None
+
+    return (locate, displayed)
+
+
+# ======================= 四、对外接口 =======================
+
+def evaluate(dir_path):
+    """按 §2.2 约定，返回结构化 dict；不 print、不改 sys.stdout、不 sys.exit。
+    入参 dir_path 为"脚本所在目录的路径"，脚本自己在该目录里定位并打开被评估的
+    .docx（忽略以 ~$ 开头的 Word 临时锁文件）。脚本自身崩溃（含目录不存在、
+    未找到文档等）由本函数捕获并返回 status='error'、error=异常摘要、
+    dim1_pass=''、dim1_reason=''、max_score=0——此时维度一根本没跑起来，
+    故不给出 True/False 结论，未通过原因由 error 字段承载。"""
     result = {
         "id": SCRIPT_ID,
         "file_name": "",
         "status": "ok",
         "error": None,
-        "dim1_pass": False,
+        "dim1_pass": True,
         "dim1_reason": "",
         "dim2_items": [],
         "total_score": 0,
-        "max_score": 0,
+        "max_score": MAX_SCORE_TOTAL,
     }
-
     try:
-        file_path = _locate_docx(dir_path)
-        result["file_name"] = os.path.basename(file_path)
-
-        evaluator = DocxEvaluator(file_path)
-        # 内部检查过程中的调试 print 全部丢弃，避免污染 stdout/stderr
-        # （符合接口约定 §2.3：主结果只走 return，不 print 到 stdout）
-        import contextlib
-        with open(os.devnull, 'w', encoding='utf-8') as _devnull, \
-                contextlib.redirect_stdout(_devnull), \
-                contextlib.redirect_stderr(_devnull):
-            score, raw_results = evaluator.evaluate()
-
-        # 划分维度一 / 维度二：score_change == 0 视为维度一子项
-        dim1_items = [r for r in raw_results if r['score_change'] == 0]
-        dim2_raw = [r for r in raw_results if r['score_change'] != 0]
-
-        dim1_failed = [r for r in dim1_items if not r['passed']]
-        result["dim1_pass"] = evaluator.dimension1_passed and not dim1_failed
-        if dim1_failed:
-            result["dim1_reason"] = "；".join(r['description'] for r in dim1_failed)
-
-        # 维度二逐项：命中与未命中均输出
-        for r in dim2_raw:
-            delta = r['score_change'] if r['passed'] else 0
-            result["dim2_items"].append({
-                "rule": r['description'],
-                "max_delta": r['score_change'],
-                "delta": delta,
-                "hit": bool(r['passed']),
-                "detail": "",
-            })
-
-        # 满分：仅累加加分项（正 max_delta）；扣分项仅在命中时才拉低总分
-        result["max_score"] = sum(
-            item["max_delta"] for item in result["dim2_items"]
-            if item["max_delta"] > 0
+        if not dir_path or not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"目录不存在：{dir_path}")
+        cands = sorted(
+            f for f in os.listdir(dir_path)
+            if f.lower().endswith('.docx') and not f.startswith('~$')
         )
-        result["total_score"] = score
+        if not cands:
+            raise FileNotFoundError(f"目录中未找到 .docx 文件：{dir_path}")
+        file_path = os.path.join(dir_path, cands[0])
+        result["file_name"] = os.path.basename(file_path)
+        return _evaluate_impl(file_path, result)
     except Exception as exc:
+        # 脚本异常（目录不存在 / 未找到 .docx / 文档打不开等）：status=error，
+        # error 给出异常摘要；维度一未执行，故 dim1_pass 与 dim1_reason 均置空，
+        # 满分也归零（没有实际评分过程）。目录/文件类问题只给可读消息，
+        # 其余异常带上类型名便于定位。
+        msg = str(exc).strip()
+        if not isinstance(exc, (FileNotFoundError, NotADirectoryError)) or not msg:
+            msg = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
         result["status"] = "error"
-        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["error"] = msg
+        result["dim1_pass"] = ""
+        result["dim1_reason"] = ""
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = 0
+        return result
 
+def _evaluate_impl(file_path, result):
+    """维度一门禁 + 维度二逐项评分；results 内先按固定顺序追加
+    "+N：说明" / "-N：说明"，末尾统一反解为结构化 dim2_items。"""
+    doc = _open_word_document(file_path)
+    results = []   # [(raw, detail), ...]
+
+    def gain(value, rule, ok, detail=""):
+        """加分项：命中记 +value，未命中记 +0。"""
+        results.append(("+%d：%s" % (value if ok else 0, rule), detail))
+
+    def penalty(value, rule, violated, detail=""):
+        """减分项：触发（即出现指令未涉及的破坏性改动）记 -value，未触发记 -0。"""
+        results.append(("-%d：%s" % (value if violated else 0, rule), detail))
+
+    paras = doc.paragraphs
+    all_text = '\n'.join(p.text for p in paras)
+    toc_title_idx, entry_idx, body_start = _locate_toc(doc, paras)
+
+    # 目录条目结构化：(段索引, 段落, 原文, 层级, 行末页码, 剥离页码后的正文)
+    entries = []
+    for i in entry_idx:
+        p = paras[i]
+        raw = _para_text_with_fields(p)
+        entries.append({
+            'idx': i,
+            'para': p,
+            'raw': raw,
+            'level': _entry_level(raw, _style_name(p)),
+            'page': _entry_page(raw),
+            'body': _entry_body(raw),
+            'core': _strip_numbering(_entry_body(raw)),
+        })
+    lv = {n: [e for e in entries if e['level'] == n] for n in (1, 2, 3)}
+
+    # 版心尺寸（twips）：右对齐制表位应落在版心右边界
+    sec0 = doc.sections[0]
+    page_w = sec0.page_width.twips if sec0.page_width is not None else 11906
+    lm = sec0.left_margin.twips if sec0.left_margin is not None else 1800
+    rm = sec0.right_margin.twips if sec0.right_margin is not None else 1800
+    text_width = page_w - lm - rm          # 本套模板 = 8306 twips = 14.65cm
+
+    # 正文段落（目录之后）。用文档序全量段落，避免漏掉排在表格内的标题；
+    # 索引 j 为"全量段落序号"，与 paras（仅顶层段落）的索引体系相互独立。
+    apar = _all_paragraphs(doc)
+    aels = [p._element for p in apar]
+    try:
+        astart = aels.index(paras[body_start]._element) if body_start < len(paras) \
+            else len(apar)
+    except ValueError:
+        astart = 0
+    body = [(j, apar[j]) for j in range(astart, len(apar))]
+
+    # 章标题 / 节标题：优先按大纲级别取（自动目录即以此为据），
+    # 大纲级别缺失时退回按序号写法识别。
+    ol_group = {n: [(j, p) for (j, p) in body if _eff_outline(doc, p) == n]
+                for n in (0, 1, 2)}
+    chapter_heads = ol_group[0] if len(ol_group[0]) >= 4 else \
+        [(j, p) for (j, p) in body
+         if _LVL1_RE.match(_nows(p.text)) and 0 < len(_nows(p.text)) <= 40]
+    section_heads = ol_group[1] if len(ol_group[1]) >= 10 else \
+        [(j, p) for (j, p) in body
+         if _LVL2_RE.match(_nows(p.text)) and 0 < len(_nows(p.text)) <= 30]
+    sub_heads = ol_group[2] if len(ol_group[2]) >= 10 else \
+        [(j, p) for (j, p) in body
+         if _LVL3_RE.match(_nows(p.text)) and 0 < len(_nows(p.text)) <= 30]
+    body_texts_nows = set(_nows(p.text) for (_j, p) in body if p.text.strip())
+    body_cores = set(_strip_numbering(p.text) for (_j, p) in body if p.text.strip())
+
+    # ========== 维度1：可用与可修改性 ==========
+    dim1_fail = []
+    if toc_title_idx is None:
+        dim1_fail.append('未找到"目  录"标题段落')
+    if len(entries) < 5:
+        dim1_fail.append('目录区可编辑条目不足5条（疑为图片/不可编辑对象）')
+    for key, label in (('成人高等教育毕业论文', '封面'), ('作者声明', '作者声明'),
+                       ('Abstract', 'Abstract'), ('致谢', '致谢')):
+        if key not in all_text:
+            dim1_fail.append('缺失%s整块内容' % label)
+    # 页码越出纸张可打印区域（右对齐制表位跑到纸张右边缘之外）→ 不可辨认
+    over = [e for e in entries
+            for (v, pos, _ld) in _eff_tabs(doc, e['para'])
+            if v == 'right' and pos is not None and pos > text_width + rm]
+    if over:
+        dim1_fail.append('目录页码制表位越出纸张右边缘，页码被裁切')
+    if dim1_fail:
+        result["dim1_pass"] = False
+        result["dim1_reason"] = '；'.join(dim1_fail)
+        result["dim2_items"] = []
+        result["total_score"] = 0
+        result["max_score"] = MAX_SCORE_TOTAL
+        return result
+
+    # ---------- 01 +5 目录由TOC域或toc样式承载 ----------
+    # 严格对齐细则，仅踩细则明确写出的点：TOC域 或 toc 1/2/3 专用样式
+    has_field = _has_toc_field(doc)
+    styled = sum(1 for e in entries if re.match(r'^toc\s*[123]$', _style_name(e['para']), re.I))
+    ok01 = has_field or styled >= max(3, int(len(entries) * 0.8))
+    gain(5, '目录由可自动更新的目录域（TOC域）或专用目录样式（toc 1/2/3）承载，而非逐行手工敲入的普通段落文字',
+         ok01, 'TOC域=%s，toc样式条目=%d/%d' % (has_field, styled, len(entries)))
+
+    # 第01项同时作为"前置检查项"：下列以 gain01 记分的项（06/07/12/16/17/18/19）
+    # 在原稿手工目录上也会被动满足，脱离自动更新目录即失去意义，故目录未由
+    # TOC域/toc样式承载时一律不给分。
+    def gain01(value, rule, ok, detail=""):
+        gain(value, rule, bool(ok01 and ok),
+             detail + '；前置项01（自动更新目录）=%s' % ok01)
+
+    # ---------- 02 +5 正文各级标题设置了大纲级别/标题样式 ----------
+    o0, o1, o2 = (len(ol_group[n]) for n in (0, 1, 2))
+    ok02 = o0 >= 4 and o1 >= 10 and o2 >= 10
+    gain(5, '正文各级标题已设置对应大纲级别或标题样式（章标题=大纲1级、"（一）（二）"=大纲2级、"1./2."=大纲3级），使目录可随正文自动生成与更新',
+         ok02, '大纲1级=%d、2级=%d、3级=%d' % (o0, o1, o2))
+
+    # ---------- 03 +5 三级层级收录完整、条目≥45、无成组遗漏 ----------
+    cores = [e['core'] for e in entries if e['core']]
+
+    def covered(text):
+        """该正文标题是否被某条目录条目收录（条目文字含自动编号，故按核心文字比对）。"""
+        c = _strip_numbering(text)
+        if not c:
+            return True
+        return any(c == x or c in x or x in c for x in cores)
+    miss = [_nows(p.text)[:16] for (_j, p) in (section_heads + sub_heads)
+            if not covered(p.text)]
+    ok03 = (len(entries) >= 45 and len(lv[1]) >= 4 and len(lv[2]) >= 12
+            and len(lv[3]) >= 25 and not miss)
+    gain(5, '目录完整收录三级层级——4个章标题、12个"（一）（二）…"节标题及其下全部"1./2./3."小节标题，条目总数不少于45条，无成组遗漏',
+         ok03, '条目=%d（一级%d/二级%d/三级%d），正文节标题%d+小节标题%d，未收录%d个%s'
+         % (len(entries), len(lv[1]), len(lv[2]), len(lv[3]),
+            len(section_heads), len(sub_heads), len(miss), miss[:5]))
+
+    # ---------- 04 +5 点线前导符 + 版心右边界右对齐制表位 ----------
+    tol = 113                                     # 0.2cm ≈ 113 twips
+    bad04 = []
+    for e in entries:
+        tabs = _eff_tabs(doc, e['para'])
+        right = [(pos, ld) for (v, pos, ld) in tabs if v == 'right' and pos is not None]
+        hit = any(abs(pos - text_width) <= tol and (ld in ('dot', 'middleDot', 'hyphen'))
+                  for (pos, ld) in right)
+        if not hit:
+            bad04.append('[%d]%s tabs=%s' % (e['idx'], e['body'][:12],
+                                             [(p, l) for (p, l) in right]))
+    gain(5, '每条目录行以点线前导符（点线或中圆点）连接条目文字与页码，并由一个右对齐制表位收尾；制表位落在版心右边界（8306 twips / 14.65cm，误差≤0.2cm），页码右端与版心右边界对齐且不越出右页边距',
+         not bad04, '版心宽=%d twips，不合格%d条%s' % (text_width, len(bad04), bad04[:3]))
+
+    # ---------- 05 +5 目录条目文字与正文标题完全一致 ----------
+    bad05 = []
+    for e in entries:
+        t = _nows(e['body'])
+        if not t:
+            continue
+        if t in body_texts_nows:
+            continue
+        core = e['core']
+        if core and core in body_cores:
+            if e['level'] == 1:                   # 一级条目须连序号写法一并一致
+                bad05.append('[%d]%s（序号写法与正文不一致）' % (e['idx'], t[:16]))
+            continue
+        if not any(core and (core in b or b in core) for b in body_cores if b):
+            bad05.append('[%d]%s（正文无对应标题）' % (e['idx'], t[:16]))
+    gain(5, '目录条目文字与正文对应标题文字完全一致（含"一.""二.""三.""四."、"（一）""（二）"、"1.""2."等序号写法及其中的标点与空格），不出现擅自改写、缩写、漏字',
+         not bad05, '不一致%d条%s' % (len(bad05), bad05[:3]))
+
+    # ---------- 06 +3 目录标题"目  录"格式 ----------
+    tp = paras[toc_title_idx]
+    t06 = tp.text
+    runs06 = [r for r in tp.runs if r.text.strip()]
+    sb, sbl = _eff_spacing(doc, tp, 'before'), _eff_spacing(doc, tp, 'beforeLines')
+    sa, sal = _eff_spacing(doc, tp, 'after'), _eff_spacing(doc, tp, 'afterLines')
+
+    def one_line(v_twips, v_lines):
+        """段前/段后"1行"：beforeLines≈100 或 before≈1×行高（312 twips，16磅行）。"""
+        if v_lines is not None:
+            try:
+                return abs(int(v_lines) - 100) <= 20
+            except ValueError:
+                return False
+        if v_twips is not None:
+            try:
+                return 260 <= int(v_twips) <= 400
+            except ValueError:
+                return False
+        return False
+    ok06 = (re.match(r'^目[\s　]{1,2}录$', (t06 or '').strip()) is not None
+            and _eff_jc(doc, tp) == 'center'
+            and bool(runs06)
+            and all(_is_heiti(_eff_eastasia(doc, r)) for r in runs06)
+            and all(_eff_size_pt(doc, r) == 16 for r in runs06)
+            and not any(_eff_bold(doc, r) for r in runs06)
+            and one_line(sb, sbl) and one_line(sa, sal)
+            and _eff_line_multiple(doc, tp) == 2.0)
+    gain01(3, '目录标题"目  录"为居中、中间空两个字符、黑体三号（16磅）、不加粗，段前段后1行、2倍行距',
+         ok06, 'text=%r jc=%s 字体=%s 字号=%s 加粗=%s 段前=%s/%s 段后=%s/%s 行距=%s'
+         % (t06, _eff_jc(doc, tp), [_eff_eastasia(doc, r) for r in runs06][:2],
+            [_eff_size_pt(doc, r) for r in runs06][:2],
+            [_eff_bold(doc, r) for r in runs06][:2],
+            sb, sbl, sa, sal, _eff_line_multiple(doc, tp)))
+
+    def check_entries(group, want_font, no_bold=False):
+        """按层级校验条目字体/字号/对齐/行距（no_bold 时另校验不加粗）。"""
+        bad = []
+        for e in group:
+            p = e['para']
+            runs = [r for r in p.runs if r.text.strip()]
+            f_ok = bool(runs) and all(want_font(_eff_eastasia(doc, r)) for r in runs)
+            s_ok = bool(runs) and all(_eff_size_pt(doc, r) == 12 for r in runs)
+            b_ok = (not any(_eff_bold(doc, r) for r in runs)) if no_bold else True
+            if not (f_ok and s_ok and b_ok
+                    and _eff_jc(doc, p) in ('left', 'both', None)
+                    and _eff_line_multiple(doc, p) == 1.5):
+                bad.append('[%d]%s 字体=%s 字号=%s 粗=%s jc=%s 行距=%s'
+                           % (e['idx'], e['body'][:10],
+                              [_eff_eastasia(doc, r) for r in runs][:1],
+                              [_eff_size_pt(doc, r) for r in runs][:1],
+                              [_eff_bold(doc, r) for r in runs][:1],
+                              _eff_jc(doc, p), _eff_line_multiple(doc, p)))
+        return bad
+
+    # ---------- 07 +3 一级条目 黑体小四、左对齐、1.5倍行距、不加粗 ----------
+    b07 = check_entries(lv[1], _is_heiti, no_bold=True)
+    gain01(3, '一级条目（章标题行）为黑体小四（12磅）、左对齐、1.5倍行距、不加粗',
+         bool(lv[1]) and not b07, '一级%d条，不合格%d条%s' % (len(lv[1]), len(b07), b07[:3]))
+
+    # ---------- 08 +3 二级条目 宋体小四、左对齐、1.5倍行距、缩进为0 ----------
+    b08 = check_entries(lv[2], _is_songti)
+    for e in lv[2]:
+        vals = [(k, _eff_ind(doc, e['para'], k) or 0)
+                for k in ('left', 'leftChars', 'firstLine', 'firstLineChars')]
+        if any(v != 0 for (_k, v) in vals):
+            b08.append('[%d]%s ind=%s' % (e['idx'], e['body'][:10], vals))
+    gain(3, '二级条目"（一）…"为宋体小四（12磅）、左对齐、1.5倍行距，左缩进与首行缩进均为0',
+         bool(lv[2]) and not b08, '二级%d条，不合格%d条%s' % (len(lv[2]), len(b08), b08[:3]))
+
+    # ---------- 09 +1 三级条目 宋体小四、左对齐、1.5倍行距、左缩进约1字符 ----------
+    b09 = check_entries(lv[3], _is_songti)
+    for e in lv[3]:
+        chars = _eff_ind(doc, e['para'], 'leftChars')
+        left = _eff_ind(doc, e['para'], 'left') or 0
+        # 1 字符：leftChars≈100（百分之一字符为单位）或 left≈240 twips（小四12磅）
+        if not ((chars is not None and 50 <= chars <= 160) or 110 <= left <= 360):
+            b09.append('[%d]%s leftChars=%s left=%s' % (e['idx'], e['body'][:10], chars, left))
+    gain(1, '三级条目"1. …"为宋体小四（12磅）、左对齐、1.5倍行距，左缩进约1个字符',
+         bool(lv[3]) and not b09, '三级%d条，不合格%d条%s' % (len(lv[3]), len(b09), b09[:3]))
+
+    # ---------- 10 +3 三级缩进正确递进且同级完全一致 ----------
+    def ind_key(e):
+        c = _eff_ind(doc, e['para'], 'leftChars')
+        return c if c is not None else (_eff_ind(doc, e['para'], 'left') or 0)
+    set1, set2, set3 = (set(ind_key(e) for e in lv[n]) for n in (1, 2, 3))
+    ok10 = (len(set1) <= 1 and len(set2) <= 1 and len(set3) == 1
+            and all(v == 0 for v in set1) and all(v == 0 for v in set2)
+            and all(v > 0 for v in set3))
+    gain(3, '三级层级缩进呈正确递进（一级与二级顶格、三级比二级多缩进约1字符），且同级条目缩进量完全一致',
+         ok10, '一级缩进=%s 二级=%s 三级=%s' % (sorted(set1), sorted(set2), sorted(set3)))
+
+    # ---------- 11 +3 目录中不再出现"参考文献""附  录" ----------
+    ghost = [e['body'] for e in entries
+             if _nows(e['body']) and re.search(r'(参考文献|附录)', _nows(e['body']))]
+    gain(1, '目录中不再出现正文没有对应章节的"参考文献""附  录"两个条目',
+         not ghost, '残留条目%s' % (ghost[:3],))
+
+    # ---------- 12 +1 目录收录"总结""致谢" ----------
+    has_sum = any('总结' in _nows(e['body']) for e in entries)
+    has_ack = any('致谢' in _nows(e['body']) for e in entries)
+    gain01(1, '目录收录正文末尾的"总结""致谢"两个条目',
+         has_sum and has_ack, '总结=%s 致谢=%s' % (has_sum, has_ack))
+
+    # ---------- 13 +3 无手工省略号/句点串填充 ----------
+    filler_re = re.compile(r'…{2,}|\.{4,}|[．·‧・]{4,}')
+    bad13 = [(e['idx'], e['raw'][:24]) for e in entries if filler_re.search(e['raw'] or '')]
+    gain(3, '目录中不再保留手工输入的省略号/句点串（"…………""......"）作填充，各行无长度参差的省略号残留',
+         not bad13, '残留填充%d条%s' % (len(bad13), bad13[:3]))
+
+    # ---------- 14 +3 每行行末均有阿拉伯数字页码，无空缺、无占位符 ----------
+    bad14 = [(e['idx'], e['raw'][-18:]) for e in entries if e['page'] is None]
+    ph14 = [(e['idx'], e['raw'][-18:]) for e in entries
+            if re.search(r'(页码|#|\?|？|PAGE)\s*$', (e['raw'] or '').strip(), re.I)]
+    gain(3, '每条目录行末均有对应的阿拉伯数字页码，无页码空缺、无"页码""#""?"等占位符',
+         not bad14 and not ph14, '缺页码%d条%s；占位符%d条%s'
+         % (len(bad14), bad14[:3], len(ph14), ph14[:2]))
+
+    # ---------- 15 +3 页码与标题实际所在页一致，且自上而下只增不减 ----------
+    pages = [e['page'] for e in entries if e['page'] is not None]
+    monotonic = all(b >= a for a, b in zip(pages, pages[1:]))
+    locate, displayed = _build_pdf_probe(file_path)
+    if locate is None:
+        ok15 = bool(pages) and monotonic and len(pages) == len(entries)
+        d15 = '未能渲染PDF，仅作静态判定：页码序列%s，只增不减=%s' % (pages[:12], monotonic)
+    else:
+        # 逐条比对：条目页码 与 该标题在重排后实际出现页的页脚页码；允许全篇一致偏移≤1页
+        diffs, unfound = [], 0
+        for e in entries:
+            if e['page'] is None:
+                continue
+            phys = locate(e['body'] or e['raw'])
+            if phys is None:
+                unfound += 1
+                continue
+            real = displayed[phys] if phys < len(displayed) else None
+            if real is None:
+                unfound += 1
+                continue
+            diffs.append((e['idx'], e['page'] - real))
+        offs = set(d for (_i, d) in diffs)
+        ok15 = (bool(diffs) and monotonic and len(offs) == 1
+                and abs(next(iter(offs))) <= 1)
+        d15 = '偏移集合=%s（须唯一且|偏移|≤1），只增不减=%s，未定位%d条' \
+            % (sorted(offs)[:6], monotonic, unfound)
+    gain(3, '目录页码与标题实际所在页一致——逐条比对条目页码与该标题重新分页后实际出现的页码，允许全篇一致偏移1页以内，不允许单条偏差；页码自上而下只增不减，同页条目页码相同、跨页条目依次递增，不出现前大后小的逆序',
+         ok15, d15)
+
+    # ---------- 16 +3 每条条目单行显示，文字与页码同行 ----------
+    # 估算：条目文字宽度（小四12磅，1全角字=240 twips）+ 页码宽度 + 左缩进 ≤ 版心宽
+    bad16 = []
+    for e in entries:
+        left = _eff_ind(doc, e['para'], 'left')
+        if left is None:
+            c = _eff_ind(doc, e['para'], 'leftChars')
+            left = int(c * 2.4) if c is not None else 0
+        need = left + _visual_units(e['body']) * 240 \
+            + len(str(e['page'] if e['page'] is not None else 0)) * 120
+        if need > text_width or '\n' in (e['raw'] or '') or '\v' in (e['raw'] or ''):
+            bad16.append('[%d]%s 估算宽=%d>%d' % (e['idx'], e['body'][:12], need, text_width))
+    gain01(3, '每条目录条目单行显示，条目文字与页码同处一行，不出现条目折行或页码被挤到下一行',
+         not bad16, '折行风险%d条%s' % (len(bad16), bad16[:3]))
+
+    # ---------- 17 +1 条目段前段后为0（或全表统一），条目间无空行 ----------
+    sp17 = set()
+    for e in entries:
+        sp17.add((_eff_spacing(doc, e['para'], 'before'),
+                  _eff_spacing(doc, e['para'], 'beforeLines'),
+                  _eff_spacing(doc, e['para'], 'after'),
+                  _eff_spacing(doc, e['para'], 'afterLines')))
+    blank17 = sum(1 for i in range(entries[0]['idx'], entries[-1]['idx'])
+                  if not (paras[i].text or '').strip())
+    zero17 = all(v in (None, '0') for tup in sp17 for v in tup)
+    gain01(1, '目录各条目段前段后间距为0（或全表统一取值），条目之间无多余空行',
+         (zero17 or len(sp17) == 1) and blank17 == 0,
+         '段前后取值集合=%s，条目间空行=%d' % (sorted(map(str, sp17))[:3], blank17))
+
+    # ---------- 18 +1 只收录标题级文字，不混入正文段落/图注/"（1）（2）" ----------
+    bad18 = []
+    for e in entries:
+        t = _nows(e['body'])
+        if re.match(r'^[（(]\d+[)）]', t):
+            bad18.append('[%d]%s（正文小点）' % (e['idx'], t[:14]))
+        elif not (_LVL1_RE.match(t) or _LVL2_RE.match(t) or _LVL3_RE.match(t)
+                  or any(k in t for k in _L1_KEYWORDS)):
+            bad18.append('[%d]%s（非标题级文字）' % (e['idx'], t[:14]))
+        elif len(t) > 40:
+            bad18.append('[%d]%s（疑为正文段落）' % (e['idx'], t[:14]))
+    gain01(1, '目录只收录标题级文字，不混入正文段落内容、图注，也不收录"（1）（2）（3）"级别的正文小点',
+         not bad18, '异常%d条%s' % (len(bad18), bad18[:3]))
+
+    # ---------- 19 +1 目录位于Abstract之后、"引  言"之前，独立起页 ----------
+    abs_idx = next((i for i, p in enumerate(paras)
+                    if _nows(p.text).lower() == 'abstract'), None)
+    intro_idx = next((i for i in range(body_start, len(paras))
+                      if '引言' in _nows(paras[i].text)
+                      and len(_nows(paras[i].text)) <= 12), None)
+    secmap = _para_section_index(doc, paras)
+
+    def new_page_at(i):
+        """该段是否另起一页：分节、pageBreakBefore、或本段/前段含分页符。"""
+        if i <= 0:
+            return True
+        if secmap.get(i) != secmap.get(i - 1):
+            return True
+        for el in _ppr_chain(doc, paras[i])[:1]:
+            if el.find(qn('w:pageBreakBefore')) is not None:
+                return True
+        for j in (i - 1, i):
+            for br in paras[j]._element.iter(qn('w:br')):
+                if br.get(qn('w:type')) == 'page':
+                    return True
+        return False
+    ok19 = (abs_idx is not None and intro_idx is not None
+            and abs_idx < toc_title_idx < intro_idx
+            and new_page_at(toc_title_idx) and new_page_at(intro_idx))
+    gain01(1, '目录位于Abstract之后、正文"引  言"之前，独立起页，其后正文仍从新页开始',
+         ok19, 'Abstract段=%s 目录段=%s 引言段=%s 目录另起页=%s 正文另起页=%s'
+         % (abs_idx, toc_title_idx, intro_idx,
+            new_page_at(toc_title_idx) if abs_idx is not None else None,
+            new_page_at(intro_idx) if intro_idx is not None else None))
+
+    # ---------- 20 +1 "三"章条目为完整标题，未被截断为半句 ----------
+    e20 = next((e for e in lv[1] if _nows(e['body']).startswith('三')), None)
+    t20 = _nows(e20['body']) if e20 else ''
+    ok20 = '活动资源梳理与一日生活融合路径' in t20 and '生活环节融合切入点' in t20
+    gain(1, '"三"章条目为完整标题"活动资源梳理与一日生活融合路径与生活环节融合切入点"，未被截断为半句',
+         ok20, '目录条目=%r' % (e20['body'] if e20 else None,))
+
+    # ================= 减分项：指令未要求的破坏性改动 =================
+
+    def find_para(pred, lo=0, hi=None):
+        for i in range(lo, len(paras) if hi is None else hi):
+            if pred(_nows(paras[i].text)):
+                return (i, paras[i])
+        return (None, None)
+
+    def fmt_of(p):
+        runs = [r for r in p.runs if r.text.strip()]
+        return ('jc=%s 中文字体=%s 西文=%s 字号=%s 粗=%s 行距=%s 首行=%s/%s 段前后=%s/%s'
+                % (_eff_jc(doc, p), [_eff_eastasia(doc, r) for r in runs][:1],
+                   [_eff_ascii(doc, r) for r in runs][:1],
+                   sorted(str(_eff_size_pt(doc, r)) for r in runs),
+                   [_eff_bold(doc, r) for r in runs][:1], _eff_line_multiple(doc, p),
+                   _eff_ind(doc, p, 'firstLine'), _eff_ind(doc, p, 'firstLineChars'),
+                   _eff_spacing(doc, p, 'before'), _eff_spacing(doc, p, 'after')))
+
+    def sizes(p):
+        return set(_eff_size_pt(doc, r) for r in p.runs if r.text.strip())
+
+    def fonts_ea(p):
+        return set(_eff_eastasia(doc, r) for r in p.runs if r.text.strip())
+
+    def first_line_2char(p):
+        fc = _eff_ind(doc, p, 'firstLineChars')
+        fl = _eff_ind(doc, p, 'firstLine') or 0
+        return (fc is not None and 150 <= fc <= 250) or 480 <= fl <= 760
+
+    # ---------- 21 -5 封面校徽图形/图片缺失 ----------
+    decl_idx, _decl_p = find_para(lambda t: '作者声明' in t)
+    cover_hi = decl_idx if decl_idx is not None else min(len(paras), 20)
+    logo = any(_has_drawing(paras[i]._element) for i in range(0, cover_hi))
+    penalty(5, '封面页顶部的校徽图形/图片元素缺失或被替换', not logo,
+            '封面区（段0-%d）图形对象=%s' % (cover_hi, logo))
+
+    # ---------- 22 -5 正文段落整段删除/重复/顺序错乱 ----------
+    _CN = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6}
+    order = [_CN.get(_nows(p.text)[:1]) for (_i, p) in chapter_heads]
+    order = [v for v in order if v is not None]
+    asc = all(b > a for a, b in zip(order, order[1:]))
+    longs = [_nows(p.text) for (_i, p) in body if len(_nows(p.text)) >= 60]
+    dup = [t[:16] for t in set(longs) if longs.count(t) > 1]
+    need22 = ['引言', '理论依据', '设计原则', '活动资源', '优化策略', '总结', '致谢']
+    lost = [k for k in need22 if k not in _nows(all_text)]
+    penalty(5, '正文四章（引  言／自然探究活动融入一日生活的理论依据与设计原则／活动资源梳理与一日生活融合路径／优化策略与研究结论）及总结、致谢的段落出现整段删除、整段重复或前后顺序错乱',
+            (not asc) or bool(dup) or bool(lost) or len(order) < 4,
+            '章序=%s 递增=%s 重复段=%s 缺失关键块=%s' % (order, asc, dup[:3], lost))
+
+    # ---------- 23 -5 分节结构被破坏 ----------
+    n_sect = len(doc.sections)
+    s_decl = secmap.get(decl_idx) if decl_idx is not None else None
+    s_toc = secmap.get(toc_title_idx)
+    s_body = secmap.get(intro_idx) if intro_idx is not None else None
+    penalty(5, '文档分节结构被破坏，封面、作者声明、摘要与Abstract、目录、正文不再分属独立节，导致分段页码编排失效',
+            n_sect < 4 or s_toc is None or s_body is None or s_toc == s_body
+            or (s_decl is not None and s_decl == s_toc),
+            '节数=%d 作者声明节=%s 目录节=%s 正文节=%s' % (n_sect, s_decl, s_toc, s_body))
+
+    # ---------- 24 -3 纸张A4与页边距 ----------
+    bad24 = []
+    for k, s in enumerate(doc.sections):
+        def tw(v):
+            return None if v is None else v.twips
+        got = (tw(s.page_width), tw(s.page_height), tw(s.top_margin),
+               tw(s.bottom_margin), tw(s.left_margin), tw(s.right_margin))
+        want = (11906, 16838, 1440, 1440, 1800, 1800)
+        if any(g is None or abs(g - w) > 30 for g, w in zip(got, want)):
+            bad24.append('节%d=%s' % (k, got))
+    penalty(3, '纸张不满足A4（21cm×29.7cm / 11906×16838 twips），页边距不满足上2.54cm、下2.54cm、左3.17cm、右3.17cm',
+            bool(bad24), '不合格%d节%s（期望11906×16838/1440/1440/1800/1800）'
+            % (len(bad24), bad24[:3]))
+
+    def pg_num_type(sect):
+        sp = sect._sectPr
+        node = sp.find(qn('w:pgNumType'))
+        if node is None:
+            return (None, None)
+        return (node.get(qn('w:fmt')), node.get(qn('w:start')))
+
+    # ---------- 25 -3 前置部分页码为大写罗马数字 ----------
+    front_sects = sorted(set(v for k, v in secmap.items()
+                            if k <= (entries[-1]['idx'] if entries else toc_title_idx)))
+    fmts25 = [(k, pg_num_type(doc.sections[k])[0]) for k in front_sects
+              if k < len(doc.sections)]
+    penalty(3, '封面、作者声明、摘要、Abstract、目录等前置部分的页码不满足大写罗马数字（Ⅰ、Ⅱ、Ⅲ…）格式',
+            not fmts25 or not any(f == 'upperRoman' for (_k, f) in fmts25),
+            '前置各节页码格式=%s' % (fmts25,))
+
+    # ---------- 26 -3 正文页码为阿拉伯数字且从1重新起编 ----------
+    fmt26, start26 = pg_num_type(doc.sections[s_body]) if \
+        (s_body is not None and s_body < len(doc.sections)) else (None, None)
+    penalty(3, '正文部分页码不满足阿拉伯数字格式且从1重新起编',
+            fmt26 not in (None, 'decimal') or start26 != '1',
+            '正文节=%s fmt=%s start=%s' % (s_body, fmt26, start26))
+
+    # ---------- 27 -3 页眉/页脚被删除或格式被改动 ----------
+    def part_has_content(part):
+        """页眉/页脚是否有内容（含域代码，页码域在 .text 里取不到）。"""
+        el = part._element
+        for t in el.iter(qn('w:t')):
+            if (t.text or '').strip():
+                return True
+        for tag in ('w:instrText', 'w:fldChar', 'w:drawing', 'w:pict'):
+            if el.find('.//' + qn(tag)) is not None:
+                return True
+        return False
+
+    bad27 = []
+    for k in range(s_toc if s_toc is not None else 0, n_sect):
+        s = doc.sections[k]
+        if not part_has_content(s.header):
+            bad27.append('节%d页眉被删空' % k)
+        if not part_has_content(s.footer):
+            bad27.append('节%d页脚被删空' % k)
+    for k, s in enumerate(doc.sections):
+        for p in [q for q in s.header.paragraphs if (q.text or '').strip()]:
+            pbdr = _chain_node(_ppr_chain(doc, p), 'w:pBdr')
+            has_bottom = pbdr is not None and pbdr.find(qn('w:bottom')) is not None
+            szs = sizes(p)
+            # 小五=9磅、五号=10.5磅：本文各节页眉原为该两档，超出即视为字号被改动
+            if _eff_jc(doc, p) != 'center' or not has_bottom or szs - {9.0, 10.5}:
+                bad27.append('节%d页眉 jc=%s 下框线=%s 字号=%s'
+                             % (k, _eff_jc(doc, p), has_bottom,
+                                sorted(map(str, szs))))
+    penalty(3, '页眉/页脚被删除，或其居中、带下框线、字号9磅（小五）的格式被改动',
+            bool(bad27), '；'.join(bad27[:4]))
+
+    # ---------- 28 -1 "学校代码："行 右对齐、宋体四号 ----------
+    i28, p28 = find_para(lambda t: t.startswith('学校代码'), 0, cover_hi)
+    penalty(1, '文档首页顶部"学校代码："一行不满足右对齐、宋体四号（14磅）',
+            p28 is None or _eff_jc(doc, p28) != 'right'
+            or not all(_is_songti(f) for f in fonts_ea(p28)) or sizes(p28) - {14.0},
+            '段%s %s' % (i28, fmt_of(p28) if p28 is not None else '未找到'))
+
+    # ---------- 29 -1 "成人高等教育毕业论文（设计）" 居中、宋体小二、加粗 ----------
+    i29, p29 = find_para(lambda t: '成人高等教育毕业论文' in t, 0, cover_hi)
+    penalty(1, '封面"成人高等教育毕业论文（设计）"不满足居中、宋体小二（32磅）、加粗',
+            p29 is None or _eff_jc(doc, p29) != 'center'
+            or not all(_is_songti(f) for f in fonts_ea(p29)) or sizes(p29) - {32.0}
+            or not all(_eff_bold(doc, r) for r in p29.runs if r.text.strip()),
+            '段%s %s' % (i29, fmt_of(p29) if p29 is not None else '未找到'))
+
+    # ---------- 30 -1 封面题目两行 各自独立成行、居中、华文新魏二号、不加粗 ----------
+    t30a, t30b = '幼儿园自然探究活动融入一日生活的', '课程设计与应用'
+    i30a, p30a = find_para(lambda t: t == t30a, 0, cover_hi)
+    i30b, p30b = find_para(lambda t: t == t30b, 0, cover_hi)
+    bad30 = p30a is None or p30b is None
+    if not bad30:
+        for p in (p30a, p30b):
+            if (_eff_jc(doc, p) != 'center'
+                    or not all('华文新魏' in (f or '') for f in fonts_ea(p))
+                    or sizes(p) - {24.0}
+                    or any(_eff_bold(doc, r) for r in p.runs if r.text.strip())):
+                bad30 = True
+    penalty(1, '封面题目"幼儿园自然探究活动融入一日生活的""课程设计与应用"两行不满足各自独立成行、居中、华文新魏二号（24磅）、不加粗',
+            bad30, '段%s/%s %s | %s' % (i30a, i30b,
+                                        fmt_of(p30a) if p30a is not None else '未找到',
+                                        fmt_of(p30b) if p30b is not None else '未找到'))
+
+    # ---------- 31 -1 "启明学院毕业论文作者声明" 居中、宋体三号、1.5倍行距 ----------
+    i31, p31 = find_para(lambda t: '毕业论文作者声明' in t)
+    penalty(1, '"启明学院毕业论文作者声明"不满足居中、宋体三号（16磅）、1.5倍行距',
+            p31 is None or _eff_jc(doc, p31) != 'center'
+            or not all(_is_songti(f) for f in fonts_ea(p31)) or sizes(p31) - {16.0}
+            or _eff_line_multiple(doc, p31) != 1.5,
+            '段%s %s' % (i31, fmt_of(p31) if p31 is not None else '未找到'))
+
+    # ---------- 32 -1 作者声明两段正文 三号、首行缩进2字符、1.5倍行距 ----------
+    decl_body = [(i, paras[i]) for i in range(i31 + 1 if i31 is not None else 0,
+                                              min(len(paras), (i31 or 0) + 12))
+                 if _nows(paras[i].text).startswith(('本人声明', '本人同意学校'))]
+    bad32 = len(decl_body) < 2
+    for _i, p in decl_body:
+        if sizes(p) - {16.0} or not first_line_2char(p) \
+                or _eff_line_multiple(doc, p) != 1.5:
+            bad32 = True
+    penalty(1, '作者声明两段正文（"本人声明：……""本人同意学校……"）不满足三号（16磅）、首行缩进2字符、1.5倍行距',
+            bad32, '找到%d段：%s' % (len(decl_body),
+                                    [(i, fmt_of(p)) for (i, p) in decl_body][:2]))
+
+    # ---------- 33 -1 签名两行的文字内容/空格占位/三号字号 ----------
+    i33a, p33a = find_para(lambda t: t.startswith('作者签名'))
+    i33b, p33b = find_para(lambda t: t.startswith('指导教师签名'))
+    bad33 = p33a is None or p33b is None
+    if not bad33:
+        bad33 = (_nows(p33a.text) != '作者签名：日期：2026.4.20'
+                 or _nows(p33b.text) != '指导教师签名：日期：'
+                 or bool(sizes(p33a) - {16.0}) or bool(sizes(p33b) - {16.0})
+                 or not re.search(r'\s{4,}', p33a.text or '')
+                 or not re.search(r'\s{4,}', p33b.text or ''))
+    penalty(1, '"作者签名：                   日期：2026.4.20"与"指导教师签名：               日期："两行的文字内容、空格占位或三号（16磅）字号被改动',
+            bad33, '段%s=%r 字号%s；段%s=%r 字号%s'
+            % (i33a, (p33a.text if p33a is not None else None), sorted(map(str, sizes(p33a))) if p33a is not None else None,
+               i33b, (p33b.text if p33b is not None else None), sorted(map(str, sizes(p33b))) if p33b is not None else None))
+
+    def sp_157(p):
+        """段前段后15.7磅（314 twips，容差±20）。"""
+        b, a = _eff_spacing(doc, p, 'before'), _eff_spacing(doc, p, 'after')
+        try:
+            return abs(int(b) - 314) <= 20 and abs(int(a) - 314) <= 20
+        except (TypeError, ValueError):
+            return False
+
+    # ---------- 34 -1 "摘  要" 居中、黑体三号、段前段后15.7磅、2倍行距 ----------
+    i34, p34 = find_para(lambda t: t == '摘要')
+    penalty(1, '"摘  要"不满足居中、黑体三号（16磅）、段前段后15.7磅、2倍行距',
+            p34 is None or _eff_jc(doc, p34) != 'center'
+            or not all(_is_heiti(f) for f in fonts_ea(p34)) or sizes(p34) - {16.0}
+            or not sp_157(p34) or _eff_line_multiple(doc, p34) != 2.0,
+            '段%s %s' % (i34, fmt_of(p34) if p34 is not None else '未找到'))
+
+    # ---------- 35 -1 摘要正文 小四、首行缩进2字符、1.5倍行距、西文Times New Roman ----------
+    i36, p36 = find_para(lambda t: t.startswith('关键词'))
+    abs_body = [(i, paras[i]) for i in range((i34 or 0) + 1, i36 if i36 else (i34 or 0) + 1)
+                if (paras[i].text or '').strip()]
+    bad35 = not abs_body
+    for _i, p in abs_body:
+        if sizes(p) - {12.0} or not first_line_2char(p) \
+                or _eff_line_multiple(doc, p) != 1.5 \
+                or any('Times New Roman' not in (_eff_ascii(doc, r) or '')
+                       for r in p.runs if r.text.strip()):
+            bad35 = True
+    penalty(1, '摘要正文不满足小四（12磅）、首行缩进2字符、1.5倍行距，或其西文字体不为Times New Roman',
+            bad35, '%d段：%s' % (len(abs_body), [(i, fmt_of(p)) for (i, p) in abs_body][:2]))
+
+    # ---------- 36 -1 中文关键词行 左对齐、黑体四号、条目未被增删改写 ----------
+    kw = '关键词：自然探究；学前教育；一日生活；课程设计；活动应用'
+    penalty(1, '"关键词：自然探究；学前教育；一日生活；课程设计；活动应用"不满足左对齐、黑体四号（14磅），或关键词条目被增删改写',
+            p36 is None or _nows(p36.text) != _nows(kw)
+            or _eff_jc(doc, p36) not in ('left', 'both', None)
+            or not all(_is_heiti(f) for f in fonts_ea(p36)) or sizes(p36) - {14.0},
+            '段%s=%r %s' % (i36, (p36.text if p36 is not None else None),
+                            fmt_of(p36) if p36 is not None else ''))
+
+    # ---------- 37 -1 "Abstract" 居中、三号、段前段后15.7磅、2倍行距 ----------
+    p37 = paras[abs_idx] if abs_idx is not None else None
+    penalty(1, '"Abstract"不满足居中、三号（16磅）、段前段后15.7磅、2倍行距',
+            p37 is None or _eff_jc(doc, p37) != 'center' or sizes(p37) - {16.0}
+            or not sp_157(p37) or _eff_line_multiple(doc, p37) != 2.0,
+            '段%s %s' % (abs_idx, fmt_of(p37) if p37 is not None else '未找到'))
+
+    # ---------- 38 -1 Abstract正文 TNR小四、两端对齐、首行缩进2字符、1.5倍行距 ----------
+    i39, p39 = find_para(lambda t: t.lower().startswith('keywords'))
+    en_body = [(i, paras[i]) for i in range((abs_idx or 0) + 1,
+                                           i39 if i39 else (abs_idx or 0) + 1)
+               if (paras[i].text or '').strip()]
+    bad38 = not en_body
+    for _i, p in en_body:
+        if sizes(p) - {12.0} or not first_line_2char(p) \
+                or _eff_line_multiple(doc, p) != 1.5 \
+                or _eff_jc(doc, p) not in ('both', 'justify') \
+                or any('Times New Roman' not in (_eff_ascii(doc, r) or '')
+                       for r in p.runs if r.text.strip()):
+            bad38 = True
+    penalty(1, 'Abstract正文不满足Times New Roman小四（12磅）、两端对齐、首行缩进2字符、1.5倍行距',
+            bad38, '%d段：%s' % (len(en_body), [(i, fmt_of(p)) for (i, p) in en_body][:2]))
+
+    # ---------- 39 -1 英文关键词行 左对齐、四号、条目未被增删改写 ----------
+    t39 = _nows(p39.text) if p39 is not None else ''
+    penalty(1, '"Keywords:  Nature Inquiry; …"一行不满足左对齐、四号（14磅），或英文关键词被增删改写',
+            p39 is None or 'NatureInquiry' not in t39 or t39.count(';') < 4
+            or _eff_jc(doc, p39) not in ('left', 'both', None) or sizes(p39) - {14.0},
+            '段%s=%r %s' % (i39, (p39.text if p39 is not None else None),
+                            fmt_of(p39) if p39 is not None else ''))
+
+    # ---------- 40 -3 正文章标题 居中、黑体三号、2倍行距 ----------
+    # 只取"一/二/三/四"四章（"总结""致谢"另由第41项判定）
+    main_chaps = [(j, p) for (j, p) in chapter_heads
+                  if not re.search(r'(总结|致谢)', _nows(p.text))]
+    bad40 = []
+    for j, p in main_chaps:
+        # 输入中"四．优化策略与研究结论"以大首行缩进呈视觉居中，等同居中处理
+        centered = _eff_jc(doc, p) == 'center' or (_eff_ind(doc, p, 'firstLine') or 0) >= 1200
+        if not centered or not all(_is_heiti(f) for f in fonts_ea(p)) \
+                or sizes(p) - {16.0} or _eff_line_multiple(doc, p) != 2.0:
+            bad40.append('[%d]%s %s' % (j, _nows(p.text)[:12], fmt_of(p)))
+    penalty(3, '正文章标题"一.引  言""二.自然探究活动融入一日生活的理论依据与设计原则""三.活动资源梳理与一日生活融合路径""四．优化策略与研究结论"不满足居中、黑体三号（16磅）、2倍行距',
+            len(main_chaps) < 4 or bool(bad40),
+            '章标题%d个，不合格%d个%s' % (len(main_chaps), len(bad40), bad40[:2]))
+
+    # ---------- 41 -1 "总结""致谢"标题 居中、三号、2倍行距 ----------
+    bad41 = []
+    for key in ('总结', '致谢'):
+        i, p = find_para(lambda t, k=key: t.endswith(k) and len(t) <= 6, body_start)
+        if p is None or _eff_jc(doc, p) != 'center' or sizes(p) - {16.0} \
+                or _eff_line_multiple(doc, p) != 2.0:
+            bad41.append('%s：%s' % (key, fmt_of(p) if p is not None else '未找到'))
+    penalty(1, '"总结""致谢"两个标题不满足居中、三号（16磅）、2倍行距',
+            bool(bad41), '；'.join(bad41))
+
+    # ---------- 42 -3 正文二级标题 左对齐、黑体四号、1.5倍行距 ----------
+    bad42 = []
+    for j, p in section_heads:
+        if _eff_jc(doc, p) not in ('left', 'both', None) \
+                or not all(_is_heiti(f) for f in fonts_ea(p)) \
+                or sizes(p) - {14.0} or _eff_line_multiple(doc, p) != 1.5:
+            bad42.append('[%d]%s %s' % (j, _nows(p.text)[:10], fmt_of(p)))
+    penalty(3, '正文二级标题"（一）研究背景""（二）研究价值""（三)相关研究述评""（一）理论依据""（二）设计原则""（一）活动资源筛选""（二）生活环节融合切入点""（三）社会领域融合切入点""（四）科学领域融合切入点""（五） 艺术领域融合切入点"不满足左对齐、黑体四号（14磅）、1.5倍行距',
+            len(section_heads) < 10 or bool(bad42),
+            '二级标题%d个，不合格%d个%s' % (len(section_heads), len(bad42), bad42[:2]))
+
+    # ---------- 43 -1 正文叙述段落 小四、1.5倍行距 ----------
+    head_j = set(j for (j, _p) in chapter_heads) | set(j for (j, _p) in section_heads) \
+        | set(j for (j, _p) in sub_heads)
+    narr, bad43 = [], []
+    for j, p in body:
+        t = _nows(p.text)
+        if j in head_j or len(t) < 20 or t.startswith('•') \
+                or _eff_outline(doc, p) is not None:
+            continue
+        narr.append(j)
+        if sizes(p) - {12.0} or _eff_line_multiple(doc, p) != 1.5:
+            bad43.append('[%d]%s' % (j, fmt_of(p)))
+    # 判定为"批量改乱"而非个别段落：不合格占比超过四分之一才计入减分
+    penalty(1, '正文叙述段落不满足小四（12磅）、1.5倍行距',
+            bool(narr) and len(bad43) > max(10, len(narr) * 0.25),
+            '叙述段%d个，不合格%d个%s' % (len(narr), len(bad43), bad43[:2]))
+
+    # ---------- 44 -1 "•"项目符号被删除或改为其他编号 ----------
+    bullets = [_nows(p.text)[:8] for (_i, p) in body if _nows(p.text).startswith('•')]
+    penalty(1, '"• 自然观察""• 简单探究""• 数学经验""• 美术活动""• 音乐活动""• 律动活动"等行首的"•"项目符号被删除或改为其他编号形式',
+            len(bullets) < 6, '以"•"起首的行=%d条%s' % (len(bullets), bullets[:6]))
+
+    # ---------- 45 -3 批注/修订/高亮/底纹/彩色字体 ----------
+    bad45 = []
+    bodyel = doc.element.body
+    if any(True for _ in bodyel.iter(qn('w:commentReference'))):
+        bad45.append('存在批注')
+    for tag in ('w:ins', 'w:del', 'w:moveFrom', 'w:moveTo'):
+        if any(True for _ in bodyel.iter(qn(tag))):
+            bad45.append('存在修订标记(%s)' % tag)
+            break
+    for p in apar:
+        for r in p.runs:
+            rpr = r._element.rPr
+            if rpr is None:
+                continue
+            hl = rpr.find(qn('w:highlight'))
+            if hl is not None and (hl.get(qn('w:val')) or 'none') != 'none':
+                bad45.append('高亮:%r' % r.text[:8])
+            shd = rpr.find(qn('w:shd'))
+            if shd is not None and (shd.get(qn('w:fill')) or 'auto') not in \
+                    ('auto', 'nil', 'FFFFFF', 'ffffff'):
+                bad45.append('底纹:%r' % r.text[:8])
+            col = rpr.find(qn('w:color'))
+            if col is not None and (col.get(qn('w:val')) or 'auto') not in \
+                    ('auto', '000000'):
+                bad45.append('彩色字:%r=%s' % (r.text[:8], col.get(qn('w:val'))))
+    penalty(3, '文档中被插入未经要求的批注、修订标记、文字高亮、底纹或彩色字体',
+            bool(bad45), '共%d处%s' % (len(bad45), bad45[:4]))
+
+    # ---------- 46 -1 致谢正文文字内容被改写/删减/扩写 ----------
+    i46, p46 = find_para(lambda t: t.startswith('时光流转'), body_start)
+    penalty(1, '致谢正文段落（"时光流转，论文写作至此……"）文字内容被改写、删减或扩写',
+            p46 is None or len(_nows(p46.text)) < 60,
+            '段%s 字数=%s' % (i46, len(_nows(p46.text)) if p46 is not None else None))
+
+    # ================= 反解为结构化条目 =================
+    assert len(results) == len(_MAX_DELTAS_ORDER), \
+        '细则条目数与 _MAX_DELTAS_ORDER 不一致：%d vs %d' \
+        % (len(results), len(_MAX_DELTAS_ORDER))
+    dim2_items = []
+    total = 0
+    for (raw, _detail), max_delta in zip(results, _MAX_DELTAS_ORDER):
+        head, _, rule = raw.partition("：")
+        try:
+            delta = int(head.replace("+", "").strip())
+        except ValueError:
+            delta = 0
+        hit = delta != 0
+        dim2_items.append({
+            "rule": rule,
+            "max_delta": max_delta,
+            "delta": max_delta if hit else 0,
+            "hit": hit,
+        })
+        total += max_delta if hit else 0
+    result["dim2_items"] = dim2_items
+    result["total_score"] = max(0, total)
+    result["max_score"] = MAX_SCORE_TOTAL
     return result
 
 
-def main():
-    # 本地调试入口：命令行参数指定脚本所在目录；缺省时使用本脚本所在目录
-    if len(sys.argv) >= 2:
-        dir_path = sys.argv[1]
-    else:
-        dir_path = os.path.dirname(os.path.abspath(__file__))
-    payload = json.dumps(evaluate(dir_path), ensure_ascii=False, indent=2)
-    # 直接向 stdout.buffer 写 UTF-8 字节，避免 Windows cp1252 控制台
-    # 对中文字符抛 UnicodeEncodeError；同时避免改动 sys.stdout 全局对象
-    try:
-        sys.stdout.buffer.write((payload + "\n").encode("utf-8"))
-        sys.stdout.buffer.flush()
-    except AttributeError:
-        # 非二进制 stdout（如某些 IDE 捕获）时回退到普通 print
-        print(payload)
-
-
 if __name__ == "__main__":
-    main()
+    _out = evaluate(os.path.dirname(os.path.abspath(__file__)))
+    print(json.dumps(_out, ensure_ascii=False, indent=2))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
